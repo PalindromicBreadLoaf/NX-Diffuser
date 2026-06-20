@@ -26,9 +26,42 @@ G-Diffuser/
 └── CMakeLists.txt   Top-level build
 ```
 
-## Building
+## Building (Windows)
 
-Requires a user-supplied F-Zero X dump. Build instructions land with milestone M0.
+> M0 status: libultraship and Torch build; assets extract. The bootable executable
+> (`port/`) is in progress (M1).
+
+### Prerequisites
+
+- Visual Studio 2022/2026 (MSVC toolset), CMake ≥ 3.20, Ninja
+- vcpkg (for libultraship's C++ dependencies)
+- A legally obtained F-Zero X ROM dump (US rev 1.0)
+
+> Build from a clean shell **without** MSYS2/MinGW on `PATH`, or MSVC may pick up MinGW
+> headers. Run the commands from a Developer Command Prompt (`vcvars64`).
+
+### Steps
+
+```sh
+# 1. Clone with submodules
+git clone --recursive https://github.com/Zorkats/G-Diffuser.git
+
+# 2. Install libultraship's dependencies via vcpkg
+vcpkg install zlib bzip2 sdl2 glew libzip nlohmann-json tinyxml2 spdlog --triplet x64-windows
+
+# 3. Configure + build (libultraship)
+cmake -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake \
+  -DVCPKG_TARGET_TRIPLET=x64-windows -S . -B build/x64
+cmake --build build/x64
+
+# 4. Build the Torch asset tool
+cmake -G Ninja -S torch -B torch/build/x64
+cmake --build torch/build/x64
+
+# 5. Extract assets from your ROM into an .o2r archive
+torch/build/x64/torch o2r <your_rom.z64> -s decomp -d assets/extracted -u 1.0.0
+```
 
 ## Legal
 
