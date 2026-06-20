@@ -18,6 +18,11 @@ baserom*
 *.ndd
 *.z64dd
 
+# Local build helpers (machine-specific absolute paths) and logs
+build-lus.bat
+build.bat
+*.log
+
 # IDE / editor
 .vs/
 .vscode/
