@@ -18,10 +18,10 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libultraship/CMakeLists.txt")
         "  git submodule update --init --recursive")
 endif()
 
-# --- Components (wired up in M0) ----------------------------------------------
-# add_subdirectory(libultraship)   # runtime + Fast3D renderer
-# add_subdirectory(port)           # game glue + decomp sources
+# --- Components ---------------------------------------------------------------
+add_subdirectory(libultraship)     # runtime + Fast3D renderer
+# add_subdirectory(port)           # game glue + decomp sources (Slice 4)
 #
 # Asset extraction (Torch) is driven as a build step against the user-supplied ROM.
 
-message(STATUS "G-Diffuser scaffold configured. Build wiring lands in M0.")
+message(STATUS "G-Diffuser: libultraship wired via add_subdirectory.")
