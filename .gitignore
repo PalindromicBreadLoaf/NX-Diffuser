@@ -1,0 +1,50 @@
+# Build output
+/build/
+/out/
+/cmake-build-*/
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Extracted assets / archives (built from user's ROM, never committed)
+*.o2r
+*.otr
+/assets/extracted/
+baserom*
+*.z64
+*.ndd
+*.z64dd
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AI / assistant tooling (local only — never committed)
+.atl/
+.claude/
+.claudeignore
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+.cursor/
+.cursorrules
+.aider*
+.windsurf/
+.windsurfrules
+.continue/
+.github/copilot-instructions.md
+.engram/
+**/.engram/
+memory/
+
+# Personal docs — local only, not for the repo
+docs/

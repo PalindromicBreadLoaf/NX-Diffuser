@@ -1,0 +1,9 @@
+[submodule "libultraship"]
+	path = libultraship
+	url = https://github.com/Kenix3/libultraship.git
+[submodule "torch"]
+	path = torch
+	url = https://github.com/HarbourMasters/Torch.git
+[submodule "decomp"]
+	path = decomp
+	url = https://github.com/inspectredc/fzerox.git
