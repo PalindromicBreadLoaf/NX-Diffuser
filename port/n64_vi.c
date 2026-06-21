@@ -17,6 +17,9 @@
 
 extern void gdx_yield(void);
 
+// VI clock global (decomp initialize.c, which set this, is excluded — it did N64 hardware I/O).
+s32 osViClock = 48681812; // VI_NTSC_CLOCK
+
 static void* sCurrentFb = (void*) 0;
 static void* sNextFb = (void*) 0;
 static OSMesgQueue* sViQueue = (void*) 0;

@@ -31,6 +31,9 @@ list(FILTER GAME_SOURCES EXCLUDE REGEX "/libultra/os/timerintr\\.c$")
 # R6 fiber scheduler: our osCreateThread (port/n64_sched.c) captures entry+arg with full 64-bit
 # pointers (the decomp's stores them in truncating u32 context fields) — exclude the decomp's.
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/libultra/os/createthread\\.c$")
+# R6: the decomp's osInitialize does real N64 hardware I/O (PIF/PI register reads via IO_READ) —
+# replaced by a no-op + the init globals in port/n64_sched.c.
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/libultra/os/initialize\\.c$")
 
 # US base first: exclude Expansion Kit / 64DD code (folded in with the EK slice).
 # Mirrors the decomp Makefile's EXPANSION_KIT=0 EXCLUSION_FILES list.

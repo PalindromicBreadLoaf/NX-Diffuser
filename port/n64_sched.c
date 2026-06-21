@@ -11,8 +11,9 @@
 
 #include "PR/os_thread.h"
 #include "PR/osint.h"
-#include "PR/sptask.h"  // OSTask, OSYieldResult, osSpTask* (gfx/audio task submission)
-#include "fzx_thread.h" // THREAD_ID_IDLE
+#include "PR/os_system.h" // OS_CLOCK_RATE, OS_IM_ALL
+#include "PR/sptask.h"     // OSTask, OSYieldResult, osSpTask* (gfx/audio task submission)
+#include "fzx_thread.h"    // THREAD_ID_IDLE
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -88,6 +89,8 @@ OSThread* __osPopThread(OSThread** queue) {
 #ifdef _WIN32
 static void __stdcall gdx_fiber_main(void* param) {
     GdxThreadFiber* tf = (GdxThreadFiber*) param;
+    fprintf(stderr, "[sched] thread id=%d entry\n", (int) tf->thread->id);
+    fflush(stderr);
     tf->entry(tf->arg);
     __osCleanupThread(); // entry returned -> thread is done
 }
@@ -124,6 +127,8 @@ void __osDispatchThread(void) {
             fflush(stderr);
             return;
         }
+        fprintf(stderr, "[sched] dispatch -> id=%d pri=%d\n", (int) t->id, (int) t->priority);
+        fflush(stderr);
         SwitchToFiber(gdx_get_fiber(tf));
     }
 }
@@ -224,6 +229,18 @@ void gdx_dispatch(void) {
 // libultraship's Fast3D (Fast3dWindow::DrawAndRunGraphicsCommands) and posts SP/DP completion.
 // ---------------------------------------------------------------------------------------------
 u32 osMemSize = 0x400000;
+
+// libultra init globals — the decomp's initialize.c is excluded (it does real N64 hardware I/O).
+// osInitialize is a no-op on the host; these globals just need sane values.
+OSTime osClockRate = OS_CLOCK_RATE;
+u32 __osShutdown = 0;
+u32 __OSGlobalIntMask = OS_IM_ALL;
+u32 __kmc_pt_mode = 0;
+void* __printfunc = (void*) 0;
+
+void osInitialize(void) {
+    // N64 RCP / PIF / PI hardware init is not needed on the host.
+}
 
 void osSpTaskLoad(OSTask* tp) {
     (void) tp;
