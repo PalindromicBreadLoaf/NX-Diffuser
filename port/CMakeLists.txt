@@ -59,6 +59,7 @@ list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ending/ending_effects\\.c$")
 add_library(gdiffuser_game OBJECT ${GAME_SOURCES}
     "${CMAKE_CURRENT_SOURCE_DIR}/decomp_port.c"            # port subsystems (segment/save/pool)
     "${CMAKE_CURRENT_SOURCE_DIR}/n64_sched.c"             # R6: cooperative fiber scheduler
+    "${CMAKE_CURRENT_SOURCE_DIR}/n64_vi.c"               # R6: VI bridge (framebuffer + retrace)
     "${CMAKE_CURRENT_SOURCE_DIR}/gen/AssetBindings.c"      # R2: asset symbol defs
     "${CMAKE_CURRENT_SOURCE_DIR}/gen/LinkStubs.c")         # R4/R5 bring-up: placeholder defs to link
 

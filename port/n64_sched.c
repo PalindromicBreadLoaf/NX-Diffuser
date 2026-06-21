@@ -197,6 +197,26 @@ void gdx_yield_to_host(void) {
 #endif
 }
 
+// Cooperative yield that keeps the running thread RUNNABLE — for N64 busy-waits that on hardware
+// spun while the VI/RDP advanced in the background (e.g. `while (osViGetCurrentFramebuffer() !=
+// fb) {}`). Re-enqueue self on the run queue and return to the host so it can advance VI state,
+// then we get re-dispatched to re-check the condition.
+void gdx_yield(void) {
+    if (__osRunningThread == NULL) {
+        return; // host context: nothing to yield
+    }
+    __osRunningThread->state = OS_STATE_RUNNABLE;
+    __osEnqueueThread(&__osRunQueue, __osRunningThread);
+    __osDispatchThread(); // switches away; when empty -> host
+}
+
+// Host: run runnable game threads until the game goes quiescent (all blocked / yielded to host).
+void gdx_dispatch(void) {
+    if (__osRunQueue != (OSThread*) &__osThreadTail) {
+        __osDispatchThread();
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // RDRAM size + SP task submission.
 // osMemSize: 4 MB N64 base RAM (US base game; the Expansion Kit / 64DD needs the 8 MB pak).

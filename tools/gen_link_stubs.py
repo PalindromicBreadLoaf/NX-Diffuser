@@ -31,6 +31,10 @@ EXCLUDE = {
     "__osDequeueThread", "__osThreadTail", "__osDisableInt", "__osRestoreInt",
     "__osCleanupThread", "__osGetCurrFaultedThread",
     "osSpTaskStart", "osSpTaskLoad", "osSpTaskStartGo", "osSpTaskYield", "osSpTaskYielded",
+    # R6 VI bridge (port/n64_vi.c) — we provide these (libultraship os_vi.cpp is disabled).
+    "osViSwapBuffer", "osViGetCurrentFramebuffer", "osViGetNextFramebuffer", "osViSetEvent",
+    "osCreateViManager", "osViSetMode", "osViBlack", "osViSetSpecialFeatures",
+    "osViSetXScale", "osViSetYScale", "osMemSize",
 }
 
 syms = set()
@@ -41,6 +45,14 @@ with open(LOG, encoding="utf-8", errors="ignore") as f:
             s = m.group(1).strip()
             if s not in EXCLUDE:
                 syms.add(s)
+
+# Guard: LinkStubs is generated from a FAILING build log's undefined symbols. If the log is a
+# clean build (no undefined symbols), do NOT overwrite — that would wipe the existing stubs. To
+# regenerate, first empty/remove LinkStubs.c, build (it will fail), then run this against that log.
+if not syms:
+    print("gen_link_stubs: no 'undefined symbol' lines in {} — leaving {} unchanged.".format(
+        os.path.basename(LOG), os.path.relpath(OUT, REPO)))
+    raise SystemExit(0)
 
 # Heuristic: linker-marker / global / blob symbols are DATA; everything else is a function.
 DATA_RE = re.compile(

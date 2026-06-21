@@ -22,6 +22,8 @@
 extern "C" void GDiffuser_LoadAllAssets(void); // generated asset binding loader (R2)
 extern "C" void bootproc(void);                // decomp boot entry (src/sys/sys_main.c)
 extern "C" void gdx_sched_init(void);          // R6: init cooperative fiber scheduler (host fiber)
+extern "C" void gdx_vi_tick(void);             // R6: advance VI + post retrace (wakes Main thread)
+extern "C" void gdx_dispatch(void);            // R6: run game threads until quiescent
 
 static void logStep(const char* s) {
     std::printf("[G-Diffuser] %s\n", s);
@@ -81,6 +83,8 @@ int main(int argc, char** argv) {
     auto w = ctx->GetWindow();
     while (w != nullptr && w->IsRunning()) {
         w->HandleEvents();
+        gdx_vi_tick();   // advance VI framebuffer + post retrace -> wakes the Main scheduler thread
+        gdx_dispatch();  // run the decomp's game threads cooperatively until they block again
         w->StartFrame();
         w->EndFrame();
     }
