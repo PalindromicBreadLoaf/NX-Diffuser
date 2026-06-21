@@ -45,14 +45,14 @@ list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ending/ending_effects\\.c$")
 
 add_library(gdiffuser_game OBJECT ${GAME_SOURCES}
     "${CMAKE_CURRENT_SOURCE_DIR}/decomp_port.c"            # port subsystems (segment/save/pool)
-    "${CMAKE_CURRENT_SOURCE_DIR}/gen/AssetBindings.c")     # R2: asset pointer defs + o2r loader
+    "${CMAKE_CURRENT_SOURCE_DIR}/gen/AssetBindings.c"      # R2: asset symbol defs
+    "${CMAKE_CURRENT_SOURCE_DIR}/gen/LinkStubs.c")         # R4/R5 bring-up: placeholder defs to link
 
 target_include_directories(gdiffuser_game PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/gen"          # R2 shadow pointer headers — MUST precede torch array headers
     "${DECOMP}"            # decomp root: the C uses includes relative to it (e.g. "src/audio/...")
     "${DECOMP}/include"
     "${DECOMP}/src"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../include"   # Torch-generated array headers (shadowed by gen/)
+    "${CMAKE_CURRENT_SOURCE_DIR}/../include"   # Torch-generated asset headers (arrays + #defines)
 )
 
 target_compile_definitions(gdiffuser_game PRIVATE
