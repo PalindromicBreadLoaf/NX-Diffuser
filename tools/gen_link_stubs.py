@@ -18,6 +18,19 @@ OUT = os.path.join(REPO, "port", "gen", "LinkStubs.c")
 # Symbols we implement for real elsewhere (shims.c, decomp_port.c) — never stub these.
 EXCLUDE = {
     "Arena_Allocate", "Arena_StartInit", "Arena_DefaultStartInit", "Arena_EndInit",
+    # R6: decomp's libultra/os/*.c is now compiled (real N64 cooperative scheduler) — these
+    # are DEFINED by the decomp, so they must not be stubbed (would be duplicate symbols).
+    "osCreateThread", "osStartThread", "osStopThread", "osDestroyThread", "osYieldThread",
+    "osSetThreadPri", "osGetThreadPri", "osGetActiveQueue", "__osGetActiveQueue",
+    "osCreateMesgQueue", "osSendMesg", "osRecvMesg", "osJamMesg", "osSetEventMesg",
+    "osPhysicalToVirtual", "osVirtualToPhysical", "osGetMemSize", "osMemSize", "osInitialize",
+    "osSetGlobalIntMask", "osResetGlobalIntMask",
+    # R6: port-provided primitives (port/n64_sched.c context switch + gfx bridge) — we WRITE
+    # these, so don't stub them either.
+    "__osDispatchThread", "__osEnqueueAndYield", "__osEnqueueThread", "__osPopThread",
+    "__osDequeueThread", "__osThreadTail", "__osDisableInt", "__osRestoreInt",
+    "__osCleanupThread", "__osGetCurrFaultedThread",
+    "osSpTaskStart", "osSpTaskLoad", "osSpTaskStartGo", "osSpTaskYield", "osSpTaskYielded",
 }
 
 syms = set()

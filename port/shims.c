@@ -23,9 +23,8 @@ int osEPiWriteIo(void)       { return -1; }
 int osEPiLinkHandle(void)    { return  0; }
 int osDriveRomInit(void)     { return -1; }
 
-// Threading / low-level.
-void osStopThread(void)         {}
-void __osSetHWIntrRoutine(void) {}
+// Threading / low-level: osStopThread + __osSetHWIntrRoutine are now provided by the decomp's
+// real libultra/os scheduler (stopthread.c, sethwinterrupt.c) — R6 Starship-style.
 
 // Audio interface (libultraship provides osAiSetNextBuffer but not this).
 int osAiSetFrequency(void) { return 0; }

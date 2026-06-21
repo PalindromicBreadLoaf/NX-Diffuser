@@ -8,7 +8,9 @@ endif()
 set(DECOMP "${CMAKE_CURRENT_SOURCE_DIR}/../decomp")
 
 # Decomp game C compiled for PC. Exclude:
-#   libultra/* (libultraship provides it) EXCEPT gu/ (matrix/gfx math),
+#   libultra/* (libultraship provides most) EXCEPT gu/ (matrix/gfx math) and os/ (the real
+#   N64 cooperative scheduler — R6 Starship-style: we run the decomp's own thread scheduler
+#   and provide only the low-level context switch __osDispatchThread in the port),
 #   rsp/* (RSP microcode .s -> Fast3D), leo/* (64DD -> later slice).
 file(GLOB_RECURSE GAME_SOURCES CONFIGURE_DEPENDS
     "${DECOMP}/src/game/*.c"
@@ -17,7 +19,18 @@ file(GLOB_RECURSE GAME_SOURCES CONFIGURE_DEPENDS
     "${DECOMP}/src/audio/*.c"
     "${DECOMP}/src/framebuffers/*.c"
     "${DECOMP}/src/libultra/gu/*.c"
+    "${DECOMP}/src/libultra/os/*.c"
 )
+
+# R6: time/timer come from libultraship (os_time.cpp, SDL-based) — exclude the decomp's to
+# avoid duplicate osGetTime/osSetTime/osSetTimer. We keep the decomp's threading+messaging+events.
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/libultra/os/gettime\\.c$")
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/libultra/os/settime\\.c$")
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/libultra/os/settimer\\.c$")
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/libultra/os/timerintr\\.c$")
+# R6 fiber scheduler: our osCreateThread (port/n64_sched.c) captures entry+arg with full 64-bit
+# pointers (the decomp's stores them in truncating u32 context fields) — exclude the decomp's.
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/libultra/os/createthread\\.c$")
 
 # US base first: exclude Expansion Kit / 64DD code (folded in with the EK slice).
 # Mirrors the decomp Makefile's EXPANSION_KIT=0 EXCLUSION_FILES list.
@@ -45,6 +58,7 @@ list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ending/ending_effects\\.c$")
 
 add_library(gdiffuser_game OBJECT ${GAME_SOURCES}
     "${CMAKE_CURRENT_SOURCE_DIR}/decomp_port.c"            # port subsystems (segment/save/pool)
+    "${CMAKE_CURRENT_SOURCE_DIR}/n64_sched.c"             # R6: cooperative fiber scheduler
     "${CMAKE_CURRENT_SOURCE_DIR}/gen/AssetBindings.c"      # R2: asset symbol defs
     "${CMAKE_CURRENT_SOURCE_DIR}/gen/LinkStubs.c")         # R4/R5 bring-up: placeholder defs to link
 

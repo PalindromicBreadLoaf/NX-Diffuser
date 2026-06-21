@@ -21,6 +21,7 @@
 
 extern "C" void GDiffuser_LoadAllAssets(void); // generated asset binding loader (R2)
 extern "C" void bootproc(void);                // decomp boot entry (src/sys/sys_main.c)
+extern "C" void gdx_sched_init(void);          // R6: init cooperative fiber scheduler (host fiber)
 
 static void logStep(const char* s) {
     std::printf("[G-Diffuser] %s\n", s);
@@ -65,6 +66,9 @@ int main(int argc, char** argv) {
 
     logStep("GDiffuser_LoadAllAssets");
     GDiffuser_LoadAllAssets();
+
+    logStep("gdx_sched_init() — cooperative fiber scheduler");
+    gdx_sched_init();
 
     logStep("bootproc() — starting the decomp game threads");
     bootproc();
