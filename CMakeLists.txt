@@ -18,6 +18,10 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libultraship/CMakeLists.txt")
         "  git submodule update --init --recursive")
 endif()
 
+# Match libultraship's static C runtime (/MT) across the whole tree, or the final link
+# fails with a RuntimeLibrary mismatch (LUS = MT_StaticRelease, default = MD_DynamicRelease).
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 # --- Components ---------------------------------------------------------------
 add_subdirectory(libultraship)     # runtime + Fast3D renderer
 add_subdirectory(port)             # game glue + decomp sources + G-Diffuser executable

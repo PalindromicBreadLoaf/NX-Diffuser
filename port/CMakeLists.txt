@@ -81,12 +81,15 @@ endif()
 # Slice 4b stage 1: link the game objects + stub main, with NO libultraship, to surface
 # the unresolved-symbol set (the shim surface). This will NOT link cleanly yet — that is
 # the diagnostic. Real libultraship linking + entry point come next.
-add_executable(G-Diffuser main.cpp $<TARGET_OBJECTS:gdiffuser_game>)
+add_executable(G-Diffuser main.cpp shims.c $<TARGET_OBJECTS:gdiffuser_game>)
 target_include_directories(G-Diffuser PRIVATE "${DECOMP}/include" "${DECOMP}/src")
 
 # Link libultraship when built from the top-level project (it provides the libultra HLE:
 # os* threading/messaging, VI, controller, Fast3D). Remaining unresolved symbols after this
 # (ROM-segment symbols, audio microcode) are the port-reimplemented set for Slice 4c.
+if(MSVC)
+    target_link_options(G-Diffuser PRIVATE /errorlimit:0)  # show ALL unresolved (4c scoping)
+endif()
 if(TARGET libultraship)
     target_link_libraries(G-Diffuser PRIVATE libultraship)
     target_include_directories(G-Diffuser PRIVATE
