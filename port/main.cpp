@@ -9,6 +9,8 @@
 #include "resource/ResourceFactories.h"
 #include "GDiffuserControlDeck.h"
 #include "fast/Fast3dWindow.h"
+#include "fast/Fast3dGui.h"
+#include "ship/window/gui/GuiWindow.h"
 
 #include <chrono>
 #include <cstdio>
@@ -43,10 +45,16 @@ int main(int argc, char** argv) {
     // ResourceManager (with f3d.o2r shaders) MUST init before the window is constructed/inited.
     logStep("InitResourceManager");   ctx->InitResourceManager(std::vector<std::string>{ "f3d.o2r", "generic.o2r" }, {}, 1);
 
-    // Now the resource manager exists — safe to build and init the window.
-    logStep("construct Fast3dWindow"); auto window = std::make_shared<Fast::Fast3dWindow>();
+    // Console must exist BEFORE the Gui is built: the Gui adds a ConsoleWindow whose Init()
+    // (called by AddGuiWindow) registers commands via Context::GetConsole().
     logStep("InitCrashHandler");      ctx->InitCrashHandler();
     logStep("InitConsole");           ctx->InitConsole();
+
+    // Now resource manager + console exist — safe to build and init the window.
+    logStep("construct Fast3dGui");
+    auto gui = std::make_shared<Fast::Fast3dGui>(std::vector<std::shared_ptr<Ship::GuiWindow>>());
+    logStep("construct Fast3dWindow(gui)");
+    auto window = std::make_shared<Fast::Fast3dWindow>(gui);
     logStep("InitWindow");            ctx->InitWindow(window);
     logStep("InitAudio");             ctx->InitAudio({});
     logStep("InitEventSystem");       ctx->InitEventSystem();
