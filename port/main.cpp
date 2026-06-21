@@ -1,21 +1,17 @@
 // G-Diffuser — port entry point.
-// Slice 4c: init libultraship, mount assets, register factories, bind assets, then hand off to
-// the decomp's own boot sequence (bootproc -> idle/main/game threads). libultraship provides the
-// real libultra (threads, message queues, VI, controller) the game's threads run on.
-//
-// STATUS: bring-up. The game's frame-loop <-> libultraship window-loop integration is not final
-// (see keep-alive below) — expect the boot to progress until it needs the frame pump, then stall.
-// Use the log to see how far it gets. printf goes to stdout; libultraship also logs via spdlog.
+// Slice 4c: granular libultraship init. The ControlDeck must be constructed AFTER the Context +
+// ConsoleVariables exist (its GlobalSDLDeviceSettings reads CVars via Context::GetInstance()),
+// so we use CreateUninitializedInstance + step-by-step Init rather than the one-shot CreateInstance.
+// After init: register factories, bind assets, then hand off to the decomp boot (bootproc).
 
 #include "ship/Context.h"
 #include "ship/resource/ResourceManager.h"
 #include "resource/ResourceFactories.h"
 #include "GDiffuserControlDeck.h"
 
-#include <memory>
-
 #include <chrono>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -29,19 +25,26 @@ static void logStep(const char* s) {
 }
 
 int main(int argc, char** argv) {
-    logStep("CreateInstance (libultraship: window/audio/input/resources)");
-    auto controlDeck = std::make_shared<GDiffuser::ControlDeck>();
-    auto ctx = Ship::Context::CreateInstance("G-Diffuser", "gdiffuser", "gdiffuser.cfg.json",
-                                             std::vector<std::string>{ "generic.o2r" },
-                                             /* validHashes */ {},
-                                             /* reservedThreadCount */ 1,
-                                             /* audioSettings */ {},
-                                             /* window */ nullptr,
-                                             controlDeck);
-    if (ctx == nullptr) {
-        logStep("FATAL: Context init failed");
-        return 1;
-    }
+    logStep("CreateUninitializedInstance");
+    auto ctx = Ship::Context::CreateUninitializedInstance("G-Diffuser", "gdiffuser",
+                                                          "gdiffuser.cfg.json");
+    if (ctx == nullptr) { logStep("FATAL: CreateUninitializedInstance"); return 1; }
+
+    logStep("InitLogging");          ctx->InitLogging();
+    logStep("InitConfiguration");    ctx->InitConfiguration();
+    logStep("InitConsoleVariables"); ctx->InitConsoleVariables();
+
+    // Context + CVars exist now — safe to build the ControlDeck.
+    logStep("construct ControlDeck"); auto controlDeck = std::make_shared<GDiffuser::ControlDeck>();
+
+    logStep("InitResourceManager");  ctx->InitResourceManager(std::vector<std::string>{ "generic.o2r" }, {}, 1);
+    logStep("InitControlDeck");      ctx->InitControlDeck(controlDeck);
+    logStep("InitCrashHandler");     ctx->InitCrashHandler();
+    logStep("InitConsole");          ctx->InitConsole();
+    logStep("InitWindow");           ctx->InitWindow();
+    logStep("InitAudio");            ctx->InitAudio({});
+    logStep("InitEventSystem");      ctx->InitEventSystem();
+    logStep("InitFileDropMgr");      ctx->InitFileDropMgr();
 
     logStep("RegisterResourceFactories");
     GDiffuser::RegisterResourceFactories(ctx->GetResourceManager()->GetResourceLoader());
@@ -53,9 +56,6 @@ int main(int argc, char** argv) {
     bootproc();
     logStep("bootproc() returned; game threads running");
 
-    // Keep the process alive so the game's libultraship-backed threads run.
-    // TODO (R6): replace with the real frame loop — drive libultraship's window/frame pump here
-    // and bridge it to the game's VI retrace so the main/game threads advance per frame.
     logStep("entering keep-alive (frame-loop integration pending)");
     for (;;) {
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
