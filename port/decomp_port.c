@@ -28,22 +28,8 @@ s32 Save_SaveSettingsProfiles(void) {
     return 0; // pretend success
 }
 
-// ---- Fixed-address / asset-data placeholders -------------------------------
-// D_1000000: the N64 graphics pool (segment 0x01). Real buffer so allocations have somewhere
-// to live. aVp*: standard screen/split viewports (real values via resource system later).
+// ---- Graphics pool ---------------------------------------------------------
+// D_1000000: the N64 graphics pool (segment 0x01) — a real runtime buffer (NOT an o2r asset),
+// so display-list/matrix allocations have somewhere to live.
+// (aVp* viewports and D_80149A0 are real assets now provided by the R2 asset bindings.)
 GfxPool D_1000000;
-Gfx D_80149A0[1];
-
-Vp aVpFullScreen;
-Vp aVpTopHalf;
-Vp aVpBottomHalf;
-Vp aVpLeftHalf;
-Vp aVpRightHalf;
-Vp aVpTopLeftQuarter;
-Vp aVpTopRightQuarter;
-Vp aVpBottomLeftQuarter;
-Vp aVpBottomRightQuarter;
-Vp aVpTopCenterQuarter;
-Vp aVpBottomCenterQuarter;
-Vp aVpLeftCenterQuarter;
-Vp aVpRightCenterQuarter;

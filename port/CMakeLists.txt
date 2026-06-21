@@ -44,13 +44,15 @@ list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ovl_i2/save\\.c$")        # RO
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ending/ending_effects\\.c$")
 
 add_library(gdiffuser_game OBJECT ${GAME_SOURCES}
-    "${CMAKE_CURRENT_SOURCE_DIR}/decomp_port.c")  # port subsystems compiled with decomp headers
+    "${CMAKE_CURRENT_SOURCE_DIR}/decomp_port.c"            # port subsystems (segment/save/pool)
+    "${CMAKE_CURRENT_SOURCE_DIR}/gen/AssetBindings.c")     # R2: asset pointer defs + o2r loader
 
 target_include_directories(gdiffuser_game PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/gen"          # R2 shadow pointer headers — MUST precede torch array headers
     "${DECOMP}"            # decomp root: the C uses includes relative to it (e.g. "src/audio/...")
     "${DECOMP}/include"
     "${DECOMP}/src"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../include"   # Torch-generated asset headers (assets/us/rev0/*.h)
+    "${CMAKE_CURRENT_SOURCE_DIR}/../include"   # Torch-generated array headers (shadowed by gen/)
 )
 
 target_compile_definitions(gdiffuser_game PRIVATE
@@ -82,8 +84,16 @@ endif()
 # Slice 4b stage 1: link the game objects + stub main, with NO libultraship, to surface
 # the unresolved-symbol set (the shim surface). This will NOT link cleanly yet — that is
 # the diagnostic. Real libultraship linking + entry point come next.
-add_executable(G-Diffuser main.cpp shims.c $<TARGET_OBJECTS:gdiffuser_game>)
-target_include_directories(G-Diffuser PRIVATE "${DECOMP}/include" "${DECOMP}/src")
+add_executable(G-Diffuser
+    main.cpp
+    shims.c
+    AssetLoader.cpp
+    resource/ResourceFactories.cpp
+    $<TARGET_OBJECTS:gdiffuser_game>)
+target_include_directories(G-Diffuser PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"   # for "resource/ResourceFactories.h"
+    "${DECOMP}/include"
+    "${DECOMP}/src")
 
 # Link libultraship when built from the top-level project (it provides the libultra HLE:
 # os* threading/messaging, VI, controller, Fast3D). Remaining unresolved symbols after this
