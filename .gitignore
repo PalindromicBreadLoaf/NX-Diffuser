@@ -1,5 +1,5 @@
 # Build output
-/build/
+build/
 /out/
 /cmake-build-*/
 *.o
@@ -13,6 +13,10 @@
 *.o2r
 *.otr
 /assets/extracted/
+# Torch-generated asset headers / C (built from ROM)
+/include/
+/src/assets/
+torch.hash.yml
 baserom*
 *.z64
 *.ndd
