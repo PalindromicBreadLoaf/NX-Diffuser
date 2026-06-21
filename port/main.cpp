@@ -35,19 +35,22 @@ int main(int argc, char** argv) {
     logStep("InitConfiguration");    ctx->InitConfiguration();
     logStep("InitConsoleVariables"); ctx->InitConsoleVariables();
 
-    // Context + CVars exist now — safe to build the ControlDeck and Window.
+    // Order matches BattleShip's working sequence: ControlDeck -> ResourceManager -> Window.
+    // Context + CVars exist now — safe to build the ControlDeck.
     logStep("construct ControlDeck"); auto controlDeck = std::make_shared<GDiffuser::ControlDeck>();
-    logStep("construct Fast3dWindow"); auto window = std::make_shared<Fast::Fast3dWindow>();
+    logStep("InitControlDeck");       ctx->InitControlDeck(controlDeck);
 
-    // Mount f3d.o2r (Fast3D shaders) BEFORE the window inits, plus the game assets.
-    logStep("InitResourceManager");  ctx->InitResourceManager(std::vector<std::string>{ "f3d.o2r", "generic.o2r" }, {}, 1);
-    logStep("InitControlDeck");      ctx->InitControlDeck(controlDeck);
-    logStep("InitCrashHandler");     ctx->InitCrashHandler();
-    logStep("InitConsole");          ctx->InitConsole();
-    logStep("InitWindow");           ctx->InitWindow(window);
-    logStep("InitAudio");            ctx->InitAudio({});
-    logStep("InitEventSystem");      ctx->InitEventSystem();
-    logStep("InitFileDropMgr");      ctx->InitFileDropMgr();
+    // ResourceManager (with f3d.o2r shaders) MUST init before the window is constructed/inited.
+    logStep("InitResourceManager");   ctx->InitResourceManager(std::vector<std::string>{ "f3d.o2r", "generic.o2r" }, {}, 1);
+
+    // Now the resource manager exists — safe to build and init the window.
+    logStep("construct Fast3dWindow"); auto window = std::make_shared<Fast::Fast3dWindow>();
+    logStep("InitCrashHandler");      ctx->InitCrashHandler();
+    logStep("InitConsole");           ctx->InitConsole();
+    logStep("InitWindow");            ctx->InitWindow(window);
+    logStep("InitAudio");             ctx->InitAudio({});
+    logStep("InitEventSystem");       ctx->InitEventSystem();
+    logStep("InitFileDropMgr");       ctx->InitFileDropMgr();
 
     logStep("RegisterResourceFactories");
     GDiffuser::RegisterResourceFactories(ctx->GetResourceManager()->GetResourceLoader());
