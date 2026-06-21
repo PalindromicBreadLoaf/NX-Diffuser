@@ -10,6 +10,9 @@
 #include "ship/Context.h"
 #include "ship/resource/ResourceManager.h"
 #include "resource/ResourceFactories.h"
+#include "GDiffuserControlDeck.h"
+
+#include <memory>
 
 #include <chrono>
 #include <cstdio>
@@ -27,8 +30,14 @@ static void logStep(const char* s) {
 
 int main(int argc, char** argv) {
     logStep("CreateInstance (libultraship: window/audio/input/resources)");
+    auto controlDeck = std::make_shared<GDiffuser::ControlDeck>();
     auto ctx = Ship::Context::CreateInstance("G-Diffuser", "gdiffuser", "gdiffuser.cfg.json",
-                                             std::vector<std::string>{ "generic.o2r" });
+                                             std::vector<std::string>{ "generic.o2r" },
+                                             /* validHashes */ {},
+                                             /* reservedThreadCount */ 1,
+                                             /* audioSettings */ {},
+                                             /* window */ nullptr,
+                                             controlDeck);
     if (ctx == nullptr) {
         logStep("FATAL: Context init failed");
         return 1;
