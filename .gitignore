@@ -17,6 +17,8 @@ build/
 /include/
 /src/assets/
 torch.hash.yml
+# Generated asset bindings (regenerate via tools/gen_asset_bindings.py)
+/port/gen/
 baserom*
 *.z64
 *.ndd
