@@ -98,3 +98,15 @@ if(TARGET libultraship)
         "${CMAKE_SOURCE_DIR}/libultraship/include"
     )
 endif()
+
+# R1 resource smoke test: links libultraship ONLY (no game objects), so it builds and runs
+# now to verify the .o2r resource pipeline, independent of the not-yet-linking full game.
+if(TARGET libultraship)
+    add_executable(resource_smoketest resource_smoketest.cpp resource/ResourceFactories.cpp)
+    target_include_directories(resource_smoketest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_SOURCE_DIR}/libultraship/src"
+        "${CMAKE_SOURCE_DIR}/libultraship/include"
+    )
+    target_link_libraries(resource_smoketest PRIVATE libultraship)
+endif()
