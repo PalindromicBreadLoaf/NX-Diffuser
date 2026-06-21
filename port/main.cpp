@@ -8,6 +8,7 @@
 #include "ship/resource/ResourceManager.h"
 #include "resource/ResourceFactories.h"
 #include "GDiffuserControlDeck.h"
+#include "fast/Fast3dWindow.h"
 
 #include <chrono>
 #include <cstdio>
@@ -34,14 +35,16 @@ int main(int argc, char** argv) {
     logStep("InitConfiguration");    ctx->InitConfiguration();
     logStep("InitConsoleVariables"); ctx->InitConsoleVariables();
 
-    // Context + CVars exist now — safe to build the ControlDeck.
+    // Context + CVars exist now — safe to build the ControlDeck and Window.
     logStep("construct ControlDeck"); auto controlDeck = std::make_shared<GDiffuser::ControlDeck>();
+    logStep("construct Fast3dWindow"); auto window = std::make_shared<Fast::Fast3dWindow>();
 
-    logStep("InitResourceManager");  ctx->InitResourceManager(std::vector<std::string>{ "generic.o2r" }, {}, 1);
+    // Mount f3d.o2r (Fast3D shaders) BEFORE the window inits, plus the game assets.
+    logStep("InitResourceManager");  ctx->InitResourceManager(std::vector<std::string>{ "f3d.o2r", "generic.o2r" }, {}, 1);
     logStep("InitControlDeck");      ctx->InitControlDeck(controlDeck);
     logStep("InitCrashHandler");     ctx->InitCrashHandler();
     logStep("InitConsole");          ctx->InitConsole();
-    logStep("InitWindow");           ctx->InitWindow();
+    logStep("InitWindow");           ctx->InitWindow(window);
     logStep("InitAudio");            ctx->InitAudio({});
     logStep("InitEventSystem");      ctx->InitEventSystem();
     logStep("InitFileDropMgr");      ctx->InitFileDropMgr();
@@ -56,9 +59,13 @@ int main(int argc, char** argv) {
     bootproc();
     logStep("bootproc() returned; game threads running");
 
-    logStep("entering keep-alive (frame-loop integration pending)");
-    for (;;) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    // Frame loop: pump the libultraship window while the game's threads run and submit gfx.
+    logStep("entering frame loop");
+    auto w = ctx->GetWindow();
+    while (w != nullptr && w->IsRunning()) {
+        w->StartFrame();
+        w->EndFrame();
     }
+    logStep("window closed; exiting");
     return 0;
 }
