@@ -74,3 +74,9 @@ if(MSVC)
         -Wno-incompatible-function-pointer-types
     )
 endif()
+
+# Slice 4b stage 1: link the game objects + stub main, with NO libultraship, to surface
+# the unresolved-symbol set (the shim surface). This will NOT link cleanly yet — that is
+# the diagnostic. Real libultraship linking + entry point come next.
+add_executable(G-Diffuser main.cpp $<TARGET_OBJECTS:gdiffuser_game>)
+target_include_directories(G-Diffuser PRIVATE "${DECOMP}/include" "${DECOMP}/src")
