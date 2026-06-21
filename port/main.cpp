@@ -70,10 +70,13 @@ int main(int argc, char** argv) {
     bootproc();
     logStep("bootproc() returned; game threads running");
 
-    // Frame loop: pump the libultraship window while the game's threads run and submit gfx.
+    // Frame loop: pump SDL events + libultraship window each tick.
+    // HandleEvents() MUST be called every frame to drain the SDL event queue;
+    // without it, click/close events pile up and the window manager crashes.
     logStep("entering frame loop");
     auto w = ctx->GetWindow();
     while (w != nullptr && w->IsRunning()) {
+        w->HandleEvents();
         w->StartFrame();
         w->EndFrame();
     }
