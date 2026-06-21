@@ -20,7 +20,7 @@ endif()
 
 # --- Components ---------------------------------------------------------------
 add_subdirectory(libultraship)     # runtime + Fast3D renderer
-# add_subdirectory(port)           # game glue + decomp sources (Slice 4)
+add_subdirectory(port)             # game glue + decomp sources + G-Diffuser executable
 #
 # Asset extraction (Torch) is driven as a build step against the user-supplied ROM.
 

@@ -31,6 +31,9 @@ list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/machine_create/")
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ead_demo/")
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/audio/disk/")
 
+# libultraship already provides these libultra functions — exclude to avoid duplicate symbols.
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/audio/rom/lib/aisetnextbuf\\.c$")  # osAiSetNextBuffer
+
 # Deferred to port reimplementation (Slice 4c):
 #   segment.c / cartridge_offsets.c -> N64 ROM-segment system (linker segment symbols
 #     don't exist on host; replaced by libultraship's resource loading).
@@ -80,3 +83,14 @@ endif()
 # the diagnostic. Real libultraship linking + entry point come next.
 add_executable(G-Diffuser main.cpp $<TARGET_OBJECTS:gdiffuser_game>)
 target_include_directories(G-Diffuser PRIVATE "${DECOMP}/include" "${DECOMP}/src")
+
+# Link libultraship when built from the top-level project (it provides the libultra HLE:
+# os* threading/messaging, VI, controller, Fast3D). Remaining unresolved symbols after this
+# (ROM-segment symbols, audio microcode) are the port-reimplemented set for Slice 4c.
+if(TARGET libultraship)
+    target_link_libraries(G-Diffuser PRIVATE libultraship)
+    target_include_directories(G-Diffuser PRIVATE
+        "${CMAKE_SOURCE_DIR}/libultraship/src"
+        "${CMAKE_SOURCE_DIR}/libultraship/include"
+    )
+endif()
