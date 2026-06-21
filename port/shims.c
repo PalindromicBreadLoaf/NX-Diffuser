@@ -8,6 +8,7 @@
 
 #include <string.h>
 #include <stddef.h>
+#include <stdlib.h>
 
 // ---- libultra function stubs ------------------------------------------------
 // Controller Pak (save) — to be backed by libultraship's save/storage system.
@@ -35,6 +36,14 @@ void LeoBootGame(void) {}
 // libc: BSD byte-compare not in the MSVC CRT.
 int bcmp(const void* a, const void* b, int n) { return memcmp(a, b, (size_t)n); }
 void bcopy(const void* src, void* dst, int n) { memmove(dst, src, (size_t)n); }
+
+// ---- Memory arena (port reimplementation) ----------------------------------
+// N64 carved arenas out of fixed RDRAM regions; on host we just use the heap so the game's
+// allocations actually have backing memory. (allocationType is ignored for now.)
+void* Arena_Allocate(int allocationType, size_t size) { (void)allocationType; return malloc(size); }
+void  Arena_StartInit(void)        {}
+void  Arena_DefaultStartInit(void) {}
+void  Arena_EndInit(void)          {}
 
 // ---- N64 ROM-segment / audio-microcode symbols ------------------------------
 // Placeholders so global audio data links; real values come from the resource system (4c).

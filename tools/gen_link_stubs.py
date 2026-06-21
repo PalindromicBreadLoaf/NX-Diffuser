@@ -15,12 +15,19 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG = os.path.join(REPO, "top-build.log")
 OUT = os.path.join(REPO, "port", "gen", "LinkStubs.c")
 
+# Symbols we implement for real elsewhere (shims.c, decomp_port.c) — never stub these.
+EXCLUDE = {
+    "Arena_Allocate", "Arena_StartInit", "Arena_DefaultStartInit", "Arena_EndInit",
+}
+
 syms = set()
 with open(LOG, encoding="utf-8", errors="ignore") as f:
     for line in f:
         m = re.search(r"undefined symbol: (\S+)", line)
         if m:
-            syms.add(m.group(1).strip())
+            s = m.group(1).strip()
+            if s not in EXCLUDE:
+                syms.add(s)
 
 # Heuristic: linker-marker / global / blob symbols are DATA; everything else is a function.
 DATA_RE = re.compile(
