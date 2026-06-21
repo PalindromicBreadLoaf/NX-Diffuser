@@ -19,8 +19,26 @@ file(GLOB_RECURSE GAME_SOURCES CONFIGURE_DEPENDS
     "${DECOMP}/src/libultra/gu/*.c"
 )
 
-# US base first: exclude Expansion Kit / 64DD disk audio (folded in with the EK slice).
+# US base first: exclude Expansion Kit / 64DD code (folded in with the EK slice).
+# Mirrors the decomp Makefile's EXPANSION_KIT=0 EXCLUSION_FILES list.
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/sys/disk/")
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ovl_i2/dd_save\\.c$")
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ovl_i2/ovl_i2_data2\\.c$")
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ovl_i10/.*187510\\.c$")
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/expansion_kit/")
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/course_edit/")
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/machine_create/")
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ead_demo/")
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/audio/disk/")
+
+# Deferred to port reimplementation (Slice 4c):
+#   segment.c / cartridge_offsets.c -> N64 ROM-segment system (linker segment symbols
+#     don't exist on host; replaced by libultraship's resource loading).
+#   ending_effects.c -> static GBI display list; needs port-aware gbi pointer packing.
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/sys/segment\\.c$")
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/sys/cartridge_offsets\\.c$")
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ovl_i2/save\\.c$")        # ROM-DMA ghost loading
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ending/ending_effects\\.c$")
 
 add_library(gdiffuser_game OBJECT ${GAME_SOURCES})
 
