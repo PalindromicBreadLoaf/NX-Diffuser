@@ -14,6 +14,7 @@
 int osPfsInitPak(void)       { return -1; }
 int osPfsAllocateFile(void)  { return -1; }
 int osPfsReadWriteFile(void) { return -1; }
+int osPfsFindFile(void)      { return -1; }
 
 // PI / EPI (ROM DMA) — to be replaced by resource-archive reads.
 int osEPiReadIo(void)        { return -1; }
@@ -33,6 +34,7 @@ void LeoBootGame(void) {}
 
 // libc: BSD byte-compare not in the MSVC CRT.
 int bcmp(const void* a, const void* b, int n) { return memcmp(a, b, (size_t)n); }
+void bcopy(const void* src, void* dst, int n) { memmove(dst, src, (size_t)n); }
 
 // ---- N64 ROM-segment / audio-microcode symbols ------------------------------
 // Placeholders so global audio data links; real values come from the resource system (4c).

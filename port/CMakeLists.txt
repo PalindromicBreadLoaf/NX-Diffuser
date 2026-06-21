@@ -43,7 +43,8 @@ list(FILTER GAME_SOURCES EXCLUDE REGEX "/sys/cartridge_offsets\\.c$")
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ovl_i2/save\\.c$")        # ROM-DMA ghost loading
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ending/ending_effects\\.c$")
 
-add_library(gdiffuser_game OBJECT ${GAME_SOURCES})
+add_library(gdiffuser_game OBJECT ${GAME_SOURCES}
+    "${CMAKE_CURRENT_SOURCE_DIR}/decomp_port.c")  # port subsystems compiled with decomp headers
 
 target_include_directories(gdiffuser_game PRIVATE
     "${DECOMP}"            # decomp root: the C uses includes relative to it (e.g. "src/audio/...")
