@@ -127,8 +127,6 @@ void __osDispatchThread(void) {
             fflush(stderr);
             return;
         }
-        fprintf(stderr, "[sched] dispatch -> id=%d pri=%d\n", (int) t->id, (int) t->priority);
-        fflush(stderr);
         SwitchToFiber(gdx_get_fiber(tf));
     }
 }
@@ -216,9 +214,15 @@ void gdx_yield(void) {
     if (__osRunningThread == NULL) {
         return; // host context: nothing to yield
     }
+    // Re-enqueue as runnable, then return to the HOST loop (NOT __osDispatchThread, which would
+    // just re-pick this same highest-priority thread and never let the host advance VI). The host
+    // pumps a frame (gdx_vi_tick advances the framebuffer) and re-dispatches us to re-check.
     __osRunningThread->state = OS_STATE_RUNNABLE;
     __osEnqueueThread(&__osRunQueue, __osRunningThread);
-    __osDispatchThread(); // switches away; when empty -> host
+    __osRunningThread = NULL;
+#ifdef _WIN32
+    SwitchToFiber(sHostFiber);
+#endif
 }
 
 // Host: run runnable game threads until the game goes quiescent (all blocked / yielded to host).
