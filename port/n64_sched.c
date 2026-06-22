@@ -202,6 +202,12 @@ void gdx_yield_to_host(void) {
 #endif
 }
 
+// Diagnostic log helper for decomp .c files that can't include <stdio.h> (libc/stdint.h clash).
+void gdx_ck(const char* s) {
+    fprintf(stderr, "%s\n", s);
+    fflush(stderr);
+}
+
 // Cooperative yield that keeps the running thread RUNNABLE — for N64 busy-waits that on hardware
 // spun while the VI/RDP advanced in the background (e.g. `while (osViGetCurrentFramebuffer() !=
 // fb) {}`). Re-enqueue self on the run queue and return to the host so it can advance VI state,
