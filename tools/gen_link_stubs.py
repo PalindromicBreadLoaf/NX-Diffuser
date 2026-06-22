@@ -35,6 +35,8 @@ EXCLUDE = {
     "osViSwapBuffer", "osViGetCurrentFramebuffer", "osViGetNextFramebuffer", "osViSetEvent",
     "osCreateViManager", "osViSetMode", "osViBlack", "osViSetSpecialFeatures",
     "osViSetXScale", "osViSetYScale", "osMemSize",
+    # libultra globals the decomp uses as ARRAYS (must be real writable data, not function stubs).
+    "osAppNMIBuffer",
 }
 
 syms = set()

@@ -206,6 +206,11 @@ void gdx_ck(const char* s) {
     fflush(stderr);
 }
 
+void gdx_cki(const char* s, int v) {
+    fprintf(stderr, "%s=%d (0x%x)\n", s, v, (unsigned) v);
+    fflush(stderr);
+}
+
 // Cooperative yield that keeps the running thread RUNNABLE — for N64 busy-waits that on hardware
 // spun while the VI/RDP advanced in the background (e.g. `while (osViGetCurrentFramebuffer() !=
 // fb) {}`). Re-enqueue self on the run queue and return to the host so it can advance VI state,
@@ -239,6 +244,10 @@ void gdx_dispatch(void) {
 // libultraship's Fast3D (Fast3dWindow::DrawAndRunGraphicsCommands) and posts SP/DP completion.
 // ---------------------------------------------------------------------------------------------
 u32 osMemSize = 0x400000;
+
+// libultra app NMI buffer (decomp uses it as an s32[] — must be real writable data, not a stub).
+// 64 bytes (OS_APP_NMI_BUFSIZE) = 16 s32.
+s32 osAppNMIBuffer[16];
 
 // libultra init globals — the decomp's initialize.c is excluded (it does real N64 hardware I/O).
 // osInitialize is a no-op on the host; these globals just need sane values.
