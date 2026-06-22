@@ -252,6 +252,12 @@ void osInitialize(void) {
     // N64 RCP / PIF / PI hardware init is not needed on the host.
 }
 
+// The decomp's osGetMemSize probes RAM by dereferencing N64 bus addresses (crashes on host).
+// Just report our RAM size.
+u32 osGetMemSize(void) {
+    return osMemSize;
+}
+
 void osSpTaskLoad(OSTask* tp) {
     (void) tp;
 }

@@ -34,6 +34,9 @@ list(FILTER GAME_SOURCES EXCLUDE REGEX "/libultra/os/createthread\\.c$")
 # R6: the decomp's osInitialize does real N64 hardware I/O (PIF/PI register reads via IO_READ) —
 # replaced by a no-op + the init globals in port/n64_sched.c.
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/libultra/os/initialize\\.c$")
+# R6: the decomp's osGetMemSize probes RAM by dereferencing N64 bus addresses (K1BASE+size =
+# 0xA0400000...) — replaced by a host version returning osMemSize in port/n64_sched.c.
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/libultra/os/getmemsize\\.c$")
 
 # US base first: exclude Expansion Kit / 64DD code (folded in with the EK slice).
 # Mirrors the decomp Makefile's EXPANSION_KIT=0 EXCLUSION_FILES list.
