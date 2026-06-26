@@ -8,6 +8,9 @@ build/
 *.dll
 *.so
 *.dylib
+x64/
+gdiffuser.cfg.json
+imgui.ini
 
 # Extracted assets / archives (built from user's ROM, never committed)
 *.o2r
@@ -39,23 +42,10 @@ build.bat
 .DS_Store
 Thumbs.db
 
-# AI / assistant tooling (local only — never committed)
 .atl/
-.claude/
-.claudeignore
-CLAUDE.md
-CLAUDE.local.md
-AGENTS.md
-.cursor/
-.cursorrules
-.aider*
-.windsurf/
-.windsurfrules
-.continue/
-.github/copilot-instructions.md
-.engram/
-**/.engram/
-memory/
+.idea/
+.agents/
+openspec/
 
 # Personal docs — local only, not for the repo
 docs/

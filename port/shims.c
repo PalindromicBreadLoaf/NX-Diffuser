@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include "port_log.h"
 
 // ---- libultra function stubs ------------------------------------------------
 // Controller Pak (save) — to be backed by libultraship's save/storage system.
@@ -26,6 +27,13 @@ int osDriveRomInit(void)     { return -1; }
 // Threading / low-level: osStopThread + __osSetHWIntrRoutine are now provided by the decomp's
 // real libultra/os scheduler (stopthread.c, sethwinterrupt.c) — R6 Starship-style.
 
+// libultra debug error hook. Some libultra paths reference this as a function; keep a real
+// no-op function shim instead of satisfying the linker with a data symbol.
+void __osError(short code, short numArgs, ...) {
+    (void)code;
+    (void)numArgs;
+}
+
 // Audio interface (libultraship provides osAiSetNextBuffer but not this).
 int osAiSetFrequency(void) { return 0; }
 
@@ -36,10 +44,22 @@ void LeoBootGame(void) {}
 int bcmp(const void* a, const void* b, int n) { return memcmp(a, b, (size_t)n); }
 void bcopy(const void* src, void* dst, int n) { memmove(dst, src, (size_t)n); }
 
+// Host CRT wrappers for decomp-side code. The gdiffuser_game object target must not include
+// MSVC system headers, so it calls these wrappers instead of relying on implicit CRT prototypes.
+void* gdx_host_calloc(size_t count, size_t size) { return calloc(count, size); }
+void  gdx_host_exit(int status) { exit(status); }
+void  gdx_host_abort(void) { abort(); }
+
 // ---- Memory arena (port reimplementation) ----------------------------------
-// N64 carved arenas out of fixed RDRAM regions; on host we just use the heap so the game's
-// allocations actually have backing memory. (allocationType is ignored for now.)
-void* Arena_Allocate(int allocationType, size_t size) { (void)allocationType; return malloc(size); }
+// Arena_Allocate now carves from the 8MB RDRAM bump allocator (gdx_rdram_alloc_raw).
+// The whole RDRAM buffer is registered once at startup in gdx_rdram_init() —
+// no per-allocation gdx_register_host_range call needed here.
+void* gdx_rdram_alloc_raw(size_t size, size_t align); // defined in decomp_port.c
+
+void* Arena_Allocate(int allocationType, size_t size) {
+    (void)allocationType;
+    return gdx_rdram_alloc_raw(size, 16u);
+}
 void  Arena_StartInit(void)        {}
 void  Arena_DefaultStartInit(void) {}
 void  Arena_EndInit(void)          {}

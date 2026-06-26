@@ -6,6 +6,7 @@ if(NOT DEFINED PROJECT_NAME)
 endif()
 
 set(DECOMP "${CMAKE_CURRENT_SOURCE_DIR}/../decomp")
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 # Decomp game C compiled for PC. Exclude:
 #   libultra/* (libultraship provides most) EXCEPT gu/ (matrix/gfx math) and os/ (the real
@@ -58,14 +59,17 @@ list(FILTER GAME_SOURCES EXCLUDE REGEX "/audio/rom/lib/aisetnextbuf\\.c$")  # os
 #     don't exist on host; replaced by libultraship's resource loading).
 #   ending_effects.c -> static GBI display list; needs port-aware gbi pointer packing.
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/sys/segment\\.c$")
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/libultra/os/virtualtophysical\\.c$")
+list(FILTER GAME_SOURCES EXCLUDE REGEX "/libultra/os/physicaltovirtual\\.c$")
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/sys/cartridge_offsets\\.c$")
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ovl_i2/save\\.c$")        # ROM-DMA ghost loading
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ending/ending_effects\\.c$")
 
 add_library(gdiffuser_game OBJECT ${GAME_SOURCES}
     "${CMAKE_CURRENT_SOURCE_DIR}/decomp_port.c"            # port subsystems (segment/save/pool)
-    "${CMAKE_CURRENT_SOURCE_DIR}/n64_sched.c"             # R6: cooperative fiber scheduler
-    "${CMAKE_CURRENT_SOURCE_DIR}/n64_vi.c"               # R6: VI bridge (framebuffer + retrace)
+    "${CMAKE_CURRENT_SOURCE_DIR}/n64_sched.c"              # R6: cooperative fiber scheduler
+    "${CMAKE_CURRENT_SOURCE_DIR}/n64_vi.c"                # R6: VI bridge (framebuffer + retrace)
+    "${DECOMP}/src/libultra/io/devmgr.c"                  # PORT PI manager: host-backed DMA completion
     "${CMAKE_CURRENT_SOURCE_DIR}/gen/AssetBindings.c"      # R2: asset symbol defs
     "${CMAKE_CURRENT_SOURCE_DIR}/gen/LinkStubs.c")         # R4/R5 bring-up: placeholder defs to link
 
@@ -88,39 +92,54 @@ target_compile_definitions(gdiffuser_game PRIVATE
     ASSET_REVISION=rev0
 )
 
-# clang-cl: Slice 4a is about *compiling*. Downgrade the decomp-porting diagnostics that
-# clang errors on by default (int<->pointer, implicit decls) so the legacy IDO-era C builds.
-# NOTE: -Wint-conversion masks the real 64-bit pointer-truncation risk (decomp stores N64
-# pointers in u32 / 32-bit uintptr_t) — must be revisited for M1 runtime correctness.
+# MSVC: suppress warnings from IDO-era C code (int<->pointer truncation, implicit decls).
 if(MSVC)
-    target_compile_options(gdiffuser_game PRIVATE
-        /W0
-        -Wno-int-conversion
-        -Wno-implicit-function-declaration
-        -Wno-incompatible-pointer-types
-        -Wno-incompatible-function-pointer-types
-    )
+    target_compile_options(gdiffuser_game PRIVATE /W0)
 endif()
 
-# Slice 4b stage 1: link the game objects + stub main, with NO libultraship, to surface
-# the unresolved-symbol set (the shim surface). This will NOT link cleanly yet — that is
-# the diagnostic. Real libultraship linking + entry point come next.
+# Main executable.
 add_executable(G-Diffuser
     main.cpp
+    input_bridge.c
+    n64_gfx_bridge.cpp
     shims.c
     AssetLoader.cpp
     resource/ResourceFactories.cpp
+    rom_buffer.cpp
+    mio0_wrap.c
+    "${CMAKE_CURRENT_SOURCE_DIR}/../torch/lib/libmio0/mio0.c"
     $<TARGET_OBJECTS:gdiffuser_game>)
+
+if(WIN32)
+    set_target_properties(G-Diffuser PROPERTIES WIN32_EXECUTABLE TRUE)
+endif()
+
+file(GLOB_RECURSE GDIFFUSER_F3D_SHADER_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/libultraship/src/fast/shaders/*")
+set(GDIFFUSER_F3D_O2R "${CMAKE_CURRENT_BINARY_DIR}/f3d.o2r")
+add_custom_command(
+    OUTPUT "${GDIFFUSER_F3D_O2R}"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/gen_f3d_o2r.py" "${GDIFFUSER_F3D_O2R}"
+    DEPENDS "${CMAKE_SOURCE_DIR}/tools/gen_f3d_o2r.py" ${GDIFFUSER_F3D_SHADER_SOURCES}
+    COMMENT "Generating Fast3D shader archive f3d.o2r"
+    VERBATIM)
+add_custom_target(gdiffuser_f3d_o2r DEPENDS "${GDIFFUSER_F3D_O2R}")
+add_dependencies(G-Diffuser gdiffuser_f3d_o2r)
+add_custom_command(TARGET G-Diffuser POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${GDIFFUSER_F3D_O2R}" "$<TARGET_FILE_DIR:G-Diffuser>/f3d.o2r"
+    VERBATIM)
+
 target_include_directories(G-Diffuser PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"   # for "resource/ResourceFactories.h"
     "${DECOMP}/include"
-    "${DECOMP}/src")
+    "${DECOMP}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../torch/lib/libmio0"  # S5: mio0.h + utils.h for mio0_wrap.c and mio0.c
+)
 
 # Link libultraship when built from the top-level project (it provides the libultra HLE:
-# os* threading/messaging, VI, controller, Fast3D). Remaining unresolved symbols after this
-# (ROM-segment symbols, audio microcode) are the port-reimplemented set for Slice 4c.
-if(MSVC)
-    target_link_options(G-Diffuser PRIVATE /errorlimit:0)  # show ALL unresolved (4c scoping)
+# os* threading/messaging, VI, controller, Fast3D).
+if(WIN32)
+    target_link_libraries(G-Diffuser PRIVATE user32 Comdlg32)
 endif()
 if(TARGET libultraship)
     target_link_libraries(G-Diffuser PRIVATE libultraship)

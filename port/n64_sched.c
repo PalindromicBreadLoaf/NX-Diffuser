@@ -23,6 +23,8 @@
 #include <stddef.h>
 #include <stdio.h>
 
+#include "port_log.h"
+
 // ---------------------------------------------------------------------------------------------
 // Per-thread fiber registry. We capture entry+arg here (with full 64-bit pointers) because the
 // decomp's OSThread.context.pc/a0 are u32 and truncate a host function pointer to 32 bits.
@@ -89,8 +91,7 @@ OSThread* __osPopThread(OSThread** queue) {
 #ifdef _WIN32
 static void __stdcall gdx_fiber_main(void* param) {
     GdxThreadFiber* tf = (GdxThreadFiber*) param;
-    fprintf(stderr, "[sched] thread id=%d entry\n", (int) tf->thread->id);
-    fflush(stderr);
+    gdx_port_logf("[sched] thread id=%d entry\n", (int) tf->thread->id);
     tf->entry(tf->arg);
     __osCleanupThread(); // entry returned -> thread is done
 }
@@ -123,8 +124,7 @@ void __osDispatchThread(void) {
     {
         GdxThreadFiber* tf = gdx_find(t);
         if (tf == NULL) {
-            fprintf(stderr, "[sched] FATAL: dispatch unknown thread id=%d\n", (int) t->id);
-            fflush(stderr);
+            gdx_port_logf("[sched] FATAL: dispatch unknown thread id=%d\n", (int) t->id);
             return;
         }
         SwitchToFiber(gdx_get_fiber(tf));
@@ -189,8 +189,7 @@ void gdx_sched_init(void) {
 #ifdef _WIN32
     sHostFiber = ConvertThreadToFiber(NULL);
 #endif
-    fprintf(stderr, "[sched] host fiber ready\n");
-    fflush(stderr);
+    gdx_port_logf("[sched] host fiber ready\n");
 }
 
 // Called by the (port-patched) idle thread's spin: hand the CPU back to the host loop.
@@ -202,13 +201,25 @@ void gdx_yield_to_host(void) {
 
 // Diagnostic log helper for decomp .c files that can't include <stdio.h> (libc/stdint.h clash).
 void gdx_ck(const char* s) {
-    fprintf(stderr, "%s\n", s);
-    fflush(stderr);
+    gdx_port_logf("%s\n", s);
 }
 
 void gdx_cki(const char* s, int v) {
-    fprintf(stderr, "%s=%d (0x%x)\n", s, v, (unsigned) v);
-    fflush(stderr);
+    gdx_port_logf("%s=%d (0x%x)\n", s, v, (unsigned) v);
+}
+
+void gdx_ckp(const char* s, void* p) {
+    gdx_port_logf("%s=%p\n", s, p);
+}
+
+void gdx_seg_log(const char* kind, int seg, uintptr_t raw, void* resolved) {
+    gdx_port_logf("[seg] %s seg=%d raw=%p raw32=%08X resolved=%p\n",
+                  kind, seg, (void*)raw, (unsigned)(raw & 0xFFFFFFFFu), resolved);
+}
+
+void gdx_addr_log(const char* kind, uintptr_t raw, void* resolved) {
+    gdx_port_logf("[addr-resolve] %s raw=%p raw32=%08X resolved=%p\n",
+                  kind, (void*)raw, (unsigned)(raw & 0xFFFFFFFFu), resolved);
 }
 
 // Cooperative yield that keeps the running thread RUNNABLE — for N64 busy-waits that on hardware
@@ -243,7 +254,7 @@ void gdx_dispatch(void) {
 // The osSpTask* functions are STUBS for now — R6 piece 4 routes the GFX OSTask's display list to
 // libultraship's Fast3D (Fast3dWindow::DrawAndRunGraphicsCommands) and posts SP/DP completion.
 // ---------------------------------------------------------------------------------------------
-u32 osMemSize = 0x400000;
+u32 osMemSize = 0x1000000; /* 16 MB: base 8MB + Expansion Pak (required by F-Zero X US) */
 
 // libultra app NMI buffer (decomp uses it as an s32[] — must be real writable data, not a stub).
 // 64 bytes (OS_APP_NMI_BUFSIZE) = 16 s32.
@@ -267,12 +278,26 @@ u32 osGetMemSize(void) {
     return osMemSize;
 }
 
+extern void gdx_gfx_run(void* dl, size_t dl_size); /* C-linkage bridge (port/n64_gfx_bridge.cpp) */
+extern OSMesgQueue gMainThreadMesgQueue;
+extern OSMesgQueue D_800DCAC8;
+
 void osSpTaskLoad(OSTask* tp) {
     (void) tp;
 }
+
 void osSpTaskStartGo(OSTask* tp) {
-    (void) tp; // TODO R6 piece 4: GFX task -> Fast3D
+    gdx_port_logf("[sched] osSpTaskStartGo: dl=%p size=%u\n",
+                  (void*)tp->t.data_ptr, (unsigned)tp->t.data_size);
+    gdx_gfx_run(tp->t.data_ptr, tp->t.data_size);                                      /* synchronous Fast3D Run() */
+    gdx_port_logf("[sched] osSpTaskStartGo: gdx_gfx_run done\n");
+    osSendMesg(&gMainThreadMesgQueue, (OSMesg)(uintptr_t)EVENT_MESG_SP, OS_MESG_NOBLOCK); /* SP done */
+    osSendMesg(&D_800DCAC8,           (OSMesg)(uintptr_t)0x2A,           OS_MESG_NOBLOCK); /* DP done */
 }
+
+/* DP hardware status: always idle on host — no RDP hardware. */
+u32  osDpGetStatus(void)         { return 0; }
+void osDpSetStatus(u32 status)   { (void)status; }
 void osSpTaskYield(void) {
 }
 OSYieldResult osSpTaskYielded(OSTask* tp) {
