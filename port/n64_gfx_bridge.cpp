@@ -1256,7 +1256,8 @@ class N64DisplayListAdapter {
             return true;
         }
 
-        if ((encodedSegment < kGfxSegmentCount) && (gSegments[encodedSegment] != 0) &&
+        if ((encodedSegment < kGfxSegmentCount) && 
+            ((gSegments[encodedSegment] != 0) || (encodedSegment == 0)) &&
             ((raw & 0x00FFFFFF) < kSegmentOffsetLimit)) {
             out.full = gSegments[encodedSegment] + encodedOffset;
             out.segment = encodedSegment;
@@ -1512,21 +1513,20 @@ class N64DisplayListAdapter {
         size_t readable = registeredRemaining;
         if (readable == 0) readable = ReadableByteLimit(translated);
 
-        size_t required = 0;
-        if (readable >= kMinRawTextureCopyBytes) {
-            required = std::min(readable, kMaxRawTextureCopyBytes);
-        } else {
-            required = EstimateRawTextureCopyBytes(source, index, limit, stride, isBig);
-            if (required == 0) {
-                static int sBadTextureEstimatePrints = 0;
-                if (sBadTextureEstimatePrints < 200) {
-                    gdx_port_logf("[texdiag] zero/oversized texture estimate raw=%08X translated=%p\n",
-                                  raw, reinterpret_cast<const void*>(translated));
-                    sBadTextureEstimatePrints++;
-                }
-                return 0;
+        size_t required = EstimateRawTextureCopyBytes(source, index, limit, stride, isBig);
+        if (required == 0) {
+            static int sBadTextureEstimatePrints = 0;
+            if (sBadTextureEstimatePrints < 200) {
+                gdx_port_logf("[texdiag] zero/oversized texture estimate raw=%08X translated=%p\n",
+                              raw, reinterpret_cast<const void*>(translated));
+                sBadTextureEstimatePrints++;
             }
+            // Fallback to min of readable or kMaxRawTextureCopyBytes
+            required = std::min(readable, kMaxRawTextureCopyBytes);
         }
+        
+        // Always clamp to what is actually readable to avoid page faults
+        required = std::min(required, readable);
 
         const N64Gfx setImg = ReadCommand(source, index, stride, isBig);
         const uint32_t extractedFmt = (setImg.w0 >> 21) & 0x7;
@@ -1874,6 +1874,9 @@ class N64DisplayListAdapter {
                     if (WordParam(in.w0) == kMovewordSegmentIndex) {
                         const uint8_t segIdx = static_cast<uint8_t>((in.w0 & 0xFFFF) / 4);
                         uintptr_t translated = TranslateDataPointer(in.w1);
+                        if (translated == 0 && in.w1 == 0 && gdx_rdram != nullptr) {
+                            translated = reinterpret_cast<uintptr_t>(gdx_rdram);
+                        }
                         if (translated != 0 && segIdx < kGfxSegmentCount) {
                             gSegments[segIdx] = NormalizeLusDirectPointer(translated);
                         }
@@ -1898,6 +1901,9 @@ class N64DisplayListAdapter {
                         IsResolvableDisplayList(in.w1)) {
                         outW1 = TranslateDisplayListPointer(in.w1, item.source, i);
                     }
+                    
+                    // Emit 0xB4 for G_RDPHALF_1 in F3DEX2 instead of 0xE1
+                    outW0 = (static_cast<uintptr_t>(0xB4) << 24) | (outW0 & 0x00FFFFFFu);
                     break;
 
                 // F3D G_ENDDL (0xB8): stop list processing, emit F3DEX2 ENDDL so Fast3D sees a clean end.
@@ -1979,6 +1985,9 @@ class N64DisplayListAdapter {
                         if (WordParam(in.w0) == kMovewordSegmentIndex) {
                             const uint8_t segIdx = static_cast<uint8_t>((in.w0 & 0xFFFF) / 4);
                             uintptr_t translated = TranslateDataPointer(in.w1);
+                            if (translated == 0 && in.w1 == 0 && gdx_rdram != nullptr) {
+                                translated = reinterpret_cast<uintptr_t>(gdx_rdram);
+                            }
                             if (translated != 0 && segIdx < kGfxSegmentCount) {
                                 gSegments[segIdx] = NormalizeLusDirectPointer(translated);
                             }
@@ -2075,6 +2084,11 @@ class N64DisplayListAdapter {
                         outW0 = (static_cast<uintptr_t>(kOpVtx) << 24) |
                                 (static_cast<uintptr_t>(n) << 12) |
                                 static_cast<uintptr_t>((v0 + n) * 2u);
+                    } else {
+                        // F3DEX2 G_BRANCH_Z (0x04)
+                        // NOP it to never branch (always draw highest LOD) and avoid infinite recursion
+                        outW0 = 0;
+                        outW1 = 0;
                     }
                     break;
 
@@ -2384,6 +2398,7 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size) {
             interp->TextureCacheDelete(reinterpret_cast<const uint8_t*>(ptr));
         }
         gPendingTextureCacheDeletes.clear();
+        gPersistentAllocations.clear();
     }
 
     interp->Run(reinterpret_cast<Gfx*>(converted), {});

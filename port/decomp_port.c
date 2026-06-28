@@ -26,7 +26,7 @@ extern s32   gGameMode;
 
 extern unsigned char* gdx_rom_buffer;
 extern size_t gdx_rom_size;
-extern unk_80225800 D_80225800_2;
+extern unk_80225800 D_80225800;
 
 // ---- RDRAM host buffer globals ----------------------------------------------
 // gdx_rdram: single 16MB contiguous buffer allocated by gdx_rdram_init().
@@ -182,11 +182,11 @@ static void* Gdx_ResolvePortAddress(uintptr_t addr) {
 
     /* LinkStubs.c can only provide a one-byte marker for the original linker
        segment symbol. Segment 2, however, addresses the real host-compiled BSS
-       object beginning at D_80225800_2 (not that marker). Bind the start token
+       object beginning at D_80225800 (not that marker). Bind the start token
        explicitly so segmented pointers such as 0x02000000 resolve to the
        matrix/context storage they reference. */
     if (raw == (unsigned int)(uintptr_t)SEGMENT_VRAM_START(unk_bss_segment)) {
-        void* resolved = &D_80225800_2;
+        void* resolved = &D_80225800;
         if (resolveLogs < 12) {
             resolveLogs++;
             gdx_addr_log("unk-bss", addr, resolved);
