@@ -11,6 +11,9 @@
 #include <stdlib.h>
 #include "port_log.h"
 
+#define GDX_LEO_TEST_UNIT_MR 0x01
+#define GDX_LEO_ERROR_MEDIUM_NOT_PRESENT 42
+
 // ---- libultra function stubs ------------------------------------------------
 // Controller Pak (save) — to be backed by libultraship's save/storage system.
 int osPfsInitPak(void)       { return -1; }
@@ -39,6 +42,16 @@ int osAiSetFrequency(void) { return 0; }
 
 // 64DD / leo boot (Expansion Kit) — stubbed for the US base.
 void LeoBootGame(void) {}
+
+// Base-game 64DD probe: the PC port has no inserted disk. Report that state
+// explicitly so title-screen logic does not mistake a zeroed status word for
+// a fatal drive condition and cover the frame with its black error overlay.
+int LeoTestUnitReady(unsigned char* status) {
+    if (status != NULL) {
+        *status = GDX_LEO_TEST_UNIT_MR;
+    }
+    return GDX_LEO_ERROR_MEDIUM_NOT_PRESENT;
+}
 
 // libc: BSD byte-compare not in the MSVC CRT.
 int bcmp(const void* a, const void* b, int n) { return memcmp(a, b, (size_t)n); }

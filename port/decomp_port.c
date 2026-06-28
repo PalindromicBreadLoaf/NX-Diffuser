@@ -6,6 +6,8 @@
 // comes next.
 
 #include "global.h"
+#include "fzx_course.h"
+#include "fzx_game.h"
 #include "n64_rdram.h"
 
 /* port_log.h pulls in <stdio.h> which clashes with the decomp's libc/stdint.h.
@@ -19,9 +21,12 @@ extern void  gdx_host_abort(void);
 extern void* gdx_resolve_registered_host_address(unsigned int addr);
 extern void* gdx_resolve_module_host_address(unsigned int addr);
 extern void* gdx_ensure_asset_segment_for_symbol(unsigned int symLow32, unsigned int* outOffset);
+extern int   gdx_load_venue_texture_segment(int venue);
+extern s32   gGameMode;
 
 extern unsigned char* gdx_rom_buffer;
 extern size_t gdx_rom_size;
+extern unk_80225800 D_80225800_2;
 
 // ---- RDRAM host buffer globals ----------------------------------------------
 // gdx_rdram: single 16MB contiguous buffer allocated by gdx_rdram_init().
@@ -175,6 +180,20 @@ static void* Gdx_ResolvePortAddress(uintptr_t addr) {
 
     raw = (unsigned int)addr;
 
+    /* LinkStubs.c can only provide a one-byte marker for the original linker
+       segment symbol. Segment 2, however, addresses the real host-compiled BSS
+       object beginning at D_80225800_2 (not that marker). Bind the start token
+       explicitly so segmented pointers such as 0x02000000 resolve to the
+       matrix/context storage they reference. */
+    if (raw == (unsigned int)(uintptr_t)SEGMENT_VRAM_START(unk_bss_segment)) {
+        void* resolved = &D_80225800_2;
+        if (resolveLogs < 12) {
+            resolveLogs++;
+            gdx_addr_log("unk-bss", addr, resolved);
+        }
+        return resolved;
+    }
+
     assetBase = gdx_ensure_asset_segment_for_symbol(raw, &assetOffset);
     if (assetBase != NULL) {
         void* resolved = (u8*)assetBase + assetOffset;
@@ -276,6 +295,27 @@ Gfx* Segment_SetTableAddresses(Gfx* gfx) {
         gSPSegment(gfx++, i, gSegments[i]);
     }
     return gfx;
+}
+
+void Segment_LoadAssets(void) {
+    switch (GET_MODE(gGameMode)) {
+        case GAMEMODE_GP_RACE:
+        case GAMEMODE_PRACTICE:
+        case GAMEMODE_VS_2P:
+        case GAMEMODE_VS_3P:
+        case GAMEMODE_VS_4P:
+        case GAMEMODE_RECORDS:
+        case GAMEMODE_COURSE_EDIT:
+        case GAMEMODE_TIME_ATTACK:
+        case GAMEMODE_GP_END_CS:
+        case GAMEMODE_DEATH_RACE:
+            if (!gdx_load_venue_texture_segment(COURSE_CONTEXT()->courseData.venue)) {
+                gdx_ck("[segment] venue texture segment load failed");
+            }
+            break;
+        default:
+            break;
+    }
 }
 
 // ---- Save system (stubbed for first boot; back with libultraship save later) ----

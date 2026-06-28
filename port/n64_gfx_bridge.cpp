@@ -28,6 +28,7 @@ extern "C" {
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -59,6 +60,19 @@ extern "C" uint8_t D_30005D8[];
 extern "C" uint8_t D_3000688[];
 extern "C" uint8_t D_30006D0[];
 extern "C" uint8_t aVpFullScreen[];
+extern "C" uint16_t D_A000000_235130[];
+extern "C" uint16_t D_A000000_239A80[];
+extern "C" uint16_t D_A000000_23EC50[];
+extern "C" uint16_t D_A000000_243D90[];
+extern "C" uint16_t D_A000000_24A270[];
+extern "C" uint16_t D_A000000_2507F0[];
+extern "C" uint16_t D_A000000_255100[];
+extern "C" uint16_t D_A000000_259600[];
+extern "C" uint16_t D_A000000_25F360[];
+extern "C" uint16_t D_A000000_266C20[];
+extern "C" uint16_t D_A000000_26D780[];
+extern "C" uint8_t D_2000000[];
+extern "C" uint8_t D_80225800_2[];
 
 extern "C" int gdx_lookup_asset_segment(unsigned int sym_low32,
                                          unsigned char* segment,
@@ -181,8 +195,9 @@ uint8_t WordParam(uint32_t w0) {
 
 void LogTexturePipelineCommand(const N64Gfx* source, size_t index, size_t limit, size_t stride, uint32_t w0, uint32_t w1,
                                bool isBig) {
+    static const bool sTraceEnabled = std::getenv("GDX_GFX_TRACE") != nullptr;
     static int sPipeDiagPrints = 0;
-    if (sPipeDiagPrints >= 220) {
+    if (!sTraceEnabled || sPipeDiagPrints >= 10000) {
         return;
     }
 
@@ -279,10 +294,11 @@ void LogTexturePipelineCommand(const N64Gfx* source, size_t index, size_t limit,
 
 bool IsLikelyDisplayListOpcode(uint8_t op) {
     if (op <= 0x09) return true;
-    if ((op >= 0x20) && (op <= 0x49)) return true; 
-    if ((op >= 0xC8) && (op <= 0xCF)) return true; 
-    if ((op >= 0xD3) && (op <= 0xE3)) return true; 
-    if ((op >= 0xE4) && (op <= 0xFF)) return true; 
+    if ((op >= 0x20) && (op <= 0x49)) return true;
+    if ((op >= 0xB0) && (op <= 0xBF)) return true;  // F3D opcodes: G_TRI1, G_ENDDL, G_TEXTURE, etc.
+    if ((op >= 0xC8) && (op <= 0xCF)) return true;
+    if ((op >= 0xD3) && (op <= 0xE3)) return true;
+    if ((op >= 0xE4) && (op <= 0xFF)) return true;
     return false;
 }
 
@@ -310,6 +326,39 @@ struct ConversionStats {
     size_t textureCopies = 0;
     size_t textureCopyBytes = 0;
     size_t commandsOut = 0;
+    size_t f3dLists = 0;
+    uint8_t firstFallbackDataOp = 0;
+    uint32_t firstFallbackDataRaw = 0;
+    uint32_t firstFallbackDataW0 = 0;
+    uintptr_t firstFallbackDataSource = 0;
+    size_t firstFallbackDataIndex = 0;
+    uint8_t firstSkippedDataOp = 0;
+    uint32_t firstSkippedDataRaw = 0;
+    uint32_t firstSkippedDataW0 = 0;
+    uint32_t firstNoopDlRaw = 0;
+    size_t missingDisplayLists = 0;
+    size_t badDisplayLists = 0;
+    uint32_t firstMissingDlRaw = 0;
+    uint32_t firstBadDlRaw = 0;
+    uintptr_t firstMissingParent = 0;
+    size_t firstMissingParentIndex = 0;
+    size_t firstMissingParentStride = 0;
+    bool firstMissingParentBigEndian = false;
+    bool firstMissingParentF3D = false;
+    uint32_t firstMissingParentRawW0 = 0;
+    uint32_t firstMissingParentRawW1 = 0;
+    uint32_t firstMissingParentDecodedW0 = 0;
+    uint32_t firstMissingParentDecodedW1 = 0;
+    uintptr_t firstBadDlTarget = 0;
+    size_t firstBadDlLimit = 0;
+    size_t firstBadDlStride = 0;
+    bool firstBadDlBigEndian = false;
+    bool firstBadDlF3D = false;
+    uint32_t firstBadDlFirstW0 = 0;
+    uint32_t firstBadDlFirstW1 = 0;
+    size_t firstBadDlFailureIndex = 0;
+    uint8_t firstBadDlFailureOpcode = 0;
+    uint8_t firstBadDlFailureReason = 0; // 1=zero limit, 2=invalid opcode, 3=no terminator
 };
 
 struct HostRange {
@@ -327,6 +376,8 @@ struct PersistentRawTextureCopy {
 std::vector<HostRange> gHostRanges;
 std::vector<HostRange> gRawN64Ranges;
 std::vector<HostRange> gHostN64CommandRanges;
+std::vector<HostRange> gF3DAssetRanges;
+std::vector<HostRange> gNativeRgba16Ranges;
 std::vector<uint8_t> gSetupGfxSegment;
 std::vector<PersistentRawTextureCopy> gRawTextureCopies;
 std::vector<uintptr_t> gPendingTextureCacheDeletes;
@@ -353,15 +404,75 @@ std::vector<LoadedAssetSegment> gLoadedAssetSegments;
 // the generation at copy time; a mismatch on the next frame triggers a re-upload.
 // This avoids expensive per-frame memcmp against large raw texture copies.
 static uint64_t gDmaGeneration = 0;
+struct DmaDirtyRange {
+    uintptr_t begin;
+    uintptr_t end;
+    uint64_t generation;
+};
+static std::vector<DmaDirtyRange> gDmaDirtyRanges;
 
 } // namespace (temporarily close to define extern "C")
 
 extern "C" void gdx_record_dma_load(uint32_t rdram_phys, uint32_t rom_offset, uint32_t size) {
-    (void)rdram_phys; (void)rom_offset; (void)size;
+    (void)rom_offset;
     ++gDmaGeneration;
+    if (gdx_rdram != nullptr && size != 0 && rdram_phys < GDX_RDRAM_SIZE) {
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(gdx_rdram) + rdram_phys;
+        const uintptr_t end = begin + std::min<size_t>(size, GDX_RDRAM_SIZE - rdram_phys);
+        gDmaDirtyRanges.push_back({begin, end, gDmaGeneration});
+        if (gDmaDirtyRanges.size() > 4096) {
+            gDmaDirtyRanges.erase(gDmaDirtyRanges.begin(), gDmaDirtyRanges.begin() + 2048);
+        }
+    }
 }
 
 namespace {
+
+bool RdramRangeChanged(uintptr_t source, size_t size, uint64_t sinceGeneration) {
+    if (sinceGeneration == gDmaGeneration) {
+        return false;
+    }
+    if (!gDmaDirtyRanges.empty() && sinceGeneration < gDmaDirtyRanges.front().generation) {
+        return true;
+    }
+
+    const uintptr_t end = source + size;
+    for (auto it = gDmaDirtyRanges.rbegin(); it != gDmaDirtyRanges.rend(); ++it) {
+        if (it->generation <= sinceGeneration) {
+            break;
+        }
+        if (source < it->end && end > it->begin) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsNativeRgba16Range(uintptr_t source, size_t size) {
+    for (const HostRange& range : gNativeRgba16Ranges) {
+        if (source >= range.begin && source + size <= range.begin + range.size) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void CopyRawTextureBytes(uint8_t* destination, uintptr_t source, size_t size) {
+    const auto* input = reinterpret_cast<const uint8_t*>(source);
+    if (!IsNativeRgba16Range(source, size)) {
+        std::memcpy(destination, input, size);
+        return;
+    }
+
+    size_t i = 0;
+    for (; i + 1 < size; i += 2) {
+        destination[i] = input[i + 1];
+        destination[i + 1] = input[i];
+    }
+    if (i < size) {
+        destination[i] = input[i];
+    }
+}
 
 alignas(8) const int32_t kFallbackIdentityMtx[16] = {
     0x00010000, 0x00000000,
@@ -448,7 +559,9 @@ uintptr_t EnsureAssetSegmentImage(const AssetSegmentLookup& lookup) {
         }
     } else {
         const size_t available = gdx_rom_size - lookup.romBase;
-        const size_t allocSize = std::max<size_t>(lookup.imageSize, std::min<size_t>(available, 8 * 1024 * 1024));
+        const size_t allocSize = lookup.imageSize != 0
+            ? std::min<size_t>(lookup.imageSize, available)
+            : std::min<size_t>(available, 8 * 1024 * 1024);
         if (allocSize == 0) {
             return 0;
         }
@@ -568,6 +681,36 @@ bool IsHostN64CommandPointer(uintptr_t full_addr) {
     return false;
 }
 
+bool IsF3DAssetPointer(uintptr_t full_addr) {
+    for (const HostRange& range : gF3DAssetRanges) {
+        if ((range.begin == 0) || (range.size == 0)) {
+            continue;
+        }
+        if ((full_addr >= range.begin) && (full_addr < range.begin + range.size)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool DisplayListUsesF3D(const N64Gfx* source, size_t limit, size_t stride, bool isBig) {
+    if (source == nullptr || limit == 0) {
+        return false;
+    }
+
+    const size_t scanLimit = std::min(limit, kDisplayListValidationCommandLimit);
+    for (size_t i = 0; i < scanLimit; ++i) {
+        const uint8_t op = Opcode(ReadCommand(source, i, stride, isBig).w0);
+        if (op == 0xB8u) {
+            return true; // F3D G_ENDDL
+        }
+        if (op == kOpEndDl) {
+            return false; // F3DEX2 G_ENDDL
+        }
+    }
+    return false;
+}
+
 bool ResolveRegisteredHostPointer(uint32_t raw, ResolvedAddress& out) {
     for (const HostRange& range : gHostRanges) {
         if ((range.begin == 0) || (range.size == 0)) {
@@ -603,6 +746,24 @@ bool ResolveGeneratedAssetStub(uint32_t raw, ResolvedAddress& out) {
         out.offset = offset;
         out.segmented = false;
     }
+    return true;
+}
+
+bool ResolvePortBssAlias(uint32_t raw, ResolvedAddress& out) {
+    /*
+     * D_2000000 is the original segment-2 BSS base. LinkStubs can only provide
+     * a one-byte symbol token for it, while the actual host storage begins at
+     * D_80225800_2. Host-built display lists carry the token directly, so they
+     * bypass normal segmented-address resolution and need the same alias here.
+     */
+    if (raw != Low32(reinterpret_cast<uintptr_t>(D_2000000))) {
+        return false;
+    }
+
+    out.full = reinterpret_cast<uintptr_t>(D_80225800_2);
+    out.segment = 2;
+    out.offset = 0;
+    out.segmented = true;
     return true;
 }
 
@@ -833,11 +994,7 @@ uintptr_t MakePersistentRawTextureCopy(uintptr_t source, size_t requiredBytes, b
         bool changed = needsResize;
         if (!needsResize) {
             if (IsRdramHostPointer(source)) {
-                // RDRAM textures are DMA-loaded segments. The byteswapped copy can never
-                // match the raw RDRAM bytes, so memcmp always returns != 0 and forces a
-                // full re-upload every frame. Use the DMA generation counter instead:
-                // only re-upload when a new DMA load has hit RDRAM since the last copy.
-                changed = (copy.dmaGenAtCopy != gDmaGeneration);
+                changed = RdramRangeChanged(source, copy.size, copy.dmaGenAtCopy);
             } else {
                 // ROM-backed textures are stable after the segment is loaded; skip memcmp.
                 const bool stableSource = RegisteredHostRemaining(source) > 0;
@@ -854,7 +1011,7 @@ uintptr_t MakePersistentRawTextureCopy(uintptr_t source, size_t requiredBytes, b
             if (!needsResize) {
                 gPendingTextureCacheDeletes.push_back(reinterpret_cast<uintptr_t>(copy.bytes.get()));
                 std::memset(copy.bytes.get(), 0, copy.size);
-                std::memcpy(copy.bytes.get(), reinterpret_cast<const void*>(source), copyBytes);
+                CopyRawTextureBytes(copy.bytes.get(), source, copyBytes);
             } else {
                 if (copy.bytes != nullptr) {
                     gPendingTextureCacheDeletes.push_back(reinterpret_cast<uintptr_t>(copy.bytes.get()));
@@ -862,7 +1019,7 @@ uintptr_t MakePersistentRawTextureCopy(uintptr_t source, size_t requiredBytes, b
                 }
                 auto refreshed = std::make_unique<uint8_t[]>(requiredBytes);
                 std::memset(refreshed.get(), 0, requiredBytes);
-                std::memcpy(refreshed.get(), reinterpret_cast<const void*>(source), copyBytes);
+                CopyRawTextureBytes(refreshed.get(), source, copyBytes);
                 copy.bytes = std::move(refreshed);
                 copy.size = requiredBytes;
             }
@@ -876,7 +1033,7 @@ uintptr_t MakePersistentRawTextureCopy(uintptr_t source, size_t requiredBytes, b
     copy.size = requiredBytes;
     copy.bytes = std::make_unique<uint8_t[]>(requiredBytes);
     std::memset(copy.bytes.get(), 0, requiredBytes);
-    std::memcpy(copy.bytes.get(), reinterpret_cast<const void*>(source), copyBytes);
+    CopyRawTextureBytes(copy.bytes.get(), source, copyBytes);
     copy.dmaGenAtCopy = gDmaGeneration;
 
     const uintptr_t out = reinterpret_cast<uintptr_t>(copy.bytes.get());
@@ -1007,9 +1164,13 @@ class N64DisplayListAdapter {
         return limit;
     }
 
-    bool TryResolveAddress(uint32_t raw, ResolvedAddress& out) const {
+    bool TryResolveAddress(uint32_t raw, ResolvedAddress& out, size_t requiredBytes = 1, bool preferPhysical = false) const {
         if (raw == 0) {
             return false;
+        }
+
+        if (ResolvePortBssAlias(raw, out)) {
+            return true;
         }
 
         if (ResolveGeneratedAssetStub(raw, out)) {
@@ -1054,12 +1215,57 @@ class N64DisplayListAdapter {
         const uint8_t encodedSegment = static_cast<uint8_t>(raw >> 24);
         const uint32_t encodedOffset = raw & 0x00FFFFFE;
 
+        /* K0_TO_PHYS() stores only the low 29 bits of host-built pointers in
+           commands such as G_MTX.  Extract the window helper early so it can
+           run either before or after the segment table depending on the caller.
+           Bounds + readability checks prevent small immediates from matching. */
+        constexpr uintptr_t kPhysicalAddressMask = 0x1FFFFFFFu;
+        const auto tryPhysicalWindow = [&](uintptr_t begin, uintptr_t end) -> bool {
+            if ((begin == 0) || (end <= begin)) {
+                return false;
+            }
+            const uintptr_t full = (begin & ~kPhysicalAddressMask) | static_cast<uintptr_t>(raw);
+            if ((full < begin) || (full >= end) ||
+                (requiredBytes > static_cast<size_t>(end - full)) ||
+                (ReadableByteLimit(full) < requiredBytes)) {
+                return false;
+            }
+            out.full = full;
+            out.segmented = false;
+            return true;
+        };
+        const auto tryAllPhysicalWindows = [&]() -> bool {
+            if (raw > 0x1FFFFFFFu) return false;
+            if (tryPhysicalWindow(mModuleBegin, mModuleEnd)) return true;
+            for (const HostRange& range : gHostRanges) {
+                if ((range.begin == 0) || (range.size == 0) ||
+                    (range.size > UINTPTR_MAX - range.begin)) {
+                    continue;
+                }
+                if (tryPhysicalWindow(range.begin, range.begin + range.size)) return true;
+            }
+            return false;
+        };
+
+        /* When the caller knows this raw value came from K0_TO_PHYS on a host
+           pointer (e.g., a G_MTX from host-built F3DEX2 code), try the 512MB
+           physical window BEFORE the segment table.  That prevents raw values
+           whose top byte matches an active segment index — e.g., 0x0805DAA0
+           matching segment 8 — from being misrouted. */
+        if (preferPhysical && tryAllPhysicalWindows()) {
+            return true;
+        }
+
         if ((encodedSegment < kGfxSegmentCount) && (gSegments[encodedSegment] != 0) &&
             ((raw & 0x00FFFFFF) < kSegmentOffsetLimit)) {
             out.full = gSegments[encodedSegment] + encodedOffset;
             out.segment = encodedSegment;
             out.offset = encodedOffset;
             out.segmented = true;
+            return true;
+        }
+
+        if (!preferPhysical && tryAllPhysicalWindows()) {
             return true;
         }
 
@@ -1137,11 +1343,30 @@ class N64DisplayListAdapter {
                     return true;
                 }
             }
+
+            /* Also try high32 from every registered host range (covers heap / fiber-stack
+               allocations that share a VirtualAlloc region with gdx_rdram but whose full
+               address isn't yet captured in gSegments or the module range). */
+            for (const auto& range : gHostRanges) {
+                if (range.begin == 0) {
+                    continue;
+                }
+                const uintptr_t high = range.begin & 0xFFFFFFFF00000000ULL;
+                if (high == 0) {
+                    continue;
+                }
+                const uintptr_t full = high | static_cast<uintptr_t>(raw);
+                if (IsReadableAddress(full)) {
+                    out.full = full;
+                    out.segmented = false;
+                    return true;
+                }
+            }
         }
 
         {
             static int sResolveFails = 0;
-            if (sResolveFails < 8) {
+            if (sResolveFails < 200) {
                 ++sResolveFails;
                 const uintptr_t rootHigh = mRootBegin
                     ? (reinterpret_cast<uintptr_t>(mRootBegin) & 0xFFFFFFFF00000000ULL)
@@ -1166,13 +1391,13 @@ class N64DisplayListAdapter {
         return false;
     }
 
-    uintptr_t TranslateDataPointer(uint32_t raw) const {
+    uintptr_t TranslateDataPointer(uint32_t raw, size_t requiredBytes = 1, bool preferPhysical = false) const {
         if (raw == 0) {
             return 0;
         }
 
         ResolvedAddress resolved = {};
-        if (TryResolveAddress(raw, resolved)) {
+        if (TryResolveAddress(raw, resolved, requiredBytes, preferPhysical)) {
             return IsReadableAddress(resolved.full) ? resolved.full : 0;
         }
 
@@ -1190,14 +1415,16 @@ class N64DisplayListAdapter {
         }
     }
 
-    static uint64_t LoadBlockCopyBytes(const N64Gfx& command, uint32_t size) {
+    static uint64_t LoadBlockCopyBytes(const N64Gfx& command, uint32_t size, uint32_t imageWidth) {
         /* G_LOADBLOCK's uls is a raw source texel offset (bits 23:12 of w0),
          * unlike G_LOADTILE's fixed-point texture coordinates. The bridge must copy from
          * settimg_ptr all the way through the end of this load (uls + lrs + 1 texels)
          * so libultraship can index into the buffer at the correct source offset. */
         const uint32_t uls_texels = (command.w0 >> 12) & 0xFFF;
+        const uint32_t ult_rows = command.w0 & 0xFFF;
         const uint32_t lrs = (command.w1 >> 12) & 0xFFF;
-        return TextureBytesForPixels(static_cast<uint64_t>(uls_texels) + lrs + 1, size);
+        const uint64_t startTexel = static_cast<uint64_t>(ult_rows) * imageWidth + uls_texels;
+        return TextureBytesForPixels(startTexel + lrs + 1, size);
     }
 
     static uint64_t LoadTileCopyBytes(const N64Gfx& command, uint32_t size, uint32_t imageWidth) {
@@ -1244,7 +1471,7 @@ class N64DisplayListAdapter {
                     i = scanEnd;
                     break;
                 case kOpLoadBlock:
-                    required = std::max(required, LoadBlockCopyBytes(command, size));
+                    required = std::max(required, LoadBlockCopyBytes(command, size, imageWidth));
                     break;
                 case kOpLoadTile:
                     required = std::max(required, LoadTileCopyBytes(command, size, imageWidth));
@@ -1268,7 +1495,7 @@ class N64DisplayListAdapter {
         const uintptr_t translated = TranslateDataPointer(raw);
         if (translated == 0) {
             static int sMissingTexturePointerPrints = 0;
-            if (sMissingTexturePointerPrints < 32) {
+            if (sMissingTexturePointerPrints < 200) {
                 gdx_port_logf("[texdiag] unresolved G_SETTIMG pointer raw=%08X\n", raw);
                 sMissingTexturePointerPrints++;
             }
@@ -1281,8 +1508,9 @@ class N64DisplayListAdapter {
         // this gives us 7+ MB remaining — enough to cap cleanly at kMaxRawTextureCopyBytes.
         // For non-RDRAM host ranges gHostRanges is the fallback.
         // If neither gives us anything, fall back to scanning the local display list.
-        size_t readable = ReadableByteLimit(translated);
-        if (readable == 0) readable = RegisteredHostRemaining(translated);
+        const size_t registeredRemaining = RegisteredHostRemaining(translated);
+        size_t readable = registeredRemaining;
+        if (readable == 0) readable = ReadableByteLimit(translated);
 
         size_t required = 0;
         if (readable >= kMinRawTextureCopyBytes) {
@@ -1291,7 +1519,7 @@ class N64DisplayListAdapter {
             required = EstimateRawTextureCopyBytes(source, index, limit, stride, isBig);
             if (required == 0) {
                 static int sBadTextureEstimatePrints = 0;
-                if (sBadTextureEstimatePrints < 32) {
+                if (sBadTextureEstimatePrints < 200) {
                     gdx_port_logf("[texdiag] zero/oversized texture estimate raw=%08X translated=%p\n",
                                   raw, reinterpret_cast<const void*>(translated));
                     sBadTextureEstimatePrints++;
@@ -1312,12 +1540,11 @@ class N64DisplayListAdapter {
             sTextureCopyPrints++;
         }
 
-        if (mStats != nullptr) {
-            mStats->textureCopyBytes += required;
-        }
-
         bool textureCopyRefreshed = false;
         uintptr_t outPtr = MakePersistentRawTextureCopy(translated, required, &textureCopyRefreshed);
+        if (mStats != nullptr && textureCopyRefreshed) {
+            mStats->textureCopyBytes += required;
+        }
         if (outPtr == 0) {
             static int sTextureCopyFailPrints = 0;
             if (sTextureCopyFailPrints < 32) {
@@ -1360,10 +1587,37 @@ class N64DisplayListAdapter {
     }
 
     uintptr_t TranslateDisplayListPointer(uint32_t raw, const N64Gfx* parentSource = nullptr, size_t parentIndex = 0) {
+        /*
+         * Resolve the exact token first. Generated asset symbols are one-byte
+         * host stubs and are not necessarily 8-byte aligned; masking them first
+         * can collapse several distinct symbols into an unrelated texture.
+         *
+         * Genuine N64 DL addresses still get the hardware-compatible alignment
+         * fallback, but only when the exact candidate is absent or invalid.
+         */
         const N64Gfx* target = ResolveDisplayListSource(raw);
+        const auto isValidTarget = [this](const N64Gfx* candidate) {
+            if (candidate == nullptr) {
+                return false;
+            }
+            const size_t candidateLimit = KnownCommandLimit(candidate);
+            return (candidateLimit != 0) && LooksLikeDisplayList(candidate, candidateLimit);
+        };
+
+        if (!isValidTarget(target)) {
+            const uint32_t alignedRaw = raw & ~static_cast<uint32_t>(7u);
+            if (alignedRaw != raw) {
+                const N64Gfx* alignedTarget = ResolveDisplayListSource(alignedRaw);
+                if (isValidTarget(alignedTarget)) {
+                    raw = alignedRaw;
+                    target = alignedTarget;
+                }
+            }
+        }
+
         if (target == nullptr) {
             static int sMissingDlPrints = 0;
-            if (sMissingDlPrints < 16) {
+            if (sMissingDlPrints < 200) {
                 ++sMissingDlPrints;
                 const uintptr_t parent = reinterpret_cast<uintptr_t>(parentSource);
                 const size_t parentStride = parentSource ? CommandStrideForSource(parentSource) : kN64GfxStride;
@@ -1380,14 +1634,37 @@ class N64DisplayListAdapter {
                               reinterpret_cast<void*>(gSegments[3]),
                               reinterpret_cast<void*>(gSegments[8]));
             }
-            if (mStats != nullptr) mStats->noopDisplayLists++;
+            if (mStats != nullptr) {
+                mStats->noopDisplayLists++;
+                if (mStats->firstNoopDlRaw == 0) mStats->firstNoopDlRaw = raw;
+                mStats->missingDisplayLists++;
+                if (mStats->firstMissingDlRaw == 0) {
+                    mStats->firstMissingDlRaw = raw;
+                    mStats->firstMissingParent = reinterpret_cast<uintptr_t>(parentSource);
+                    mStats->firstMissingParentIndex = parentIndex;
+                    if (parentSource != nullptr) {
+                        const size_t stride = CommandStrideForSource(parentSource);
+                        const bool isBig = CommandSourceIsBigEndian(parentSource, stride);
+                        const N64Gfx rawParent = ReadRawCommand(parentSource, parentIndex, stride);
+                        const N64Gfx decodedParent = ReadCommand(parentSource, parentIndex, stride, isBig);
+                        mStats->firstMissingParentStride = stride;
+                        mStats->firstMissingParentBigEndian = isBig;
+                        mStats->firstMissingParentF3D =
+                            IsF3DAssetPointer(reinterpret_cast<uintptr_t>(parentSource));
+                        mStats->firstMissingParentRawW0 = rawParent.w0;
+                        mStats->firstMissingParentRawW1 = rawParent.w1;
+                        mStats->firstMissingParentDecodedW0 = decodedParent.w0;
+                        mStats->firstMissingParentDecodedW1 = decodedParent.w1;
+                    }
+                }
+            }
             return reinterpret_cast<uintptr_t>(mNoopList.data());
         }
 
         const size_t limit = KnownCommandLimit(target);
         if ((limit == 0) || !LooksLikeDisplayList(target, limit)) {
             static int sBadDlPrints = 0;
-            if (sBadDlPrints < 16) {
+            if (sBadDlPrints < 200) {
                 ++sBadDlPrints;
                 const uint32_t alignedRaw = raw & ~7u;
                 const N64Gfx* alignedTarget = (alignedRaw != raw) ? ResolveDisplayListSource(alignedRaw) : nullptr;
@@ -1408,7 +1685,44 @@ class N64DisplayListAdapter {
                               parentIndex,
                               parentCmd.w0);
             }
-            if (mStats != nullptr) mStats->noopDisplayLists++;
+            if (mStats != nullptr) {
+                mStats->noopDisplayLists++;
+                if (mStats->firstNoopDlRaw == 0) mStats->firstNoopDlRaw = raw;
+                mStats->badDisplayLists++;
+                if (mStats->firstBadDlRaw == 0) {
+                    const size_t stride = CommandStrideForSource(target);
+                    const bool isBig = CommandSourceIsBigEndian(target, stride);
+                    const size_t scanLimit = std::min(limit, kDisplayListValidationCommandLimit);
+                    mStats->firstBadDlRaw = raw;
+                    mStats->firstBadDlTarget = reinterpret_cast<uintptr_t>(target);
+                    mStats->firstBadDlLimit = limit;
+                    mStats->firstBadDlStride = stride;
+                    mStats->firstBadDlBigEndian = isBig;
+                    mStats->firstBadDlF3D = IsF3DAssetPointer(reinterpret_cast<uintptr_t>(target));
+                    if (limit == 0) {
+                        mStats->firstBadDlFailureReason = 1;
+                    } else {
+                        const N64Gfx first = ReadCommand(target, 0, stride, isBig);
+                        mStats->firstBadDlFirstW0 = first.w0;
+                        mStats->firstBadDlFirstW1 = first.w1;
+                        mStats->firstBadDlFailureReason = 3;
+                        mStats->firstBadDlFailureIndex = scanLimit;
+                        for (size_t i = 0; i < scanLimit; ++i) {
+                            const N64Gfx command = ReadCommand(target, i, stride, isBig);
+                            const uint8_t op = Opcode(command.w0);
+                            if (!IsLikelyDisplayListOpcode(op)) {
+                                mStats->firstBadDlFailureReason = 2;
+                                mStats->firstBadDlFailureIndex = i;
+                                mStats->firstBadDlFailureOpcode = op;
+                                break;
+                            }
+                            if ((op == kOpEndDl) || (op == 0xB8u)) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             return reinterpret_cast<uintptr_t>(mNoopList.data());
         }
 
@@ -1431,7 +1745,7 @@ class N64DisplayListAdapter {
             const N64Gfx command = ReadCommand(source, i, stride, isBig);
             const uint8_t op = Opcode(command.w0);
             if (!IsLikelyDisplayListOpcode(op)) return false;
-            if (op == kOpEndDl) return true;
+            if (op == kOpEndDl || op == 0xB8u) return true;  // 0xB8 = F3D G_ENDDL
         }
         return false;
     }
@@ -1459,23 +1773,64 @@ class N64DisplayListAdapter {
          * Use the physical location rather than a heuristic to avoid false positives. */
         const size_t stride = CommandStrideForSource(item.source);
         const bool isBig = CommandSourceIsBigEndian(item.source, stride);
+        const bool isF3DSource =
+            IsF3DAssetPointer(reinterpret_cast<uintptr_t>(item.source)) ||
+            DisplayListUsesF3D(item.source, item.limit, stride, isBig);
+        if (isF3DSource && mStats != nullptr) {
+            mStats->f3dLists++;
+        }
 
         for (size_t i = 0; i < item.limit; i++) {
             N64Gfx in = ReadCommand(item.source, i, stride, isBig);
             const uint8_t op = Opcode(in.w0);
             LogTexturePipelineCommand(item.source, i, item.limit, stride, in.w0, in.w1, isBig);
+
+            /* TEXRECT coord probe: log first 8 TEXRECTs unconditionally to diagnose zoom. */
+            if (op == 0xE4 || op == 0xE5) {
+                static int sTRectProbe = 0;
+                if (sTRectProbe < 8) {
+                    const uint32_t lrx = (in.w0 >> 12) & 0xFFF;
+                    const uint32_t lry = in.w0 & 0xFFF;
+                    const uint32_t tile = (in.w1 >> 24) & 0x7;
+                    const uint32_t ulx = (in.w1 >> 12) & 0xFFF;
+                    const uint32_t uly = in.w1 & 0xFFF;
+                    gdx_port_logf("[trect] #%d op=%02X ul=(%u,%u) lr=(%u,%u) tile=%u stride=%zu f3d=%d big=%d\n",
+                                  sTRectProbe, op, ulx, uly, lrx, lry, tile, stride, (int)isF3DSource, (int)isBig);
+                    sTRectProbe++;
+                }
+            }
             uintptr_t outW0 = static_cast<uintptr_t>(in.w0);
             uintptr_t outW1 = static_cast<uintptr_t>(in.w1);
             if (mStats != nullptr) mStats->opCounts[op]++;
 
             switch (op) {
                 case kOpVtx:
-                case kOpMtx:
-                case kOpMovemem:
+                    // F3D uses opcode 0x01 for G_MTX (not G_VTX). Remap to kOpMtx so Fast3D
+                    // doesn't try to load a 64-byte matrix struct as a vertex buffer.
+                    if (isF3DSource) {
+                        outW0 = (outW0 & 0x00FFFFFFu) | (static_cast<uintptr_t>(kOpMtx) << 24);
+                    }
                     outW1 = TranslateDataPointer(in.w1);
-                    if (outW1 != 0 && isBig && op == kOpVtx) {
+                    if (outW1 != 0 && isBig && !isF3DSource) {
                         outW1 = MakePersistentVtxCopy(outW1, (outW0 >> 12) & 0xFF);
                     }
+                    if (outW1 != 0) {
+                        outW1 = NormalizeLusDirectPointer(outW1);
+                    }
+                    break;
+
+                case kOpMtx:
+                    outW1 = TranslateDataPointer(in.w1, 64, /*preferPhysical=*/!isF3DSource);
+                    if ((outW1 & 7u) != 0) {
+                        outW1 = 0;
+                    }
+                    if (outW1 != 0) {
+                        outW1 = NormalizeLusDirectPointer(outW1);
+                    }
+                    break;
+
+                case kOpMovemem:
+                    outW1 = TranslateDataPointer(in.w1);
                     if (outW1 != 0) {
                         outW1 = NormalizeLusDirectPointer(outW1);
                     }
@@ -1545,6 +1900,184 @@ class N64DisplayListAdapter {
                     }
                     break;
 
+                // F3D G_ENDDL (0xB8): stop list processing, emit F3DEX2 ENDDL so Fast3D sees a clean end.
+                case 0xB8:
+                    outW0 = static_cast<uintptr_t>(kOpEndDl) << 24;
+                    outW1 = 0;
+                    item.listPtr->commands.push_back(MakeLusGfx(outW0, outW1));
+                    if (mStats != nullptr) mStats->commandsOut++;
+                    return;
+
+                // F3D G_DL (0x06): sub-display-list call — same layout as F3DEX2 G_DL (0xDE).
+                // GUARD: F3DEX2 uses 0x06 for G_TRI2; only remap in F3D asset DLs.
+                case 0x06:
+                    if (isF3DSource) {
+                        outW0 = (outW0 & 0x00FFFFFFu) | (static_cast<uintptr_t>(kOpDl) << 24);
+                        outW1 = TranslateDisplayListPointer(in.w1, item.source, i);
+                    }
+                    break;
+
+                // F3D G_TRI1 (0xBF): vertex indices in w0[23:0] → F3DEX2 G_TRI1 has them in w1[31:8].
+                // GUARD: F3DEX2 uses 0xBF for G_CULLDL; only convert in F3D asset DLs.
+                case 0xBF:
+                    if (isF3DSource) {
+                        outW0 = static_cast<uintptr_t>(0x05u) << 24;
+                        outW1 = static_cast<uintptr_t>(in.w0 & 0x00FFFFFFu) << 8;
+                    }
+                    break;
+
+                /* F3D G_MOVEMEM (0x03): in F3DEX2, 0x03 = G_CULLDL — cannot pass through.
+                   For F3D sources, remap the DMEM target index to F3DEX2 and emit a proper
+                   G_MOVEMEM (0xDC).  Only the viewport slot is handled for now; lights/lookat
+                   are NOPed until their F3DEX2 DMEM layout is confirmed. */
+                case 0x03:
+                    if (isF3DSource) {
+                        const uint8_t f3dSizeH = static_cast<uint8_t>((in.w0 >> 16) & 0xFFu);
+                        const uint8_t f3dIndex = static_cast<uint8_t>((in.w0 >>  8) & 0xFFu);
+
+                        /* F3DEX2 G_MV_VIEWPORT = 8; skip all other DMEM targets for now */
+                        if (f3dIndex != 0x80u) {
+                            continue;
+                        }
+
+                        /* F3D encodes size as sizeof(data)/2; F3DEX2 gDma1p uses the full byte count. */
+                        const size_t xferSize = (f3dSizeH > 0u) ? (static_cast<size_t>(f3dSizeH) * 2u) : 16u;
+
+                        uintptr_t addr = TranslateDataPointer(in.w1, xferSize);
+                        if (addr == 0) {
+                            addr = FallbackDataPointer(kOpMovemem);
+                        }
+                        if (addr == 0) {
+                            if (mStats != nullptr) mStats->skippedDataCommands++;
+                            continue;
+                        }
+                        addr = NormalizeLusDirectPointer(addr);
+
+                        /* F3DEX2 gDma1p: w0 = (cmd<<24)|(p<<16)|l, w1 = data_addr */
+                        outW0 = (static_cast<uintptr_t>(kOpMovemem) << 24) |
+                                (static_cast<uintptr_t>(8u) << 16) | /* G_MV_VIEWPORT */
+                                static_cast<uintptr_t>(xferSize);
+                        outW1 = addr;
+                    }
+                    break;
+
+                /* F3D G_POPMTX (0xBD) → F3DEX2 G_POPMTX (0xD8).
+                   F3DEX2 encodes the pop count as n*sizeof(Mtx) in w1; F3D uses 0. */
+                case 0xBD:
+                    if (isF3DSource) {
+                        outW0 = static_cast<uintptr_t>(0xD8u) << 24;
+                        outW1 = 64u; /* sizeof(Mtx) — pop 1 matrix */
+                    }
+                    break;
+
+                /* F3D G_MOVEWORD (0xBC) → F3DEX2 G_MOVEWORD (0xDB).
+                   Same word layout (index in w0[23:16], offset in w0[15:0], data in w1).
+                   Handle segment-table writes identically to case kOpMoveword above. */
+                case 0xBC:
+                    if (isF3DSource) {
+                        outW0 = (outW0 & 0x00FFFFFFu) | (static_cast<uintptr_t>(kOpMoveword) << 24);
+                        if (WordParam(in.w0) == kMovewordSegmentIndex) {
+                            const uint8_t segIdx = static_cast<uint8_t>((in.w0 & 0xFFFF) / 4);
+                            uintptr_t translated = TranslateDataPointer(in.w1);
+                            if (translated != 0 && segIdx < kGfxSegmentCount) {
+                                gSegments[segIdx] = NormalizeLusDirectPointer(translated);
+                            }
+                            outW1 = (segIdx < kGfxSegmentCount) ? gSegments[segIdx]
+                                                                 : static_cast<uintptr_t>(in.w1);
+                        }
+                    }
+                    break;
+
+                /* F3D G_TEXTURE (0xBB) → F3DEX2 G_TEXTURE (0xD7).  Same word layout. */
+                case 0xBB:
+                    if (isF3DSource) {
+                        outW0 = (outW0 & 0x00FFFFFFu) | (static_cast<uintptr_t>(0xD7u) << 24);
+                    }
+                    break;
+
+                /* F3D G_SETOTHERMODE_H (0xBA) → F3DEX2 G_SETOTHERMODE_H (0xE3).
+                   F3D stores shift/length directly, while F3DEX2 stores
+                   (32 - shift - length)/(length - 1). Re-encode both fields. */
+                case 0xBA:
+                    if (isF3DSource) {
+                        const uint32_t shift = (in.w0 >> 8) & 0xFFu;
+                        const uint32_t length = in.w0 & 0xFFu;
+                        if ((length == 0u) || (shift + length > 32u)) {
+                            continue;
+                        }
+                        outW0 = (static_cast<uintptr_t>(0xE3u) << 24) |
+                                (static_cast<uintptr_t>(32u - shift - length) << 8) |
+                                static_cast<uintptr_t>(length - 1u);
+                    }
+                    break;
+
+                /* F3D G_SETOTHERMODE_L (0xB9) → F3DEX2 G_SETOTHERMODE_L (0xE2).
+                   Re-encode the legacy direct shift/length fields for F3DEX2. */
+                case 0xB9:
+                    if (isF3DSource) {
+                        const uint32_t shift = (in.w0 >> 8) & 0xFFu;
+                        const uint32_t length = in.w0 & 0xFFu;
+                        if ((length == 0u) || (shift + length > 32u)) {
+                            continue;
+                        }
+                        outW0 = (static_cast<uintptr_t>(0xE2u) << 24) |
+                                (static_cast<uintptr_t>(32u - shift - length) << 8) |
+                                static_cast<uintptr_t>(length - 1u);
+                    }
+                    break;
+
+                /* F3D G_SETGEOMETRYMODE (0xB7): OR flags into geometry mode.
+                   F3DEX2 G_GEOMETRYMODE (0xD9): w0[23:0]=keep-mask, w1=set-bits.
+                   Keep-mask 0xFFFFFF means keep all existing bits, then OR in w1. */
+                case 0xB7:
+                    if (isF3DSource) {
+                        outW0 = (static_cast<uintptr_t>(0xD9u) << 24) | 0x00FFFFFFu;
+                        outW1 = static_cast<uintptr_t>(in.w1);
+                    }
+                    break;
+
+                /* F3D G_CLEARGEOMETRYMODE (0xB6): AND-clear flags from geometry mode.
+                   F3DEX2 G_GEOMETRYMODE: keep-mask=~flags (clear exactly those bits), set=0. */
+                case 0xB6:
+                    if (isF3DSource) {
+                        outW0 = (static_cast<uintptr_t>(0xD9u) << 24) | (~in.w1 & 0x00FFFFFFu);
+                        outW1 = 0;
+                    }
+                    break;
+
+                /* F3D G_CULLDL (0xBE): sub-DL conditional cull.  No F3DEX2 equivalent at 0xBE.
+                   NOP — culling is an optimization, not a correctness requirement. */
+                case 0xBE:
+                    if (isF3DSource) {
+                        continue;
+                    }
+                    break;
+
+                // F3D G_VTX (0x04): only in ROM asset DLs; GfxPool F3DEX2 DLs use 0x04 for G_BRANCH_Z.
+                case 0x04:
+                    if (isF3DSource) {
+                        // F3D: w0 = [04, par=(n-1)<<4|v0, len=sizeof(Vtx)*n]; w1 = vtx addr
+                        // F3DEX2: w0 = [01, n<<12 | (v0+n)*2]; w1 = vtx addr
+                        const uint16_t len = static_cast<uint16_t>(in.w0 & 0xFFFFu);
+                        const uint8_t n = (len >= 16u) ? static_cast<uint8_t>(len / 16u) : 1u;
+                        const uint8_t par = static_cast<uint8_t>((in.w0 >> 16) & 0xFFu);
+                        const uint8_t v0 = par & 0x0Fu;
+                        outW1 = TranslateDataPointer(in.w1);
+                        if (outW1 != 0) {
+                            outW1 = NormalizeLusDirectPointer(outW1);
+                        } else {
+                            outW1 = FallbackDataPointer(kOpVtx);
+                            if (outW1 == 0) {
+                                if (mStats != nullptr) mStats->skippedDataCommands++;
+                                continue;
+                            }
+                        }
+                        outW0 = (static_cast<uintptr_t>(kOpVtx) << 24) |
+                                (static_cast<uintptr_t>(n) << 12) |
+                                static_cast<uintptr_t>((v0 + n) * 2u);
+                    }
+                    break;
+
                 default:
                     break;
             }
@@ -1552,9 +2085,23 @@ class N64DisplayListAdapter {
             if (outW1 == 0 && (op == kOpVtx || op == kOpMtx || op == kOpMovemem || op == kOpSetTextureImage)) {
                 outW1 = FallbackDataPointer(op);
                 if (outW1 != 0) {
-                    if (mStats != nullptr) mStats->fallbackDataCommands++;
+                    if (mStats != nullptr) {
+                        if (mStats->fallbackDataCommands == 0) {
+                            mStats->firstFallbackDataOp = op;
+                            mStats->firstFallbackDataRaw = in.w1;
+                            mStats->firstFallbackDataW0 = in.w0;
+                            mStats->firstFallbackDataSource = reinterpret_cast<uintptr_t>(item.source);
+                            mStats->firstFallbackDataIndex = i;
+                        }
+                        mStats->fallbackDataCommands++;
+                    }
                 } else {
                     if (mStats != nullptr) {
+                        if (mStats->skippedDataCommands == 0) {
+                            mStats->firstSkippedDataOp = op;
+                            mStats->firstSkippedDataRaw = in.w1;
+                            mStats->firstSkippedDataW0 = in.w0;
+                        }
                         mStats->skippedDataCommands++;
                         mStats->skippedTextures++;
                     }
@@ -1580,6 +2127,26 @@ class N64DisplayListAdapter {
 extern "C" void gdx_register_host_range(void* ptr, size_t size) {
     if ((ptr == nullptr) || (size == 0)) return;
     gHostRanges.push_back({ reinterpret_cast<uintptr_t>(ptr), size });
+}
+
+extern "C" void gdx_register_host_n64_command_range(void* ptr, size_t size) {
+    if ((ptr == nullptr) || (size == 0)) return;
+    gHostN64CommandRanges.push_back({ reinterpret_cast<uintptr_t>(ptr), size });
+}
+
+extern "C" void gdx_set_native_rgba16_texture_range(void* ptr, size_t size, int enabled) {
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr);
+    gNativeRgba16Ranges.erase(
+        std::remove_if(gNativeRgba16Ranges.begin(), gNativeRgba16Ranges.end(),
+                       [begin](const HostRange& range) { return range.begin == begin; }),
+        gNativeRgba16Ranges.end());
+    if (enabled && ptr != nullptr && size != 0) {
+        gNativeRgba16Ranges.push_back({begin, size});
+    }
+    if (ptr != nullptr && size != 0 && IsRdramHostPointer(begin)) {
+        gdx_record_dma_load(static_cast<uint32_t>(begin - reinterpret_cast<uintptr_t>(gdx_rdram)), 0,
+                            static_cast<uint32_t>(std::min<size_t>(size, UINT32_MAX)));
+    }
 }
 
 extern "C" void gdx_register_main_module_range(void) {
@@ -1610,6 +2177,39 @@ extern "C" void* gdx_ensure_asset_segment_for_symbol(unsigned int symLow32, unsi
         *outOffset = offset;
     }
     return reinterpret_cast<void*>(base);
+}
+
+extern "C" int gdx_load_venue_texture_segment(int venue) {
+    static const void* const kVenueSegmentSymbols[] = {
+        D_A000000_235130, // Mute City
+        D_A000000_239A80, // Port Town
+        D_A000000_23EC50, // Big Blue
+        D_A000000_243D90, // Sand Ocean
+        D_A000000_24A270, // Devil's Forest
+        D_A000000_2507F0, // White Land
+        D_A000000_255100, // Sector
+        D_A000000_259600, // Red Canyon
+        D_A000000_25F360, // Fire Field
+        D_A000000_266C20, // Silence
+        D_A000000_26D780, // Ending
+    };
+
+    if (venue < 0 || static_cast<size_t>(venue) >= std::size(kVenueSegmentSymbols)) {
+        gdx_port_logf("[segment] invalid venue texture segment %d\n", venue);
+        return 0;
+    }
+
+    const uint32_t symbol = Low32(reinterpret_cast<uintptr_t>(kVenueSegmentSymbols[venue]));
+    uint32_t offset = 0;
+    const uintptr_t base = EnsureAssetSegmentForSymbol(symbol, &offset);
+    if (base == 0) {
+        gdx_port_logf("[segment] failed to load venue=%d symbol=%08X\n", venue, symbol);
+        return 0;
+    }
+
+    gdx_port_logf("[segment] loaded venue=%d segment=10 base=%p symbol=%08X offset=%08X\n",
+                  venue, reinterpret_cast<void*>(base), symbol, offset);
+    return 1;
 }
 
 extern "C" void* gdx_resolve_registered_host_address(unsigned int addr) {
@@ -1704,21 +2304,76 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size) {
                       dl, dl_size, static_cast<int>(isBigEndian));
     }
 
-    static int sDiagPrints = 0;
-    if (sDiagPrints < 32) {
-        gdx_port_logf("[gfxdiag] lists=%zu cmds=%zu noop_dl=%zu fallback_data=%zu skip_data=%zu skip_tex=%zu "
+    static uint64_t sDiagFrames = 0;
+    const bool shouldLogDiagnostics =
+        sDiagFrames < 8 || (sDiagFrames % 120) == 0 ||
+        stats.noopDisplayLists != 0 || stats.fallbackDataCommands != 0 ||
+        stats.skippedDataCommands != 0 || stats.textureCopyBytes != 0;
+    if (shouldLogDiagnostics) {
+        gdx_port_logf("[gfxdiag] lists=%zu f3d_lists=%zu cmds=%zu noop_dl=%zu noop_raw=%08X "
+                      "miss_dl=%zu miss_raw=%08X bad_dl=%zu bad_raw=%08X "
+                      "fallback_data=%zu skip_data=%zu skip_tex=%zu "
                       "tex_copy_bytes=%zu vtx=%zu mtx=%zu dl=%zu teximg=%zu settile=%zu "
                       "tlut=%zu loadblk=%zu loadtile=%zu tilesize=%zu texrect=%zu fillrect=%zu "
                       "setcimg=%zu setzimg=%zu tris=%zu end=%zu size=%zu\n",
-                      stats.convertedLists, stats.commandsOut, stats.noopDisplayLists, stats.fallbackDataCommands,
+                      stats.convertedLists, stats.f3dLists, stats.commandsOut,
+                      stats.noopDisplayLists, stats.firstNoopDlRaw,
+                      stats.missingDisplayLists, stats.firstMissingDlRaw,
+                      stats.badDisplayLists, stats.firstBadDlRaw,
+                      stats.fallbackDataCommands,
                       stats.skippedDataCommands, stats.skippedTextures, stats.textureCopyBytes, stats.opCounts[kOpVtx],
                       stats.opCounts[kOpMtx], stats.opCounts[kOpDl], stats.opCounts[kOpSetTextureImage], stats.opCounts[kOpSetTile],
                       stats.opCounts[kOpLoadTlut], stats.opCounts[kOpLoadBlock], stats.opCounts[kOpLoadTile], stats.opCounts[kOpSetTileSize],
                       stats.opCounts[0xE4] + stats.opCounts[0xE5], stats.opCounts[0xF6], stats.opCounts[kOpSetColorImage],
-                      stats.opCounts[kOpSetDepthImage], stats.opCounts[0x05] + stats.opCounts[0x06] + stats.opCounts[0x07],
+                      stats.opCounts[kOpSetDepthImage],
+                      stats.opCounts[0x05] + stats.opCounts[0x06] + stats.opCounts[0x07] + stats.opCounts[0xBF],
                       stats.opCounts[kOpEndDl], dl_size);
-        sDiagPrints++;
+        if (stats.noopDisplayLists != 0) {
+            gdx_port_logf("[gfxfail] "
+                          "miss=%zu raw=%08X parent=%p pidx=%zu pstride=%zu pbig=%d pf3d=%d "
+                          "praw=%08X/%08X pdecoded=%08X/%08X "
+                          "bad=%zu raw=%08X target=%p limit=%zu stride=%zu big=%d f3d=%d "
+                          "first=%08X/%08X reason=%u fail_idx=%zu fail_op=%02X\n",
+                          stats.missingDisplayLists,
+                          stats.firstMissingDlRaw,
+                          reinterpret_cast<void*>(stats.firstMissingParent),
+                          stats.firstMissingParentIndex,
+                          stats.firstMissingParentStride,
+                          static_cast<int>(stats.firstMissingParentBigEndian),
+                          static_cast<int>(stats.firstMissingParentF3D),
+                          stats.firstMissingParentRawW0,
+                          stats.firstMissingParentRawW1,
+                          stats.firstMissingParentDecodedW0,
+                          stats.firstMissingParentDecodedW1,
+                          stats.badDisplayLists,
+                          stats.firstBadDlRaw,
+                          reinterpret_cast<void*>(stats.firstBadDlTarget),
+                          stats.firstBadDlLimit,
+                          stats.firstBadDlStride,
+                          static_cast<int>(stats.firstBadDlBigEndian),
+                          static_cast<int>(stats.firstBadDlF3D),
+                          stats.firstBadDlFirstW0,
+                          stats.firstBadDlFirstW1,
+                          static_cast<unsigned>(stats.firstBadDlFailureReason),
+                          stats.firstBadDlFailureIndex,
+                          static_cast<unsigned>(stats.firstBadDlFailureOpcode));
+        }
+        if (stats.fallbackDataCommands != 0 || stats.skippedDataCommands != 0) {
+            gdx_port_logf("[datafail] fallback=%zu op=%02X raw=%08X w0=%08X source=%p idx=%zu "
+                          "skipped=%zu op=%02X raw=%08X w0=%08X\n",
+                          stats.fallbackDataCommands,
+                          static_cast<unsigned>(stats.firstFallbackDataOp),
+                          stats.firstFallbackDataRaw,
+                          stats.firstFallbackDataW0,
+                          reinterpret_cast<void*>(stats.firstFallbackDataSource),
+                          stats.firstFallbackDataIndex,
+                          stats.skippedDataCommands,
+                          static_cast<unsigned>(stats.firstSkippedDataOp),
+                          stats.firstSkippedDataRaw,
+                          stats.firstSkippedDataW0);
+        }
     }
+    sDiagFrames++;
 
     if (!gPendingTextureCacheDeletes.empty()) {
         std::sort(gPendingTextureCacheDeletes.begin(), gPendingTextureCacheDeletes.end());
@@ -1732,4 +2387,27 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size) {
     }
 
     interp->Run(reinterpret_cast<Gfx*>(converted), {});
+}
+
+extern "C" int gdx_read_current_framebuffer(void* rgba16Buffer, unsigned int width, unsigned int height) {
+    if (rgba16Buffer == nullptr || width == 0 || height == 0) {
+        return 0;
+    }
+
+    auto wnd = Ship::Context::GetInstance()->GetWindow();
+    auto* fw = static_cast<Fast::Fast3dWindow*>(wnd.get());
+    if (fw == nullptr) {
+        return 0;
+    }
+
+    auto interp = fw->GetInterpreterWeak().lock();
+    if (!interp) {
+        return 0;
+    }
+
+    interp->Flush();
+    const int framebuffer = interp->mRendersToFb ? interp->mGameFb : 0;
+    interp->GetCurrentRenderingAPI()->ReadFramebufferToCPU(
+        framebuffer, width, height, static_cast<uint16_t*>(rgba16Buffer));
+    return 1;
 }

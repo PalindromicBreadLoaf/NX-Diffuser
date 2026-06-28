@@ -155,7 +155,6 @@ long LeoReadWrite() { return 0; }
 long LeoReset() { return 0; }
 long LeoResetClear() { return 0; }
 long LeoSpdlMotor() { return 0; }
-long LeoTestUnitReady() { return 0; }
 long Mfs_CreateLeoManager() { return 0; }
 long Mfs_GetFileIndex() { return 0; }
 long Mfs_InitRamArea() { return 0; }
@@ -174,7 +173,6 @@ long Save_UpdateCharacterSave() { return 0; }
 long Save_UpdateCourseCharacterSave() { return 0; }
 long Save_UpdateCupCompletion() { return 0; }
 long Save_UpdateCupSave() { return 0; }
-long Segment_LoadAssets() { return 0; }
 long Segment_LoadOverlays() { return 0; }
 long Sram_Init() { return 0; }
 long Sram_ReadWrite() { return 0; }

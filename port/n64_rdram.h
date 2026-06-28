@@ -9,7 +9,7 @@ extern "C" {
 /* 16MB host RDRAM buffer — maps N64 physical addr `phys` to `gdx_rdram + phys`.
    F-Zero X requires the Expansion Pak; overlay texture offsets reach ~12-13MB physical. */
 #define GDX_RDRAM_SIZE           ((size_t)0x1000000u)  /* 16 MB (base 8MB + Expansion Pak) */
-#define GDX_RDRAM_GFXPOOL_OFFSET ((size_t)0x100000u)   /* D_1000000 — segment 0x01 */
+#define GDX_RDRAM_GFXPOOL_OFFSET ((size_t)0x4000u)     /* lower bound for bare RDRAM offsets (course sub-DLs start ~0x6000) */
 
 /* Allocated once at startup by gdx_rdram_init(), before bootproc(). */
 extern unsigned char* gdx_rdram;

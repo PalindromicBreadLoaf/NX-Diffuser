@@ -35,6 +35,8 @@ EXCLUDE = {
     "osViSwapBuffer", "osViGetCurrentFramebuffer", "osViGetNextFramebuffer", "osViSetEvent",
     "osCreateViManager", "osViSetMode", "osViBlack", "osViSetSpecialFeatures",
     "osViSetXScale", "osViSetYScale", "osMemSize",
+    # PC has no 64DD medium; shims.c reports that state with the real signature.
+    "LeoTestUnitReady",
     # libultra globals the decomp uses as ARRAYS (must be real writable data, not function stubs).
     "osAppNMIBuffer",
 }

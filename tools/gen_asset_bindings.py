@@ -20,6 +20,7 @@ func_80077CF0 (object.c) so MIO0 decompression reads from the right place in gdx
 """
 import glob
 import os
+import re
 import yaml
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -114,7 +115,14 @@ for path in sorted(glob.glob(os.path.join(ASSET_YAML_DIR, "*.yaml"))):
     is_common = (fname == "common_assets_compressed.yaml")
 
     with open(path) as f:
-        data = yaml.safe_load(f) or {}
+        yaml_text = f.read()
+    data = yaml.safe_load(yaml_text) or {}
+
+    # Some segment YAMLs record the decoded image size in a trailing comment.
+    # Keep it so the final variable-length GFX entry has an upper boundary even
+    # though there is no following asset offset from which to infer its size.
+    size_matches = re.findall(r"(?m)^\s*#\s*size\s*=\s*(0x[0-9A-Fa-f]+|\d+)", yaml_text)
+    segment_declared_size = int(size_matches[-1], 0) if size_matches else 0
 
     # Extract ROM base offset and segment id from :config: segments.
     rom_base = None
@@ -163,10 +171,15 @@ for path in sorted(glob.glob(os.path.join(ASSET_YAML_DIR, "*.yaml"))):
                 offset = int(offset)
                 declared = asset_declared_size(val)
                 if val.get("type") == "GFX":
-                    declared = max(0, int(next_offsets.get(key, offset)) - offset)
+                    gfx_end = next_offsets.get(key)
+                    if gfx_end is None and segment_declared_size > offset:
+                        gfx_end = segment_declared_size
+                    declared = max(0, int(gfx_end if gfx_end is not None else offset) - offset)
 
                 image_key = (int(segment_id), int(rom_base), int(compressed))
                 image_size = segment_images.get(image_key, 0)
+                if segment_declared_size > 0:
+                    image_size = max(image_size, segment_declared_size)
                 if declared > 0:
                     image_size = max(image_size, offset + declared)
                 elif key in next_offsets:
