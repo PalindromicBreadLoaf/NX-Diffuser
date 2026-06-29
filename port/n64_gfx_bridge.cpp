@@ -1224,7 +1224,19 @@ class N64DisplayListAdapter {
             if ((begin == 0) || (end <= begin)) {
                 return false;
             }
-            const uintptr_t full = (begin & ~kPhysicalAddressMask) | static_cast<uintptr_t>(raw);
+            uintptr_t full = (begin & ~kPhysicalAddressMask) | static_cast<uintptr_t>(raw);
+            /*
+             * A host range can cross a 512 MB K0 physical-token window.
+             * In that case the token may belong to the next window even
+             * though the range begins in the previous one.
+             */
+            if (full < begin) {
+                constexpr uintptr_t kPhysicalAddressWindow = kPhysicalAddressMask + 1u;
+                if (full > UINTPTR_MAX - kPhysicalAddressWindow) {
+                    return false;
+                }
+                full += kPhysicalAddressWindow;
+            }
             if ((full < begin) || (full >= end) ||
                 (requiredBytes > static_cast<size_t>(end - full)) ||
                 (ReadableByteLimit(full) < requiredBytes)) {
@@ -1905,6 +1917,17 @@ class N64DisplayListAdapter {
                     // Emit 0xB4 for G_RDPHALF_1 in F3DEX2 instead of 0xE1
                     outW0 = (static_cast<uintptr_t>(0xB4) << 24) | (outW0 & 0x00FFFFFFu);
                     break;
+
+                /*
+                 * F-Zero X switches between stock F3DEX2 reject variants with
+                 * gSPLoadUcodeL. The command's low 24 bits encode the ucode-data
+                 * size, not libultraship's UcodeHandlers enum. Passing it through
+                 * makes gfx_set_ucode_handler assert on an out-of-range value.
+                 * The converted stream remains F3DEX2-compatible, so keep the
+                 * current handler and treat the physical ucode load as a no-op.
+                 */
+                case 0xDD:
+                    continue;
 
                 // F3D G_ENDDL (0xB8): stop list processing, emit F3DEX2 ENDDL so Fast3D sees a clean end.
                 case 0xB8:
