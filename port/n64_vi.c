@@ -14,6 +14,7 @@
 
 #include "PR/os_vi.h"
 #include "PR/os_message.h"
+#include "n64_gfx_bridge.h"
 
 extern void gdx_yield(void);
 
@@ -27,6 +28,7 @@ static OSMesg sViMsg = (void*) 0;
 
 void osViSwapBuffer(void* fb) {
     sNextFb = fb;
+    gdx_vi_set_next_framebuffer(fb);
 }
 
 void* osViGetCurrentFramebuffer(void) {
@@ -68,6 +70,7 @@ void osViSetYScale(f32 scale) {
 // --- host driver: advance the framebuffer rotation and post the VI retrace message. ---
 void gdx_vi_tick(void) {
     sCurrentFb = sNextFb;
+    gdx_vi_set_current_framebuffer(sCurrentFb);
     if (sViQueue != (void*) 0) {
         osSendMesg(sViQueue, sViMsg, OS_MESG_NOBLOCK);
     }

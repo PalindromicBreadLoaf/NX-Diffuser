@@ -20,6 +20,7 @@
 #include "port_log.h"
 #include "rom_buffer.h"
 #include "n64_rdram.h"
+#include "n64_gfx_bridge.h"
 extern "C" {
 #include "mio0.h"
 }
@@ -153,8 +154,8 @@ constexpr uint8_t kOpBranchZ = 0x04;
 // G_BRANCH_Z in the original F3D microcode (used by F-Zero X race DLs).
 // In F3D: G_IMMFIRST=0xE5, so G_BRANCH_Z = 0xE5-15 = 0xD6.
 // In F3DEX2: G_BRANCH_Z = 0x04 (kOpBranchZ above).
-// We NOP this on PC: the z-condition can't be evaluated without RSP vertex state,
-// and the sub-DL at w1 is alternate near-clip geometry the interpreter doesn't need.
+// Legacy F3D assets still omit this optimization; host-built F3DEX2 lists retain
+// opcode 0x04 and evaluate it against the interpreter's transformed vertex state.
 constexpr uint8_t kOpBranchZF3D = 0xD6;
 constexpr uint8_t kOpEndDl = 0xDF;
 constexpr uint8_t kOpDl = 0xDE;
@@ -373,6 +374,13 @@ struct PersistentRawTextureCopy {
     uint64_t dmaGenAtCopy = UINT64_MAX;
 };
 
+struct N64FramebufferInfo {
+    uintptr_t address = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool valid = false;
+};
+
 std::vector<HostRange> gHostRanges;
 std::vector<HostRange> gRawN64Ranges;
 std::vector<HostRange> gHostN64CommandRanges;
@@ -382,6 +390,10 @@ std::vector<uint8_t> gSetupGfxSegment;
 std::vector<PersistentRawTextureCopy> gRawTextureCopies;
 std::vector<uintptr_t> gPendingTextureCacheDeletes;
 std::vector<std::unique_ptr<uint8_t[]>> gPersistentAllocations; // Fixed undefined mPersistentAllocations
+std::vector<N64FramebufferInfo> gN64Framebuffers;
+uintptr_t gViCurrentFramebuffer = 0;
+uintptr_t gViNextFramebuffer = 0;
+uintptr_t gLastRenderedFramebuffer = 0;
 
 struct AssetSegmentLookup {
     uint8_t segment = 0;
@@ -411,6 +423,17 @@ struct DmaDirtyRange {
 };
 static std::vector<DmaDirtyRange> gDmaDirtyRanges;
 
+void RecordHostWrite(uintptr_t begin, size_t size) {
+    ++gDmaGeneration;
+    if (begin == 0 || size == 0 || size > UINTPTR_MAX - begin) {
+        return;
+    }
+    gDmaDirtyRanges.push_back({ begin, begin + size, gDmaGeneration });
+    if (gDmaDirtyRanges.size() > 4096) {
+        gDmaDirtyRanges.erase(gDmaDirtyRanges.begin(), gDmaDirtyRanges.begin() + 2048);
+    }
+}
+
 } // namespace (temporarily close to define extern "C")
 
 extern "C" void gdx_record_dma_load(uint32_t rdram_phys, uint32_t rom_offset, uint32_t size) {
@@ -428,7 +451,7 @@ extern "C" void gdx_record_dma_load(uint32_t rdram_phys, uint32_t rom_offset, ui
 
 namespace {
 
-bool RdramRangeChanged(uintptr_t source, size_t size, uint64_t sinceGeneration) {
+bool HostRangeChanged(uintptr_t source, size_t size, uint64_t sinceGeneration) {
     if (sinceGeneration == gDmaGeneration) {
         return false;
     }
@@ -442,6 +465,22 @@ bool RdramRangeChanged(uintptr_t source, size_t size, uint64_t sinceGeneration) 
             break;
         }
         if (source < it->end && end > it->begin) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsN64FramebufferRange(uintptr_t source, size_t size) {
+    if (size > UINTPTR_MAX - source) {
+        return false;
+    }
+    const uintptr_t end = source + size;
+    for (const N64FramebufferInfo& framebuffer : gN64Framebuffers) {
+        const size_t framebufferSize =
+            static_cast<size_t>(framebuffer.width) * framebuffer.height * sizeof(uint16_t);
+        if (framebufferSize <= UINTPTR_MAX - framebuffer.address &&
+            source >= framebuffer.address && end <= framebuffer.address + framebufferSize) {
             return true;
         }
     }
@@ -802,9 +841,16 @@ uintptr_t EnsureSetupGfxSegment() {
     }
 }
 
-uintptr_t MakeFramebufferToken(uint8_t op, uint32_t raw) {
-    const uintptr_t tag = (op == kOpSetDepthImage) ? 0x20000000u : 0x10000000u;
-    return (tag | (static_cast<uintptr_t>(raw) & 0x0FFFFFFEu));
+uintptr_t MakeFramebufferToken(uint32_t raw) {
+#if UINTPTR_MAX > UINT32_MAX
+    constexpr uintptr_t kFramebufferTokenBase = 0x0000000300000000ull;
+#else
+    constexpr uintptr_t kFramebufferTokenBase = 0x30000000u;
+#endif
+    // CIMG and ZIMG commands that reference the same N64 address must retain
+    // pointer identity. Fast3D uses that identity to distinguish a depth clear
+    // from a visible color fill.
+    return kFramebufferTokenBase | (static_cast<uintptr_t>(raw) & 0xFFFFFFFEu);
 }
 
 bool ResolveSetupGfxStub(uint32_t raw, ResolvedAddress& out) {
@@ -993,8 +1039,8 @@ uintptr_t MakePersistentRawTextureCopy(uintptr_t source, size_t requiredBytes, b
         const bool needsResize = (copy.bytes == nullptr) || (copy.size < requiredBytes);
         bool changed = needsResize;
         if (!needsResize) {
-            if (IsRdramHostPointer(source)) {
-                changed = RdramRangeChanged(source, copy.size, copy.dmaGenAtCopy);
+            if (IsRdramHostPointer(source) || IsN64FramebufferRange(source, copy.size)) {
+                changed = HostRangeChanged(source, copy.size, copy.dmaGenAtCopy);
             } else {
                 // ROM-backed textures are stable after the segment is loaded; skip memcmp.
                 const bool stableSource = RegisteredHostRemaining(source) > 0;
@@ -1851,7 +1897,7 @@ class N64DisplayListAdapter {
                 case kOpSetColorImage:
                 case kOpSetDepthImage:
                     outW1 = TranslateDataPointer(in.w1);
-                    if (outW1 == 0) outW1 = MakeFramebufferToken(op, in.w1);
+                    if (outW1 == 0) outW1 = MakeFramebufferToken(in.w1);
                     break;
 
                 case kOpSetTextureImage:
@@ -1913,9 +1959,6 @@ class N64DisplayListAdapter {
                         IsResolvableDisplayList(in.w1)) {
                         outW1 = TranslateDisplayListPointer(in.w1, item.source, i);
                     }
-                    
-                    // Emit 0xB4 for G_RDPHALF_1 in F3DEX2 instead of 0xE1
-                    outW0 = (static_cast<uintptr_t>(0xB4) << 24) | (outW0 & 0x00FFFFFFu);
                     break;
 
                 /*
@@ -2107,11 +2150,6 @@ class N64DisplayListAdapter {
                         outW0 = (static_cast<uintptr_t>(kOpVtx) << 24) |
                                 (static_cast<uintptr_t>(n) << 12) |
                                 static_cast<uintptr_t>((v0 + n) * 2u);
-                    } else {
-                        // F3DEX2 G_BRANCH_Z (0x04)
-                        // NOP it to never branch (always draw highest LOD) and avoid infinite recursion
-                        outW0 = 0;
-                        outW1 = 0;
                     }
                     break;
 
@@ -2169,6 +2207,40 @@ extern "C" void gdx_register_host_range(void* ptr, size_t size) {
 extern "C" void gdx_register_host_n64_command_range(void* ptr, size_t size) {
     if ((ptr == nullptr) || (size == 0)) return;
     gHostN64CommandRanges.push_back({ reinterpret_cast<uintptr_t>(ptr), size });
+}
+
+extern "C" void gdx_register_n64_framebuffer(void* cpuAddr, unsigned int width, unsigned int height) {
+    if (cpuAddr == nullptr || width == 0 || height == 0) {
+        return;
+    }
+    const uintptr_t address = reinterpret_cast<uintptr_t>(cpuAddr);
+    auto existing = std::find_if(gN64Framebuffers.begin(), gN64Framebuffers.end(),
+                                 [address](const N64FramebufferInfo& info) {
+                                     return info.address == address;
+                                 });
+    if (existing == gN64Framebuffers.end()) {
+        gN64Framebuffers.push_back({ address, width, height, false });
+    } else {
+        existing->width = width;
+        existing->height = height;
+    }
+
+    const size_t byteCount = static_cast<size_t>(width) * height * sizeof(uint16_t);
+    const auto nativeRange = std::find_if(gNativeRgba16Ranges.begin(), gNativeRgba16Ranges.end(),
+                                         [address](const HostRange& range) {
+                                             return range.begin == address;
+                                         });
+    if (nativeRange == gNativeRgba16Ranges.end()) {
+        gNativeRgba16Ranges.push_back({ address, byteCount });
+    }
+}
+
+extern "C" void gdx_vi_set_next_framebuffer(void* cpuAddr) {
+    gViNextFramebuffer = reinterpret_cast<uintptr_t>(cpuAddr);
+}
+
+extern "C" void gdx_vi_set_current_framebuffer(void* cpuAddr) {
+    gViCurrentFramebuffer = reinterpret_cast<uintptr_t>(cpuAddr);
 }
 
 extern "C" void gdx_set_native_rgba16_texture_range(void* ptr, size_t size, int enabled) {
@@ -2300,10 +2372,14 @@ extern "C" void* gdx_resolve_module_host_address(unsigned int addr) {
     return nullptr;
 }
 
-extern "C" void gdx_gfx_run(void* dl, size_t dl_size) {
+extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
     auto wnd = Ship::Context::GetInstance()->GetWindow();
     auto* fw = static_cast<Fast::Fast3dWindow*>(wnd.get());
     if (fw == nullptr) { return; }
+    // All three F-Zero X task variants use the F3DEX2 command encoding. Keep
+    // their identity at the port boundary while selecting the matching base
+    // interpreter; reject-variant behavior is represented by their commands.
+    fw->SetRendererUCode(ucode_f3dex2);
     auto interp = fw->GetInterpreterWeak().lock();
     if (!interp) { return; }
 
@@ -2337,8 +2413,8 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size) {
                           static_cast<unsigned>(gHostRanges[ri].begin & 0xFFFFFFFFu),
                           gHostRanges[ri].size);
         }
-        gdx_port_logf("[bridge-init] DL root: ptr=%p size=%zu isBig=%d\n",
-                      dl, dl_size, static_cast<int>(isBigEndian));
+        gdx_port_logf("[bridge-init] DL root: ptr=%p size=%zu isBig=%d taskUcode=%d\n",
+                      dl, dl_size, static_cast<int>(isBigEndian), static_cast<int>(taskUcode));
     }
 
     static uint64_t sDiagFrames = 0;
@@ -2425,6 +2501,22 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size) {
     }
 
     interp->Run(reinterpret_cast<Gfx*>(converted), {});
+
+    const uintptr_t colorImage = reinterpret_cast<uintptr_t>(interp->mRdp->color_image_address);
+    auto framebuffer = std::find_if(gN64Framebuffers.begin(), gN64Framebuffers.end(),
+                                    [colorImage](const N64FramebufferInfo& info) {
+                                        return info.address == colorImage;
+                                    });
+    if (framebuffer != gN64Framebuffers.end()) {
+        const int hostFramebuffer = interp->mRendersToFb ? interp->mGameFb : 0;
+        interp->GetCurrentRenderingAPI()->ReadFramebufferToCPU(
+            hostFramebuffer, framebuffer->width, framebuffer->height,
+            reinterpret_cast<uint16_t*>(framebuffer->address));
+        framebuffer->valid = true;
+        gLastRenderedFramebuffer = framebuffer->address;
+        RecordHostWrite(framebuffer->address,
+                        static_cast<size_t>(framebuffer->width) * framebuffer->height * sizeof(uint16_t));
+    }
 }
 
 extern "C" int gdx_read_current_framebuffer(void* rgba16Buffer, unsigned int width, unsigned int height) {
@@ -2443,9 +2535,28 @@ extern "C" int gdx_read_current_framebuffer(void* rgba16Buffer, unsigned int wid
         return 0;
     }
 
+    const uintptr_t requestedAddress = reinterpret_cast<uintptr_t>(rgba16Buffer);
+    auto requested = std::find_if(gN64Framebuffers.begin(), gN64Framebuffers.end(),
+                                  [requestedAddress](const N64FramebufferInfo& info) {
+                                      return info.address == requestedAddress;
+                                  });
+    // Every completed graphics task is mirrored into its N64 CIMG buffer.
+    // Preserve that buffer's own historical contents when the transition asks
+    // for a framebuffer that is not the most recently rendered host target.
+    if (requested != gN64Framebuffers.end() && requested->valid &&
+        requestedAddress != gLastRenderedFramebuffer) {
+        return 1;
+    }
+
     interp->Flush();
     const int framebuffer = interp->mRendersToFb ? interp->mGameFb : 0;
     interp->GetCurrentRenderingAPI()->ReadFramebufferToCPU(
         framebuffer, width, height, static_cast<uint16_t*>(rgba16Buffer));
+    if (requested != gN64Framebuffers.end()) {
+        requested->valid = true;
+        gLastRenderedFramebuffer = requestedAddress;
+        RecordHostWrite(requestedAddress,
+                        static_cast<size_t>(width) * height * sizeof(uint16_t));
+    }
     return 1;
 }

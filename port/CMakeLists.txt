@@ -82,6 +82,7 @@ target_include_directories(gdiffuser_game PRIVATE
 
 target_compile_definitions(gdiffuser_game PRIVATE
     PORT=1
+    GDIFFUSER_PORT=1
     NON_MATCHING=1
     NON_EQUIVALENT=1
     AVOID_UB=1

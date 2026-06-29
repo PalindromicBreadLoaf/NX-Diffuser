@@ -13,7 +13,9 @@
 #include "PR/osint.h"
 #include "PR/os_system.h" // OS_CLOCK_RATE, OS_IM_ALL
 #include "PR/sptask.h"     // OSTask, OSYieldResult, osSpTask* (gfx/audio task submission)
+#include "PR/ucode.h"
 #include "fzx_thread.h"    // THREAD_ID_IDLE
+#include "n64_gfx_bridge.h"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -278,7 +280,6 @@ u32 osGetMemSize(void) {
     return osMemSize;
 }
 
-extern void gdx_gfx_run(void* dl, size_t dl_size); /* C-linkage bridge (port/n64_gfx_bridge.cpp) */
 extern OSMesgQueue gMainThreadMesgQueue;
 extern OSMesgQueue D_800DCAC8;
 
@@ -287,9 +288,15 @@ void osSpTaskLoad(OSTask* tp) {
 }
 
 void osSpTaskStartGo(OSTask* tp) {
+    GdxTaskUcode taskUcode = GDX_TASK_UCODE_F3DEX2;
+    if (tp->t.ucode == (u64*) gspF3DLX2_Rej_fifoTextStart) {
+        taskUcode = GDX_TASK_UCODE_F3DLX2_REJ;
+    } else if (tp->t.ucode == (u64*) gspF3DFLX2_Rej_fifoTextStart) {
+        taskUcode = GDX_TASK_UCODE_F3DFLX2_REJ;
+    }
     gdx_port_logf("[sched] osSpTaskStartGo: dl=%p size=%u\n",
                   (void*)tp->t.data_ptr, (unsigned)tp->t.data_size);
-    gdx_gfx_run(tp->t.data_ptr, tp->t.data_size);                                      /* synchronous Fast3D Run() */
+    gdx_gfx_run(tp->t.data_ptr, tp->t.data_size, taskUcode);                           /* synchronous Fast3D Run() */
     gdx_port_logf("[sched] osSpTaskStartGo: gdx_gfx_run done\n");
     osSendMesg(&gMainThreadMesgQueue, (OSMesg)(uintptr_t)EVENT_MESG_SP, OS_MESG_NOBLOCK); /* SP done */
     osSendMesg(&D_800DCAC8,           (OSMesg)(uintptr_t)0x2A,           OS_MESG_NOBLOCK); /* DP done */
