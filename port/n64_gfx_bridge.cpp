@@ -74,6 +74,7 @@ extern "C" uint16_t D_A000000_266C20[];
 extern "C" uint16_t D_A000000_26D780[];
 extern "C" uint8_t D_2000000[];
 extern "C" uint8_t D_80225800_2[];
+extern "C" uint8_t D_1000000[];
 
 extern "C" int gdx_lookup_asset_segment(unsigned int sym_low32,
                                          unsigned char* segment,
@@ -85,6 +86,10 @@ extern "C" void gdx_fixup_asset_segment_image(unsigned char segment,
                                                unsigned int rom_base,
                                                unsigned char* data,
                                                unsigned int size);
+extern "C" void gdx_register_asset_segment_command_ranges(unsigned char segment,
+                                                            unsigned int rom_base,
+                                                            unsigned char* data,
+                                                            unsigned int size);
 extern "C" const char* GDiffuser_LookupLoadedAssetKey(const void* buffer, size_t minSize, int requireUnmodified);
 extern "C" const char* gdx_lookup_asset_segment_o2r_key(unsigned int sym_low32);
 
@@ -615,6 +620,11 @@ uintptr_t EnsureAssetSegmentImage(const AssetSegmentLookup& lookup) {
                                       lookup.romBase,
                                       loaded.bytes.data(),
                                       static_cast<unsigned int>(std::min<size_t>(loaded.bytes.size(), UINT32_MAX)));
+        gdx_register_asset_segment_command_ranges(
+            lookup.segment,
+            lookup.romBase,
+            loaded.bytes.data(),
+            static_cast<unsigned int>(std::min<size_t>(loaded.bytes.size(), UINT32_MAX)));
     }
 
     const uintptr_t base = reinterpret_cast<uintptr_t>(loaded.bytes.data());
@@ -1225,6 +1235,18 @@ class N64DisplayListAdapter {
 
         if (ResolveSetupGfxStub(raw, out)) {
             return true;
+        }
+
+        const uint32_t d1000000_low = Low32(reinterpret_cast<uintptr_t>(D_1000000));
+        for (const HostRange& range : gHostRanges) {
+            if (range.begin == reinterpret_cast<uintptr_t>(D_1000000)) {
+                if (raw >= d1000000_low && (raw - d1000000_low) < range.size) {
+                    out.full = static_cast<uintptr_t>(gSegments[1]) + (raw - d1000000_low);
+                    out.segmented = false;
+                    return true;
+                }
+                break;
+            }
         }
 
         if (ResolveRegisteredHostPointer(raw, out)) {
@@ -1943,10 +1965,22 @@ class N64DisplayListAdapter {
                     break;
 
                 case kOpBranchZF3D:
-                    // F3D G_BRANCH_Z (0xD6): conditional branch on vertex z-depth.
-                    // Target DL is in w1. PC can't evaluate the RSP z-condition, so
-                    // NOP the whole command — execution continues from the normal list.
-                    continue;
+                    if (isF3DSource) {
+                        // Legacy F3D uses 0xD6 for G_BRANCH_Z. Its target/condition
+                        // encoding is not compatible with F3DEX2 G_DMA_IO.
+                        continue;
+                    }
+                    // F3DEX2 uses 0xD6 for G_DMA_IO. F3DFLX loads its per-vertex
+                    // reflection-alpha lookup table through this command.
+                    outW1 = TranslateDataPointer(in.w1);
+                    if (outW1 == 0) {
+                        if (mStats != nullptr) {
+                            mStats->skippedDataCommands++;
+                        }
+                        continue;
+                    }
+                    outW1 = NormalizeLusDirectPointer(outW1);
+                    break;
 
                 case kOpRdpHalf1:
                     /* G_RDPHALF_1 is also used as raw RDP payload for commands like
@@ -2376,12 +2410,23 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
     auto wnd = Ship::Context::GetInstance()->GetWindow();
     auto* fw = static_cast<Fast::Fast3dWindow*>(wnd.get());
     if (fw == nullptr) { return; }
-    // All three F-Zero X task variants use the F3DEX2 command encoding. Keep
-    // their identity at the port boundary while selecting the matching base
-    // interpreter; reject-variant behavior is represented by their commands.
+    // All three task variants share F3DEX2 command encoding. Their semantic
+    // differences are carried separately so the base opcode table stays valid.
     fw->SetRendererUCode(ucode_f3dex2);
     auto interp = fw->GetInterpreterWeak().lock();
     if (!interp) { return; }
+    switch (taskUcode) {
+        case GDX_TASK_UCODE_F3DLX2_REJ:
+            interp->SetF3dex2Variant(Fast::F3dex2Variant::Reject);
+            break;
+        case GDX_TASK_UCODE_F3DFLX2_REJ:
+            interp->SetF3dex2Variant(Fast::F3dex2Variant::FZeroFlxReject);
+            break;
+        case GDX_TASK_UCODE_F3DEX2:
+        default:
+            interp->SetF3dex2Variant(Fast::F3dex2Variant::Standard);
+            break;
+    }
 
     for (int i = 0; i < 16; i++) {
         interp->mSegmentPointers[i] = gSegments[i];
@@ -2500,7 +2545,48 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
         gPersistentAllocations.clear();
     }
 
+    interp->ResetGeometryDiagnostics();
     interp->Run(reinterpret_cast<Gfx*>(converted), {});
+    const Fast::GeometryDiagnostics& geometry = interp->GetGeometryDiagnostics();
+    static int sLastGeometryTaskUcode = -1;
+    const bool geometryUcodeChanged = sLastGeometryTaskUcode != static_cast<int>(taskUcode);
+    if (geometryUcodeChanged || (sDiagFrames % 120) == 0 || geometry.invalidVertices != 0) {
+        gdx_port_logf(
+            "[geodiag] ucode=%d vtx=%llu invalid=%llu w_nonpos=%llu near=%llu far=%llu "
+            "ndc_x=%.3f..%.3f ndc_y=%.3f..%.3f ndc_z=%.3f..%.3f "
+            "tri_in=%llu clip=%llu cull=%llu "
+            "invisible=%llu emitted=%llu dma=%llu flx_alpha_vtx=%llu gpu_draws=%llu gpu_tris=%llu\n",
+            static_cast<int>(taskUcode),
+            static_cast<unsigned long long>(geometry.verticesLoaded),
+            static_cast<unsigned long long>(geometry.invalidVertices),
+            static_cast<unsigned long long>(geometry.verticesNonPositiveW),
+            static_cast<unsigned long long>(geometry.verticesOutsideNear),
+            static_cast<unsigned long long>(geometry.verticesOutsideFar),
+            geometry.minNdcX, geometry.maxNdcX,
+            geometry.minNdcY, geometry.maxNdcY,
+            geometry.minNdcZ, geometry.maxNdcZ,
+            static_cast<unsigned long long>(geometry.trianglesSubmitted),
+            static_cast<unsigned long long>(geometry.trianglesClipRejected),
+            static_cast<unsigned long long>(geometry.trianglesCullRejected),
+            static_cast<unsigned long long>(geometry.trianglesInvisible),
+            static_cast<unsigned long long>(geometry.trianglesEmitted),
+            static_cast<unsigned long long>(geometry.dmaIoLoads),
+            static_cast<unsigned long long>(geometry.f3dflxAlphaVertices),
+            static_cast<unsigned long long>(geometry.gpuDrawCalls),
+            static_cast<unsigned long long>(geometry.gpuTriangles));
+        gdx_port_logf(
+            "[gpustate] vp=%.1f,%.1f %.1fx%.1f sc=%.1f,%.1f %.1fx%.1f "
+            "other=%08X/%08X cimg=%p zimg=%p same=%d renders_fb=%d fb_active=%d\n",
+            interp->mRdp->viewport.x, interp->mRdp->viewport.y,
+            interp->mRdp->viewport.width, interp->mRdp->viewport.height,
+            interp->mRdp->scissor.x, interp->mRdp->scissor.y,
+            interp->mRdp->scissor.width, interp->mRdp->scissor.height,
+            interp->mRdp->other_mode_h, interp->mRdp->other_mode_l,
+            interp->mRdp->color_image_address, interp->mRdp->z_buf_address,
+            interp->mRdp->color_image_address == interp->mRdp->z_buf_address,
+            static_cast<int>(interp->mRendersToFb), static_cast<int>(interp->mFbActive));
+    }
+    sLastGeometryTaskUcode = static_cast<int>(taskUcode);
 
     const uintptr_t colorImage = reinterpret_cast<uintptr_t>(interp->mRdp->color_image_address);
     auto framebuffer = std::find_if(gN64Framebuffers.begin(), gN64Framebuffers.end(),
