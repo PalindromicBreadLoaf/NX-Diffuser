@@ -41,6 +41,7 @@ common_asset_rom_entries = []
 # truncated placeholder addresses. This map lets the port resolve those addresses
 # back into loaded ROM segment images.
 asset_segment_entries = []
+asset_range_entries = []
 asset_fixup_entries = []
 segment_images = {}
 asset_load_entries = []
@@ -134,6 +135,36 @@ for path in sorted(glob.glob(os.path.join(ASSET_YAML_DIR, "*.yaml"))):
         rom_base = segs[0][1]  # e.g. 0x2B9EA0
 
     compressed = bool((config.get("compression") or {}).get("offset") is not None)
+
+    # YAML table declarations describe contiguous symbol ranges whose base
+    # names are used directly by game code for pointer arithmetic. They are
+    # not regular asset entries, so preserve their placeholder symbol as a
+    # token and teach the runtime resolver how offsets from that token map
+    # into the real segment image.
+    tables = config.get("tables") or {}
+    if (not is_common) and segment_id is not None and rom_base is not None:
+        for table_name, table_val in tables.items():
+            if not isinstance(table_val, dict):
+                continue
+            table_range = table_val.get("range")
+            if not isinstance(table_range, (list, tuple)) or len(table_range) < 2:
+                continue
+            range_start = int(table_range[0])
+            range_end = int(table_range[1])
+            if range_end <= range_start:
+                continue
+            range_segment = (range_start >> 24) & 0xFF
+            if range_segment != int(segment_id):
+                continue
+            asset_range_entries.append((
+                table_name,
+                int(segment_id),
+                int(rom_base),
+                int(compressed),
+                range_start & 0x00FFFFFF,
+                range_end - range_start,
+                yaml_stem,
+            ))
 
     # GFX entries are variable-length display lists. The next YAML offset is
     # the best source of truth for how many command bytes to endian-fix.
@@ -243,6 +274,19 @@ for sym, segment, rom_base, compressed, offset, image_key, yaml_stem in asset_se
 asset_lines.append("    { NULL, 0u, 0U, 0u, 0U, 0U, NULL }")
 asset_lines.append("};")
 asset_lines.append("")
+asset_lines.append("typedef struct { void* sym; unsigned char segment; unsigned int rom_base; unsigned char compressed; unsigned int offset; unsigned int size; unsigned int image_size; const char* o2r_key; } GdxAssetRangeEntry;")
+asset_lines.append("static const GdxAssetRangeEntry sAssetRangeMap[] = {")
+for sym, segment, rom_base, compressed, offset, size, yaml_stem in asset_range_entries:
+    image_key = (segment, rom_base, compressed)
+    image_size = segment_images.get(image_key, 0)
+    if image_size <= 0:
+        continue
+    o2r_key = "{}/{}".format(yaml_stem, sym)
+    asset_lines.append("    {{ {}, 0x{:02X}u, 0x{:08X}U, {}u, 0x{:08X}U, 0x{:08X}U, 0x{:08X}U, \"{}\" }},".format(
+        sym, segment, rom_base, compressed, offset, size, image_size, o2r_key))
+asset_lines.append("    { NULL, 0u, 0U, 0u, 0U, 0U, 0U, NULL }")
+asset_lines.append("};")
+asset_lines.append("")
 asset_lines.append("int gdx_lookup_asset_segment(unsigned int sym_low32, unsigned char* segment, unsigned int* rom_base,")
 asset_lines.append("                             unsigned char* compressed, unsigned int* offset, unsigned int* image_size) {")
 asset_lines.append("    int i;")
@@ -253,6 +297,18 @@ asset_lines.append("            if (rom_base != NULL) *rom_base = sAssetSegmentM
 asset_lines.append("            if (compressed != NULL) *compressed = sAssetSegmentMap[i].compressed;")
 asset_lines.append("            if (offset != NULL) *offset = sAssetSegmentMap[i].offset;")
 asset_lines.append("            if (image_size != NULL) *image_size = sAssetSegmentMap[i].image_size;")
+asset_lines.append("            return 1;")
+asset_lines.append("        }")
+asset_lines.append("    }")
+asset_lines.append("    for (i = 0; sAssetRangeMap[i].sym != NULL; i++) {")
+asset_lines.append("        unsigned int base = (unsigned int)(unsigned long long)sAssetRangeMap[i].sym;")
+asset_lines.append("        unsigned int delta = sym_low32 - base;")
+asset_lines.append("        if (delta < sAssetRangeMap[i].size) {")
+asset_lines.append("            if (segment != NULL) *segment = sAssetRangeMap[i].segment;")
+asset_lines.append("            if (rom_base != NULL) *rom_base = sAssetRangeMap[i].rom_base;")
+asset_lines.append("            if (compressed != NULL) *compressed = sAssetRangeMap[i].compressed;")
+asset_lines.append("            if (offset != NULL) *offset = sAssetRangeMap[i].offset + delta;")
+asset_lines.append("            if (image_size != NULL) *image_size = sAssetRangeMap[i].image_size;")
 asset_lines.append("            return 1;")
 asset_lines.append("        }")
 asset_lines.append("    }")

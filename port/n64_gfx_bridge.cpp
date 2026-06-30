@@ -73,8 +73,11 @@ extern "C" uint16_t D_A000000_25F360[];
 extern "C" uint16_t D_A000000_266C20[];
 extern "C" uint16_t D_A000000_26D780[];
 extern "C" uint8_t D_2000000[];
-extern "C" uint8_t D_80225800_2[];
+extern "C" uint8_t D_80225800[];
 extern "C" uint8_t D_1000000[];
+extern "C" uint8_t gspF3DEX2_fifoTextStart[];
+extern "C" uint8_t gspF3DFLX2_Rej_fifoTextStart[];
+extern "C" uint8_t gspF3DLX2_Rej_fifoTextStart[];
 
 extern "C" int gdx_lookup_asset_segment(unsigned int sym_low32,
                                          unsigned char* segment,
@@ -333,6 +336,9 @@ struct ConversionStats {
     size_t textureCopyBytes = 0;
     size_t commandsOut = 0;
     size_t f3dLists = 0;
+    size_t ucodeSwitches = 0;
+    size_t unknownUcodeSwitches = 0;
+    uint32_t firstUnknownUcodeRaw = 0;
     uint8_t firstFallbackDataOp = 0;
     uint32_t firstFallbackDataRaw = 0;
     uint32_t firstFallbackDataW0 = 0;
@@ -801,15 +807,17 @@ bool ResolveGeneratedAssetStub(uint32_t raw, ResolvedAddress& out) {
 bool ResolvePortBssAlias(uint32_t raw, ResolvedAddress& out) {
     /*
      * D_2000000 is the original segment-2 BSS base. LinkStubs can only provide
-     * a one-byte symbol token for it, while the actual host storage begins at
-     * D_80225800_2. Host-built display lists carry the token directly, so they
+     * a one-byte symbol token for it, while the active host storage begins at
+     * D_80225800. Host-built display lists carry the token directly, so they
      * bypass normal segmented-address resolution and need the same alias here.
+     * Do not use D_80225800_2: that duplicate overlap object is never initialized
+     * by Game_ThreadEntry, so it contains a zero modelview matrix.
      */
     if (raw != Low32(reinterpret_cast<uintptr_t>(D_2000000))) {
         return false;
     }
 
-    out.full = reinterpret_cast<uintptr_t>(D_80225800_2);
+    out.full = reinterpret_cast<uintptr_t>(D_80225800);
     out.segment = 2;
     out.offset = 0;
     out.segmented = true;
@@ -1995,16 +2003,47 @@ class N64DisplayListAdapter {
                     }
                     break;
 
-                /*
-                 * F-Zero X switches between stock F3DEX2 reject variants with
-                 * gSPLoadUcodeL. The command's low 24 bits encode the ucode-data
-                 * size, not libultraship's UcodeHandlers enum. Passing it through
-                 * makes gfx_set_ucode_handler assert on an out-of-range value.
-                 * The converted stream remains F3DEX2-compatible, so keep the
-                 * current handler and treat the physical ucode load as a no-op.
-                 */
-                case 0xDD:
-                    continue;
+                case 0xDD: {
+                    /*
+                     * Physical G_LOAD_UCODE packets encode a data size in w0 and
+                     * a truncated host symbol in w1. Convert known F-Zero X
+                     * F3DEX2-family loads into a semantic variant switch that
+                     * Libultraship can consume without treating the size as a
+                     * UcodeHandlers enum.
+                     */
+                    const auto matchesUcodeText = [raw = in.w1](const uint8_t* symbol) {
+                        const uint32_t symbolLow = Low32(reinterpret_cast<uintptr_t>(symbol));
+                        return raw == symbolLow || raw + 0x80000000u == symbolLow;
+                    };
+
+                    Fast::F3dex2Variant variant;
+                    if (matchesUcodeText(gspF3DEX2_fifoTextStart)) {
+                        variant = Fast::F3dex2Variant::Standard;
+                    } else if (matchesUcodeText(gspF3DLX2_Rej_fifoTextStart)) {
+                        variant = Fast::F3dex2Variant::Reject;
+                    } else if (matchesUcodeText(gspF3DFLX2_Rej_fifoTextStart)) {
+                        variant = Fast::F3dex2Variant::FZeroFlxReject;
+                    } else {
+                        // Unsupported physical microcodes (for example L3DEX2)
+                        // remain a no-op until their command semantics exist.
+                        if (mStats != nullptr) {
+                            mStats->unknownUcodeSwitches++;
+                            if (mStats->firstUnknownUcodeRaw == 0) {
+                                mStats->firstUnknownUcodeRaw = in.w1;
+                            }
+                        }
+                        continue;
+                    }
+
+                    if (mStats != nullptr) {
+                        mStats->ucodeSwitches++;
+                    }
+                    outW0 = (static_cast<uintptr_t>(0xDDu) << 24) |
+                            static_cast<uintptr_t>(ucode_f3dex2);
+                    outW1 = Fast::F3DEX2_VARIANT_SWITCH_MARKER |
+                            static_cast<uintptr_t>(variant);
+                    break;
+                }
 
                 // F3D G_ENDDL (0xB8): stop list processing, emit F3DEX2 ENDDL so Fast3D sees a clean end.
                 case 0xB8:
@@ -2466,14 +2505,16 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
     const bool shouldLogDiagnostics =
         sDiagFrames < 8 || (sDiagFrames % 120) == 0 ||
         stats.noopDisplayLists != 0 || stats.fallbackDataCommands != 0 ||
-        stats.skippedDataCommands != 0 || stats.textureCopyBytes != 0;
+        stats.skippedDataCommands != 0 || stats.textureCopyBytes != 0 ||
+        stats.ucodeSwitches != 0 || stats.unknownUcodeSwitches != 0;
     if (shouldLogDiagnostics) {
         gdx_port_logf("[gfxdiag] lists=%zu f3d_lists=%zu cmds=%zu noop_dl=%zu noop_raw=%08X "
                       "miss_dl=%zu miss_raw=%08X bad_dl=%zu bad_raw=%08X "
                       "fallback_data=%zu skip_data=%zu skip_tex=%zu "
                       "tex_copy_bytes=%zu vtx=%zu mtx=%zu dl=%zu teximg=%zu settile=%zu "
                       "tlut=%zu loadblk=%zu loadtile=%zu tilesize=%zu texrect=%zu fillrect=%zu "
-                      "setcimg=%zu setzimg=%zu tris=%zu end=%zu size=%zu\n",
+                      "setcimg=%zu setzimg=%zu tris=%zu end=%zu "
+                      "ucode_switch=%zu ucode_unknown=%zu ucode_raw=%08X size=%zu\n",
                       stats.convertedLists, stats.f3dLists, stats.commandsOut,
                       stats.noopDisplayLists, stats.firstNoopDlRaw,
                       stats.missingDisplayLists, stats.firstMissingDlRaw,
@@ -2485,7 +2526,9 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
                       stats.opCounts[0xE4] + stats.opCounts[0xE5], stats.opCounts[0xF6], stats.opCounts[kOpSetColorImage],
                       stats.opCounts[kOpSetDepthImage],
                       stats.opCounts[0x05] + stats.opCounts[0x06] + stats.opCounts[0x07] + stats.opCounts[0xBF],
-                      stats.opCounts[kOpEndDl], dl_size);
+                      stats.opCounts[kOpEndDl],
+                      stats.ucodeSwitches, stats.unknownUcodeSwitches,
+                      stats.firstUnknownUcodeRaw, dl_size);
         if (stats.noopDisplayLists != 0) {
             gdx_port_logf("[gfxfail] "
                           "miss=%zu raw=%08X parent=%p pidx=%zu pstride=%zu pbig=%d pf3d=%d "
@@ -2550,7 +2593,8 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
     const Fast::GeometryDiagnostics& geometry = interp->GetGeometryDiagnostics();
     static int sLastGeometryTaskUcode = -1;
     const bool geometryUcodeChanged = sLastGeometryTaskUcode != static_cast<int>(taskUcode);
-    if (geometryUcodeChanged || (sDiagFrames % 120) == 0 || geometry.invalidVertices != 0) {
+    if (geometryUcodeChanged || (sDiagFrames % 120) == 0 ||
+        geometry.invalidVertices != 0 || geometry.variantSwitches != 0) {
         gdx_port_logf(
             "[geodiag] ucode=%d vtx=%llu invalid=%llu w_nonpos=%llu near=%llu far=%llu "
             "ndc_x=%.3f..%.3f ndc_y=%.3f..%.3f ndc_z=%.3f..%.3f "
@@ -2577,14 +2621,69 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
         gdx_port_logf(
             "[gpustate] vp=%.1f,%.1f %.1fx%.1f sc=%.1f,%.1f %.1fx%.1f "
             "other=%08X/%08X cimg=%p zimg=%p same=%d renders_fb=%d fb_active=%d\n",
-            interp->mRdp->viewport.x, interp->mRdp->viewport.y,
-            interp->mRdp->viewport.width, interp->mRdp->viewport.height,
-            interp->mRdp->scissor.x, interp->mRdp->scissor.y,
-            interp->mRdp->scissor.width, interp->mRdp->scissor.height,
+            static_cast<double>(interp->mRdp->viewport.x),
+            static_cast<double>(interp->mRdp->viewport.y),
+            static_cast<double>(interp->mRdp->viewport.width),
+            static_cast<double>(interp->mRdp->viewport.height),
+            static_cast<double>(interp->mRdp->scissor.x),
+            static_cast<double>(interp->mRdp->scissor.y),
+            static_cast<double>(interp->mRdp->scissor.width),
+            static_cast<double>(interp->mRdp->scissor.height),
             interp->mRdp->other_mode_h, interp->mRdp->other_mode_l,
             interp->mRdp->color_image_address, interp->mRdp->z_buf_address,
             interp->mRdp->color_image_address == interp->mRdp->z_buf_address,
             static_cast<int>(interp->mRendersToFb), static_cast<int>(interp->mFbActive));
+        if (geometry.variantSwitches != 0) {
+            gdx_port_logf(
+                "[phasegeom] switches=%llu pre_flx_vtx=%llu pre_flx_tri=%llu "
+                "pre_flx_emit=%llu pre_flx_draws=%llu pre_flx_gpu_tri=%llu "
+                "pre_flx_rgba16=%llu/%llu forced_opaque=%llu pre_flx_depth_bypass=%llu "
+                "material tex=%llu bound0=%llu missing0=%llu forced_simple=%llu "
+                "shader=%016llX/%016llX uv=%.3f..%.3f,%.3f..%.3f "
+                "fog tri=%llu bypass=%llu factor=%.3f..%.3f mul=%d off=%d "
+                "other=%08X/%08X combine=%016llX texture=%p "
+                "post_flx_vtx=%llu post_flx_emit=%llu post_flx_gpu_tri=%llu "
+                "post_flx_rgba16=%llu/%llu forced_opaque=%llu post_flx_depth_bypass=%llu\n",
+                static_cast<unsigned long long>(geometry.variantSwitches),
+                static_cast<unsigned long long>(geometry.preFlxVertices),
+                static_cast<unsigned long long>(geometry.preFlxTrianglesSubmitted),
+                static_cast<unsigned long long>(geometry.preFlxTrianglesEmitted),
+                static_cast<unsigned long long>(geometry.preFlxGpuDrawCalls),
+                static_cast<unsigned long long>(geometry.preFlxGpuTriangles),
+                static_cast<unsigned long long>(geometry.preFlxRgba16OpaquePixels),
+                static_cast<unsigned long long>(geometry.preFlxRgba16TransparentPixels),
+                static_cast<unsigned long long>(geometry.preFlxRgba16ForcedOpaquePixels),
+                static_cast<unsigned long long>(geometry.preFlxDepthBypassTriangles),
+                static_cast<unsigned long long>(geometry.preFlxTexturedTriangles),
+                static_cast<unsigned long long>(geometry.preFlxTexture0BoundTriangles),
+                static_cast<unsigned long long>(geometry.preFlxTexture0MissingTriangles),
+                static_cast<unsigned long long>(geometry.preFlxForcedSimpleMaterialTriangles),
+                static_cast<unsigned long long>(geometry.preFlxShaderId0),
+                static_cast<unsigned long long>(geometry.preFlxShaderId1),
+                geometry.preFlxMinTextureU, geometry.preFlxMaxTextureU,
+                geometry.preFlxMinTextureV, geometry.preFlxMaxTextureV,
+                static_cast<unsigned long long>(geometry.preFlxFogTriangles),
+                static_cast<unsigned long long>(geometry.preFlxFogBypassTriangles),
+                geometry.preFlxMinFogFactor, geometry.preFlxMaxFogFactor,
+                static_cast<int>(geometry.preFlxFogMul),
+                static_cast<int>(geometry.preFlxFogOffset),
+                geometry.preFlxOtherModeH, geometry.preFlxOtherModeL,
+                static_cast<unsigned long long>(geometry.preFlxCombineMode),
+                geometry.preFlxTexture,
+                static_cast<unsigned long long>(geometry.verticesLoaded - geometry.preFlxVertices),
+                static_cast<unsigned long long>(geometry.trianglesEmitted -
+                                                geometry.preFlxTrianglesEmitted),
+                static_cast<unsigned long long>(geometry.gpuTriangles -
+                                                geometry.preFlxGpuTriangles),
+                static_cast<unsigned long long>(geometry.rgba16OpaquePixels -
+                                                geometry.preFlxRgba16OpaquePixels),
+                static_cast<unsigned long long>(geometry.rgba16TransparentPixels -
+                                                geometry.preFlxRgba16TransparentPixels),
+                static_cast<unsigned long long>(geometry.rgba16ForcedOpaquePixels -
+                                                geometry.preFlxRgba16ForcedOpaquePixels),
+                static_cast<unsigned long long>(geometry.depthBypassTriangles -
+                                                geometry.preFlxDepthBypassTriangles));
+        }
     }
     sLastGeometryTaskUcode = static_cast<int>(taskUcode);
 
