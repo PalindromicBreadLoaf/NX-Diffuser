@@ -85,6 +85,12 @@ extern "C" int gdx_lookup_asset_segment(unsigned int sym_low32,
                                          unsigned char* compressed,
                                          unsigned int* offset,
                                          unsigned int* image_size);
+extern "C" int gdx_lookup_asset_segment_interior(unsigned int sym_low32,
+                                                  unsigned char* segment,
+                                                  unsigned int* rom_base,
+                                                  unsigned char* compressed,
+                                                  unsigned int* offset,
+                                                  unsigned int* image_size);
 extern "C" void gdx_fixup_asset_segment_image(unsigned char segment,
                                                unsigned int rom_base,
                                                unsigned char* data,
@@ -557,7 +563,8 @@ bool LookupAssetSegment(uint32_t raw, AssetSegmentLookup& out) {
     unsigned int offset = 0;
     unsigned int imageSize = 0;
 
-    if (gdx_lookup_asset_segment(raw, &segment, &romBase, &compressed, &offset, &imageSize) == 0) {
+    if (gdx_lookup_asset_segment(raw, &segment, &romBase, &compressed, &offset, &imageSize) == 0 &&
+        gdx_lookup_asset_segment_interior(raw, &segment, &romBase, &compressed, &offset, &imageSize) == 0) {
         return false;
     }
 
@@ -1894,9 +1901,18 @@ class N64DisplayListAdapter {
             switch (op) {
                 case kOpVtx:
                     // F3D uses opcode 0x01 for G_MTX (not G_VTX). Remap to kOpMtx so Fast3D
-                    // doesn't try to load a 64-byte matrix struct as a vertex buffer.
+                    // doesn't try to load a 64-byte matrix struct as a vertex buffer. The
+                    // parameter flags also differ: legacy F3D stores them in w0[23:16],
+                    // while F3DEX2 stores its XOR-with-PUSH form in w0[7:0].
                     if (isF3DSource) {
-                        outW0 = (outW0 & 0x00FFFFFFu) | (static_cast<uintptr_t>(kOpMtx) << 24);
+                        const uint8_t legacy = static_cast<uint8_t>((in.w0 >> 16) & 0xFFu);
+                        uint8_t parameters = 0;
+                        if ((legacy & 0x01u) != 0) parameters |= 0x04u; // projection
+                        if ((legacy & 0x02u) != 0) parameters |= 0x02u; // load
+                        if ((legacy & 0x04u) != 0) parameters |= 0x01u; // push
+                        const uint8_t encoded = parameters ^ 0x01u;
+                        outW0 = (static_cast<uintptr_t>(kOpMtx) << 24) |
+                                static_cast<uintptr_t>(encoded);
                     }
                     outW1 = TranslateDataPointer(in.w1);
                     if (outW1 != 0 && isBig && !isF3DSource) {
@@ -2062,33 +2078,51 @@ class N64DisplayListAdapter {
                     }
                     break;
 
-                // F3D G_TRI1 (0xBF): vertex indices in w0[23:0] → F3DEX2 G_TRI1 has them in w1[31:8].
+                // F3D G_TRI1 (0xBF): w1 stores three vertex indices multiplied by 10.
+                // F3DEX2 G_TRI1 stores the indices multiplied by 2 in w0[23:0].
                 // GUARD: F3DEX2 uses 0xBF for G_CULLDL; only convert in F3D asset DLs.
                 case 0xBF:
                     if (isF3DSource) {
-                        outW0 = static_cast<uintptr_t>(0x05u) << 24;
-                        outW1 = static_cast<uintptr_t>(in.w0 & 0x00FFFFFFu) << 8;
+                        const uint8_t v0 = static_cast<uint8_t>((in.w1 >> 16) & 0xFFu) / 10u;
+                        const uint8_t v1 = static_cast<uint8_t>((in.w1 >> 8) & 0xFFu) / 10u;
+                        const uint8_t v2 = static_cast<uint8_t>(in.w1 & 0xFFu) / 10u;
+                        outW0 = (static_cast<uintptr_t>(0x05u) << 24) |
+                                (static_cast<uintptr_t>(v0 * 2u) << 16) |
+                                (static_cast<uintptr_t>(v1 * 2u) << 8) |
+                                static_cast<uintptr_t>(v2 * 2u);
+                        outW1 = 0;
                     }
                     break;
 
                 /* F3D G_MOVEMEM (0x03): in F3DEX2, 0x03 = G_CULLDL — cannot pass through.
-                   For F3D sources, remap the DMEM target index to F3DEX2 and emit a proper
-                   G_MOVEMEM (0xDC).  Only the viewport slot is handled for now; lights/lookat
-                   are NOPed until their F3DEX2 DMEM layout is confirmed. */
+                   Legacy gDma1p stores the target in w0[23:16] and byte count in w0[15:0].
+                   Translate viewport, look-at, and light slots to the F3DEX2 G_MV_LIGHT
+                   index/offset layout used by Libultraship. */
                 case 0x03:
                     if (isF3DSource) {
-                        const uint8_t f3dSizeH = static_cast<uint8_t>((in.w0 >> 16) & 0xFFu);
-                        const uint8_t f3dIndex = static_cast<uint8_t>((in.w0 >>  8) & 0xFFu);
+                        const uint8_t legacyIndex = static_cast<uint8_t>((in.w0 >> 16) & 0xFFu);
+                        const size_t xferSize = static_cast<size_t>(in.w0 & 0xFFFFu);
+                        uint8_t index = 0;
+                        uint8_t offset = 0;
 
-                        /* F3DEX2 G_MV_VIEWPORT = 8; skip all other DMEM targets for now */
-                        if (f3dIndex != 0x80u) {
+                        if (legacyIndex == 0x80u) {
+                            index = 8u; // G_MV_VIEWPORT
+                        } else if (legacyIndex == 0x84u) {
+                            index = 10u; // G_MV_LIGHT / G_MVO_LOOKATX
+                            offset = 0u;
+                        } else if (legacyIndex == 0x82u) {
+                            index = 10u; // G_MV_LIGHT / G_MVO_LOOKATY
+                            offset = 24u;
+                        } else if (legacyIndex >= 0x86u && legacyIndex <= 0x94u &&
+                                   ((legacyIndex - 0x86u) & 1u) == 0) {
+                            index = 10u; // G_MV_LIGHT
+                            offset = static_cast<uint8_t>(
+                                48u + ((legacyIndex - 0x86u) / 2u) * 24u);
+                        } else {
                             continue;
                         }
 
-                        /* F3D encodes size as sizeof(data)/2; F3DEX2 gDma1p uses the full byte count. */
-                        const size_t xferSize = (f3dSizeH > 0u) ? (static_cast<size_t>(f3dSizeH) * 2u) : 16u;
-
-                        uintptr_t addr = TranslateDataPointer(in.w1, xferSize);
+                        uintptr_t addr = TranslateDataPointer(in.w1, std::max<size_t>(xferSize, 1u));
                         if (addr == 0) {
                             addr = FallbackDataPointer(kOpMovemem);
                         }
@@ -2098,10 +2132,11 @@ class N64DisplayListAdapter {
                         }
                         addr = NormalizeLusDirectPointer(addr);
 
-                        /* F3DEX2 gDma1p: w0 = (cmd<<24)|(p<<16)|l, w1 = data_addr */
+                        /* The F3DEX2 handler consumes index from low 8 bits and
+                           offset in units of eight bytes from bits 15:8. */
                         outW0 = (static_cast<uintptr_t>(kOpMovemem) << 24) |
-                                (static_cast<uintptr_t>(8u) << 16) | /* G_MV_VIEWPORT */
-                                static_cast<uintptr_t>(xferSize);
+                                (static_cast<uintptr_t>(offset / 8u) << 8) |
+                                static_cast<uintptr_t>(index);
                         outW1 = addr;
                     }
                     break;
@@ -2591,6 +2626,25 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
     interp->ResetGeometryDiagnostics();
     interp->Run(reinterpret_cast<Gfx*>(converted), {});
     const Fast::GeometryDiagnostics& geometry = interp->GetGeometryDiagnostics();
+    static int sBigTriPrints = 0;
+    if (geometry.bigTriangles != 0 && sBigTriPrints < 60) {
+        ++sBigTriPrints;
+        gdx_port_logf(
+            "[bigtri] ucode=%d count=%llu v0=(%.1f,%.1f,%.1f,%.2f) v1=(%.1f,%.1f,%.1f,%.2f) "
+            "v2=(%.1f,%.1f,%.1f,%.2f) geo=%08X combine=%016llX tile=%u tex=%p "
+            "vp=%.1f,%.1f %.1fx%.1f\n",
+            static_cast<int>(taskUcode),
+            static_cast<unsigned long long>(geometry.bigTriangles),
+            geometry.bigTriX[0], geometry.bigTriY[0], geometry.bigTriZ[0], geometry.bigTriW[0],
+            geometry.bigTriX[1], geometry.bigTriY[1], geometry.bigTriZ[1], geometry.bigTriW[1],
+            geometry.bigTriX[2], geometry.bigTriY[2], geometry.bigTriZ[2], geometry.bigTriW[2],
+            geometry.bigTriGeometryMode,
+            static_cast<unsigned long long>(geometry.bigTriCombine),
+            static_cast<unsigned>(geometry.bigTriTile),
+            geometry.bigTriTexture,
+            geometry.bigTriViewportX, geometry.bigTriViewportY,
+            geometry.bigTriViewportW, geometry.bigTriViewportH);
+    }
     static int sLastGeometryTaskUcode = -1;
     const bool geometryUcodeChanged = sLastGeometryTaskUcode != static_cast<int>(taskUcode);
     if (geometryUcodeChanged || (sDiagFrames % 120) == 0 ||
@@ -2640,6 +2694,7 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
                 "pre_flx_rgba16=%llu/%llu forced_opaque=%llu pre_flx_depth_bypass=%llu "
                 "material tex=%llu bound0=%llu missing0=%llu forced_simple=%llu "
                 "shader=%016llX/%016llX uv=%.3f..%.3f,%.3f..%.3f "
+                "texstate=%ux%u line=%u size=%u tile=%u tmem=%u mask=%u/%u scale=%04X/%04X "
                 "fog tri=%llu bypass=%llu factor=%.3f..%.3f mul=%d off=%d "
                 "other=%08X/%08X combine=%016llX texture=%p "
                 "post_flx_vtx=%llu post_flx_emit=%llu post_flx_gpu_tri=%llu "
@@ -2662,6 +2717,14 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
                 static_cast<unsigned long long>(geometry.preFlxShaderId1),
                 geometry.preFlxMinTextureU, geometry.preFlxMaxTextureU,
                 geometry.preFlxMinTextureV, geometry.preFlxMaxTextureV,
+                geometry.preFlxTextureWidth, geometry.preFlxTextureHeight,
+                geometry.preFlxTextureLineBytes, geometry.preFlxTextureSizeBytes,
+                static_cast<unsigned int>(geometry.preFlxTextureTile),
+                static_cast<unsigned int>(geometry.preFlxTextureTmem),
+                static_cast<unsigned int>(geometry.preFlxTextureMaskS),
+                static_cast<unsigned int>(geometry.preFlxTextureMaskT),
+                static_cast<unsigned int>(geometry.preFlxTextureScaleS),
+                static_cast<unsigned int>(geometry.preFlxTextureScaleT),
                 static_cast<unsigned long long>(geometry.preFlxFogTriangles),
                 static_cast<unsigned long long>(geometry.preFlxFogBypassTriangles),
                 geometry.preFlxMinFogFactor, geometry.preFlxMaxFogFactor,
