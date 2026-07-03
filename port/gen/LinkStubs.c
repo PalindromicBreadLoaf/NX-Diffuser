@@ -15,8 +15,13 @@ unsigned char D_A006000[1];
 unsigned char D_A007000[1];
 unsigned char D_A008000[1];
 unsigned char __libm_qnan_f[1];
-unsigned char aPositionDigitTexs[1];
-unsigned char aPositionOrdinalSuffixTexs[1];
+/* Real byte sizes (not 1-byte placeholders): the race HUD addresses these as
+   interior pointers (aPositionDigitTexs + digit * 0x700), and interior asset
+   lookup only matches within the symbol's byte size. Sizes from
+   assets/yaml/us/rev0/hud_gfx.yaml: 10 digits * 28x32 RGBA16, 4 suffixes
+   * 20x20 RGBA16. */
+unsigned char aPositionDigitTexs[0x4600];
+unsigned char aPositionOrdinalSuffixTexs[0xC80];
 unsigned char boot_textures_ROM_START[1];
 unsigned char buffers_VRAM[1];
 unsigned char buffers_VRAM_END[1];

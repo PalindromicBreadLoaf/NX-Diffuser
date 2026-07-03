@@ -271,6 +271,21 @@ for sym, segment, rom_base, compressed, offset, image_key, yaml_stem in asset_se
     o2r_key = "{}/{}".format(yaml_stem, sym)
     asset_lines.append("    {{ {}, 0x{:02X}u, 0x{:08X}U, {}u, 0x{:08X}U, 0x{:08X}U, (unsigned int)sizeof({}), \"{}\" }},".format(
         sym, segment, rom_base, compressed, offset, image_size, sym, o2r_key))
+# YAML table symbols (e.g. aPositionDigitTexs) also get segment rows so exact-base
+# AND interior references resolve through gdx_lookup_asset_segment(_interior).
+# The size is hardcoded from the yaml range (the symbol is only extern'd here;
+# its storage lives in LinkStubs.c, which must define it at this same real size —
+# a 1-byte definition makes the range window swallow every neighboring stub).
+# NULL o2r key: game code indexes these tables at interior offsets, so all
+# references must take the raw ROM-segment copy path, never a per-symbol o2r
+# resource that would only cover the first entry.
+for sym, segment, rom_base, compressed, offset, size, yaml_stem in asset_range_entries:
+    image_key = (segment, rom_base, compressed)
+    image_size = segment_images.get(image_key, 0)
+    if image_size <= 0:
+        continue
+    asset_lines.append("    {{ {}, 0x{:02X}u, 0x{:08X}U, {}u, 0x{:08X}U, 0x{:08X}U, 0x{:X}u, NULL }},".format(
+        sym, segment, rom_base, compressed, offset, image_size, size))
 asset_lines.append("    { NULL, 0u, 0U, 0u, 0U, 0U, 0U, NULL }")
 asset_lines.append("};")
 asset_lines.append("")

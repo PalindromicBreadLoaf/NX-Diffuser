@@ -30,6 +30,8 @@ extern "C" {
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+
+extern "C" int gGdxRaceActive;
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -75,6 +77,19 @@ extern "C" uint16_t D_A000000_26D780[];
 extern "C" uint8_t D_2000000[];
 extern "C" uint8_t D_80225800[];
 extern "C" uint8_t D_1000000[];
+/* Unsuffixed venue texture bank symbols (segment 0x0A, 0x1000-byte banks).
+   course.c's road material table references them directly (ROAD_1..WALLED_ROAD),
+   but they are 1-byte LinkStubs — the per-venue data loads via the suffixed
+   symbols (D_A000000_235130 etc.) into gSegments[0x0A]. */
+extern "C" uint8_t D_A000000[];
+extern "C" uint8_t D_A001000[];
+extern "C" uint8_t D_A002000[];
+extern "C" uint8_t D_A003000[];
+extern "C" uint8_t D_A004000[];
+extern "C" uint8_t D_A005000[];
+extern "C" uint8_t D_A006000[];
+extern "C" uint8_t D_A007000[];
+extern "C" uint8_t D_A008000[];
 extern "C" uint8_t gspF3DEX2_fifoTextStart[];
 extern "C" uint8_t gspF3DFLX2_Rej_fifoTextStart[];
 extern "C" uint8_t gspF3DLX2_Rej_fifoTextStart[];
@@ -429,6 +444,38 @@ struct LoadedAssetSegment {
 
 std::vector<LoadedAssetSegment> gLoadedAssetSegments;
 
+/* Hybrid segment-tag table: static asset segments have a KNOWN display-list
+ * dialect, so DLs inside their decompressed images never need the per-DL
+ * opcode-scan heuristics (which misclassify, e.g., F3DEX2 setup DLs whose
+ * byte stream happens to contain 0xB8 before 0xDF).
+ *   segment 0x08 — course_track_gfx: F3DEX2 (setup DLs use 0xD9 geometry
+ *                  mode, 0xDF G_ENDDL, and 0x06 as G_TRI2)
+ *   segment 0x03 — setup/machine gfx: legacy F3D (0x01 G_MTX, 0xB8 G_ENDDL)
+ *   segment 0x0A — venue textures: data only, no display lists
+ * Segments not listed keep the existing heuristic path. */
+enum class GdxSegmentUcode : uint8_t { Unknown = 0, F3D, F3DEX2 };
+
+static GdxSegmentUcode GdxSegmentDialect(uint8_t segment) {
+    switch (segment) {
+        case 0x08:
+            return GdxSegmentUcode::F3DEX2;
+        case 0x03:
+            return GdxSegmentUcode::F3D;
+        default:
+            return GdxSegmentUcode::Unknown;
+    }
+}
+
+GdxSegmentUcode GdxAssetPointerDialect(uintptr_t addr) {
+    for (const LoadedAssetSegment& seg : gLoadedAssetSegments) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(seg.bytes.data());
+        if ((base != 0) && (addr >= base) && (addr < base + seg.bytes.size())) {
+            return GdxSegmentDialect(seg.segment);
+        }
+    }
+    return GdxSegmentUcode::Unknown;
+}
+
 // Incremented on every DMA chunk loaded into RDRAM. RDRAM texture copies record
 // the generation at copy time; a mismatch on the next frame triggers a re-upload.
 // This avoids expensive per-frame memcmp against large raw texture copies.
@@ -582,7 +629,15 @@ uintptr_t EnsureAssetSegmentImage(const AssetSegmentLookup& lookup) {
             (loaded.romBase == lookup.romBase) &&
             (loaded.compressed == lookup.compressed) &&
             !loaded.bytes.empty()) {
-            gSegments[lookup.segment] = reinterpret_cast<uintptr_t>(loaded.bytes.data());
+            /* Claim the segment slot only when it is unowned, mirroring the
+               fresh-load path below. Reassigning on every cache hit lets any
+               stray pointer that matches another venue's texture symbol hijack
+               segment 0x0A mid-race — the road then renders with a different
+               venue's texture. gdx_load_venue_texture_segment remains the
+               authority for slot 0x0A and assigns it unconditionally. */
+            if (gSegments[lookup.segment] == 0) {
+                gSegments[lookup.segment] = reinterpret_cast<uintptr_t>(loaded.bytes.data());
+            }
             return reinterpret_cast<uintptr_t>(loaded.bytes.data());
         }
     }
@@ -608,6 +663,28 @@ uintptr_t EnsureAssetSegmentImage(const AssetSegmentLookup& lookup) {
             return 0;
         }
 
+        loaded.bytes.resize(outputSize);
+        std::memset(loaded.bytes.data(), 0, loaded.bytes.size());
+        const int decoded = mio0_decode(gdx_rom_buffer + lookup.romBase, loaded.bytes.data(), nullptr);
+        if (decoded <= 0) {
+            return 0;
+        }
+    } else if (gdx_rom_size >= static_cast<size_t>(lookup.romBase) + MIO0_HEADER_LENGTH &&
+               std::memcmp(gdx_rom_buffer + lookup.romBase, "MIO0", 4) == 0) {
+        gdx_port_logf("[segload] MIO0-autodetect seg=%u romBase=%08X (binding said uncompressed)\n",
+                      lookup.segment, lookup.romBase);
+        // Some segments (notably the per-venue texture segments, e.g. Mute City's
+        // D_A000000_235130) are MIO0-compressed in ROM but the asset bindings mark
+        // them uncompressed. Copying the raw MIO0 bytes as texture data renders the
+        // compressed stream directly — that is the "track stripes". Detect the MIO0
+        // magic here and decompress regardless of the (wrong) compressed flag.
+        // Keep loaded.compressed = lookup.compressed so the segment cache key still
+        // matches future lookups (the cached bytes are already decompressed).
+        const uint32_t decodedSize = ReadBE32(gdx_rom_buffer + lookup.romBase + 4);
+        const size_t outputSize = std::max<size_t>(decodedSize, lookup.imageSize);
+        if (outputSize == 0) {
+            return 0;
+        }
         loaded.bytes.resize(outputSize);
         std::memset(loaded.bytes.data(), 0, loaded.bytes.size());
         const int decoded = mio0_decode(gdx_rom_buffer + lookup.romBase, loaded.bytes.data(), nullptr);
@@ -829,6 +906,38 @@ bool ResolvePortBssAlias(uint32_t raw, ResolvedAddress& out) {
     out.offset = 0;
     out.segmented = true;
     return true;
+}
+
+/* course.c's road material table (ROAD_1..WALLED_ROAD) stores the unsuffixed
+ * venue bank symbols D_A000000..D_A008000 directly, so road-pass SETTIMGs carry
+ * those stubs' truncated addresses. The stubs are 1-byte placeholders with no
+ * binding; without this alias they false-match zero-filled memory and the road
+ * samples an all-black texture. The real data is the per-venue segment image
+ * gdx_load_venue_texture_segment puts in gSegments[0x0A]; bank N sits at
+ * N * 0x1000 (the suffixed per-venue symbols confirm the stride). Exact-base
+ * match only: the stubs are packed 1 byte apart, so interior spans would
+ * collide with the next symbol. */
+bool ResolveVenueBankAlias(uint32_t raw, ResolvedAddress& out) {
+    if (gSegments[0x0A] == 0) {
+        return false;
+    }
+    static const uint32_t kBankLow32[] = {
+        Low32(reinterpret_cast<uintptr_t>(D_A000000)), Low32(reinterpret_cast<uintptr_t>(D_A001000)),
+        Low32(reinterpret_cast<uintptr_t>(D_A002000)), Low32(reinterpret_cast<uintptr_t>(D_A003000)),
+        Low32(reinterpret_cast<uintptr_t>(D_A004000)), Low32(reinterpret_cast<uintptr_t>(D_A005000)),
+        Low32(reinterpret_cast<uintptr_t>(D_A006000)), Low32(reinterpret_cast<uintptr_t>(D_A007000)),
+        Low32(reinterpret_cast<uintptr_t>(D_A008000)),
+    };
+    for (uint32_t bank = 0; bank < static_cast<uint32_t>(std::size(kBankLow32)); bank++) {
+        if (raw == kBankLow32[bank]) {
+            out.full = gSegments[0x0A] + bank * 0x1000u;
+            out.segment = 0x0A;
+            out.offset = bank * 0x1000u;
+            out.segmented = true;
+            return true;
+        }
+    }
+    return false;
 }
 
 uintptr_t EnsureSetupGfxSegment() {
@@ -1235,12 +1344,17 @@ class N64DisplayListAdapter {
         return limit;
     }
 
-    bool TryResolveAddress(uint32_t raw, ResolvedAddress& out, size_t requiredBytes = 1, bool preferPhysical = false) const {
+    bool TryResolveAddress(uint32_t raw, ResolvedAddress& out, size_t requiredBytes = 1, bool preferPhysical = false,
+                           uintptr_t sourceHint = 0) const {
         if (raw == 0) {
             return false;
         }
 
         if (ResolvePortBssAlias(raw, out)) {
+            return true;
+        }
+
+        if (ResolveVenueBankAlias(raw, out)) {
             return true;
         }
 
@@ -1264,6 +1378,37 @@ class N64DisplayListAdapter {
             }
         }
 
+        /* Explicit N64 segment addresses (top byte = segment index 1..15, e.g.
+           the course/venue texture pointers 0x08xxxxxx / 0x0Axxxxxx emitted by
+           F3D asset display lists) must resolve through the segment table, which
+           now points at the decompressed venue image. Do this BEFORE the low-32
+           host-range heuristic: that heuristic can false-match a segment address
+           against an unrelated host allocation whose low 32 bits happen to cover
+           it, which is what left the track textures reading raw/garbage bytes. */
+        {
+            const uint8_t seg = static_cast<uint8_t>(raw >> 24);
+            const uint32_t segOffset = raw & 0x00FFFFFFu;
+            if (seg >= 1 && seg < kGfxSegmentCount && gSegments[seg] != 0 &&
+                segOffset < kSegmentOffsetLimit) {
+                const uintptr_t full = gSegments[seg] + segOffset;
+                /* A segment match is only authoritative when the result is
+                   actually readable. K0_TO_PHYS truncates module data pointers
+                   to 29 bits, so e.g. 0x7FF702142C10 & 0x1FFFFFFF = 0x02142C10
+                   masquerades as a segment-2 offset far past the real segment-2
+                   buffer. Accepting it blindly yields an unreadable pointer that
+                   TranslateDataPointer nulls — the texture silently vanishes.
+                   Fall through so the physical-window paths can reconstruct the
+                   original module pointer instead. */
+                if (ReadableByteLimit(full) >= requiredBytes) {
+                    out.full = full;
+                    out.segment = seg;
+                    out.offset = segOffset;
+                    out.segmented = true;
+                    return true;
+                }
+            }
+        }
+
         if (ResolveRegisteredHostPointer(raw, out)) {
             return true;
         }
@@ -1278,7 +1423,41 @@ class N64DisplayListAdapter {
                 out.segmented = false;
                 return true;
             }
-            return false; /* out-of-RDRAM KSEG0 (MMIO/cart range) — no match */
+            /* Out-of-RDRAM KSEG0: NOT necessarily MMIO/cart — a truncated
+               64-bit host pointer whose low32 happens to fall in 0x80-0x9F
+               (e.g. 0x933AEF70 from heap 0x20A933AEF70) looks identical.
+               Try reconstructing it against known high-32 windows before
+               giving up; texture loads feed garbage into TMEM otherwise. */
+            {
+                const uintptr_t highCandidates[] = {
+                    reinterpret_cast<uintptr_t>(mRootBegin) & 0xFFFFFFFF00000000ULL,
+                    mModuleBegin & 0xFFFFFFFF00000000ULL,
+                };
+                for (uintptr_t high : highCandidates) {
+                    if (high == 0) {
+                        continue;
+                    }
+                    const uintptr_t full = high | static_cast<uintptr_t>(raw);
+                    if (ReadableByteLimit(full) >= requiredBytes) {
+                        out.full = full;
+                        out.segmented = false;
+                        return true;
+                    }
+                }
+                for (const HostRange& range : gHostRanges) {
+                    const uintptr_t high = range.begin & 0xFFFFFFFF00000000ULL;
+                    if (high == 0) {
+                        continue;
+                    }
+                    const uintptr_t full = high | static_cast<uintptr_t>(raw);
+                    if (ReadableByteLimit(full) >= requiredBytes) {
+                        out.full = full;
+                        out.segmented = false;
+                        return true;
+                    }
+                }
+            }
+            return false; /* genuinely unresolvable KSEG0 (MMIO/cart range) */
         }
 
         /* Some PORT paths pass bare physical RDRAM offsets through display-list
@@ -1342,26 +1521,56 @@ class N64DisplayListAdapter {
             return false;
         };
 
+        /* A host-built display list and the matrices/vertices it references are
+         * almost always allocated together in the same 512 MB physical-token
+         * window (the GfxPool / task DL arena). When that arena is not a
+         * registered host range, the reconstructions above miss and the pointer
+         * would fall back to an identity matrix. Reconstruct the pointer from the
+         * referencing DL's own window as a last resort, accepting it only when the
+         * result is readable AND lies within one allocation region of the source
+         * so it can never false-match unrelated memory elsewhere in the window. */
+        const auto trySourceWindow = [&]() -> bool {
+            // A/B escape hatch: GDX_DIAG_NO_SRCWIN=1 disables the source-window
+            // matrix reconstruction so regressions can be bisected without a rebuild.
+            static const bool sSrcWinDisabled = std::getenv("GDX_DIAG_NO_SRCWIN") != nullptr;
+            if (sSrcWinDisabled || (sourceHint == 0) || (raw > 0x1FFFFFFFu)) return false;
+            uintptr_t full = (sourceHint & ~kPhysicalAddressMask) | static_cast<uintptr_t>(raw);
+            const uintptr_t lo = (full < sourceHint) ? full : sourceHint;
+            const uintptr_t hi = (full < sourceHint) ? sourceHint : full;
+            constexpr uintptr_t kSourceWindowSpan = 0x04000000u; // 64 MB around the DL
+            if ((hi - lo) > kSourceWindowSpan) return false;
+            if (ReadableByteLimit(full) < requiredBytes) return false;
+            out.full = full;
+            out.segmented = false;
+            return true;
+        };
+
         /* When the caller knows this raw value came from K0_TO_PHYS on a host
            pointer (e.g., a G_MTX from host-built F3DEX2 code), try the 512MB
            physical window BEFORE the segment table.  That prevents raw values
            whose top byte matches an active segment index — e.g., 0x0805DAA0
            matching segment 8 — from being misrouted. */
-        if (preferPhysical && tryAllPhysicalWindows()) {
+        if (preferPhysical && (tryAllPhysicalWindows() || trySourceWindow())) {
             return true;
         }
 
-        if ((encodedSegment < kGfxSegmentCount) && 
+        if ((encodedSegment < kGfxSegmentCount) &&
             ((gSegments[encodedSegment] != 0) || (encodedSegment == 0)) &&
             ((raw & 0x00FFFFFF) < kSegmentOffsetLimit)) {
-            out.full = gSegments[encodedSegment] + encodedOffset;
-            out.segment = encodedSegment;
-            out.offset = encodedOffset;
-            out.segmented = true;
-            return true;
+            const uintptr_t full = gSegments[encodedSegment] + encodedOffset;
+            /* Same readability gate as the explicit-segment path above: reject
+               truncated module pointers masquerading as segment offsets so the
+               physical-window reconstruction below gets a chance. */
+            if (ReadableByteLimit(full) >= requiredBytes) {
+                out.full = full;
+                out.segment = encodedSegment;
+                out.offset = encodedOffset;
+                out.segmented = true;
+                return true;
+            }
         }
 
-        if (!preferPhysical && tryAllPhysicalWindows()) {
+        if (!preferPhysical && (tryAllPhysicalWindows() || trySourceWindow())) {
             return true;
         }
 
@@ -1487,13 +1696,14 @@ class N64DisplayListAdapter {
         return false;
     }
 
-    uintptr_t TranslateDataPointer(uint32_t raw, size_t requiredBytes = 1, bool preferPhysical = false) const {
+    uintptr_t TranslateDataPointer(uint32_t raw, size_t requiredBytes = 1, bool preferPhysical = false,
+                                   uintptr_t sourceHint = 0) const {
         if (raw == 0) {
             return 0;
         }
 
         ResolvedAddress resolved = {};
-        if (TryResolveAddress(raw, resolved, requiredBytes, preferPhysical)) {
+        if (TryResolveAddress(raw, resolved, requiredBytes, preferPhysical, sourceHint)) {
             return IsReadableAddress(resolved.full) ? resolved.full : 0;
         }
 
@@ -1588,7 +1798,12 @@ class N64DisplayListAdapter {
 
     uintptr_t TranslateTexturePointer(uint32_t raw, const N64Gfx* source, size_t index, size_t limit, bool isBig,
                                       size_t stride) {
-        const uintptr_t translated = TranslateDataPointer(raw);
+        /* Resolve with the actual upcoming load size so the readability gates in
+           TryResolveAddress can reject short false matches (e.g. a segment base
+           plus a truncated-module-pointer offset that is only readable for a few
+           bytes) instead of feeding a partial buffer to the texture copy. */
+        const size_t estimatedBytes = EstimateRawTextureCopyBytes(source, index, limit, stride, isBig);
+        const uintptr_t translated = TranslateDataPointer(raw, std::max<size_t>(estimatedBytes, 1));
         if (translated == 0) {
             static int sMissingTexturePointerPrints = 0;
             if (sMissingTexturePointerPrints < 200) {
@@ -1608,7 +1823,7 @@ class N64DisplayListAdapter {
         size_t readable = registeredRemaining;
         if (readable == 0) readable = ReadableByteLimit(translated);
 
-        size_t required = EstimateRawTextureCopyBytes(source, index, limit, stride, isBig);
+        size_t required = estimatedBytes;
         if (required == 0) {
             static int sBadTextureEstimatePrints = 0;
             if (sBadTextureEstimatePrints < 200) {
@@ -1868,16 +2083,44 @@ class N64DisplayListAdapter {
          * Use the physical location rather than a heuristic to avoid false positives. */
         const size_t stride = CommandStrideForSource(item.source);
         const bool isBig = CommandSourceIsBigEndian(item.source, stride);
+        // Prefer the segment-tag table: DLs inside a tagged asset segment have a
+        // known dialect and must never fall back to the opcode-scan heuristics.
+        const GdxSegmentUcode sourceDialect =
+            GdxAssetPointerDialect(reinterpret_cast<uintptr_t>(item.source));
         const bool isF3DSource =
-            IsF3DAssetPointer(reinterpret_cast<uintptr_t>(item.source)) ||
-            DisplayListUsesF3D(item.source, item.limit, stride, isBig);
+            (sourceDialect == GdxSegmentUcode::F3D)    ? true
+            : (sourceDialect == GdxSegmentUcode::F3DEX2) ? false
+            : (IsF3DAssetPointer(reinterpret_cast<uintptr_t>(item.source)) ||
+               DisplayListUsesF3D(item.source, item.limit, stride, isBig));
         if (isF3DSource && mStats != nullptr) {
             mStats->f3dLists++;
+        }
+
+        // Diagnostic: dump how the course material setup DLs (segment 8 +0x14040 /
+        // +0x14078) are classified and converted; their SETTILEs program tiles 1-7
+        // for every track draw, so a misconversion here breaks all course tiling.
+        static const bool sDiagSetupDl = std::getenv("GDX_DIAG_SETUPDL") != nullptr;
+        bool diagThisList = false;
+        if (sDiagSetupDl && gSegments[8] != 0) {
+            const uintptr_t src = reinterpret_cast<uintptr_t>(item.source);
+            if (src == gSegments[8] + 0x14040 || src == gSegments[8] + 0x14078) {
+                static int sSetupDlDumps = 0;
+                if (sSetupDlDumps < 40) {
+                    ++sSetupDlDumps;
+                    diagThisList = (sSetupDlDumps <= 2);
+                    gdx_port_logf("[setupdl] source=%p off=+%X stride=%zu big=%d f3d=%d limit=%zu race=%d\n",
+                                  item.source, (unsigned)(src - gSegments[8]), stride, (int)isBig,
+                                  (int)isF3DSource, item.limit, gGdxRaceActive);
+                }
+            }
         }
 
         for (size_t i = 0; i < item.limit; i++) {
             N64Gfx in = ReadCommand(item.source, i, stride, isBig);
             const uint8_t op = Opcode(in.w0);
+            if (diagThisList && i < 24) {
+                gdx_port_logf("[setupdl]   #%02zu %08X %08X op=%02X\n", i, in.w0, in.w1, op);
+            }
             LogTexturePipelineCommand(item.source, i, item.limit, stride, in.w0, in.w1, isBig);
 
             /* TEXRECT coord probe: log first 8 TEXRECTs unconditionally to diagnose zoom. */
@@ -1924,7 +2167,8 @@ class N64DisplayListAdapter {
                     break;
 
                 case kOpMtx:
-                    outW1 = TranslateDataPointer(in.w1, 64, /*preferPhysical=*/!isF3DSource);
+                    outW1 = TranslateDataPointer(in.w1, 64, /*preferPhysical=*/!isF3DSource,
+                                                 reinterpret_cast<uintptr_t>(item.source));
                     if ((outW1 & 7u) != 0) {
                         outW1 = 0;
                     }
@@ -1967,6 +2211,72 @@ class N64DisplayListAdapter {
                                 outW1 = NormalizeLusDirectPointer(outW1);
                             }
                         }
+                        // Resolution-audit probe. Classifies the RESOLVED SOURCE
+                        // (`translated`), not the persistent-copy output — the copy is
+                        // always an unregistered heap buffer, so classifying outW1 only
+                        // reports which delivery path ran, never whether the data is
+                        // correct. Fingerprints the bytes LUS will actually consume and
+                        // flags MIO0-compressed streams reaching the sampler (stripes).
+                        static const bool sDiagSettimg = std::getenv("GDX_DIAG_SETTIMG") != nullptr;
+                        if (sDiagSettimg && gGdxRaceActive != 0) {
+                            static int sSettimgCount = 0;
+                            if (sSettimgCount < 6000) {
+                                ++sSettimgCount;
+                                const auto classify = [this](uintptr_t p) -> const char* {
+                                    if (p == 0) {
+                                        return "NULL";
+                                    }
+                                    if (gdx_rdram != nullptr && p >= reinterpret_cast<uintptr_t>(gdx_rdram) &&
+                                        p < reinterpret_cast<uintptr_t>(gdx_rdram) + GDX_RDRAM_SIZE) {
+                                        return "rdram";
+                                    }
+                                    for (const LoadedAssetSegment& segImg : gLoadedAssetSegments) {
+                                        const uintptr_t base = reinterpret_cast<uintptr_t>(segImg.bytes.data());
+                                        if (base != 0 && p >= base && p < base + segImg.bytes.size()) {
+                                            return "assetseg";
+                                        }
+                                    }
+                                    if (p >= mModuleBegin && p < mModuleEnd) {
+                                        return "module";
+                                    }
+                                    for (const HostRange& range : gHostRanges) {
+                                        if (range.begin != 0 && p >= range.begin &&
+                                            p < range.begin + range.size) {
+                                            return "hostrange";
+                                        }
+                                    }
+                                    return "OTHER";
+                                };
+                                const uint32_t fmt = (in.w0 >> 21) & 0x7;
+                                const uint32_t siz = (in.w0 >> 19) & 0x3;
+                                const uint32_t width = (in.w0 & 0xFFF) + 1;
+                                uint8_t head[8] = {};
+                                uint32_t sum = 0;
+                                int mio0 = 0;
+                                const uintptr_t fpSrc = (outW1 != 0) ? outW1 : translated;
+                                const size_t fpAvail = (fpSrc != 0) ? ReadableByteLimit(fpSrc) : 0;
+                                if (fpAvail >= sizeof(head)) {
+                                    std::memcpy(head, reinterpret_cast<const void*>(fpSrc), sizeof(head));
+                                    const size_t span = std::min<size_t>(fpAvail, 256);
+                                    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(fpSrc);
+                                    for (size_t b = 0; b < span; b++) {
+                                        sum = sum * 31u + bytes[b];
+                                    }
+                                    mio0 = (std::memcmp(head, "MIO0", 4) == 0) ? 1 : 0;
+                                }
+                                FILE* tf = fopen("settimg-trace.txt", sSettimgCount == 1 ? "w" : "a");
+                                if (tf != nullptr) {
+                                    fprintf(tf,
+                                            "T raw=%08X src=%p scls=%s out=%p fmt=%u siz=%u w=%u "
+                                            "fp=%02X%02X%02X%02X%02X%02X%02X%02X sum=%08X mio0=%d dl=%p\n",
+                                            in.w1, reinterpret_cast<void*>(translated), classify(translated),
+                                            reinterpret_cast<void*>(outW1), fmt, siz, width,
+                                            head[0], head[1], head[2], head[3], head[4], head[5], head[6], head[7],
+                                            sum, mio0, item.source);
+                                    fclose(tf);
+                                }
+                            }
+                        }
                     }
                     break;
 
@@ -1982,7 +2292,19 @@ class N64DisplayListAdapter {
                             translated = reinterpret_cast<uintptr_t>(gdx_rdram);
                         }
                         if (translated != 0 && segIdx < kGfxSegmentCount) {
-                            gSegments[segIdx] = NormalizeLusDirectPointer(translated);
+                            const uintptr_t normalized = NormalizeLusDirectPointer(translated);
+                            /* Segment 0x0A feeds the road texture bank alias; a mid-race
+                               repoint swaps every road texture, so make it visible. */
+                            if (segIdx == 0x0A && gSegments[segIdx] != normalized) {
+                                static int sSeg10RepointLogs = 0;
+                                if (sSeg10RepointLogs < 32) {
+                                    ++sSeg10RepointLogs;
+                                    gdx_port_logf("[segment] moveword repoints seg 0x0A: %p -> %p (raw=%08X)\n",
+                                                  reinterpret_cast<void*>(gSegments[segIdx]),
+                                                  reinterpret_cast<void*>(normalized), in.w1);
+                                }
+                            }
+                            gSegments[segIdx] = normalized;
                         }
                         outW1 = (segIdx < kGfxSegmentCount) ? gSegments[segIdx] : static_cast<uintptr_t>(in.w1);
                     }
@@ -2424,6 +2746,20 @@ extern "C" int gdx_load_venue_texture_segment(int venue) {
         return 0;
     }
 
+    // Force segment 0x0A to point at the (decompressed) venue texture image.
+    // EnsureAssetSegmentImage only claims a segment slot when it is still 0, but
+    // the game sets segment 0x0A via gsSPSegment before this loads, so the slot
+    // was already non-zero and kept a stale/raw pointer — the track then sampled
+    // raw ROM/compressed bytes (the "stripes"). This loader is the authority for
+    // the venue texture segment, so assign it unconditionally.
+    gSegments[0x0A] = base;
+
+    // Mark race rendering active for the interpreter-side diagnostics, which
+    // must ignore menu screens (they exhaust probe caps before any race).
+    {
+        gGdxRaceActive = 1;
+    }
+
     gdx_port_logf("[segment] loaded venue=%d segment=10 base=%p symbol=%08X offset=%08X\n",
                   venue, reinterpret_cast<void*>(base), symbol, offset);
     return 1;
@@ -2481,8 +2817,21 @@ extern "C" void* gdx_resolve_module_host_address(unsigned int addr) {
 }
 
 extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
-    auto wnd = Ship::Context::GetInstance()->GetWindow();
-    auto* fw = static_cast<Fast::Fast3dWindow*>(wnd.get());
+    // The Fast3dWindow is created once at startup and lives for the whole
+    // program. Fetch it once and cache the raw pointer instead of copying the
+    // Context's window shared_ptr every frame: that per-frame refcount touch
+    // crashed in _Ptr_base<Window>::_Incref when the Context's window member
+    // was transiently unreadable during rapid mode transitions (e.g. machine
+    // select -> settings). The cache is populated at startup when state is
+    // clean, so later frames never re-read that member.
+    static Fast::Fast3dWindow* sCachedWindow = nullptr;
+    if (sCachedWindow == nullptr) {
+        auto ctx = Ship::Context::GetInstance();
+        if (ctx == nullptr) { return; }
+        auto wnd = ctx->GetWindow();
+        sCachedWindow = static_cast<Fast::Fast3dWindow*>(wnd.get());
+    }
+    Fast::Fast3dWindow* fw = sCachedWindow;
     if (fw == nullptr) { return; }
     // All three task variants share F3DEX2 command encoding. Their semantic
     // differences are carried separately so the base opcode table stays valid.
