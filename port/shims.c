@@ -40,7 +40,9 @@ void __osError(short code, short numArgs, ...) {
 // Audio interface (libultraship provides osAiSetNextBuffer but not this).
 int osAiSetFrequency(void) { return 0; }
 
-// 64DD / leo boot (Expansion Kit) — stubbed for the US base.
+#ifndef EXPANSION_KIT
+// 64DD / leo boot — stubbed for the US-only build. With EXPANSION_KIT enabled
+// port/n64_leo.c provides the disk-image-backed implementations of both.
 void LeoBootGame(void) {}
 
 // Base-game 64DD probe: the PC port has no inserted disk. Report that state
@@ -52,6 +54,7 @@ int LeoTestUnitReady(unsigned char* status) {
     }
     return GDX_LEO_ERROR_MEDIUM_NOT_PRESENT;
 }
+#endif
 
 // libc: BSD byte-compare not in the MSVC CRT.
 int bcmp(const void* a, const void* b, int n) { return memcmp(a, b, (size_t)n); }

@@ -145,20 +145,24 @@ unsigned char unk_bss_segment_VRAM_END[1];
 unsigned char unk_gfx_segment_VRAM[1];
 unsigned char unk_gfx_segment_VRAM_END[1];
 
+#ifndef EXPANSION_KIT /* real definition in leo/mfs (mfs_data.c) under EK */
 long D_i1_80428618() { return 0; }
+#endif
 const char D_i2_8010ADE0[] = { 'F', '-', 'Z', 'E', 'R', 'O', ' ', 'X' }; /* save file signature */
 long EndingCutsceneEffects_DrawFireworks() { return 0; }
 long EndingCutsceneEffects_DrawPodiumRacerCharacters() { return 0; }
 long EndingCutsceneEffects_Init() { return 0; }
 long EndingCutsceneEffects_Update() { return 0; }
+/* With the Expansion Kit enabled these come from the real implementations:
+   Leo* from port/n64_leo.c + decomp leo/lib pure files, Mfs_* from the
+   decomp's leo/mfs filesystem. Keep the no-op stubs only for the US-only
+   build so it still links without the disk subsystem. */
+#ifndef EXPANSION_KIT
 long LeoByteToLBA() { return 0; }
 long LeoCACreateLeoManager() { return 0; }
-long LeoGetAAdr2() { return 0; }
 long LeoLBAToByte() { return 0; }
 long LeoReadDiskID() { return 0; }
 long LeoReadWrite() { return 0; }
-long LeoReset() { return 0; }
-long LeoResetClear() { return 0; }
 long LeoSpdlMotor() { return 0; }
 long Mfs_CreateLeoManager() { return 0; }
 long Mfs_GetFileIndex() { return 0; }
@@ -166,6 +170,10 @@ long Mfs_InitRamArea() { return 0; }
 long Mfs_LoadFileInDir() { return 0; }
 long Mfs_ModeSelectAsync() { return 0; }
 long Mfs_SetGameCode() { return 0; }
+#endif
+long LeoGetAAdr2() { return 0; }
+long LeoReset() { return 0; }
+long LeoResetClear() { return 0; }
 long Save_Init() { return 0; }
 long Save_InitGhost() { return 0; }
 long Save_Load() { return 0; }
@@ -192,8 +200,10 @@ long __osSiRawReadIo() { return 0; }
 long __osSiRawWriteIo() { return 0; }
 void bzero(void* ptr, int n) { memset(ptr, 0, n); }
 long func_800AA6BC() { return 0; }
+#ifndef EXPANSION_KIT /* real definitions in leo/mfs (mfs_ram.c) under EK */
 long func_i1_8040428C() { return 0; }
 long func_i1_804046F0() { return 0; }
+#endif
 long func_i2_801017B8() { return 0; }
 long func_i2_801039BC() { return 0; }
 long guNormalize() { return 0; }
@@ -202,5 +212,10 @@ long osGetIntMask() { return 0; }
 long osLeoDiskInit() { return 0; }
 long osMapTLBRdb() { return 0; }
 long osPiRawReadIo() { return 0; }
-long osResetType() { return 0; }
+/* DATA, not a function: the decomp declares `extern s32 osResetType`
+   (os_system.h:87). Stubbing it as a function made `switch (osResetType)`
+   in the EK boot read x64 machine-code bytes as the reset type, so
+   gRamDDCompatible never became true and the whole 64DD init was skipped.
+   0 = cold reset. */
+int osResetType = 0;
 long osSetIntMask() { return 0; }

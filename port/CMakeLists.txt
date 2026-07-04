@@ -39,17 +39,54 @@ list(FILTER GAME_SOURCES EXCLUDE REGEX "/libultra/os/initialize\\.c$")
 # 0xA0400000...) — replaced by a host version returning osMemSize in port/n64_sched.c.
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/libultra/os/getmemsize\\.c$")
 
-# US base first: exclude Expansion Kit / 64DD code (folded in with the EK slice).
-# Mirrors the decomp Makefile's EXPANSION_KIT=0 EXCLUSION_FILES list.
-list(FILTER GAME_SOURCES EXCLUDE REGEX "/sys/disk/")
-list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ovl_i2/dd_save\\.c$")
-list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ovl_i2/ovl_i2_data2\\.c$")
-list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ovl_i10/.*187510\\.c$")
-list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/expansion_kit/")
-list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/course_edit/")
-list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/machine_create/")
-list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ead_demo/")
-list(FILTER GAME_SOURCES EXCLUDE REGEX "/audio/disk/")
+# Expansion Kit: compile the EK/64DD sources into the US-based build.
+# EXPANSION_KIT activates the decomp's EK hooks WITHOUT VERSION_JP — EK code
+# paths are gated by EXPANSION_KIT in shared files; the VERSION_JP sites are
+# JP-cart text/font differences deliberately kept on US behavior. EK modes are
+# runtime-gated by disk-image presence (port/n64_leo.c).
+option(GDX_EXPANSION_KIT "Compile Expansion Kit (64DD) support into the port" ON)
+
+if(NOT GDX_EXPANSION_KIT)
+    # US base only: exclude Expansion Kit / 64DD code.
+    # Mirrors the decomp Makefile's EXPANSION_KIT=0 EXCLUSION_FILES list.
+    list(FILTER GAME_SOURCES EXCLUDE REGEX "/sys/disk/")
+    list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ovl_i2/dd_save\\.c$")
+    list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ovl_i2/ovl_i2_data2\\.c$")
+    list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ovl_i10/.*187510\\.c$")
+    list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/expansion_kit/")
+    list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/course_edit/")
+    list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/machine_create/")
+    list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ead_demo/")
+    list(FILTER GAME_SOURCES EXCLUDE REGEX "/audio/disk/")
+else()
+    # Mirror the decomp Makefile's EXPANSION_KIT=1 exclusions: the disk-side
+    # subsystems REPLACE their rom-side twins (audio/disk supersedes audio/rom,
+    # sys/disk supersedes sys/rom, dd_save.c supersedes save_buffer.c) — they
+    # are alternatives, never compiled together.
+    list(FILTER GAME_SOURCES EXCLUDE REGEX "/sys/rom/")
+    list(FILTER GAME_SOURCES EXCLUDE REGEX "/audio/rom/")
+    list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ovl_i2/save_buffer\\.c$")
+    list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ovl_i11/")
+    # ead_demo (the 64DD attract demo) has broken WIP C bodies upstream
+    # (mangled matrix code in ead_demo_engine.c) — exclude until the decomp
+    # matures; it is cosmetic-only.
+    list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ead_demo/")
+    # libultraship provides the osAi* surface (same reason rom/lib's
+    # aisetnextbuf.c is excluded below for the US build).
+    list(FILTER GAME_SOURCES EXCLUDE REGEX "/audio/disk/lib/os\\.c$")
+    # The leo drive library and MFS filesystem live outside the globbed dirs.
+    # Compile only the pure-math leo files (LBA<->byte zone tables); the
+    # hardware command/interrupt layer is replaced wholesale by port/n64_leo.c.
+    file(GLOB EK_LEO_SOURCES
+        "${DECOMP}/src/leo/lib/bytetolba.c"
+        "${DECOMP}/src/leo/lib/lbatobyte.c"
+        "${DECOMP}/src/leo/lib/leo_tbl.c"
+        "${DECOMP}/src/leo/lib/leotranslat.c"
+        "${DECOMP}/src/leo/lib/leoutil.c"
+        "${DECOMP}/src/leo/mfs/*.c"
+    )
+    list(APPEND GAME_SOURCES ${EK_LEO_SOURCES})
+endif()
 
 # libultraship already provides these libultra functions — exclude to avoid duplicate symbols.
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/audio/rom/lib/aisetnextbuf\\.c$")  # osAiSetNextBuffer
@@ -72,6 +109,17 @@ add_library(gdiffuser_game OBJECT ${GAME_SOURCES}
     "${DECOMP}/src/libultra/io/devmgr.c"                  # PORT PI manager: host-backed DMA completion
     "${CMAKE_CURRENT_SOURCE_DIR}/gen/AssetBindings.c"      # R2: asset symbol defs
     "${CMAKE_CURRENT_SOURCE_DIR}/gen/LinkStubs.c")         # R4/R5 bring-up: placeholder defs to link
+
+if(GDX_EXPANSION_KIT)
+    target_sources(gdiffuser_game PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/n64_leo.c"            # EK: 64DD drive backed by disk image
+        "${CMAKE_CURRENT_SOURCE_DIR}/gen/EkAssetBindings.c" # EK: disk asset symbol defs + fill
+        "${CMAKE_CURRENT_SOURCE_DIR}/gen/EkLinkStubs.c")   # EK: deferred-subsystem placeholders
+    # MFS_VERSION=1 (version B) and BUILD_VERSION=VERSION_J (2.0J libultra API
+    # shapes, e.g. 3-arg __osSetHWIntrRoutine) match the decomp Makefile's EK
+    # configuration; sethwinterrupt.c and the headers are both gated on it.
+    target_compile_definitions(gdiffuser_game PRIVATE EXPANSION_KIT=1 MFS_VERSION=1 BUILD_VERSION=VERSION_J)
+endif()
 
 target_include_directories(gdiffuser_game PRIVATE
     "${DECOMP}"            # decomp root: the C uses includes relative to it (e.g. "src/audio/...")
@@ -110,6 +158,14 @@ add_executable(G-Diffuser
     mio0_wrap.c
     "${CMAKE_CURRENT_SOURCE_DIR}/../torch/lib/libmio0/mio0.c"
     $<TARGET_OBJECTS:gdiffuser_game>)
+
+if(GDX_EXPANSION_KIT)
+    # Host-side disk image loader; references gdx_ek_assets_fill from the
+    # EK-only EkAssetBindings.c, so it must not build in US-only configs.
+    target_sources(G-Diffuser PRIVATE disk_buffer.cpp)
+    # shims.c guards its US-only Leo stubs on this define.
+    target_compile_definitions(G-Diffuser PRIVATE EXPANSION_KIT=1)
+endif()
 
 if(WIN32)
     set_target_properties(G-Diffuser PROPERTIES WIN32_EXECUTABLE TRUE)
