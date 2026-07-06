@@ -8,13 +8,15 @@ Reads the disk-side asset yamls from the fzerox-expansion-kit decomp and emits:
                                         symbol (never 1-byte stubs: indexed tables and the
                                         runtime resolvers need real storage sizes), plus
                                         gdx_ek_assets_fill() copying data from the 64DD
-                                        disk image for every yaml that declares a disk
-                                        segment base. Entries without a segment base are
-                                        defined zero-filled (delivered later via MFS).
+                                        disk image.
 
-The disk image is treated as linear: yaml offsets are relative to the yaml's
-segment base byte offset within the .ndd dump.
+The yaml offsets address the synthetic baserom.jp.z64dd assembled by
+fzerox-expansion-kit/tools/extract_baserom.py. They are not physical offsets in
+an .ndd image. This generator maps each synthetic section back to its source
+LBA, then converts that LBA to the physical/block-linear .ndd byte offset.
 """
+import ast
+import bisect
 import glob
 import os
 
@@ -28,6 +30,120 @@ HEADER_OUT_DIR = os.path.join(REPO, "include", "assets", "us", "ek")
 PAYLOAD_OUT_DIR = os.path.join(REPO, "decomp", "src", "assets", "us", "ek")
 BINDING_C = os.path.join(REPO, "port", "gen", "EkAssetBindings.c")
 DECOMP_SRC = os.path.join(REPO, "decomp", "src")
+EK_PATCH_SCRIPT = os.path.join(REPO, "fzerox-expansion-kit", "tools", "patch.py")
+
+# Both the retail JP disk and LuigiBlood's translated disk are type 3. These
+# tables mirror decomp/src/leo/lib/leo_tbl.c and LeoLBAToByte().
+EK_DISK_TYPE = 3
+NDD_SYSTEM_AREA_BYTES = 0x738C0
+NUM_LBAS = 4292
+LEO_BLOCK_BYTES = (0x4D08, 0x47B8, 0x4510, 0x3FC0, 0x3A70, 0x3520, 0x2FD0, 0x2A80, 0x2530)
+LEO_VZONE_BOUNDS = (
+    (0x0124, 0x0248, 0x035A, 0x047E, 0x05A2, 0x06B4, 0x07C6, 0x08D8,
+     0x09EA, 0x0AB6, 0x0B82, 0x0C94, 0x0DA6, 0x0EB8, 0x0FCA, 0x10DC),
+    (0x0124, 0x0248, 0x035A, 0x046C, 0x057E, 0x06A2, 0x07C6, 0x08D8,
+     0x09EA, 0x0AFC, 0x0BC8, 0x0C94, 0x0DA6, 0x0EB8, 0x0FCA, 0x10DC),
+    (0x0124, 0x0248, 0x035A, 0x046C, 0x057E, 0x0690, 0x07A2, 0x08C6,
+     0x09EA, 0x0AFC, 0x0C0E, 0x0CDA, 0x0DA6, 0x0EB8, 0x0FCA, 0x10DC),
+    (0x0124, 0x0248, 0x035A, 0x046C, 0x057E, 0x0690, 0x07A2, 0x08B4,
+     0x09C6, 0x0AEA, 0x0C0E, 0x0D20, 0x0DEC, 0x0EB8, 0x0FCA, 0x10DC),
+    (0x0124, 0x0248, 0x035A, 0x046C, 0x057E, 0x0690, 0x07A2, 0x08B4,
+     0x09C6, 0x0AD8, 0x0BEA, 0x0D0E, 0x0E32, 0x0EFE, 0x0FCA, 0x10DC),
+    (0x0124, 0x0248, 0x035A, 0x046C, 0x057E, 0x0690, 0x07A2, 0x086E,
+     0x0980, 0x0A92, 0x0BA4, 0x0CB6, 0x0DC8, 0x0EEC, 0x1010, 0x10DC),
+    (0x0124, 0x0248, 0x035A, 0x046C, 0x057E, 0x0690, 0x07A2, 0x086E,
+     0x093A, 0x0A4C, 0x0B5E, 0x0C70, 0x0D82, 0x0E94, 0x0FB8, 0x10DC),
+)
+LEO_VZONE_PZONE = (
+    (0x00, 0x01, 0x02, 0x09, 0x08, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A),
+    (0x00, 0x01, 0x02, 0x03, 0x0A, 0x09, 0x08, 0x04, 0x05, 0x06, 0x07, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B),
+    (0x00, 0x01, 0x02, 0x03, 0x04, 0x0B, 0x0A, 0x09, 0x08, 0x05, 0x06, 0x07, 0x0F, 0x0E, 0x0D, 0x0C),
+    (0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x06, 0x07, 0x0F, 0x0E, 0x0D),
+    (0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x0F, 0x0E),
+    (0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x0F),
+    (0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08),
+)
+
+
+def load_patch_dict(name):
+    """Read a literal dictionary from patch.py without importing its tooling dependencies."""
+    with open(EK_PATCH_SCRIPT, encoding="utf-8") as f:
+        module = ast.parse(f.read(), EK_PATCH_SCRIPT)
+    for node in module.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1 and
+                isinstance(node.targets[0], ast.Name) and node.targets[0].id == name):
+            return ast.literal_eval(node.value)
+    raise RuntimeError("{} not found in {}".format(name, EK_PATCH_SCRIPT))
+
+
+def load_synthetic_sections():
+    rom_addrs = load_patch_dict("diskRomAddrs")
+    disk_lbas = load_patch_dict("diskSegments")
+    if set(rom_addrs) != set(disk_lbas):
+        raise RuntimeError("patch.py diskRomAddrs and diskSegments disagree")
+
+    # extract_baserom.py starts the main block at synthetic offset zero. The
+    # patcher's main ROM symbol starts at 0x60 because that initial header is
+    # outside the linked main section.
+    rom_addrs["main"] = 0
+
+    # Audio is appended after the ghost blocks by extract_baserom.py but is not
+    # part of patch.py's relocatable section table.
+    rom_addrs.update({"audio_bank_dd": 0x266B30, "audio_seq_dd": 0x26C520})
+    disk_lbas.update({"audio_bank_dd": 1000, "audio_seq_dd": 1002})
+
+    return sorted((int(rom_addrs[name]), int(disk_lbas[name]), name) for name in rom_addrs)
+
+
+def lba_block_size(user_lba):
+    physical_lba = user_lba + 0x18
+    bounds = LEO_VZONE_BOUNDS[EK_DISK_TYPE]
+    vzone = bisect.bisect_right(bounds, physical_lba)
+    if vzone >= len(bounds):
+        raise ValueError("LBA {} is outside the disk".format(user_lba))
+    pzone = LEO_VZONE_PZONE[EK_DISK_TYPE][vzone]
+    zone = pzone - 7 if pzone >= 8 else pzone
+    return LEO_BLOCK_BYTES[zone]
+
+
+def build_lba_file_offsets():
+    offsets = [NDD_SYSTEM_AREA_BYTES]
+    for lba in range(NUM_LBAS):
+        offsets.append(offsets[-1] + lba_block_size(lba))
+    return offsets
+
+
+SYNTHETIC_SECTIONS = load_synthetic_sections()
+SYNTHETIC_SECTION_STARTS = [section[0] for section in SYNTHETIC_SECTIONS]
+SYNTHETIC_SECTIONS_BY_NAME = {section[2]: section for section in SYNTHETIC_SECTIONS}
+LBA_FILE_OFFSETS = build_lba_file_offsets()
+EXPECTED_NDD_SIZE = 64_931_840
+if LBA_FILE_OFFSETS[-1] != EXPECTED_NDD_SIZE:
+    raise RuntimeError(
+        "64DD geometry produced {} bytes, expected {}".format(LBA_FILE_OFFSETS[-1], EXPECTED_NDD_SIZE)
+    )
+
+
+def synthetic_to_physical(synthetic_offset):
+    section_index = bisect.bisect_right(SYNTHETIC_SECTION_STARTS, synthetic_offset) - 1
+    if section_index < 0:
+        raise ValueError("synthetic offset 0x{:X} precedes the first disk section".format(synthetic_offset))
+    section_start, start_lba, _name = SYNTHETIC_SECTIONS[section_index]
+    return LBA_FILE_OFFSETS[start_lba] + (synthetic_offset - section_start)
+
+
+def synthetic_section_end(synthetic_offset):
+    section_index = bisect.bisect_right(SYNTHETIC_SECTION_STARTS, synthetic_offset) - 1
+    if section_index < 0 or section_index + 1 >= len(SYNTHETIC_SECTIONS):
+        return None
+    return SYNTHETIC_SECTIONS[section_index + 1][0]
+
+
+def synthetic_section_name(synthetic_offset):
+    section_index = bisect.bisect_right(SYNTHETIC_SECTION_STARTS, synthetic_offset) - 1
+    if section_index < 0:
+        return None
+    return SYNTHETIC_SECTIONS[section_index][2]
 
 
 def scan_payload_includes():
@@ -38,13 +154,25 @@ def scan_payload_includes():
     generated payload file rather than in EkAssetBindings.c (the include would
     otherwise produce duplicate definitions at link)."""
     paths = set()
+
+    # Read CMakeLists.txt to see which files are actually compiled
+    cmake_path = os.path.join(REPO, "port", "CMakeLists.txt")
+    compiled_files = set()
+    with open(cmake_path, "r") as f:
+        cmake_content = f.read()
+        for m in re.finditer(r"decomp/src/([^\s]+)", cmake_content):
+            compiled_files.add(os.path.normpath(os.path.join(DECOMP_SRC, m.group(1))))
+
     for root, _dirs, files in os.walk(DECOMP_SRC):
         if os.sep + "assets" in root:
             continue
         for name in files:
             if not name.endswith((".c", ".h")):
                 continue
-            with open(os.path.join(root, name), encoding="utf-8", errors="ignore") as f:
+            full_path = os.path.normpath(os.path.join(root, name))
+            if name.endswith(".c") and full_path not in compiled_files:
+                continue
+            with open(full_path, encoding="utf-8", errors="ignore") as f:
                 for m in re.finditer(r"ASSET_SOURCE_EK\(([^)]+\.c)\)", f.read()):
                     paths.add(m.group(1).strip())
     return paths
@@ -66,6 +194,8 @@ def entry_ctype(val):
 def entry_size(val, next_offset):
     # COMPRESSED_TEXTURE symbols hold the compressed stream (the game inflates
     # at runtime), so their storage size is the on-disk span, not w*h*bpp.
+    if val.get("size") is not None:
+        return int(val["size"])
     if val.get("type") == "TEXTURE":
         bpp = TEXTURE_BPP.get(val.get("format", ""), 2)
         w = int(val.get("width", 0))
@@ -87,7 +217,7 @@ def ctype_bytes(ctype):
 headers = []       # (relative_header_path, [lines])
 definitions = []   # (ctype, sym, element_count, byte_size)
 payloads = []      # (relative_payload_c_path, [definition lines])
-fills = []         # (sym, disk_byte_offset, byte_size)
+fills = []         # (ctype, asset_type, sym, disk_byte_offset, byte_size, n64_address)
 seen_syms = set()
 payload_includes = scan_payload_includes()
 
@@ -107,9 +237,22 @@ for path in sorted(glob.glob(os.path.join(EK_YAML_DIR, "**", "*.yaml"), recursiv
 
     config = data.get(":config", {}) or {}
     segs = config.get("segments") or []
-    disk_base = None
+    synthetic_base = 0
+    expected_section = None
+    address_kind = None
+    address_base = 0
     if segs and isinstance(segs[0], (list, tuple)) and len(segs[0]) >= 2:
-        disk_base = int(segs[0][1])
+        synthetic_base = int(segs[0][1])
+        expected_section = synthetic_section_name(synthetic_base)
+        address_kind = "segment"
+        address_base = int(segs[0][0]) << 24
+    elif (isinstance(config.get("virtual"), (list, tuple)) and
+          len(config["virtual"]) >= 2):
+        expected_section = synthetic_section_name(int(config["virtual"][1]))
+        address_kind = "virtual"
+        address_base = int(config["virtual"][0])
+    elif stem in SYNTHETIC_SECTIONS_BY_NAME:
+        expected_section = stem
 
     items = []
     for key, val in data.items():
@@ -120,6 +263,10 @@ for path in sorted(glob.glob(os.path.join(EK_YAML_DIR, "**", "*.yaml"), recursiv
     for idx, (offset, key, _val) in enumerate(items):
         if idx + 1 < len(items):
             next_offsets[key] = items[idx + 1][0]
+        else:
+            section_end = synthetic_section_end(synthetic_base + offset)
+            if section_end is not None and section_end > synthetic_base + offset:
+                next_offsets[key] = section_end - synthetic_base
 
     guard = stem_rel.replace("/", "_").replace("-", "_").upper() + "_H"
     lines = ["#ifndef {}".format(guard), "#define {}".format(guard), "", '#include "gfx.h"', ""]
@@ -147,8 +294,28 @@ for path in sorted(glob.glob(os.path.join(EK_YAML_DIR, "**", "*.yaml"), recursiv
             payload_lines.append("{} {}[{}];".format(ctype, sym, count))
         else:
             definitions.append((ctype, sym, count, size))
-        if disk_base is not None and val.get("offset") is not None:
-            fills.append((sym, disk_base + int(val["offset"]), size))
+        if val.get("offset") is not None:
+            synthetic_offset = synthetic_base + int(val["offset"])
+            actual_section = synthetic_section_name(synthetic_offset)
+            if expected_section is not None and actual_section != expected_section:
+                raise ValueError(
+                    "{}:{} maps to synthetic section {}, expected {}".format(
+                        rel, key, actual_section, expected_section
+                    )
+                )
+            n64_address = 0
+            if address_kind == "segment":
+                n64_address = address_base | int(val["offset"])
+            elif address_kind == "virtual":
+                n64_address = address_base + int(val["offset"]) - int(config["virtual"][1])
+            fills.append((
+                ctype,
+                val.get("type", ""),
+                sym,
+                synthetic_to_physical(synthetic_offset),
+                size,
+                n64_address,
+            ))
 
     lines += ["", "#endif", ""]
     headers.append((stem_rel + ".h", lines))
@@ -184,14 +351,25 @@ with open(BINDING_C, "w") as f:
     f.write('#include "global.h"\n\n')
     for ctype, sym, count, _size in definitions:
         f.write("{} {}[{}];\n".format(ctype, sym, count))
-    f.write("\ntypedef struct { void* dest; unsigned int diskOffset; unsigned int size; } GdxEkAssetFill;\n")
+    for ctype, _asset_type, sym, disk_off, size, _n64_address in fills:
+        f.write("extern {} {}[];\n".format(ctype, sym))
+    f.write("\nextern void gdx_register_host_raw_n64_range(void* ptr, unsigned long long size);\n")
+    f.write("extern void gdx_register_n64_address_range(unsigned int n64Begin, void* hostBegin, unsigned long long size);\n")
+    f.write("\nenum { GDX_EK_ASSET_OTHER, GDX_EK_ASSET_GFX, GDX_EK_ASSET_VP };\n")
+    f.write("typedef struct { void* dest; unsigned int diskOffset; unsigned int size; unsigned int n64Address; unsigned char kind; } GdxEkAssetFill;\n")
     f.write("static const GdxEkAssetFill sEkAssetFills[] = {\n")
-    for sym, disk_off, size in fills:
-        f.write("    {{ {}, 0x{:08X}U, 0x{:X}U }},\n".format(sym, disk_off, size))
-    f.write("    { 0, 0U, 0U }\n};\n\n")
-    f.write("/* Copies EK asset payloads out of the loaded 64DD disk image. Big-endian\n")
-    f.write(" * u16 texel data is byte-swapped per 16-bit word elsewhere by the gfx\n")
-    f.write(" * bridge's raw N64 range handling, so this stays a straight copy. */\n")
+    for _ctype, asset_type, sym, disk_off, size, n64_address in fills:
+        kind = {
+            "GFX": "GDX_EK_ASSET_GFX",
+            "VP": "GDX_EK_ASSET_VP",
+        }.get(asset_type, "GDX_EK_ASSET_OTHER")
+        f.write("    {{ {}, 0x{:08X}U, 0x{:X}U, 0x{:08X}U, {} }},\n".format(
+            sym, disk_off, size, n64_address, kind
+        ))
+    f.write("    { 0, 0U, 0U, 0U, GDX_EK_ASSET_OTHER }\n};\n\n")
+    f.write("/* Copies EK payloads from the 64DD image and records their original N64\n")
+    f.write(" * address ranges. Gfx commands remain big-endian/raw; Vp fields are\n")
+    f.write(" * converted to native s16 because the host interpreter reads Vp directly. */\n")
     f.write("void gdx_ek_assets_fill(const unsigned char* disk, unsigned long long diskSize) {\n")
     f.write("    int i;\n")
     f.write("    unsigned int b;\n")
@@ -204,6 +382,18 @@ with open(BINDING_C, "w") as f:
     f.write("               clash with the MSVC CRT's <string.h> */\n")
     f.write("            for (b = 0; b < sEkAssetFills[i].size; b++) {\n")
     f.write("                dest[b] = src[b];\n")
+    f.write("            }\n")
+    f.write("            if (sEkAssetFills[i].kind == GDX_EK_ASSET_VP) {\n")
+    f.write("                for (b = 0; b + 1 < sEkAssetFills[i].size; b += 2) {\n")
+    f.write("                    unsigned char hi = dest[b];\n")
+    f.write("                    dest[b] = dest[b + 1];\n")
+    f.write("                    dest[b + 1] = hi;\n")
+    f.write("                }\n")
+    f.write("            } else if (sEkAssetFills[i].kind == GDX_EK_ASSET_GFX) {\n")
+    f.write("                gdx_register_host_raw_n64_range(dest, sEkAssetFills[i].size);\n")
+    f.write("            }\n")
+    f.write("            if (sEkAssetFills[i].n64Address != 0) {\n")
+    f.write("                gdx_register_n64_address_range(sEkAssetFills[i].n64Address, dest, sEkAssetFills[i].size);\n")
     f.write("            }\n")
     f.write("        }\n")
     f.write("    }\n")

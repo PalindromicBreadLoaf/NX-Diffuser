@@ -27,6 +27,10 @@ extern s32   gGameMode;
 extern unsigned char* gdx_rom_buffer;
 extern size_t gdx_rom_size;
 extern unk_80225800 D_80225800;
+#ifdef EXPANSION_KIT
+extern unk_80128C94* D_80128C90;
+extern unk_80128C94* D_80128C94;
+#endif
 
 // ---- RDRAM host buffer globals ----------------------------------------------
 // gdx_rdram: single 16MB contiguous buffer allocated by gdx_rdram_init().
@@ -312,22 +316,50 @@ void Segment_LoadAssets(void) {
             if (!gdx_load_venue_texture_segment(COURSE_CONTEXT()->courseData.venue)) {
                 gdx_ck("[segment] venue texture segment load failed");
             }
+            /* Race-diagnostics gate: set here (mode-aware) rather than inside
+               the venue loader, which the course-select preview also calls. */
+            {
+                extern int gGdxRaceActive;
+                gGdxRaceActive = 1;
+            }
             break;
         default:
             break;
     }
 }
 
-// ---- Save system (stubbed for first boot; back with libultraship save later) ----
-s32 Save_LoadStaffGhostRecord(GhostInfo* ghostInfo, s32 courseIndex) {
-    (void)ghostInfo;
-    (void)courseIndex;
-    return -1; // no record
+/*
+ * The original Segment_LoadOverlays() also prepared per-mode graphics memory.
+ * Most overlays are statically linked on PORT, but Course Edit still requires
+ * its two alternating segment-6 work buffers.
+ */
+void Segment_LoadOverlays(void) {
+#ifdef EXPANSION_KIT
+    if (GET_MODE(gGameMode) == GAMEMODE_COURSE_EDIT) {
+        const size_t workBufferSize = 2 * sizeof(unk_80128C94);
+        size_t i;
+
+        if (D_80128C90 == NULL) {
+            D_80128C90 = (unk_80128C94*)Arena_Allocate(
+                ALLOC_FRONT, workBufferSize);
+        }
+        D_80128C94 = D_80128C90;
+        if (D_80128C90 == NULL) {
+            gdx_ck("[segment] FATAL: Course Edit graphics allocation failed");
+            gdx_host_abort();
+        }
+        for (i = 0; i < workBufferSize; i++) {
+            ((u8*)D_80128C90)[i] = 0;
+        }
+    }
+#endif
 }
 
-s32 Save_SaveSettingsProfiles(void) {
-    return 0; // pretend success
-}
+// ---- Save system -------------------------------------------------------------
+// Save_LoadStaffGhostRecord and Save_SaveSettingsProfiles are real now: they're
+// defined in decomp/src/overlays/ovl_i2/save.c, which now compiles (save-system
+// slice). Save_LoadStaffGhostRecord still returns -1 on PORT (see the #ifdef PORT
+// guard in save.c) -- that piece needs the EK ROM segment table, a separate slice.
 
 // ---- Graphics pool ---------------------------------------------------------
 // D_1000000: the N64 graphics pool (segment 0x01) — a real runtime buffer (NOT an o2r asset),

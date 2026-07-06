@@ -93,6 +93,8 @@ extern "C" uint8_t D_A008000[];
 extern "C" uint8_t gspF3DEX2_fifoTextStart[];
 extern "C" uint8_t gspF3DFLX2_Rej_fifoTextStart[];
 extern "C" uint8_t gspF3DLX2_Rej_fifoTextStart[];
+extern "C" unsigned long long gspF3DEX2_Rej_fifoTextStart[];
+extern "C" unsigned long long gspL3DEX2_fifoTextStart[];
 
 extern "C" int gdx_lookup_asset_segment(unsigned int sym_low32,
                                          unsigned char* segment,
@@ -164,6 +166,8 @@ static inline uint16_t Byteswap16(uint16_t x) {
     return ((x & 0xFF00) >> 8) | ((x & 0x00FF) << 8);
 }
 
+bool IsLikelyDisplayListOpcode(uint8_t op); // defined below
+
 static inline bool IsLikelyBigEndianDisplayList(const N64Gfx* source, size_t readableLimit) {
     if (readableLimit == 0) return false;
     uint32_t w0 = source[0].w0;
@@ -171,6 +175,20 @@ static inline bool IsLikelyBigEndianDisplayList(const N64Gfx* source, size_t rea
     uint8_t opB = w0 & 0xFF;
     if (opL == 0 && opB != 0) return true;
     if ((opB >= 0xB0 || opB == 0x01 || opB == 0x04) && opL < 0x20) return true;
+    /* The first word alone is ambiguous when the BE command carries nonzero
+       operand bytes (e.g. gSPGeometryMode D9 FD FF FF reads as LE 0xFFFFFDD9,
+       whose top byte 0xFF is also a plausible opcode — this made every EK
+       disk-filled UI display list classify as LE and get rejected). Walk the
+       list as big-endian: a genuine BE list produces a valid opcode chain
+       that reaches G_ENDDL within the readable window. */
+    {
+        const size_t scan = (readableLimit < 64) ? readableLimit : 64;
+        for (size_t i = 0; i < scan; i++) {
+            const uint8_t op = static_cast<uint8_t>(source[i].w0 & 0xFFu);
+            if (!IsLikelyDisplayListOpcode(op)) return false;
+            if (op == 0xDF || op == 0xB8) return true; // G_ENDDL (EX2 / F3D)
+        }
+    }
     return false;
 }
 
@@ -392,10 +410,28 @@ struct ConversionStats {
     size_t firstBadDlFailureIndex = 0;
     uint8_t firstBadDlFailureOpcode = 0;
     uint8_t firstBadDlFailureReason = 0; // 1=zero limit, 2=invalid opcode, 3=no terminator
+
+    /* Every distinct resolved G_SETCOLORIMAGE host address seen while converting
+       this task's display list (deduped, capped). A single task frequently
+       redirects CIMG to an offscreen N64 framebuffer mid-task (the SETCIMG
+       "canvas" idiom in texture_utils.c's func_8007AB88/func_8007ABA4 and the
+       OBJECT_FRAMEBUFFER object type) and then restores it before the task
+       ends. The end-of-task mirror only ever inspected the FINAL color image,
+       so any framebuffer that was only a mid-task target never got mirrored to
+       CPU memory and stayed permanently invalid. Track every target here so
+       gdx_gfx_run can mirror all of them, not just the last one. */
+    std::array<uintptr_t, 8> colorImageTargets{};
+    size_t colorImageTargetCount = 0;
 };
 
 struct HostRange {
     uintptr_t begin = 0;
+    size_t size = 0;
+};
+
+struct N64AddressRange {
+    uint32_t n64Begin = 0;
+    uintptr_t hostBegin = 0;
     size_t size = 0;
 };
 
@@ -416,6 +452,7 @@ struct N64FramebufferInfo {
 std::vector<HostRange> gHostRanges;
 std::vector<HostRange> gRawN64Ranges;
 std::vector<HostRange> gHostN64CommandRanges;
+std::vector<N64AddressRange> gN64AddressRanges;
 std::vector<HostRange> gF3DAssetRanges;
 std::vector<HostRange> gNativeRgba16Ranges;
 std::vector<uint8_t> gSetupGfxSegment;
@@ -792,32 +829,31 @@ bool IsRdramHostPointer(uintptr_t full_addr) {
     return (full_addr >= base) && (full_addr < base + GDX_RDRAM_SIZE);
 }
 
-bool IsRawN64HostPointer(uintptr_t full_addr) {
-    if (IsRdramHostPointer(full_addr)) {
-        return true;
-    }
-
-    for (const HostRange& range : gRawN64Ranges) {
-        if ((range.begin == 0) || (range.size == 0)) {
-            continue;
-        }
-        if ((full_addr >= range.begin) && (full_addr < range.begin + range.size)) {
+/* These containment scans run for nearly every translated command/pointer,
+   over hundreds of registered ranges. Iterate via data()/size() — MSVC Debug
+   iterator checking on range-for made these loops a measurable per-frame
+   cost once menus/gameplay started resolving EK asset pointers. */
+static inline bool HostRangeListContains(const std::vector<HostRange>& list, uintptr_t full_addr) {
+    const HostRange* r = list.data();
+    const size_t n = list.size();
+    for (size_t i = 0; i < n; i++) {
+        if ((r[i].begin != 0) && (r[i].size != 0) &&
+            (full_addr >= r[i].begin) && (full_addr < r[i].begin + r[i].size)) {
             return true;
         }
     }
     return false;
 }
 
-bool IsHostN64CommandPointer(uintptr_t full_addr) {
-    for (const HostRange& range : gHostN64CommandRanges) {
-        if ((range.begin == 0) || (range.size == 0)) {
-            continue;
-        }
-        if ((full_addr >= range.begin) && (full_addr < range.begin + range.size)) {
-            return true;
-        }
+bool IsRawN64HostPointer(uintptr_t full_addr) {
+    if (IsRdramHostPointer(full_addr)) {
+        return true;
     }
-    return false;
+    return HostRangeListContains(gRawN64Ranges, full_addr);
+}
+
+bool IsHostN64CommandPointer(uintptr_t full_addr) {
+    return HostRangeListContains(gHostN64CommandRanges, full_addr);
 }
 
 bool IsF3DAssetPointer(uintptr_t full_addr) {
@@ -1350,6 +1386,38 @@ class N64DisplayListAdapter {
             return false;
         }
 
+        /*
+         * Disk-resident EK overlays retain their original N64 virtual or
+         * segmented pointers inside display lists. Their payloads live in
+         * generated host arrays, so resolve those explicit token ranges before
+         * the generic KSEG/segment heuristics. Reverse order lets the most
+         * recently registered overlay win if original overlay VRAM ranges
+         * overlap.
+         */
+        /* Raw-pointer reverse iteration: this runs per translated data pointer
+           over ~600 registered EK ranges; MSVC Debug checked iterators made it
+           a real per-frame cost (reverse order preserved: most recently
+           registered overlay wins on overlap). */
+        {
+            const N64AddressRange* ranges = gN64AddressRanges.data();
+            for (size_t ri = gN64AddressRanges.size(); ri > 0; ri--) {
+                const N64AddressRange& r = ranges[ri - 1];
+                if (raw < r.n64Begin) {
+                    continue;
+                }
+                const size_t offset = static_cast<size_t>(raw - r.n64Begin);
+                if (offset <= r.size && requiredBytes <= r.size - offset) {
+                    out.full = r.hostBegin + offset;
+                    out.segmented = (r.n64Begin >> 24) < kGfxSegmentCount;
+                    if (out.segmented) {
+                        out.segment = static_cast<uint8_t>(r.n64Begin >> 24);
+                        out.offset = raw & 0x00FFFFFFu;
+                    }
+                    return true;
+                }
+            }
+        }
+
         if (ResolvePortBssAlias(raw, out)) {
             return true;
         }
@@ -1477,20 +1545,28 @@ class N64DisplayListAdapter {
         const uint8_t encodedSegment = static_cast<uint8_t>(raw >> 24);
         const uint32_t encodedOffset = raw & 0x00FFFFFE;
 
-        /* K0_TO_PHYS() stores only the low 29 bits of host-built pointers in
-           commands such as G_MTX.  Extract the window helper early so it can
-           run either before or after the segment table depending on the caller.
-           Bounds + readability checks prevent small immediates from matching. */
-        constexpr uintptr_t kPhysicalAddressMask = 0x1FFFFFFFu;
+        /* K0_TO_PHYS()/OS_K0_TO_PHYSICAL() etc. used to store only the low 29
+           bits of host-built pointers in commands such as G_MTX. On PORT those
+           macros are now full passthroughs — (u32)(uintptr_t)(x) — so raw is
+           the complete unmasked low32 of the real host pointer (see
+           bugfix/os_convert_macro_corruption / bugfix/effects_regression_audit).
+           The window mask below must match that: reconstruct by taking the
+           high 32 bits from a known range and ORing in the full low32, the
+           same convention gdx_resolve_module_host_address() and the
+           mModuleBegin block below already use. Extract the window helper
+           early so it can run either before or after the segment table
+           depending on the caller. Bounds + readability checks prevent small
+           immediates from matching. */
+        constexpr uintptr_t kPhysicalAddressMask = 0xFFFFFFFFu;
         const auto tryPhysicalWindow = [&](uintptr_t begin, uintptr_t end) -> bool {
             if ((begin == 0) || (end <= begin)) {
                 return false;
             }
             uintptr_t full = (begin & ~kPhysicalAddressMask) | static_cast<uintptr_t>(raw);
             /*
-             * A host range can cross a 512 MB K0 physical-token window.
-             * In that case the token may belong to the next window even
-             * though the range begins in the previous one.
+             * A host range can cross a 4 GB low32 window (the full passthrough
+             * period). In that case the token may belong to the next window
+             * even though the range begins in the previous one.
              */
             if (full < begin) {
                 constexpr uintptr_t kPhysicalAddressWindow = kPhysicalAddressMask + 1u;
@@ -1509,7 +1585,6 @@ class N64DisplayListAdapter {
             return true;
         };
         const auto tryAllPhysicalWindows = [&]() -> bool {
-            if (raw > 0x1FFFFFFFu) return false;
             if (tryPhysicalWindow(mModuleBegin, mModuleEnd)) return true;
             for (const HostRange& range : gHostRanges) {
                 if ((range.begin == 0) || (range.size == 0) ||
@@ -1522,8 +1597,8 @@ class N64DisplayListAdapter {
         };
 
         /* A host-built display list and the matrices/vertices it references are
-         * almost always allocated together in the same 512 MB physical-token
-         * window (the GfxPool / task DL arena). When that arena is not a
+         * almost always allocated together in the same 4 GB low32 window
+         * (the GfxPool / task DL arena). When that arena is not a
          * registered host range, the reconstructions above miss and the pointer
          * would fall back to an identity matrix. Reconstruct the pointer from the
          * referencing DL's own window as a last resort, accepting it only when the
@@ -1533,7 +1608,7 @@ class N64DisplayListAdapter {
             // A/B escape hatch: GDX_DIAG_NO_SRCWIN=1 disables the source-window
             // matrix reconstruction so regressions can be bisected without a rebuild.
             static const bool sSrcWinDisabled = std::getenv("GDX_DIAG_NO_SRCWIN") != nullptr;
-            if (sSrcWinDisabled || (sourceHint == 0) || (raw > 0x1FFFFFFFu)) return false;
+            if (sSrcWinDisabled || (sourceHint == 0)) return false;
             uintptr_t full = (sourceHint & ~kPhysicalAddressMask) | static_cast<uintptr_t>(raw);
             const uintptr_t lo = (full < sourceHint) ? full : sourceHint;
             const uintptr_t hi = (full < sourceHint) ? sourceHint : full;
@@ -1546,10 +1621,10 @@ class N64DisplayListAdapter {
         };
 
         /* When the caller knows this raw value came from K0_TO_PHYS on a host
-           pointer (e.g., a G_MTX from host-built F3DEX2 code), try the 512MB
-           physical window BEFORE the segment table.  That prevents raw values
-           whose top byte matches an active segment index — e.g., 0x0805DAA0
-           matching segment 8 — from being misrouted. */
+           pointer (e.g., a G_MTX from host-built F3DEX2 code), try the full
+           low32 physical window BEFORE the segment table.  That prevents raw
+           values whose top byte matches an active segment index — e.g.,
+           0x0805DAA0 matching segment 8 — from being misrouted. */
         if (preferPhysical && (tryAllPhysicalWindows() || trySourceWindow())) {
             return true;
         }
@@ -2115,9 +2190,25 @@ class N64DisplayListAdapter {
             }
         }
 
+        /* Set while an unsupported microcode (e.g. L3DEX2, the line ucode Course
+           Edit loads for its track lines) is active: its commands have different
+           semantics, so running them through the F3DEX2 interpreter produces
+           garbage frames (the Course Edit flicker). Drop everything until the
+           display list loads a supported microcode again. */
+        bool skipUnsupportedUcode = false;
+
         for (size_t i = 0; i < item.limit; i++) {
             N64Gfx in = ReadCommand(item.source, i, stride, isBig);
             const uint8_t op = Opcode(in.w0);
+            /* Keep 0xDD (a ucode reload ends the skip) and ENDDL (0xDF EX2 /
+               0xB8 F3D — dropping the terminator would leave the translated
+               list unterminated and the interpreter would run off its end).
+               Deliberately NOT counted in skippedDataCommands: that counter
+               drives the per-frame [datafail] log line, and an intentional
+               line-ucode skip would spam it every Course Edit frame. */
+            if (skipUnsupportedUcode && op != 0xDD && op != 0xDF && op != 0xB8) {
+                continue;
+            }
             if (diagThisList && i < 24) {
                 gdx_port_logf("[setupdl]   #%02zu %08X %08X op=%02X\n", i, in.w0, in.w1, op);
             }
@@ -2188,6 +2279,18 @@ class N64DisplayListAdapter {
                 case kOpSetDepthImage:
                     outW1 = TranslateDataPointer(in.w1);
                     if (outW1 == 0) outW1 = MakeFramebufferToken(in.w1);
+                    if (op == kOpSetColorImage && outW1 != 0 && mStats != nullptr) {
+                        bool alreadySeen = false;
+                        for (size_t si = 0; si < mStats->colorImageTargetCount; si++) {
+                            if (mStats->colorImageTargets[si] == outW1) {
+                                alreadySeen = true;
+                                break;
+                            }
+                        }
+                        if (!alreadySeen && mStats->colorImageTargetCount < mStats->colorImageTargets.size()) {
+                            mStats->colorImageTargets[mStats->colorImageTargetCount++] = outW1;
+                        }
+                    }
                     break;
 
                 case kOpSetTextureImage:
@@ -2349,9 +2452,16 @@ class N64DisplayListAdapter {
                      * Libultraship can consume without treating the size as a
                      * UcodeHandlers enum.
                      */
-                    const auto matchesUcodeText = [raw = in.w1](const uint8_t* symbol) {
+                    /* The game emits this pointer through different VA->PA
+                       transforms (identity, & 0x1FFFFFFF, - 0x80000000)
+                       depending on the call site — and the symbols' truncated
+                       host addresses move every build. Compare within the
+                       512MB physical window so recognition is layout- and
+                       transform-independent (an exact-low32 match here once
+                       broke per-build: machine select lost every model). */
+                    const auto matchesUcodeText = [raw = in.w1](const void* symbol) {
                         const uint32_t symbolLow = Low32(reinterpret_cast<uintptr_t>(symbol));
-                        return raw == symbolLow || raw + 0x80000000u == symbolLow;
+                        return ((raw ^ symbolLow) & 0x1FFFFFFFu) == 0;
                     };
 
                     Fast::F3dex2Variant variant;
@@ -2359,11 +2469,33 @@ class N64DisplayListAdapter {
                         variant = Fast::F3dex2Variant::Standard;
                     } else if (matchesUcodeText(gspF3DLX2_Rej_fifoTextStart)) {
                         variant = Fast::F3dex2Variant::Reject;
+                    } else if (matchesUcodeText(gspF3DEX2_Rej_fifoTextStart)) {
+                        /* EK menus load plain F3DEX2.Rej (distinct from
+                           F3DLX2.Rej). Same reject-box semantics for the
+                           interpreter — without this arm the load was dropped
+                           and reject screening never engaged on those screens
+                           (log signature: ucode_unknown=1 every menu frame). */
+                        variant = Fast::F3dex2Variant::Reject;
                     } else if (matchesUcodeText(gspF3DFLX2_Rej_fifoTextStart)) {
                         variant = Fast::F3dex2Variant::FZeroFlxReject;
+                    } else if (matchesUcodeText(gspL3DEX2_fifoTextStart)) {
+                        /* L3DEX2 line microcode (Course Edit track lines): its
+                           command semantics have no interpreter support, and
+                           running them through F3DEX2 produced garbage frames
+                           (Course Edit flicker). Skip its section until a
+                           supported microcode is loaded again. */
+                        skipUnsupportedUcode = true;
+                        if (mStats != nullptr) {
+                            mStats->unknownUcodeSwitches++;
+                            if (mStats->firstUnknownUcodeRaw == 0) {
+                                mStats->firstUnknownUcodeRaw = in.w1;
+                            }
+                        }
+                        continue;
                     } else {
-                        // Unsupported physical microcodes (for example L3DEX2)
-                        // remain a no-op until their command semantics exist.
+                        /* Genuinely unrecognized load: drop only the load
+                           itself (never engage the skip — a false positive
+                           here would silently eat the rest of the frame). */
                         if (mStats != nullptr) {
                             mStats->unknownUcodeSwitches++;
                             if (mStats->firstUnknownUcodeRaw == 0) {
@@ -2372,6 +2504,7 @@ class N64DisplayListAdapter {
                         }
                         continue;
                     }
+                    skipUnsupportedUcode = false;
 
                     if (mStats != nullptr) {
                         mStats->ucodeSwitches++;
@@ -2639,6 +2772,32 @@ extern "C" void gdx_register_host_n64_command_range(void* ptr, size_t size) {
     gHostN64CommandRanges.push_back({ reinterpret_cast<uintptr_t>(ptr), size });
 }
 
+extern "C" void gdx_register_host_raw_n64_range(void* ptr, size_t size) {
+    if ((ptr == nullptr) || (size == 0)) return;
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr);
+    const auto duplicate = std::find_if(
+        gRawN64Ranges.begin(), gRawN64Ranges.end(),
+        [begin, size](const HostRange& range) {
+            return range.begin == begin && range.size == size;
+        });
+    if (duplicate == gRawN64Ranges.end()) {
+        gRawN64Ranges.push_back({ begin, size });
+    }
+}
+
+extern "C" void gdx_register_n64_address_range(unsigned int n64Begin, void* hostBegin, size_t size) {
+    if ((n64Begin == 0) || (hostBegin == nullptr) || (size == 0)) return;
+    const uintptr_t host = reinterpret_cast<uintptr_t>(hostBegin);
+    const auto duplicate = std::find_if(
+        gN64AddressRanges.begin(), gN64AddressRanges.end(),
+        [n64Begin, host, size](const N64AddressRange& range) {
+            return range.n64Begin == n64Begin && range.hostBegin == host && range.size == size;
+        });
+    if (duplicate == gN64AddressRanges.end()) {
+        gN64AddressRanges.push_back({ n64Begin, host, size });
+    }
+}
+
 extern "C" void gdx_register_n64_framebuffer(void* cpuAddr, unsigned int width, unsigned int height) {
     if (cpuAddr == nullptr || width == 0 || height == 0) {
         return;
@@ -2754,14 +2913,22 @@ extern "C" int gdx_load_venue_texture_segment(int venue) {
     // the venue texture segment, so assign it unconditionally.
     gSegments[0x0A] = base;
 
-    // Mark race rendering active for the interpreter-side diagnostics, which
-    // must ignore menu screens (they exhaust probe caps before any race).
-    {
-        gGdxRaceActive = 1;
-    }
+    // gGdxRaceActive is set by the caller for race modes (decomp_port.c
+    // Segment_LoadAssets) — this loader also runs for the course-select
+    // preview now, and menus must not flip the race-diagnostics gate.
 
-    gdx_port_logf("[segment] loaded venue=%d segment=10 base=%p symbol=%08X offset=%08X\n",
-                  venue, reinterpret_cast<void*>(base), symbol, offset);
+    // Segment_LoadAssets calls this every frame; log only on change so Debug
+    // builds don't pay a file write + flush per frame.
+    {
+        static int sLastVenue = -1;
+        static uintptr_t sLastBase = 0;
+        if (venue != sLastVenue || base != sLastBase) {
+            sLastVenue = venue;
+            sLastBase = base;
+            gdx_port_logf("[segment] loaded venue=%d segment=10 base=%p symbol=%08X offset=%08X\n",
+                          venue, reinterpret_cast<void*>(base), symbol, offset);
+        }
+    }
     return 1;
 }
 
@@ -3099,20 +3266,69 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
     }
     sLastGeometryTaskUcode = static_cast<int>(taskUcode);
 
-    const uintptr_t colorImage = reinterpret_cast<uintptr_t>(interp->mRdp->color_image_address);
-    auto framebuffer = std::find_if(gN64Framebuffers.begin(), gN64Framebuffers.end(),
-                                    [colorImage](const N64FramebufferInfo& info) {
-                                        return info.address == colorImage;
-                                    });
-    if (framebuffer != gN64Framebuffers.end()) {
+    /* Mirror every distinct N64 framebuffer that was targeted as CIMG anywhere
+       in this task, not just whatever CIMG happens to be set at the very end.
+       A single task's display list frequently redirects CIMG to an offscreen
+       framebuffer mid-task (the SETCIMG "canvas" idiom in texture_utils.c's
+       func_8007AB88/func_8007ABA4, driven by the OBJECT_FRAMEBUFFER object
+       type) and restores the normal display target before the task ends.
+       Checking only the final color_image_address silently dropped every such
+       mid-task target: it never became valid, so gdx_read_current_framebuffer
+       callers (transition captures / canvas composites) never saw real data
+       for it. stats.colorImageTargets was populated while converting this
+       task's display list (every resolved G_SETCOLORIMAGE, deduped); fold in
+       the interpreter's own final color image in case it was set by a path
+       the adapter didn't see, then mirror each match against gN64Framebuffers.
+       Only the buffer matching the task's FINAL color image updates
+       gLastRenderedFramebuffer — that flag distinguishes "the active display
+       target" (always re-read fresh) from other buffers holding frozen
+       snapshots (preserved as-is by gdx_read_current_framebuffer). */
+    const uintptr_t finalColorImage = reinterpret_cast<uintptr_t>(interp->mRdp->color_image_address);
+    bool finalColorImageTracked = false;
+    for (size_t ti = 0; ti < stats.colorImageTargetCount; ti++) {
+        if (stats.colorImageTargets[ti] == finalColorImage) {
+            finalColorImageTracked = true;
+            break;
+        }
+    }
+    if (!finalColorImageTracked && finalColorImage != 0 &&
+        stats.colorImageTargetCount < stats.colorImageTargets.size()) {
+        stats.colorImageTargets[stats.colorImageTargetCount++] = finalColorImage;
+    }
+
+    for (size_t ti = 0; ti < stats.colorImageTargetCount; ti++) {
+        const uintptr_t targetAddress = stats.colorImageTargets[ti];
+        auto framebuffer = std::find_if(gN64Framebuffers.begin(), gN64Framebuffers.end(),
+                                        [targetAddress](const N64FramebufferInfo& info) {
+                                            return info.address == targetAddress;
+                                        });
+        if (framebuffer == gN64Framebuffers.end()) {
+            continue;
+        }
         const int hostFramebuffer = interp->mRendersToFb ? interp->mGameFb : 0;
         interp->GetCurrentRenderingAPI()->ReadFramebufferToCPU(
             hostFramebuffer, framebuffer->width, framebuffer->height,
             reinterpret_cast<uint16_t*>(framebuffer->address));
         framebuffer->valid = true;
-        gLastRenderedFramebuffer = framebuffer->address;
-        RecordHostWrite(framebuffer->address,
-                        static_cast<size_t>(framebuffer->width) * framebuffer->height * sizeof(uint16_t));
+        const size_t mirroredBytes =
+            static_cast<size_t>(framebuffer->width) * framebuffer->height * sizeof(uint16_t);
+        RecordHostWrite(framebuffer->address, mirroredBytes);
+        const bool isFinalTarget = (targetAddress == finalColorImage);
+        if (isFinalTarget) {
+            gLastRenderedFramebuffer = framebuffer->address;
+        }
+
+        // One-shot-per-buffer diagnostic: confirms whether/when the mirror
+        // actually fires for each registered N64 framebuffer, and whether it
+        // was the task's final CIMG or a mid-task canvas target.
+        static bool sMirrorLogged[8] = {};
+        const size_t fbIndex = static_cast<size_t>(framebuffer - gN64Framebuffers.begin());
+        if (fbIndex < 8 && !sMirrorLogged[fbIndex]) {
+            sMirrorLogged[fbIndex] = true;
+            gdx_port_logf("[fbmirror] fired fb=%zu addr=%p bytes=%zu final=%d\n", fbIndex,
+                          reinterpret_cast<void*>(framebuffer->address), mirroredBytes,
+                          static_cast<int>(isFinalTarget));
+        }
     }
 }
 

@@ -99,8 +99,16 @@ list(FILTER GAME_SOURCES EXCLUDE REGEX "/sys/segment\\.c$")
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/libultra/os/virtualtophysical\\.c$")
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/libultra/os/physicaltovirtual\\.c$")
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/sys/cartridge_offsets\\.c$")
-list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ovl_i2/save\\.c$")        # ROM-DMA ghost loading
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ending/ending_effects\\.c$")
+
+# Save-system slice: ovl_i2/save.c (settings/records/cup-completion/single-slot ghost
+# checksums + Sram_Init/Sram_ReadWrite) now compiles for real. It no longer needs
+# excluding: Sram_Init/Sram_ReadWrite are PORT-ified inside save.c itself (mirrors the
+# Dma_RomCopy #ifdef PORT pattern in sys/dma.c) to read/write the host-backed SRAM
+# image in port/sram_buffer.cpp instead of doing N64 PI/DMA hardware access. The one
+# ROM-DMA-dependent piece (Save_LoadStaffGhostRecord, which copies staff ghost data
+# from the cart ROM via the still-unpopulated EK ROM segment table) stays stubbed
+# in-place — separate, not-yet-done slice.
 
 add_library(gdiffuser_game OBJECT ${GAME_SOURCES}
     "${CMAKE_CURRENT_SOURCE_DIR}/decomp_port.c"            # port subsystems (segment/save/pool)
@@ -151,10 +159,16 @@ add_executable(G-Diffuser
     main.cpp
     input_bridge.c
     n64_gfx_bridge.cpp
+    n64_audio_hle.c            # software (HLE) audio RSP interpreter -- executes the Acmd
+                                # command lists AudioSynth_Update builds (see n64_sched.c's
+                                # M_AUDTASK hook); host-side file, standard C, not part of
+                                # gdiffuser_game (no decomp headers needed -- see its own
+                                # header comment for why).
     shims.c
     AssetLoader.cpp
     resource/ResourceFactories.cpp
     rom_buffer.cpp
+    sram_buffer.cpp
     mio0_wrap.c
     "${CMAKE_CURRENT_SOURCE_DIR}/../torch/lib/libmio0/mio0.c"
     $<TARGET_OBJECTS:gdiffuser_game>)

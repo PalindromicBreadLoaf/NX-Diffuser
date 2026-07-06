@@ -49,3 +49,7 @@ openspec/
 
 # Personal docs — local only, not for the repo
 docs/
+
+# Session build/scratch artifacts
+build_x64/
+__pycache__/

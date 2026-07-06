@@ -37,13 +37,24 @@ tgt_param_form LEOtgt_param;
 LEOCmd* LEOcur_command = NULL;
 s32 LEO_country_code = 0;
 
+LEODiskID leoBootID = { 0 };
+
 void gdx_leo_on_disk_loaded(const unsigned char* disk) {
+    s32 offset;
     /* 64DD system area, byte 0x05: disk type (0-6) in the disk ID. */
     LEOdisk_type = disk[5] & 0xF;
     if (LEOdisk_type > 6) {
         LEOdisk_type = 0;
     }
+
+    /* __leoActive must be set before calling LeoLBAToByte */
     __leoActive = 1;
+
+    /* The N64 IPL normally populates leoBootID before the game boots.
+       Since we bypass the IPL, we must populate it here from the disk ID block (LBA 14). */
+    if (LeoLBAToByte(0, 14, &offset) == LEO_ERROR_GOOD) {
+        bcopy(disk + offset, &leoBootID, sizeof(LEODiskID));
+    }
 }
 
 /* Completion for async-shaped commands: work is done synchronously, so post
@@ -92,6 +103,15 @@ s32 LeoTestUnitReady(LEOStatus* status) {
     return (gdx_disk_buffer != NULL) ? LEO_ERROR_GOOD : LEO_ERROR_DRIVE_NOT_READY;
 }
 
+/* System-area size at the front of an SDK-format .ndd: the first 0x18 physical
+   LBAs (0..0x17) precede the user data, each a full zone-0 block (0x4D08). The
+   image is block-linear, so physical byte offset = system area + user-area
+   offset. Disk-type independent (vzone 0 -> pzone 0 -> 0x4D08 for every type).
+   Validated: 0x18*0x4D08 = 0x738C0, and LeoLBAToByte total + 0x738C0 == the
+   64,931,840-byte .ndd size exactly, with all DD course records landing on LBA
+   boundaries (see tools/scratchpad sdk_map). */
+#define GDX_NDD_SYSTEM_AREA_BYTES 0x738C0
+
 s32 LeoReadWrite(LEOCmd* cmdBlock, s32 direction, u32 LBA, void* buffer, u32 nLBAs, OSMesgQueue* mq) {
     s32 offset = 0;
     s32 bytes = 0;
@@ -99,10 +119,14 @@ s32 LeoReadWrite(LEOCmd* cmdBlock, s32 direction, u32 LBA, void* buffer, u32 nLB
     if (gdx_disk_buffer == NULL) {
         return LEO_ERROR_DRIVE_NOT_READY;
     }
+    /* LeoLBAToByte gives the LOGICAL user-area offset (data blocks only). The
+       SDK .ndd is a physical/block-linear image that also stores the system
+       area up front, so add it to land on the real file position. */
     if (LeoLBAToByte(0, LBA, &offset) != LEO_ERROR_GOOD ||
         LeoLBAToByte((s32)LBA, nLBAs, &bytes) != LEO_ERROR_GOOD) {
         return LEO_ERROR_LBA_OUT_OF_RANGE;
     }
+    offset += GDX_NDD_SYSTEM_AREA_BYTES;
     if ((u32)offset + (u32)bytes > gdx_disk_size) {
         return LEO_ERROR_LBA_OUT_OF_RANGE;
     }
@@ -137,10 +161,13 @@ s32 LeoSpdlMotor(LEOCmd* cmdBlock, LEOSpdlMode mode, OSMesgQueue* mq) {
 }
 
 s32 LeoReadDiskID(LEOCmd* cmdBlock, LEODiskID* vaddr, OSMesgQueue* mq) {
-    /* The game only sanity-checks gameName/gameVersion, which the EK code
-       tolerates as zeros when the manager reports the drive present. */
+    s32 offset = 0;
     if (vaddr != NULL) {
-        bzero(vaddr, sizeof(*vaddr));
+        if (gdx_disk_buffer != NULL && LeoLBAToByte(0, 14, &offset) == LEO_ERROR_GOOD) {
+            bcopy(gdx_disk_buffer + offset, vaddr, sizeof(*vaddr));
+        } else {
+            bzero(vaddr, sizeof(*vaddr));
+        }
     }
     LeoPostDone(cmdBlock, mq);
     return LEO_ERROR_GOOD;
@@ -170,10 +197,30 @@ s32 LeoInquiry(LEOVersion* ver) {
     return LEO_ERROR_GOOD;
 }
 
+extern const u16 LEORAM_START_LBA[7];
+extern const s32 LEORAM_BYTE[7];
+
 s32 LeoReadCapacity(LEOCapacity* cmdBlock, s32 dir) {
-    (void)dir;
+    /* Mirror decomp/src/leo/lib/readcapacity.c exactly. The writable-area
+       startLBA MUST include the -0x18 bias: MFS recovers the disk type by
+       matching startLBA against LEO_LBA_RAM_TOPn (= LEORAM_START_LBA[t] - 0x18)
+       and derives gDirectoryEntryCount from it. Dropping the bias makes
+       Mfs_RamGetDiskType() return 6 (invalid) and corrupts the directory-entry
+       count, overrunning gMfsRamArea.directoryEntry[] on the first menu that
+       touches saved data. */
+    if (!__leoActive) {
+        return LEO_ERROR_DRIVE_NOT_READY;
+    }
     if (cmdBlock != NULL) {
-        bzero(cmdBlock, sizeof(*cmdBlock));
+        if (dir == OS_WRITE) {
+            cmdBlock->startLBA = LEORAM_START_LBA[LEOdisk_type] - 0x18;
+            cmdBlock->endLBA = LEO_LBA_MAX;
+            cmdBlock->nbytes = LEORAM_BYTE[LEOdisk_type];
+        } else {
+            cmdBlock->startLBA = 0;
+            cmdBlock->endLBA = LEO_LBA_MAX;
+            cmdBlock->nbytes = 0x3D78F40; /* total capacity, ~64.45 MB */
+        }
     }
     return LEO_ERROR_GOOD;
 }
@@ -184,6 +231,83 @@ void LeoBootGame(void* entry) {
        making sure the disk image (and its asset fills) are loaded. */
     (void)entry;
     gdx_disk_load();
+}
+
+/* ---- Drive-ROM font address helpers -------------------------------------
+ * The decomp ships LeoGetKAdr/LeoGetAAdr only as incbin'd MIPS blobs, so these
+ * are C ports of the exact routines disassembled from the US rev0 ROM
+ * (leo overlay, text at ROM 0x80870 / 0x813B0). Both index tables live in the
+ * same overlay's data section and are read from the loaded ROM image:
+ *   kanji index table (s16): VRAM 0x80411850 -> ROM 0x80960 (0xA48 bytes)
+ *   ANK metrics table (4B):  VRAM 0x8041231C -> ROM 0x8142C (0x908 entries)
+ * Returned offsets are relative to the drive ROM's font block; callers add
+ * DDROM_FONT_START and read from the IPL ROM image (port/disk_buffer.cpp). */
+extern unsigned char* gdx_rom_buffer;
+extern size_t gdx_rom_size;
+
+#define GDX_ROM_KANJI_INDEX_TBL 0x80960u  /* s16[1316], codes 0x81xx-0x87xx */
+#define GDX_ROM_ANK_METRICS_TBL 0x8142Cu  /* 4 bytes per entry, 0x908 entries */
+
+static s16 gdx_rom_s16(u32 off) {
+    return (s16)((gdx_rom_buffer[off] << 8) | gdx_rom_buffer[off + 1]);
+}
+
+s32 LeoGetKAdr(s32 sjis) {
+    s32 row, cell;
+
+    if (sjis < 0x8140 || sjis >= 0x9873) {
+        return -1;
+    }
+    cell = (sjis & 0xFF) - 0x40;
+    if (cell >= 0x40) {
+        cell -= 1; /* the 0x7F column does not exist in shift-JIS */
+    }
+    if (sjis >= 0x8800) {
+        /* Kanji block: arithmetic mapping, 188 cells per row, appended after
+           the 0x30A glyphs of the symbol/kana block. */
+        row = (sjis >> 8) - 0x88;
+        return (cell + 0x30A + row * 0xBC) << 7;
+    }
+    /* Symbol/kana block (0x81xx-0x87xx): sparse, resolved via the ROM's
+       s16 glyph-index table. */
+    row = (sjis >> 8) - 0x81;
+    {
+        u32 tbl = GDX_ROM_KANJI_INDEX_TBL + (u32)(cell + row * 0xBC) * 2u;
+        if (gdx_rom_buffer == NULL || tbl + 2 > gdx_rom_size) {
+            return -1;
+        }
+        return (s32)gdx_rom_s16(tbl) << 7;
+    }
+}
+
+s32 LeoGetAAdr(s32 code, s32* dx, s32* dy, s32* cy) {
+    u32 entry;
+    u32 off;
+    u8 b2;
+    s8 b3;
+
+    if (code < 0 || code >= 0x908) {
+        return -1;
+    }
+    entry = GDX_ROM_ANK_METRICS_TBL + (u32)code * 4u;
+    if (gdx_rom_buffer == NULL || entry + 4 > gdx_rom_size) {
+        return -1;
+    }
+    off = ((u32)gdx_rom_buffer[entry] << 8) | gdx_rom_buffer[entry + 1];
+    b2 = gdx_rom_buffer[entry + 2];
+    b3 = (s8)gdx_rom_buffer[entry + 3];
+    /* MFS warm-up calls pass NULL metric pointers; the MIPS original stored
+       blindly (harmless on the N64 null page), so guard here. */
+    if (dy != NULL) {
+        *dy = (b2 & 0xF) + 1;
+    }
+    if (dx != NULL) {
+        *dx = (s32)(((u32)(b3 & 1) << 4) | ((u32)b2 >> 4));
+    }
+    if (cy != NULL) {
+        *cy = b3 >> 1;
+    }
+    return (s32)(off << 1) + 0x7EE80;
 }
 
 /* MFS version B work buffer — a fixed expansion-RAM address on hardware

@@ -22,6 +22,41 @@ unsigned char __libm_qnan_f[1];
    * 20x20 RGBA16. */
 unsigned char aPositionDigitTexs[0x4600];
 unsigned char aPositionOrdinalSuffixTexs[0xC80];
+/* Staff-ghost assets (staff_ghost_records ROM segment, 24 base courses x
+   record/replay-info/replay-data). save.c (compiled since the save slice)
+   references them by address in its course table. Zero-filled stubs are safe:
+   Save_LoadStaffGhostRecord is PORT-gated to return -1 ("no record"), so the
+   data is never consumed. TODO(ghost slice): bind from the Torch asset yaml
+   and re-enable staff ghosts. Sizes are generous placeholders. */
+#define GDX_STAFF_GHOST_STUB(name) \
+    unsigned char name##StaffGhostRecord[0x40]; \
+    unsigned char name##StaffGhostReplayInfo[0x40]; \
+    unsigned char name##StaffGhostData[0x2000];
+GDX_STAFF_GHOST_STUB(aMuteCity1)
+GDX_STAFF_GHOST_STUB(aSilence1)
+GDX_STAFF_GHOST_STUB(aSandOcean1)
+GDX_STAFF_GHOST_STUB(aDevilsForest1)
+GDX_STAFF_GHOST_STUB(aBigBlue1)
+GDX_STAFF_GHOST_STUB(aPortTown1)
+GDX_STAFF_GHOST_STUB(aSectorAlpha)
+GDX_STAFF_GHOST_STUB(aRedCanyon1)
+GDX_STAFF_GHOST_STUB(aDevilsForest2)
+GDX_STAFF_GHOST_STUB(aMuteCity2)
+GDX_STAFF_GHOST_STUB(aBigBlue2)
+GDX_STAFF_GHOST_STUB(aWhiteLand1)
+GDX_STAFF_GHOST_STUB(aFireField)
+GDX_STAFF_GHOST_STUB(aSilence2)
+GDX_STAFF_GHOST_STUB(aSectorBeta)
+GDX_STAFF_GHOST_STUB(aRedCanyon2)
+GDX_STAFF_GHOST_STUB(aWhiteLand2)
+GDX_STAFF_GHOST_STUB(aMuteCity3)
+GDX_STAFF_GHOST_STUB(aRainbowRoad)
+GDX_STAFF_GHOST_STUB(aDevilsForest3)
+GDX_STAFF_GHOST_STUB(aSpacePlant)
+GDX_STAFF_GHOST_STUB(aSandOcean2)
+GDX_STAFF_GHOST_STUB(aPortTown2)
+GDX_STAFF_GHOST_STUB(aBigHand)
+#undef GDX_STAFF_GHOST_STUB
 unsigned char boot_textures_ROM_START[1];
 unsigned char buffers_VRAM[1];
 unsigned char buffers_VRAM_END[1];
@@ -57,8 +92,8 @@ unsigned char framebuffer_unused_VRAM_END[1];
 unsigned char gActiveFireworks[1];
 unsigned char gArenaStartPtrs[1];
 unsigned char gMfsError[1];
-unsigned char gSettingSoundMode[1];
-void* gSramPiHandlePtr = NULL;    /* OSPiHandle* — null on host (no SRAM hardware) */
+/* gSettingSoundMode (s16) and gSramPiHandlePtr (OSPiHandle*) are real now:
+   decomp/src/overlays/ovl_i2/save.c (save-system slice). */
 unsigned char game_context_BSS_END[1];
 unsigned char game_context_BSS_START[1];
 unsigned char game_context_VRAM[1];
@@ -73,7 +108,6 @@ unsigned char gspF3DLX2_Rej_fifoDataStart[1];
 unsigned char gspF3DLX2_Rej_fifoTextStart[1];
 unsigned char hud_gfx_VRAM[1];
 unsigned char hud_gfx_VRAM_END[1];
-unsigned char leoBootID[1];
 unsigned char leo_BSS_END[1];
 unsigned char leo_BSS_START[1];
 unsigned char leo_ROM_END[1];
@@ -148,9 +182,14 @@ unsigned char unk_gfx_segment_VRAM_END[1];
 #ifndef EXPANSION_KIT /* real definition in leo/mfs (mfs_data.c) under EK */
 long D_i1_80428618() { return 0; }
 #endif
-const char D_i2_8010ADE0[] = { 'F', '-', 'Z', 'E', 'R', 'O', ' ', 'X' }; /* save file signature */
-long EndingCutsceneEffects_DrawFireworks() { return 0; }
-long EndingCutsceneEffects_DrawPodiumRacerCharacters() { return 0; }
+/* D_i2_8010ADE0 (save file "F-ZERO X" signature) is real now: save.c (save-system slice). */
+/* ending_effects.c is excluded from the build (static GBI lists need
+   port-aware pointer packing). These two are Gfx* fn(Gfx* gfx) builders whose
+   callers ASSIGN the return to their gfx cursor (ending.c / background.c:1079)
+   — returning 0 made the caller write through NULL (cup-finish crash).
+   Pass the cursor through unchanged: effects are skipped, list stays valid. */
+void* EndingCutsceneEffects_DrawFireworks(void* gfx) { return gfx; }
+void* EndingCutsceneEffects_DrawPodiumRacerCharacters(void* gfx) { return gfx; }
 long EndingCutsceneEffects_Init() { return 0; }
 long EndingCutsceneEffects_Update() { return 0; }
 /* With the Expansion Kit enabled these come from the real implementations:
@@ -174,21 +213,10 @@ long Mfs_SetGameCode() { return 0; }
 long LeoGetAAdr2() { return 0; }
 long LeoReset() { return 0; }
 long LeoResetClear() { return 0; }
-long Save_Init() { return 0; }
-long Save_InitGhost() { return 0; }
-long Save_Load() { return 0; }
-long Save_LoadGhost() { return 0; }
-long Save_LoadGhostInfo() { return 0; }
-long Save_SaveCourseRecordProfiles() { return 0; }
-long Save_SaveDeathRaceProfiles() { return 0; }
-long Save_SaveGhost() { return 0; }
-long Save_UpdateCharacterSave() { return 0; }
-long Save_UpdateCourseCharacterSave() { return 0; }
-long Save_UpdateCupCompletion() { return 0; }
-long Save_UpdateCupSave() { return 0; }
-long Segment_LoadOverlays() { return 0; }
-long Sram_Init() { return 0; }
-long Sram_ReadWrite() { return 0; }
+/* Save_Init/Save_InitGhost/Save_Load/Save_LoadGhost/Save_LoadGhostInfo/
+   Save_SaveCourseRecordProfiles/Save_SaveDeathRaceProfiles/Save_SaveGhost/
+   Save_UpdateCharacterSave/Save_UpdateCourseCharacterSave/Save_UpdateCupCompletion/
+   Save_UpdateCupSave/Sram_Init/Sram_ReadWrite are real now: save.c (save-system slice). */
 long _Printf() { return 0; }
 long __osExceptionPreamble() { return 0; }
 long __osGetSR() { return 0; }
@@ -204,8 +232,7 @@ long func_800AA6BC() { return 0; }
 long func_i1_8040428C() { return 0; }
 long func_i1_804046F0() { return 0; }
 #endif
-long func_i2_801017B8() { return 0; }
-long func_i2_801039BC() { return 0; }
+/* func_i2_801017B8/func_i2_801039BC are real now: save.c (save-system slice). */
 long guNormalize() { return 0; }
 // osDpGetStatus / osDpSetStatus defined in port/n64_sched.c (S3)
 long osGetIntMask() { return 0; }

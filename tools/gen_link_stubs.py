@@ -69,6 +69,22 @@ EXCLUDE = {
     "LeoTestUnitReady",
     # libultra globals the decomp uses as ARRAYS (must be real writable data, not function stubs).
     "osAppNMIBuffer",
+    # Save-system slice: decomp/src/overlays/ovl_i2/save.c is now compiled (real
+    # cart-SRAM save logic, host-backed via port/sram_buffer.cpp) — these are DEFINED
+    # by the decomp there, so they must not be stubbed (would be duplicate symbols).
+    "Save_Init", "Save_InitGhost", "Save_Load", "Save_LoadGhost", "Save_LoadGhostInfo",
+    "Save_SaveCourseRecordProfiles", "Save_SaveDeathRaceProfiles", "Save_SaveGhost",
+    "Save_UpdateCharacterSave", "Save_UpdateCourseCharacterSave", "Save_UpdateCupCompletion",
+    "Save_UpdateCupSave", "Sram_Init", "Sram_ReadWrite", "Save_LoadStaffGhostRecord",
+    "Save_SaveSettingsProfiles", "D_i2_8010ADE0", "gSettingSoundMode", "gSramPiHandlePtr",
+    "func_i2_801017B8", "func_i2_801039BC",
+    # EK save/ghost surface also defined for real in save.c now.
+    "Save_CalculateGhostRecordChecksum", "Save_CalculateSaveCourseRecordChecksum",
+    "Save_ClearCourseRecord", "Save_ClearGhostRecord", "Save_GetDDStaffGhostCompletion",
+    "Save_GetDDStaffGhostRecordTime", "Save_InitCourseRecord", "Save_LoadGhostData",
+    "Save_ReadGhostData", "Save_SaveGhostData", "Save_SaveGhostRecord",
+    "Save_SetDDStaffGhostComplete", "Save_WriteGhostData", "Save_WriteGhostRecord",
+    "sDDStaffGhostRecordTimes", "func_i2_800A8CE4", "D_i2_80111848",
 }
 
 syms = set()

@@ -287,11 +287,26 @@ void osSpTaskLoad(OSTask* tp) {
     (void) tp;
 }
 
+/* Software (HLE) audio RSP interpreter -- port/n64_audio_hle.c. Prototype uses plain "void
+   pointer" and "unsigned int" (not the decomp's Acmd/u64/u32 types), so this decomp-environment
+   TU doesn't need to expose the Acmd union to the host-side file: tp->t.data_ptr (a u64 pointer)
+   and tp->t.data_size (a u32) convert implicitly. See n64_audio_hle.c's header comment for why
+   the task's own data_ptr is NOT subject to the Acmd-word pointer-truncation hazard (only the
+   command payload is). */
+extern void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes);
+
 void osSpTaskStartGo(OSTask* tp) {
-    /* Only graphics tasks may be fed to the Fast3D interpreter. Audio RSP tasks
-       (M_AUDTASK) carry an ABI command list, not a GBI display list; running
-       them through gdx_gfx_run reads audio words as pointers and crashes. Ack
-       the task so the game's scheduler still advances, then return. */
+    /* Only graphics tasks may be fed to the Fast3D interpreter. Audio RSP tasks (M_AUDTASK)
+       carry an ABI command list, not a GBI display list; running them through gdx_gfx_run reads
+       audio words as pointers and crashes. Route audio tasks to the software audio HLE
+       interpreter instead; anything else (neither GFX nor AUDIO) is acked so the game's
+       scheduler still advances, then return. */
+    if (tp->t.type == M_AUDTASK) {
+        gdx_audio_hle_run(tp->t.data_ptr, tp->t.data_size);
+        osSendMesg(&gMainThreadMesgQueue, (OSMesg)(uintptr_t)EVENT_MESG_SP, OS_MESG_NOBLOCK);
+        osSendMesg(&D_800DCAC8, (OSMesg)(uintptr_t)0x2A, OS_MESG_NOBLOCK);
+        return;
+    }
     if (tp->t.type != M_GFXTASK) {
         gdx_port_logf("[sched] osSpTaskStartGo: non-gfx task type=%u ucode=%p — acked, not run\n",
                       (unsigned)tp->t.type, (void*)tp->t.ucode);

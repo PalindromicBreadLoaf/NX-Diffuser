@@ -48,7 +48,23 @@ static inline void gdx_port_write_log(const char* message) {
 
 static inline void gdx_port_vlogf(const char* fmt, va_list args) {
     char buffer[2048];
-    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    size_t prefixLen = 0;
+#ifdef _WIN32
+    /* Wall-clock prefix with millisecond precision so log lines can be
+       correlated with frame timing and external events. */
+    {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        int n = snprintf(buffer, sizeof(buffer),
+                         "[%04u-%02u-%02u %02u:%02u:%02u.%03u] ",
+                         st.wYear, st.wMonth, st.wDay,
+                         st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+        if (n > 0 && (size_t)n < sizeof(buffer)) {
+            prefixLen = (size_t)n;
+        }
+    }
+#endif
+    vsnprintf(buffer + prefixLen, sizeof(buffer) - prefixLen, fmt, args);
     buffer[sizeof(buffer) - 1] = '\0';
     gdx_port_write_log(buffer);
 }
