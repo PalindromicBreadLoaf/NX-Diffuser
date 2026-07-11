@@ -13,6 +13,7 @@
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <string.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -56,6 +57,63 @@ static void gdx_ensure_controller_connected(void) {
     }
 }
 
+/* Scripted input for headless/automated test runs: if gdx-autoinput.txt sits
+   next to the exe, each line is "<seconds_since_boot> <button>" (START, A, B,
+   UP, DOWN, LEFT, RIGHT). The named button is held for 0.25s starting at that
+   time. Real keyboard input still works and is OR'd on top. */
+static u16 gdx_autoinput_buttons(void) {
+#ifdef _WIN32
+    static int s_state = -1; /* -1 unread, 0 absent, 1 loaded */
+    static struct { double at; u16 btn; } s_events[64];
+    static int s_count = 0;
+    static ULONGLONG s_start = 0;
+
+    if (s_state == -1) {
+        FILE* f = fopen("gdx-autoinput.txt", "r");
+        s_state = 0;
+        if (f != NULL) {
+            char name[16];
+            double at;
+            while (s_count < 64 && fscanf(f, "%lf %15s", &at, name) == 2) {
+                u16 b = 0;
+                if (strcmp(name, "START") == 0) b = BTN_START;
+                else if (strcmp(name, "A") == 0) b = BTN_A;
+                else if (strcmp(name, "B") == 0) b = BTN_B;
+                else if (strcmp(name, "UP") == 0) b = BTN_UP;
+                else if (strcmp(name, "DOWN") == 0) b = BTN_DOWN;
+                else if (strcmp(name, "LEFT") == 0) b = BTN_LEFT;
+                else if (strcmp(name, "RIGHT") == 0) b = BTN_RIGHT;
+                if (b != 0) {
+                    s_events[s_count].at = at;
+                    s_events[s_count].btn = b;
+                    s_count++;
+                }
+            }
+            fclose(f);
+            s_state = 1;
+            s_start = GetTickCount64();
+            gdx_port_logf("[input] autoinput script loaded: %d events\n", s_count);
+        }
+    }
+    if (s_state != 1) {
+        return 0;
+    }
+    {
+        double now = (double) (GetTickCount64() - s_start) / 1000.0;
+        u16 buttons = 0;
+        int i;
+        for (i = 0; i < s_count; i++) {
+            if (now >= s_events[i].at && now < s_events[i].at + 0.25) {
+                buttons |= s_events[i].btn;
+            }
+        }
+        return buttons;
+    }
+#else
+    return 0;
+#endif
+}
+
 void gdx_controller_poll(void) {
     gdx_ensure_controller_connected();
 
@@ -64,6 +122,8 @@ void gdx_controller_poll(void) {
     s8 stick_x = 0;
     s8 stick_y = 0;
     u8 stick = 0;
+
+    buttons |= gdx_autoinput_buttons();
 
     if (gdx_key_down(VK_RETURN)) {
         buttons |= BTN_START;

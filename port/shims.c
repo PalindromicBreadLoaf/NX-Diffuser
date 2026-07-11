@@ -63,6 +63,7 @@ void bcopy(const void* src, void* dst, int n) { memmove(dst, src, (size_t)n); }
 // Host CRT wrappers for decomp-side code. The gdiffuser_game object target must not include
 // MSVC system headers, so it calls these wrappers instead of relying on implicit CRT prototypes.
 void* gdx_host_calloc(size_t count, size_t size) { return calloc(count, size); }
+void gdx_host_free(void* ptr) { free(ptr); }
 void  gdx_host_exit(int status) { exit(status); }
 void  gdx_host_abort(void) { abort(); }
 
@@ -71,13 +72,22 @@ void  gdx_host_abort(void) { abort(); }
 // The whole RDRAM buffer is registered once at startup in gdx_rdram_init() —
 // no per-allocation gdx_register_host_range call needed here.
 void* gdx_rdram_alloc_raw(size_t size, size_t align); // defined in decomp_port.c
+void* gdx_rdram_peek_raw(size_t size, size_t align);  // deep-audit H1: non-committing peek
+void  gdx_rdram_mode_reset(void);                     // deep-audit H1: per-mode arena rewind
 
+/* Deep-audit H1: honor console arena semantics. ALLOC_PEEK is transient
+   scratch (cursor not advanced; the next committed allocation may overwrite
+   it — exactly how the decomp's texture loader stages mio0 input). FRONT and
+   BACK both commit from the single bump region (the console's front/back
+   split is an optimization, not a semantic the callers depend on here). */
 void* Arena_Allocate(int allocationType, size_t size) {
-    (void)allocationType;
+    if (allocationType == 1 /* ALLOC_PEEK, sys.h */) {
+        return gdx_rdram_peek_raw(size, 16u);
+    }
     return gdx_rdram_alloc_raw(size, 16u);
 }
-void  Arena_StartInit(void)        {}
-void  Arena_DefaultStartInit(void) {}
+void  Arena_StartInit(void)        { gdx_rdram_mode_reset(); }
+void  Arena_DefaultStartInit(void) { gdx_rdram_mode_reset(); }
 void  Arena_EndInit(void)          {}
 
 // ---- N64 ROM-segment / audio-microcode symbols ------------------------------

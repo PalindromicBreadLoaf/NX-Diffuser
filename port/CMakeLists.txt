@@ -149,9 +149,13 @@ target_compile_definitions(gdiffuser_game PRIVATE
     ASSET_REVISION=rev0
 )
 
-# MSVC: suppress warnings from IDO-era C code (int<->pointer truncation, implicit decls).
+# MSVC: suppress warnings from IDO-era C code (int<->pointer truncation, implicit decls),
+# EXCEPT the ones that are undefined behavior on x64 and have caused real crashes:
+#   C4715/C4716 — non-void function falls off the end (the MIPS compiler left the
+#   return value in $v0 by accident; MSVC returns garbage — AudioHeap_AllocPermanent
+#   handed 0x18 to the audio loader as a buffer pointer).
 if(MSVC)
-    target_compile_options(gdiffuser_game PRIVATE /W0)
+    target_compile_options(gdiffuser_game PRIVATE /W0 /w14715 /w14716)
 endif()
 
 # Main executable.
@@ -159,11 +163,22 @@ add_executable(G-Diffuser
     main.cpp
     input_bridge.c
     n64_gfx_bridge.cpp
+    n64_gfx_convert.cpp        # G2: binary N64 (8-byte) -> wide 16-byte boundary
+                                # converter + cross-frame cache. Standalone C++
+                                # (no bridge/LUS/decomp deps); unit-tested by the
+                                # gdx_gfx_convert_tests target.
+    gdx_vi_convert.c            # RGBA5551->RGBA8888 conversion for the VI-scanout
+                                # fallback (gdx_vi_present_fallback). Standalone C,
+                                # unit-tested by the gdx_vi_fallback_tests target.
     n64_audio_hle.c            # software (HLE) audio RSP interpreter -- executes the Acmd
                                 # command lists AudioSynth_Update builds (see n64_sched.c's
                                 # M_AUDTASK hook); host-side file, standard C, not part of
                                 # gdiffuser_game (no decomp headers needed -- see its own
                                 # header comment for why).
+    gdx_audio_thread.cpp       # Phase 3: dedicated SoH-style std::thread that owns per-tick
+                                # audio production (replaces the cooperative-fiber-driven path
+                                # for silence-hole elimination). See its header comment for the
+                                # full cross-thread touchpoint enumeration and design notes.
     shims.c
     AssetLoader.cpp
     resource/ResourceFactories.cpp
@@ -183,6 +198,11 @@ endif()
 
 if(WIN32)
     set_target_properties(G-Diffuser PROPERTIES WIN32_EXECUTABLE TRUE)
+    # Graphics wave W4: emit a linker .map so crash RVAs and low32 data
+    # addresses in gdiffuser-run.log resolve to symbols without a debugger.
+    if(MSVC)
+        target_link_options(G-Diffuser PRIVATE "/MAP")
+    endif()
 endif()
 
 file(GLOB_RECURSE GDIFFUSER_F3D_SHADER_SOURCES CONFIGURE_DEPENDS
@@ -218,6 +238,68 @@ if(TARGET libultraship)
         "${CMAKE_SOURCE_DIR}/libultraship/src"
         "${CMAKE_SOURCE_DIR}/libultraship/include"
     )
+endif()
+
+# DSP unit-test harness: standalone console exe compiling n64_audio_hle.c UNMODIFIED alongside
+# port/tests/dsp_tests.c, which drives it entirely through its real public entry point
+# (gdx_audio_hle_run) with known Acmd command-vector tests (VADPCM decode/loop-restore/nibble-
+# unpack, resample unity/pitch-stepping/continuity, 8-tap FIR filter, envelope mixer). No game
+# objects, no libultraship, no decomp headers, no file/asset dependencies -- see dsp_tests.c's
+# header comment for the harness design (why a black-box approach through the public API was
+# chosen over extracting the DSP kernels or #include-ing the .c with a testing guard). Stand-in
+# definitions of the two gdx_resolve_*_host_address externs (normally in n64_gfx_bridge.cpp) live
+# in dsp_tests.c itself, so n64_gfx_bridge.cpp is not part of this target.
+add_executable(gdx_dsp_tests
+    tests/dsp_tests.c
+    n64_audio_hle.c)
+if(MSVC)
+    target_compile_options(gdx_dsp_tests PRIVATE /W3)
+endif()
+
+# VI-scanout fallback unit test: standalone console exe compiling gdx_vi_convert.c
+# UNMODIFIED alongside port/tests/test_vi_fallback.c, which drives the public
+# gdx_convert_rgba5551_to_rgba8888 entry point with known RGBA5551 pixel patterns
+# (pure/mid channels, alpha bit, multi-pixel buffer). No game objects, no
+# libultraship, no decomp headers -- runnable directly after a normal build.
+add_executable(gdx_vi_fallback_tests
+    tests/test_vi_fallback.c
+    gdx_vi_convert.c)
+if(MSVC)
+    target_compile_options(gdx_vi_fallback_tests PRIVATE /W3)
+endif()
+
+# Phase G1 wide-Gfx packing test: standalone console exe compiling ONLY the real
+# decomp gbi.h (header-only) with the same defines the game build uses, so the
+# gSP*/gDP* macros under test are exactly the ones the game emits. Verifies the
+# pointer-carrying w1 word holds a full 64-bit host pointer (no truncation) and
+# that a bridge-style reader (w0 @0, w1 @8, 16-byte stride) recovers it. No game
+# objects, no libultraship. See tests/gfx_pack_tests.c.
+add_executable(gdx_gfx_pack_tests tests/gfx_pack_tests.c)
+target_include_directories(gdx_gfx_pack_tests PRIVATE "${DECOMP}/include")
+target_compile_definitions(gdx_gfx_pack_tests PRIVATE
+    PORT=1
+    GDIFFUSER_PORT=1
+    F3DEX_GBI_2=1
+    _LANGUAGE_C=1
+    VERSION_US=1)
+if(MSVC)
+    target_compile_options(gdx_gfx_pack_tests PRIVATE /W3)
+endif()
+
+# Phase G2 binary-DL converter test: standalone console exe compiling the real
+# n64_gfx_convert.cpp UNMODIFIED alongside port/tests/gfx_convert_tests.cpp,
+# which drives its public API (ConvertList / ClassifyW1 / GfxWideCache) with
+# synthetic 8-byte N64 display lists: byteswapped big-endian streams, segmented
+# vs physical pointer ops, value ops, nested G_DL, and ENDDL. It verifies the
+# wide output word-by-word, the deterministic pointer policy, and the cache's
+# same-input-same-buffer + invalidation-drops-it behavior. No game objects, no
+# libultraship, no decomp headers -- runnable directly after a normal build.
+add_executable(gdx_gfx_convert_tests
+    tests/gfx_convert_tests.cpp
+    n64_gfx_convert.cpp)
+target_include_directories(gdx_gfx_convert_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+if(MSVC)
+    target_compile_options(gdx_gfx_convert_tests PRIVATE /W3)
 endif()
 
 # R1 resource smoke test: links libultraship ONLY (no game objects), so it builds and runs

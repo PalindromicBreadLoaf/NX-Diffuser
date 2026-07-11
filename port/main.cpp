@@ -6,6 +6,7 @@
 
 #include "ship/Context.h"
 #include "ship/resource/ResourceManager.h"
+#include "ship/audio/AudioPlayer.h"
 #include "resource/ResourceFactories.h"
 #include "GDiffuserControlDeck.h"
 #include "fast/Fast3dWindow.h"
@@ -13,6 +14,7 @@
 #include "ship/window/gui/GuiWindow.h"
 #include "port_log.h"
 #include "rom_buffer.h"
+#include "gdx_audio_thread.h"
 
 #include <chrono>
 #include <cstdio>
@@ -28,6 +30,7 @@ extern "C" void gdx_sched_init(void);          // R6: init cooperative fiber sch
 extern "C" void gdx_init_rom(int argc, char** argv); // S5: load ROM into host buffer
 extern "C" void gdx_vi_tick(void);             // R6: advance VI + post retrace (wakes Main thread)
 extern "C" void gdx_dispatch(void);            // R6: run game threads until quiescent
+extern "C" void gdx_vi_present_fallback(void); // VI-scanout fallback: present CPU-drawn framebuffers
 extern "C" void gdx_controller_poll(void);     // PORT: host keyboard -> decomp controller globals
 extern "C" void gdx_rdram_init(void);          // n64-rdram-buffer: allocate 8MB RDRAM before bootproc
 extern "C" void gdx_register_host_range(void* ptr, size_t size); // n64_gfx_bridge: expose range for TryResolveAddress
@@ -125,9 +128,27 @@ int main(int argc, char** argv) {
     logStep("construct Fast3dWindow(gui)");
     auto window = std::make_shared<Fast::Fast3dWindow>(gui);
     logStep("InitWindow");            ctx->InitWindow(window);
-    logStep("InitAudio");             ctx->InitAudio({});
+    logStep("InitAudio");
+    {
+        // Phase 3 (port/gdx_audio_thread.cpp): 4096 frames (~128ms) matches SoH's proven
+        // reservoir size (engram design/audio-pipeline-hm-ports) -- large enough for the
+        // dedicated audio thread's catch-up loop to ride out normal host scheduling jitter
+        // without libultraship/.../os.cpp's old osAiGetLength under-report cushion (removed
+        // for this path; see that file). Only matters once the dedicated thread is active —
+        // the legacy fiber path (GDX_AUDIO_THREAD=0) never reads DesiredBuffered.
+        Ship::AudioSettings audioSettings{};
+        audioSettings.DesiredBuffered = 4096;
+        ctx->InitAudio(audioSettings);
+    }
     logStep("InitEventSystem");       ctx->InitEventSystem();
     logStep("InitFileDropMgr");       ctx->InitFileDropMgr();
+
+    // Phase 3: resolve the GDX_AUDIO_THREAD kill switch and, if enabled (default), start the
+    // dedicated audio thread now. Safe this early -- it internally waits for
+    // gAudioContextInitialized (set once decomp's Audio_Init runs, well after bootproc() below)
+    // before producing anything.
+    logStep("gdx_audio_thread_start()");
+    gdx_audio_thread_start(argc, argv);
 
     logStep("RegisterResourceFactories");
     GDiffuser::RegisterResourceFactories(ctx->GetResourceManager()->GetResourceLoader());
@@ -186,13 +207,22 @@ int main(int argc, char** argv) {
         w->HandleEvents();
         gdx_controller_poll();
         gdx_vi_tick();   // advance VI framebuffer + post retrace -> wakes the Main scheduler thread
+        // Phase 3: wake the dedicated audio thread once per rendered frame (it also self-pumps
+        // every 5ms independently, so a lost/late notify here is not a correctness issue --
+        // see gdx_audio_thread.cpp). No-op when the kill switch reverts to the fiber path.
+        gdx_audio_thread_notify_frame();
         w->GetMouseStateManager()->StartFrame();
         w->GetGui()->StartDraw();
         w->StartFrame(); // must precede gdx_dispatch: Run() needs an initialized frame
         gdx_dispatch();  // run the decomp's game threads cooperatively until they block again
+        // VI-scanout fallback: if no GFX task rendered this frame (boot logo phase
+        // or any CPU-drawn screen), present the current VI framebuffer's pixels.
+        // Cheap no-op when a real frame was produced.
+        gdx_vi_present_fallback();
         w->GetGui()->EndDraw();
         w->EndFrame();
     }
     logStep("window closed; exiting");
+    gdx_audio_thread_stop();
     return 0;
 }

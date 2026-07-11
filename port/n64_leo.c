@@ -71,6 +71,27 @@ static void LeoPostDone(LEOCmd* cmdBlock, OSMesgQueue* mq) {
     }
 }
 
+/* Error completions must still post: sync callers (e.g. the audio loader's
+   AudioLoad_DiskDrive) issue the request and then osRecvMesg(BLOCK) without
+   checking the return value — an error return that never posts parks that
+   thread forever. Console code never hits these paths, the port can. */
+static void LeoPostError(LEOCmd* cmdBlock, OSMesgQueue* mq, s32 error, u32 lba, u32 nLBAs) {
+    extern void gdx_cki(const char* s, int v);
+    static int sLeoErrLogs = 0;
+    if (sLeoErrLogs < 12) {
+        sLeoErrLogs++;
+        gdx_cki("[leo] READ/WRITE ERROR code", error);
+        gdx_cki("[leo] READ/WRITE ERROR lba", (int)lba);
+        gdx_cki("[leo] READ/WRITE ERROR nLBAs", (int)nLBAs);
+    }
+    if (cmdBlock != NULL) {
+        cmdBlock->header.status = LEO_STATUS_CHECK_CONDITION;
+    }
+    if (mq != NULL) {
+        osSendMesg(mq, (OSMesg)(uintptr_t)error, OS_MESG_NOBLOCK);
+    }
+}
+
 u32 LeoDriveExist(void) {
     /* The EK boot probes the drive BEFORE creating any leo manager
        (sys_main.c: gLeoDriveConnectionState = LeoDriveExist()), so this is
@@ -117,6 +138,7 @@ s32 LeoReadWrite(LEOCmd* cmdBlock, s32 direction, u32 LBA, void* buffer, u32 nLB
     s32 bytes = 0;
 
     if (gdx_disk_buffer == NULL) {
+        LeoPostError(cmdBlock, mq, LEO_ERROR_DRIVE_NOT_READY, LBA, nLBAs);
         return LEO_ERROR_DRIVE_NOT_READY;
     }
     /* LeoLBAToByte gives the LOGICAL user-area offset (data blocks only). The
@@ -124,11 +146,18 @@ s32 LeoReadWrite(LEOCmd* cmdBlock, s32 direction, u32 LBA, void* buffer, u32 nLB
        area up front, so add it to land on the real file position. */
     if (LeoLBAToByte(0, LBA, &offset) != LEO_ERROR_GOOD ||
         LeoLBAToByte((s32)LBA, nLBAs, &bytes) != LEO_ERROR_GOOD) {
+        LeoPostError(cmdBlock, mq, LEO_ERROR_LBA_OUT_OF_RANGE, LBA, nLBAs);
         return LEO_ERROR_LBA_OUT_OF_RANGE;
     }
     offset += GDX_NDD_SYSTEM_AREA_BYTES;
     if ((u32)offset + (u32)bytes > gdx_disk_size) {
+        LeoPostError(cmdBlock, mq, LEO_ERROR_LBA_OUT_OF_RANGE, LBA, nLBAs);
         return LEO_ERROR_LBA_OUT_OF_RANGE;
+    }
+
+    if (buffer == NULL) {
+        LeoPostError(cmdBlock, mq, LEO_ERROR_MEDIUM_NOT_PRESENT, LBA, nLBAs);
+        return LEO_ERROR_MEDIUM_NOT_PRESENT;
     }
 
     if (direction == OS_READ) {

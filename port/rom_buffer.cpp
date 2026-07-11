@@ -16,6 +16,7 @@
 extern "C" {
 uint8_t* gdx_rom_buffer = nullptr;
 size_t   gdx_rom_size   = 0;
+char     gdx_rom_path[1024] = {};
 
 static FILE* open_file_utf8(const char* path) {
     FILE* f = nullptr;
@@ -32,14 +33,24 @@ static FILE* open_file_utf8(const char* path) {
 static void load_rom_from_file(FILE* f, const char* displayPath) {
     if (!f) return;
     fseek(f, 0, SEEK_END);
-    size_t sz = (size_t)ftell(f);
+    long szl = ftell(f);
     fseek(f, 0, SEEK_SET);
+    /* Deep-audit M2: a 0-byte (or unreadable) ROM previously "loaded"
+       successfully (malloc(0) + fread of 0 bytes), half-booting to a blank
+       screen past the null-buffer guard. Reject it here. */
+    if (szl <= 0) {
+        fclose(f);
+        return;
+    }
+    size_t sz = (size_t)szl;
     uint8_t* buf = (uint8_t*)malloc(sz);
     if (!buf) { fclose(f); return; }
     if (fread(buf, 1, sz, f) != sz) { free(buf); fclose(f); return; }
     fclose(f);
     gdx_rom_buffer = buf;
     gdx_rom_size   = sz;
+    strncpy(gdx_rom_path, displayPath, sizeof(gdx_rom_path) - 1);
+    gdx_rom_path[sizeof(gdx_rom_path) - 1] = '\0';
     gdx_port_logf("[rom] loaded %zu bytes from %s\n", sz, displayPath);
 }
 
@@ -137,10 +148,12 @@ void gdx_init_rom(int argc, char** argv) {
     // 2. For interactive/direct launches, ask first. This intentionally runs before
     // env/exe-dir fallbacks so a stale FZEROX_ROM or nearby baserom cannot silently
     // force the old ROM during renderer testing.
+    bool pickerCancelled = false;
 #ifdef _WIN32
     gdx_port_logf("[rom] no ROM argument provided; opening picker.\n");
     pick_rom_with_dialog();
     if (gdx_rom_buffer) return;
+    pickerCancelled = true;
 #endif
 
     // 3. Environment variable fallback for non-interactive/dev runs.
@@ -154,13 +167,40 @@ void gdx_init_rom(int argc, char** argv) {
 #else
     const char* env = getenv("FZEROX_ROM");
 #endif
-    if (env && env[0]) { load_rom(env); if (gdx_rom_buffer) return; }
+    if (env && env[0]) {
+        load_rom(env);
+        if (gdx_rom_buffer) {
+            if (pickerCancelled) {
+                gdx_port_logf("[rom] picker cancelled; falling back to %s (FZEROX_ROM)\n", gdx_rom_path);
+            }
+            return;
+        }
+    }
 
     // 4. Last convenience fallback for unattended builds from the output folder.
     load_rom_next_to_exe();
-    if (gdx_rom_buffer) return;
+    if (gdx_rom_buffer) {
+        if (pickerCancelled) {
+            gdx_port_logf("[rom] picker cancelled; falling back to %s\n", gdx_rom_path);
+        }
+        return;
+    }
 
-    gdx_port_logf("[rom] WARNING: no ROM file found. Set FZEROX_ROM env var, pass ROM path as argument, or select it in the picker.\n");
-    gdx_port_logf("[rom] Textures will be blank. Title screen will show solid colors.\n");
+    /* Without a ROM the game "runs" but every DMA read is blank — a confusing
+       half-boot. Require the ROM outright rather than continuing silently. */
+    if (pickerCancelled) {
+        gdx_port_logf("[rom] FATAL: picker cancelled and no fallback ROM found "
+                       "(FZEROX_ROM unset/invalid, no baserom next to the exe). Exiting.\n");
+    } else {
+        gdx_port_logf("[rom] FATAL: no ROM file found. Set FZEROX_ROM env var, pass ROM path as argument, or select it in the picker.\n");
+    }
+#ifdef _WIN32
+    MessageBoxW(nullptr,
+                L"G-Diffuser needs an F-Zero X (U) ROM to run.\n\n"
+                L"Select the ROM in the file picker, pass its path on the command line, "
+                L"or set the FZEROX_ROM environment variable.",
+                L"G-Diffuser - ROM required", MB_OK | MB_ICONERROR);
+#endif
+    exit(1);
 }
 } // extern "C"
