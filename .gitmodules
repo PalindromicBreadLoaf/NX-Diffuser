@@ -3,7 +3,7 @@
 	url = https://github.com/Zorkats/libultraship.git
 [submodule "torch"]
 	path = torch
-	url = https://github.com/HarbourMasters/Torch.git
+	url = https://github.com/Zorkats/Torch.git
 [submodule "decomp"]
 	path = decomp
 	url = https://github.com/Zorkats/fzerox.git
