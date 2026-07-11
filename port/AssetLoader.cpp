@@ -59,7 +59,14 @@ extern "C" int GDiffuser_LoadAssetBytes(const char* key, void* out, size_t outSi
         return 0;
     }
 
-    void* raw = resource->GetRawPointer();
+    /* Contract note (2026-07-10 delivery audit): LUS resource factories
+     * consume the 64-byte OTR header (ResourceLoader.cpp BufferOffset) and
+     * the per-type sub-header BEFORE the resource is handed back --
+     * GetRawPointer()/GetPointerSize() are already payload-only (e.g.
+     * TextureFactory sets ImageData = buffer + 0x50). Never re-strip here:
+     * an earlier "OTEX strip" at this spot operated on a disproven model and
+     * was a latent truncation hazard for payloads with coincidental magic. */
+    const unsigned char* raw = static_cast<const unsigned char*>(resource->GetRawPointer());
     const size_t rawSize = resource->GetPointerSize();
     if ((raw == nullptr) || (rawSize == 0) || (rawSize > outSize)) {
         return 0;
