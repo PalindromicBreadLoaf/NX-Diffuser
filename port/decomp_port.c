@@ -37,11 +37,16 @@ extern unk_80128C94* D_80128C94;
 // All N64 physical addresses resolve to gdx_rdram + phys.
 // gdx_gfxpool: pointer to the GfxPool D_1000000 object (alias, not RDRAM-resident).
 // gdx_rdram_bump: byte offset of the next free arena byte (carves upward).
-// gdx_rdram_arena_start: first arena byte after the GfxPool reservation.
+// gdx_rdram_arena_start: first arena byte after the GfxPool reservation AND the
+//   dedicated ALLOC_PEEK staging block (see gdx_rdram_staging_base below).
+// gdx_rdram_staging_base: byte offset of the fixed GDX_RDRAM_STAGING_SIZE block
+//   reserved for gdx_rdram_peek_raw, carved between the GfxPool and the arena.
 
 unsigned char* gdx_rdram          = NULL;
 static size_t  gdx_rdram_bump     = 0;
 size_t         gdx_rdram_arena_start = 0;
+static size_t  gdx_rdram_persist_top = 0;
+static size_t  gdx_rdram_staging_base = 0;
 GfxPool*       gdx_gfxpool        = NULL;
 
 static size_t Gdx_RomOffset(u32 addr) {
@@ -62,10 +67,15 @@ void gdx_rdram_init(void) {
         gdx_host_exit(1);
     }
 
-    // Arena starts after the GfxPool reservation, 16-byte aligned.
-    gdx_rdram_arena_start = GDX_RDRAM_GFXPOOL_OFFSET +
-                            ((sizeof(GfxPool) + 15u) & ~(size_t)15u);
-    gdx_rdram_bump        = gdx_rdram_arena_start;
+    // Staging block starts right after the GfxPool reservation, 16-byte aligned.
+    // The arena then starts after the staging block, so ALLOC_FRONT/BACK commits
+    // (gdx_rdram_alloc_raw) can never bump into the staging bytes that a live
+    // ALLOC_PEEK (gdx_rdram_peek_raw) is using.
+    gdx_rdram_staging_base = GDX_RDRAM_GFXPOOL_OFFSET +
+                             ((sizeof(GfxPool) + 15u) & ~(size_t)15u);
+    gdx_rdram_arena_start  = gdx_rdram_staging_base + GDX_RDRAM_STAGING_SIZE;
+    gdx_rdram_bump         = gdx_rdram_arena_start;
+    gdx_rdram_persist_top  = GDX_RDRAM_SIZE;
 
     // D_1000000 is a linker-symbol BSS global; point gdx_gfxpool at it.
     // The GfxPool stays as a host BSS allocation so all extern GfxPool D_1000000
@@ -81,6 +91,8 @@ void gdx_rdram_init(void) {
         extern void gdx_cki(const char*, int);
         extern void gdx_ckp(const char*, void*);
         gdx_ckp("[rdram] base", (void*)gdx_rdram);
+        gdx_cki("[rdram] staging_base", (int)gdx_rdram_staging_base);
+        gdx_cki("[rdram] staging_size", (int)GDX_RDRAM_STAGING_SIZE);
         gdx_cki("[rdram] arena_start", (int)gdx_rdram_arena_start);
         gdx_cki("[rdram] sizeof GfxPool", (int)sizeof(GfxPool));
     }
@@ -90,12 +102,109 @@ void gdx_rdram_init(void) {
 
 void* gdx_rdram_alloc_raw(size_t size, size_t align) {
     size_t base = (gdx_rdram_bump + (align - 1u)) & ~(align - 1u);
-    if (base + size > GDX_RDRAM_SIZE) {
+    if (base + size > gdx_rdram_persist_top) {
         gdx_ck("[rdram] FATAL: arena exhausted");
         gdx_host_abort();
     }
     gdx_rdram_bump = base + size;
     return gdx_rdram + base;
+}
+
+/* Persistent allocations bump DOWN from the top of RDRAM toward the mode
+   arena. gdx_rdram_mode_reset never touches this region, so it survives
+   every game-mode rewind. Used for data whose lifetime is the whole session
+   (audio soundfont conversions: gAudioCtx.soundFontList keeps pointers into
+   these across mode transitions). The two regions grow toward each other;
+   exhaustion only when they actually meet. */
+void* gdx_rdram_persist_alloc_raw(size_t size, size_t align) {
+    size_t base;
+    if (size > gdx_rdram_persist_top) {
+        gdx_ck("[rdram] FATAL: arena exhausted (persist)");
+        gdx_host_abort();
+    }
+    base = (gdx_rdram_persist_top - size) & ~(align - 1u);
+    if (base < gdx_rdram_bump) {
+        gdx_ck("[rdram] FATAL: arena exhausted (persist)");
+        gdx_host_abort();
+    }
+    gdx_rdram_persist_top = base;
+    return gdx_rdram + base;
+}
+
+/* Deep-audit H1: ALLOC_PEEK on console returns the arena cursor WITHOUT
+   advancing it (transient scratch, overwritten by the next real allocation).
+   The bump shim previously served peeks straight from the mode arena cursor
+   (gdx_rdram_bump). That is a race: the texture loader (object.c cases
+   17/18/20/21) peeks a staging buffer, DMAs MIO0-compressed data into it, then
+   calls mio0Decode, which cooperatively yields every 4096 output bytes
+   (torch/lib/libmio0/mio0.c). During a yield any other fiber committing via
+   Arena_Allocate(ALLOC_FRONT/BACK) bumps gdx_rdram_bump forward from exactly
+   where the peek sits, and the next commit can land on top of the live
+   compressed source mid-decode.
+   Fix: peeks are now served from a dedicated GDX_RDRAM_STAGING_SIZE block
+   (gdx_rdram_staging_base..+GDX_RDRAM_STAGING_SIZE) that sits BEFORE
+   gdx_rdram_arena_start and is never touched by gdx_rdram_alloc_raw or
+   gdx_rdram_persist_alloc_raw. FRONT/BACK commits physically cannot reach it.
+
+   INVARIANT: every peek is served from the SAME base offset within the
+   staging block (no bump, no accumulation across calls) — this mirrors
+   console PEEK semantics, where the next commit (or the next peek) may
+   overwrite a previous peek's contents. This is only correct if at most one
+   peek is ever "live" (allocated but not yet fully consumed) at a time.
+   Verified against every compiled ALLOC_PEEK call site (decomp/src/game/object.c,
+   decomp/src/overlays/ovl_i10/1459A0.c — decomp/src/sys/segment.c is excluded
+   from the PORT build, see port/CMakeLists.txt): each texture load does at
+   most one FRONT commit, then ONE peek that is either consumed synchronously
+   (header parse, e.g. object.c's func_800AA6BC on an 8-byte peek) before the
+   next peek call, or handed once to mio0Decode and not touched again until
+   the following iteration's peek. The save-load peek in 1459A0.c is consumed
+   synchronously via Sram_ReadWrite with no yield. No caller holds two live
+   peeks concurrently, so serving every peek at the block base is safe. */
+void* gdx_rdram_peek_raw(size_t size, size_t align) {
+    size_t base;
+
+    if (size <= GDX_RDRAM_STAGING_SIZE) {
+        base = (gdx_rdram_staging_base + (align - 1u)) & ~(align - 1u);
+        return gdx_rdram + base;
+    }
+
+    // Oversized peek (bigger than the dedicated staging block): fall back to
+    // the old cursor behavior. Still racy against a concurrent FRONT/BACK
+    // commit landing at gdx_rdram_bump, but this path should never be hit by
+    // any known compiled caller (see census above) — log once per distinct
+    // size so a regression or new caller is visible without spamming.
+    {
+        extern void gdx_cki(const char*, int);
+        static size_t gdx_rdram_peek_overflow_last = (size_t)-1;
+        if (size != gdx_rdram_peek_overflow_last) {
+            gdx_rdram_peek_overflow_last = size;
+            gdx_ck("[rdram] WARN: peek exceeds staging block");
+            gdx_cki("[rdram] WARN peek size", (int)size);
+        }
+    }
+
+    base = (gdx_rdram_bump + (align - 1u)) & ~(align - 1u);
+    if (base + size > gdx_rdram_persist_top) {
+        gdx_ck("[rdram] FATAL: arena exhausted (peek)");
+        gdx_host_abort();
+    }
+    return gdx_rdram + base;
+}
+
+/* Deep-audit H1: console Arena_StartInit resets the arena at every game-mode
+   transition; the port shim was a no-op, leaking all mode-scoped allocations.
+   The first StartInit call captures the post-boot cursor as the baseline
+   (protecting boot-time persistent carve-outs made before any mode starts);
+   later calls rewind to it. */
+static size_t gdx_rdram_mode_baseline = 0;
+static int gdx_rdram_baseline_set = 0;
+void gdx_rdram_mode_reset(void) {
+    if (!gdx_rdram_baseline_set) {
+        gdx_rdram_baseline_set = 1;
+        gdx_rdram_mode_baseline = gdx_rdram_bump;
+        return;
+    }
+    gdx_rdram_bump = gdx_rdram_mode_baseline;
 }
 
 // ---- Physical <-> Virtual address translation (PORT) -----------------------
@@ -273,6 +382,10 @@ uintptr_t Segment_SegmentedToVirtual(uintptr_t segmentedAddr) {
 }
 
 uintptr_t Segment_SetPhysicalAddress(s32 segment, uintptr_t addr) {
+    /* Deep-audit M3: defensive bounds — gSegments has 16 slots. */
+    if ((unsigned)segment >= 16u) {
+        return addr;
+    }
     void* resolved = Gdx_ResolvePortAddress(addr);
     gSegments[segment] = (unsigned long long)resolved;
     gdx_seg_log("SetPhys", segment, addr, resolved);
@@ -280,7 +393,12 @@ uintptr_t Segment_SetPhysicalAddress(s32 segment, uintptr_t addr) {
 }
 
 uintptr_t Segment_SetAddress(s32 segment, uintptr_t addr) {
-    void* resolved = Gdx_ResolvePortAddress(addr);
+    void* resolved;
+    /* Deep-audit M3: defensive bounds — gSegments has 16 slots. */
+    if ((unsigned)segment >= 16u) {
+        return addr;
+    }
+    resolved = Gdx_ResolvePortAddress(addr);
     gSegments[segment] = (unsigned long long)resolved;
     gdx_seg_log("SetAddr", segment, addr, resolved);
     return addr;
@@ -329,10 +447,150 @@ void Segment_LoadAssets(void) {
 }
 
 /*
- * The original Segment_LoadOverlays() also prepared per-mode graphics memory.
- * Most overlays are statically linked on PORT, but Course Edit still requires
- * its two alternating segment-6 work buffers.
+ * The original Segment_LoadOverlays() also prepared per-mode graphics memory:
+ * its tail runs Segment_SetupSegment4/7/9/10/5 and the Segment_LoadSegment*
+ * content DMAs (decomp/src/sys/segment.c, excluded from the port build).
+ * Dropping that chain left segments 4 and 7 permanently unset -- every element
+ * drawn through them (countdown faces, start arc, race HUD overlays via
+ * hud_gfx on segment 4; machine-part graphics via machine_global_gfx on
+ * segment 7; create_machine_textures in Create Machine) was missing or read a
+ * garbage base. The buffers are carved in sys_gfx.c's PORT block
+ * (gSegment1B8550 = segment 4, gSegment1E23F0 = segment 7); this fills them
+ * from the ROM image and points the segment table at them, mirroring the
+ * console per-mode switch. Loads are synchronous -- Dma_LoadAssets is a
+ * memcpy from gdx_rom_buffer on the port, so the console's async split is
+ * unnecessary.
  */
+extern uintptr_t gSegment1B8550VramStart;
+extern uintptr_t gSegment1E23F0VramStart;
+
+/* Deep-audit / Phase 4 hitch fix: gSegment1B8550 (seg4) and gSegment1E23F0 (seg7) are two FIXED
+   host buffers reused across every mode transition -- only their CONTENT rotates among a small,
+   fixed set of ROM assets (hud_gfx/create_machine_textures for seg4; machine_global_gfx/
+   expansion_kit_textures_beta for seg7). Profiling (`[transition] GMI_A..GMI_B (Controller_Reset +
+   Segment_LoadOverlays) took 131.02ms`, vs. 5-20ms for every other mode-change step) traced to
+   Dma_LoadAssets's cooperative yield (decomp/src/sys/dma.c, every 32KB) round-tripping through a
+   full vsync-locked host frame each time it fires (port/n64_sched.c's gdx_yield ->
+   SwitchToFiber(sHostFiber) -> main.cpp's frame loop presents before control returns). A few
+   hundred KB reload costs ~8 frames at ~16.6ms == the measured 131ms, even though the bytes being
+   copied are frequently IDENTICAL to what is already resident (e.g. race -> race retry, or any
+   race-class mode -> another race-class mode all load the exact same hud_gfx/machine_global_gfx).
+   Skipping the DMA when the requested variant already matches what's resident in the buffer is
+   behaviourally identical (same buffer, same bytes) and collapses same-variant transitions to the
+   cheap Segment_SetAddress-only path the `default:` case already took. */
+typedef enum { GDX_SEG4_CONTENT_NONE, GDX_SEG4_CONTENT_HUD_GFX, GDX_SEG4_CONTENT_CREATE_MACHINE } GdxSeg4Content;
+typedef enum { GDX_SEG7_CONTENT_NONE, GDX_SEG7_CONTENT_MACHINE_GLOBAL, GDX_SEG7_CONTENT_EK_TEXTURES } GdxSeg7Content;
+static GdxSeg4Content sGdxSeg4Resident = GDX_SEG4_CONTENT_NONE;
+static GdxSeg7Content sGdxSeg7Resident = GDX_SEG7_CONTENT_NONE;
+
+/* Carve byte-order pass (2026-07-11, served-copy family): the carves these
+   loaders fill are what gSegments[4]/[7] serve at draw time, but only the
+   bridge's separate heap images ever received the generated fixups. Seg-8's
+   identical fix put the start arc and Nintex boards on screen; the same
+   disease here left the pause-menu TLUT-setup DL (seg-4 carve, BE garbage ->
+   palette mode never enabled -> striped text) and the countdown faces / arc
+   screens (seg-7 machine_global DLs) broken. Texture regions are not in the
+   fixup tables, so already-working texture consumers are unaffected; calls
+   with images that have no fixup entries (create_machine, EK textures) are
+   no-ops by construction. */
+extern void gdx_fixup_asset_segment_image(unsigned char segment, unsigned int rom_base,
+                                          unsigned char* data, unsigned int size);
+
+static void gdx_load_seg4_if_needed(GdxSeg4Content want, unsigned char* romStart, size_t size,
+                                     const char* label) {
+    if (sGdxSeg4Resident != want) {
+        Dma_LoadAssets(romStart, osPhysicalToVirtual(gSegment1B8550VramStart), size);
+        gdx_fixup_asset_segment_image(0x04u,
+                                      (want == GDX_SEG4_CONTENT_HUD_GFX)
+                                          ? (unsigned int) PORT_hud_gfx_ROM_START
+                                          : (unsigned int) PORT_create_machine_textures_ROM_START,
+                                      (unsigned char*) osPhysicalToVirtual(gSegment1B8550VramStart),
+                                      (unsigned int) size);
+        sGdxSeg4Resident = want;
+        gdx_ck(label); // "[transition] seg4 reload: <variant>"
+    } else {
+        gdx_ck("[transition] seg4 reload skipped (already resident)");
+    }
+    Segment_SetAddress(4, gSegment1B8550VramStart);
+}
+
+static void gdx_load_seg7_if_needed(GdxSeg7Content want, unsigned char* romStart, size_t size,
+                                     const char* label) {
+    if (sGdxSeg7Resident != want) {
+        Dma_LoadAssets(romStart, osPhysicalToVirtual(gSegment1E23F0VramStart), size);
+        gdx_fixup_asset_segment_image(0x07u,
+                                      (want == GDX_SEG7_CONTENT_MACHINE_GLOBAL)
+                                          ? (unsigned int) PORT_machine_global_gfx_ROM_START
+                                          : (unsigned int) PORT_expansion_kit_textures_beta_ROM_START,
+                                      (unsigned char*) osPhysicalToVirtual(gSegment1E23F0VramStart),
+                                      (unsigned int) size);
+        sGdxSeg7Resident = want;
+        gdx_ck(label); // "[transition] seg7 reload: <variant>"
+    } else {
+        gdx_ck("[transition] seg7 reload skipped (already resident)");
+    }
+    Segment_SetAddress(7, gSegment1E23F0VramStart);
+}
+
+static void gdx_load_mode_segments(void) {
+    extern void gdx_cki(const char*, int);
+    size_t hudSize = (size_t)(PORT_hud_gfx_ROM_END - PORT_hud_gfx_ROM_START);
+    size_t createMachineSize =
+        (size_t)(PORT_create_machine_textures_ROM_END - PORT_create_machine_textures_ROM_START);
+    size_t machineGlobalSize =
+        (size_t)(PORT_machine_global_gfx_ROM_END - PORT_machine_global_gfx_ROM_START);
+    size_t ekTexturesSize =
+        (size_t)(PORT_expansion_kit_textures_beta_ROM_END - PORT_expansion_kit_textures_beta_ROM_START);
+    size_t seg7EkSize = (ekTexturesSize <= machineGlobalSize) ? ekTexturesSize : machineGlobalSize;
+    static int sModeSegLogs = 0;
+
+    switch (GET_MODE(gGameMode)) {
+        case GAMEMODE_GP_RACE:
+        case GAMEMODE_PRACTICE:
+        case GAMEMODE_VS_2P:
+        case GAMEMODE_VS_3P:
+        case GAMEMODE_VS_4P:
+        case GAMEMODE_TIME_ATTACK:
+        case GAMEMODE_GP_END_CS:
+        case GAMEMODE_DEATH_RACE:
+            /* Races: hud_gfx on segment 4, machine_global_gfx on segment 7. */
+            gdx_load_seg4_if_needed(GDX_SEG4_CONTENT_HUD_GFX, SEGMENT_ROM_START(hud_gfx), hudSize,
+                                     "[transition] seg4 reload: hud_gfx");
+            gdx_load_seg7_if_needed(GDX_SEG7_CONTENT_MACHINE_GLOBAL, SEGMENT_ROM_START(machine_global_gfx),
+                                     machineGlobalSize, "[transition] seg7 reload: machine_global_gfx");
+            break;
+
+        case GAMEMODE_CREATE_MACHINE:
+            /* Create Machine: its texture bank replaces hud_gfx on segment 4;
+               segment 7 carries the EK texture set. */
+            gdx_load_seg4_if_needed(GDX_SEG4_CONTENT_CREATE_MACHINE, SEGMENT_ROM_START(create_machine_textures),
+                                     createMachineSize, "[transition] seg4 reload: create_machine_textures");
+            gdx_load_seg7_if_needed(GDX_SEG7_CONTENT_EK_TEXTURES, SEGMENT_ROM_START(expansion_kit_textures_beta),
+                                     seg7EkSize, "[transition] seg7 reload: expansion_kit_textures_beta");
+            break;
+
+        case GAMEMODE_COURSE_EDIT:
+            /* Course Edit (EK): hud_gfx on segment 4, EK textures on 7. */
+            gdx_load_seg4_if_needed(GDX_SEG4_CONTENT_HUD_GFX, SEGMENT_ROM_START(hud_gfx), hudSize,
+                                     "[transition] seg4 reload: hud_gfx");
+            gdx_load_seg7_if_needed(GDX_SEG7_CONTENT_EK_TEXTURES, SEGMENT_ROM_START(expansion_kit_textures_beta),
+                                     seg7EkSize, "[transition] seg7 reload: expansion_kit_textures_beta");
+            break;
+
+        default:
+            /* Console behavior for menus/records/machine-select: segment 4
+               keeps pointing at the existing buffer (contents persist from
+               the previous mode). */
+            Segment_SetAddress(4, gSegment1B8550VramStart);
+            break;
+    }
+
+    if (sModeSegLogs < 12) {
+        sModeSegLogs++;
+        gdx_cki("[segment] mode segments loaded for gameMode", (int)GET_MODE(gGameMode));
+    }
+}
+
 void Segment_LoadOverlays(void) {
 #ifdef EXPANSION_KIT
     if (GET_MODE(gGameMode) == GAMEMODE_COURSE_EDIT) {
@@ -353,6 +611,7 @@ void Segment_LoadOverlays(void) {
         }
     }
 #endif
+    gdx_load_mode_segments();
 }
 
 // ---- Save system -------------------------------------------------------------

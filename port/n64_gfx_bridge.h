@@ -18,6 +18,14 @@ void gdx_register_n64_framebuffer(void* cpuAddr, unsigned int width, unsigned in
 void gdx_vi_set_next_framebuffer(void* cpuAddr);
 void gdx_vi_set_current_framebuffer(void* cpuAddr);
 
+/* VI-scanout fallback (host-side). Call once per host frame AFTER the game
+ * threads have been dispatched and BEFORE the window's EndFrame. If a real GFX
+ * task rendered this frame it is a cheap no-op; otherwise it presents the
+ * current VI framebuffer's CPU-written pixels (boot logo, etc.) as a single
+ * textured quad, preserving N64 "VI scans out whatever is in RDRAM" semantics.
+ * See port/n64_gfx_bridge.cpp for the design rationale. */
+void gdx_vi_present_fallback(void);
+
 #ifdef __cplusplus
 }
 #endif

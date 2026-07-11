@@ -21,6 +21,8 @@
 #include "rom_buffer.h"
 #include "n64_rdram.h"
 #include "n64_gfx_bridge.h"
+#include "n64_gfx_convert.h"
+#include "gdx_vi_convert.h"
 extern "C" {
 #include "mio0.h"
 }
@@ -32,13 +34,32 @@ extern "C" {
 #include <cstdlib>
 
 extern "C" int gGdxRaceActive;
+// #16 investigation aid: decomp sets this to 1 (racer.c, right where it already
+// logs "[countdown] draw emitted") the instant the countdown draw code runs, so
+// the bridge's raw vtx/mtx trace only has to cover the interesting few frames
+// instead of the whole race -- gGdxRaceActive alone stays 1 for the entire race
+// and made a fixed-size trace file fill up long before the countdown appeared.
+extern "C" int gGdxCountdownProbeArm = 0;
+// #16 phase 3: the coarse arm above stays 1 for the rest of the process once
+// the countdown first runs, so an edge-trigger on it alone catches whatever
+// triangle the interpreter happens to reach first afterward -- not necessarily
+// the countdown digit quad. decomp (racer.c) tags the digit quad's own vertex
+// pointer here (still a raw N64-style low32 at translate time, so it can be
+// compared directly against in.w1 below) right before drawing it; once this
+// bridge sees a G_VTX command whose raw pointer matches, it publishes the
+// RESOLVED host pointer so interpreter.cpp's GfxSpVertex can recognize that
+// exact draw and tighten the render-state probe to it.
+extern "C" unsigned int gGdxCountdownProbeVtxLow32 = 0;
+extern "C" uintptr_t gGdxCountdownProbeResolvedVtx = 0;
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <unordered_map>
 #include <vector>
+#include <chrono>
 
 extern "C" unsigned long long gSegments[16];
+
 extern "C" uint8_t D_3000000[];
 extern "C" uint8_t D_3000028[];
 extern "C" uint8_t D_3000050[];
@@ -241,105 +262,6 @@ uint8_t WordParam(uint32_t w0) {
     return static_cast<uint8_t>((w0 >> 16) & 0xFF);
 }
 
-void LogTexturePipelineCommand(const N64Gfx* source, size_t index, size_t limit, size_t stride, uint32_t w0, uint32_t w1,
-                               bool isBig) {
-    static const bool sTraceEnabled = std::getenv("GDX_GFX_TRACE") != nullptr;
-    static int sPipeDiagPrints = 0;
-    if (!sTraceEnabled || sPipeDiagPrints >= 10000) {
-        return;
-    }
-
-    const uint8_t op = Opcode(w0);
-    switch (op) {
-        case kOpSetTextureImage: {
-            const uint32_t fmt = (w0 >> 21) & 0x7;
-            const uint32_t siz = (w0 >> 19) & 0x3;
-            const uint32_t width = (w0 & 0xFFF) + 1;
-            gdx_port_logf("[pipedg] %04zu SETTIMG fmt=%u siz=%u width=%u raw=%08X\n",
-                          index, fmt, siz, width, w1);
-            sPipeDiagPrints++;
-            break;
-        }
-        case kOpSetTile: {
-            const uint32_t fmt = (w0 >> 21) & 0x7;
-            const uint32_t siz = (w0 >> 19) & 0x3;
-            const uint32_t line = (w0 >> 9) & 0x1FF;
-            const uint32_t tmem = w0 & 0x1FF;
-            const uint32_t tile = (w1 >> 24) & 0x7;
-            const uint32_t palette = (w1 >> 20) & 0xF;
-            const uint32_t cmt = (w1 >> 18) & 0x3;
-            const uint32_t maskt = (w1 >> 14) & 0xF;
-            const uint32_t shiftt = (w1 >> 10) & 0xF;
-            const uint32_t cms = (w1 >> 8) & 0x3;
-            const uint32_t masks = (w1 >> 4) & 0xF;
-            const uint32_t shifts = w1 & 0xF;
-            gdx_port_logf("[pipedg] %04zu SETTILE tile=%u fmt=%u siz=%u line=%u tmem=%u pal=%u cms=%u masks=%u shifts=%u cmt=%u maskt=%u shiftt=%u\n",
-                          index, tile, fmt, siz, line, tmem, palette, cms, masks, shifts, cmt, maskt, shiftt);
-            sPipeDiagPrints++;
-            break;
-        }
-        case kOpLoadBlock: {
-            const uint32_t tile = (w1 >> 24) & 0x7;
-            const uint32_t uls = (w0 >> 12) & 0xFFF;
-            const uint32_t ult = w0 & 0xFFF;
-            const uint32_t lrs = (w1 >> 12) & 0xFFF;
-            const uint32_t dxt = w1 & 0xFFF;
-            gdx_port_logf("[pipedg] %04zu LOADBLOCK tile=%u uls=%u ult=%u lrs=%u dxt=%u\n",
-                          index, tile, uls, ult, lrs, dxt);
-            sPipeDiagPrints++;
-            break;
-        }
-        case kOpLoadTile: {
-            const uint32_t tile = (w1 >> 24) & 0x7;
-            const uint32_t uls = (w0 >> 12) & 0xFFF;
-            const uint32_t ult = w0 & 0xFFF;
-            const uint32_t lrs = (w1 >> 12) & 0xFFF;
-            const uint32_t lrt = w1 & 0xFFF;
-            gdx_port_logf("[pipedg] %04zu LOADTILE tile=%u uls=%u ult=%u lrs=%u lrt=%u\n",
-                          index, tile, uls, ult, lrs, lrt);
-            sPipeDiagPrints++;
-            break;
-        }
-        case kOpSetTileSize: {
-            const uint32_t tile = (w1 >> 24) & 0x7;
-            const uint32_t uls = (w0 >> 12) & 0xFFF;
-            const uint32_t ult = w0 & 0xFFF;
-            const uint32_t lrs = (w1 >> 12) & 0xFFF;
-            const uint32_t lrt = w1 & 0xFFF;
-            gdx_port_logf("[pipedg] %04zu TILESIZE tile=%u uls=%u ult=%u lrs=%u lrt=%u\n",
-                          index, tile, uls, ult, lrs, lrt);
-            sPipeDiagPrints++;
-            break;
-        }
-        case 0xE4:
-        case 0xE5: {
-            const uint32_t lrx = (w0 >> 12) & 0xFFF;
-            const uint32_t lry = w0 & 0xFFF;
-            const uint32_t tile = (w1 >> 24) & 0x7;
-            const uint32_t ulx = (w1 >> 12) & 0xFFF;
-            const uint32_t uly = w1 & 0xFFF;
-            uint32_t st0 = 0, st1 = 0, dd0 = 0, dd1 = 0;
-            if (index + 2 < limit) {
-                N64Gfx st = ReadCommand(source, index + 1, stride, isBig);
-                N64Gfx dd = ReadCommand(source, index + 2, stride, isBig);
-                st0 = st.w0;
-                st1 = st.w1;
-                dd0 = dd.w0;
-                dd1 = dd.w1;
-            }
-            gdx_port_logf("[pipedg] %04zu TEXRECT op=%02X tile=%u ul=(%u,%u) lr=(%u,%u) st=(%04X,%04X) dd=(%04X,%04X) rawNext=%08X/%08X rawNext2=%08X/%08X\n",
-                          index, op, tile, ulx, uly, lrx, lry,
-                          (st1 >> 16) & 0xFFFF, st1 & 0xFFFF,
-                          (dd1 >> 16) & 0xFFFF, dd1 & 0xFFFF,
-                          st0, st1, dd0, dd1);
-            sPipeDiagPrints++;
-            break;
-        }
-        default:
-            break;
-    }
-}
-
 bool IsLikelyDisplayListOpcode(uint8_t op) {
     if (op <= 0x09) return true;
     if ((op >= 0x20) && (op <= 0x49)) return true;
@@ -378,6 +300,12 @@ struct ConversionStats {
     size_t ucodeSwitches = 0;
     size_t unknownUcodeSwitches = 0;
     uint32_t firstUnknownUcodeRaw = 0;
+    /* Deliberate L3DEX2 (line ucode) section skips, counted SEPARATELY from
+       unknownUcodeSwitches: the old shared counter made the benign per-menu-frame
+       L3DEX2 skip (raw = low32 of gspL3DEX2_fifoTextStart) indistinguishable from
+       a genuinely unmatched G_LOAD_UCODE in the [gfxdiag] line (graphics wave W1). */
+    size_t l3dexUcodeSkips = 0;
+    uint32_t firstL3dexUcodeRaw = 0;
     uint8_t firstFallbackDataOp = 0;
     uint32_t firstFallbackDataRaw = 0;
     uint32_t firstFallbackDataW0 = 0;
@@ -464,6 +392,19 @@ uintptr_t gViCurrentFramebuffer = 0;
 uintptr_t gViNextFramebuffer = 0;
 uintptr_t gLastRenderedFramebuffer = 0;
 
+// Phase G2 coarse asset epoch: bumped whenever an asset/ROM-backed segment image
+// is (re)decoded (EnsureAssetSegmentImage). Declared here -- ahead of that
+// function -- so it can invalidate converted lists built against an old image.
+// The rest of the G2 converter state lives further down (needs the resolver
+// helpers forward-declared below).
+uint32_t gConvertEpoch = 1;
+
+// Set by gdx_gfx_run() whenever a real GFX task renders into the current host
+// frame; checked + cleared once per frame by gdx_vi_present_fallback(). When it
+// is false at present time, no task produced this frame (boot-logo phase or any
+// other CPU-drawn screen) and the fallback must scan out the VI framebuffer.
+bool gHostFrameGfxTaskRan = false;
+
 struct AssetSegmentLookup {
     uint8_t segment = 0;
     uint32_t romBase = 0;
@@ -487,17 +428,37 @@ std::vector<LoadedAssetSegment> gLoadedAssetSegments;
  * byte stream happens to contain 0xB8 before 0xDF).
  *   segment 0x08 — course_track_gfx: F3DEX2 (setup DLs use 0xD9 geometry
  *                  mode, 0xDF G_ENDDL, and 0x06 as G_TRI2)
- *   segment 0x03 — setup/machine gfx: legacy F3D (0x01 G_MTX, 0xB8 G_ENDDL)
  *   segment 0x0A — venue textures: data only, no display lists
- * Segments not listed keep the existing heuristic path. */
+ * Segments not listed keep the existing heuristic path.
+ *
+ * segment 0x03 (machine_custom_gfx) is INTENTIONALLY absent: it is not a
+ * single dialect. ROM ground truth (baserom.us.rev0.z64, decompressed
+ * segment-3 image, offset 0x6D0) shows a genuine F3DEX2 sub-list —
+ * G_VTX(0x01)+3xG_TRI2(0x06) terminated by G_ENDDL=0xDF — sitting a few
+ * bytes before named legacy-F3D machine-part DLs in the same segment
+ * (e.g. D_3000780). A prior blanket "segment 0x03 = F3D" tag forced every
+ * G_TRI2 in that F3DEX2 sub-list through the F3D-only "0x06 = G_DL"
+ * remap (see the isF3DSource-gated case 0x06 below), sending vertex-index
+ * pairs (raw=0x00000406/0x00080A0C/0x000A0E0C, etc.) into
+ * TranslateDisplayListPointer as if they were sub-DL pointers — the
+ * dominant new [gdl-bad] classes after the resolver-window fix, and the
+ * likely source of the custom-machine-body garbage wedges (race
+ * decorations/booster glow, machine-select preview). Falling through to
+ * the per-DL heuristic below (DisplayListUsesF3D) restores correct
+ * per-list detection via the real 0xB8/0xDF terminator, the same path
+ * every other unlisted segment already relies on. */
 enum class GdxSegmentUcode : uint8_t { Unknown = 0, F3D, F3DEX2 };
 
 static GdxSegmentUcode GdxSegmentDialect(uint8_t segment) {
+    /* REVERTED 2026-07-11 (same day): a rigorous word-level re-decode of the
+     * decoration DLs (D_80172A0: 0xD7 G_TEXTURE, 0x01 G_VTX, 0x05 G_TRI1 runs,
+     * 0xDF terminator) proves they are F3DEX2 -- the blanket below was CORRECT
+     * and the earlier "they are F3D" identification was a dual-dialect
+     * pattern-matching error. The decorations' real defect is the fixup-region
+     * vertex-block swap (see sAssetFixups split, AssetBindings.c). */
     switch (segment) {
         case 0x08:
             return GdxSegmentUcode::F3DEX2;
-        case 0x03:
-            return GdxSegmentUcode::F3D;
         default:
             return GdxSegmentUcode::Unknown;
     }
@@ -614,6 +575,148 @@ void CopyRawTextureBytes(uint8_t* destination, uintptr_t source, size_t size) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase G3: quarantine of the pointer-GUESSING resolver branches.
+//
+// G1 (architecture/g1-wide-gfx) made game-emitted display lists carry real
+// 64-bit host pointers. G2 (architecture/g2-binary-dl-converters) converts
+// every binary N64 (8-byte) list to that same wide layout ONCE, at first
+// encounter, with deterministic pointer resolution (segment table + RDRAM-
+// arena physical strip only -- never a low32-window match or a high-32
+// reconstruction). Together they mean the guessing machinery below --
+// ResolveRegisteredHostPointer's low32-window match, the KSEG0 high-32
+// reconstruction, the physical/source-window high-32 reconstructions, the
+// ambiguous cross-segment fallback, and the raw-buffer/last-resort
+// substitutions -- should now only ever fire for STRAGGLERS: narrow lists
+// reached while GDX_G2_CONVERT=0 (the G2 kill switch) or a G2 conversion
+// miss, and legacy F3D asset paths G2 does not touch.
+//
+// Neither G1 nor G2 has been runtime-verified yet (no game launch permitted).
+// A hard delete of the guessing paths right now would remove the safety net
+// before a single soak run proves they are unused. Instead, every guessing
+// branch is gated behind GDX_LEGACY_RESOLVE (default ON, so soak-build
+// behavior is UNCHANGED) and instrumented so the next run quantifies exactly
+// what still relies on guessing: a per-branch hit counter, a capped
+// "[legacy-resolve] branch=<name> hits=<n> raw=%08X op=%02X" log line for the
+// first 8 hits of each branch, and a one-time "[legacy-resolve] SUMMARY" line
+// the instant any branch fires for the first time this run. Zero hits across
+// a full race is the green light to delete.
+//
+// Flip the default OFF by changing this one line once the soak is clean:
+/* W3 flip (2026-07-10, campaign doc §W3): the W2 soak ran a full session
+ * (boot→race→close) with ZERO legacy-resolve hits — the guessing branches
+ * were already idle in the widened-pointer world. Default OFF; the
+ * [legacy-resolve] SUMMARY line still names any straggler instantly, and
+ * GDX_LEGACY_RESOLVE=1 restores the old machinery without a rebuild. */
+constexpr bool kGdxLegacyResolveDefaultEnabled = false;
+//
+// POST-SOAK DELETION CHECKLIST (only after a full race shows zero hits on
+// EVERY branch below with GDX_LEGACY_RESOLVE left at its default):
+//   1. ResolveRegisteredHostPointer() and its call site in TryResolveAddress
+//      -- the registered-host low32-window match.
+//   2. The "Out-of-RDRAM KSEG0" high-32 reconstruction sub-block inside the
+//      KSEG0/KSEG1 branch of TryResolveAddress (the highCandidates loop over
+//      mRootBegin/mModuleBegin + gHostRanges). KEEP the deterministic
+//      raw & 0x1FFFFFFF RDRAM strip directly above it -- that part mirrors
+//      G2ResolvePhysical and is not a guess.
+//   3. The tryPhysicalWindow / tryAllPhysicalWindows lambdas in
+//      TryResolveAddress and both call sites (preferPhysical branch and the
+//      post-segment-table fallback branch).
+//   4. The trySourceWindow lambda in TryResolveAddress and both call sites.
+//   5. The "ambiguous cross-segment fallback" SegCandidate sort-and-probe
+//      block in TryResolveAddress.
+//   6. The mModuleBegin high-32 reconstruction block (after the cross-segment
+//      fallback, before the raw>=0x10000000 scan) in TryResolveAddress.
+//   7. The raw>=0x10000000 highCandidates scan (mRootBegin/mModuleBegin/
+//      gSegments[]/gHostRanges high32 substitution) in TryResolveAddress.
+//   8. FallbackDataPointer() + the kFallbackIdentityMtx/kFallbackViewport/
+//      kFallbackVertices static buffers, and their call sites in ProcessList.
+//   9. The raw-as-direct-pointer cast fallback at the end of
+//      TranslateDataPointer (the `direct = static_cast<uintptr_t>(raw)` path).
+//  10. This entire quarantine block (flag, counters, RecordLegacyResolveHit)
+//      once nothing references it anymore.
+// Do NOT delete: segment-table lookups (both the explicit-segment and
+// encodedSegment paths), ResolvePortBssAlias/ResolveVenueBankAlias/
+// ResolveGeneratedAssetStub/ResolveSetupGfxStub (exact known-symbol matches,
+// not guesses), the D_1000000 special case, the EK gN64AddressRanges reverse
+// scan, texture/framebuffer image op handling (SETTIMG/SETCIMG/SETZIMG),
+// BRANCH_Z/DMA_IO/RDPHALF_1, or the G2 converter/cache/GDX_G2_CONVERT switch.
+// ---------------------------------------------------------------------------
+enum class LegacyResolveBranch : uint8_t {
+    kRegisteredHostLow32 = 0, // ResolveRegisteredHostPointer: low32-window match
+    kKseg0High32,             // out-of-RDRAM KSEG0/KSEG1 high-32 reconstruction
+    kPhysicalWindow,          // tryPhysicalWindow/tryAllPhysicalWindows
+    kSourceWindow,            // trySourceWindow (referencing-DL-window guess)
+    kCrossSegmentFallback,    // ambiguous cross-segment SegCandidate sort
+    kModuleHigh32,            // mModuleBegin high-32 reconstruction
+    kRawHigh32Scan,           // raw>=0x10000000 highCandidates scan
+    kFallbackBuffer,          // FallbackDataPointer identity/viewport/vtx buffers
+    kDirectCast,              // TranslateDataPointer raw-as-pointer last resort
+    kCount,
+};
+
+inline const char* LegacyResolveBranchName(LegacyResolveBranch branch) {
+    switch (branch) {
+        case LegacyResolveBranch::kRegisteredHostLow32: return "reghost_low32";
+        case LegacyResolveBranch::kKseg0High32: return "kseg0_high32";
+        case LegacyResolveBranch::kPhysicalWindow: return "phys_window";
+        case LegacyResolveBranch::kSourceWindow: return "src_window";
+        case LegacyResolveBranch::kCrossSegmentFallback: return "cross_seg_fallback";
+        case LegacyResolveBranch::kModuleHigh32: return "module_high32";
+        case LegacyResolveBranch::kRawHigh32Scan: return "raw_high32_scan";
+        case LegacyResolveBranch::kFallbackBuffer: return "fallback_buffer";
+        case LegacyResolveBranch::kDirectCast: return "direct_cast";
+        default: return "unknown";
+    }
+}
+
+inline uint64_t (&LegacyResolveHitCounters())[static_cast<size_t>(LegacyResolveBranch::kCount)] {
+    static uint64_t hits[static_cast<size_t>(LegacyResolveBranch::kCount)] = {};
+    return hits;
+}
+
+// Set by ProcessList before each command is handled, so both member (TryResolveAddress)
+// and free-function (ResolveRegisteredHostPointer, FallbackDataPointer) guessing
+// branches can tag their [legacy-resolve] log lines with the opcode that triggered
+// them, without threading a new parameter through every call site. 0xFF = unknown
+// (a guess fired outside the per-command loop, e.g. from ResolveDisplayListSource).
+uint8_t gLegacyResolveCurrentOp = 0xFFu;
+
+// Runtime kill switch: GDX_LEGACY_RESOLVE=0 disables every guessing branch below
+// (each one then behaves as if it never matched), restoring the old machinery
+// instantly for the current process without a rebuild. Default ON so the soak
+// build's behavior is byte-for-byte unchanged from before this phase.
+inline bool LegacyResolveEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("GDX_LEGACY_RESOLVE");
+        if (env != nullptr) {
+            return env[0] != '0';
+        }
+        return kGdxLegacyResolveDefaultEnabled;
+    }();
+    return enabled;
+}
+
+// Always-on bookkeeping: increments the branch counter and prints the capped
+// diagnostic lines described above. Called only from the success path of a
+// guessing branch (i.e. "this guess actually produced a resolution"), so a
+// branch with hits==0 across a full run genuinely never contributed anything.
+inline void RecordLegacyResolveHit(LegacyResolveBranch branch, uint32_t raw, uint8_t op) {
+    static bool sAnySeen = false;
+    uint64_t& hits = LegacyResolveHitCounters()[static_cast<size_t>(branch)];
+    ++hits;
+    if (!sAnySeen) {
+        sAnySeen = true;
+        gdx_port_logf("[legacy-resolve] SUMMARY: first legacy-resolve hit this run (branch=%s) -- "
+                      "soak is NOT clean yet. GDX_LEGACY_RESOLVE=%d\n",
+                      LegacyResolveBranchName(branch), LegacyResolveEnabled() ? 1 : 0);
+    }
+    if (hits <= 8) {
+        gdx_port_logf("[legacy-resolve] branch=%s hits=%llu raw=%08X op=%02X\n",
+                      LegacyResolveBranchName(branch), static_cast<unsigned long long>(hits), raw, op);
+    }
+}
+
 alignas(8) const int32_t kFallbackIdentityMtx[16] = {
     0x00010000, 0x00000000,
     0x00000001, 0x00000000,
@@ -627,11 +730,30 @@ alignas(8) const int16_t kFallbackViewport[8] = {
     640, 480, 0, 0,
 };
 
-alignas(8) const uint8_t kFallbackVertices[64 * 16] = {};
+/* Zeroed, fully-readable stand-in substituted for an unreadable vertex
+ * pointer (see the G_VTX crash failsafe in ProcessList). It MUST be at least
+ * as large as the largest vertex load the interpreter can be asked to perform
+ * from a single G_VTX command, because the failsafe only swaps the POINTER --
+ * it does NOT reduce the vertex COUNT the interpreter re-reads from the command
+ * word (C0(12,8) for F3DEX2). F3DEX2 encodes that count in 8 bits, so up to 255
+ * vertices * sizeof(F3DVtx)(16B) can be read. A garbage/desynced command with
+ * count=0xF0 (=240, 3840B) previously overran the old 64-entry (1024B) buffer
+ * and faulted deep inside Fast::Interpreter::GfxSpVertex (campaign soak fix 3):
+ * the fix-1 failsafe fired but handed the interpreter a buffer far smaller than
+ * the count it still walked. Size for the full 8-bit range (256 entries). */
+alignas(8) const uint8_t kFallbackVertices[256 * 16] = {};
 
 uint32_t Low32(uintptr_t value) {
     return static_cast<uint32_t>(value);
 }
+
+/* PE preferred image base (map header: "Preferred load address is
+   0000000140000000"). The runtime module base is ASLR-randomized every launch,
+   so a logged runtime pointer/low32 cannot be resolved against G-Diffuser.map
+   directly. Emitting (kPreferredImageBaseVA + moduleOffset) turns any diagnostic
+   pointer into a deterministic map lookup regardless of the run's base. Kept as
+   uint64_t so the arithmetic is valid on a 32-bit host build too. */
+constexpr uint64_t kPreferredImageBaseVA = 0x140000000ULL;
 
 uint32_t ReadBE32(const uint8_t* src) {
     return (static_cast<uint32_t>(src[0]) << 24) |
@@ -658,6 +780,20 @@ bool LookupAssetSegment(uint32_t raw, AssetSegmentLookup& out) {
     out.offset = offset;
     out.imageSize = imageSize;
     return true;
+}
+
+/* True when a pointer's low32 is a generated ASSET PLACEHOLDER symbol (an
+ * exact or interior match in the asset-segment map). These 1-byte BSS stub
+ * symbols (e.g. setup_gfx's D_3000050, referenced by gSPDisplayList/gSPVertex)
+ * stand in for data that is loaded into a runtime segment; their real DL/vertex
+ * bytes live in the loaded segment image, NOT at the stub's own address. Such a
+ * pointer must be resolved through the segment/asset path (TryResolveAddress ->
+ * ResolveGeneratedAssetStub), never used verbatim. Used by ProcessList to keep
+ * a wide packet carrying a placeholder from being mistaken for a real host
+ * pointer just because its high32 is set (campaign soak fix 3). */
+bool IsAssetPlaceholderPointer(uint32_t low32) {
+    AssetSegmentLookup scratch = {};
+    return LookupAssetSegment(low32, scratch);
 }
 
 uintptr_t EnsureAssetSegmentImage(const AssetSegmentLookup& lookup) {
@@ -761,6 +897,11 @@ uintptr_t EnsureAssetSegmentImage(const AssetSegmentLookup& lookup) {
     gHostRanges.push_back({ base, loaded.bytes.size() });
     gRawN64Ranges.push_back({ base, loaded.bytes.size() });
     gLoadedAssetSegments.emplace_back(std::move(loaded));
+    // Phase G2 invalidation chokepoint: a freshly decoded asset image may rebind
+    // a segment or change the pointer targets converted lists resolved against.
+    // Bump the epoch so any cached wide conversion in the asset/ROM stamp space
+    // is rebuilt on next draw-time encounter.
+    ++gConvertEpoch;
     return base;
 }
 
@@ -781,17 +922,31 @@ uintptr_t EnsureAssetSegmentForSymbol(uint32_t symbolLow32, uint32_t* outOffset 
     return base;
 }
 
-uintptr_t FallbackDataPointer(uint8_t op) {
+uintptr_t FallbackDataPointer(uint8_t op, uint32_t raw = 0) {
+    // Guessing branch (resolution-of-last-resort): substitutes a static
+    // identity matrix / default viewport / zeroed vertex buffer when nothing
+    // resolved at all. Quarantined behind GDX_LEGACY_RESOLVE like every other
+    // guess in TryResolveAddress -- see the quarantine block above
+    // kFallbackIdentityMtx for the post-soak deletion checklist.
+    if (!LegacyResolveEnabled()) {
+        return 0;
+    }
+    uintptr_t result = 0;
     switch (op) {
         case kOpMtx:
-            return reinterpret_cast<uintptr_t>(kFallbackIdentityMtx);
+            result = reinterpret_cast<uintptr_t>(kFallbackIdentityMtx);
+            break;
         case kOpMovemem:
-            return reinterpret_cast<uintptr_t>(kFallbackViewport);
+            result = reinterpret_cast<uintptr_t>(kFallbackViewport);
+            break;
         case kOpVtx:
-            return reinterpret_cast<uintptr_t>(kFallbackVertices);
+            result = reinterpret_cast<uintptr_t>(kFallbackVertices);
+            break;
         default:
             return 0;
     }
+    RecordLegacyResolveHit(LegacyResolveBranch::kFallbackBuffer, raw, op);
+    return result;
 }
 
 bool IsReadableAddress(uintptr_t address);
@@ -827,6 +982,41 @@ bool IsRdramHostPointer(uintptr_t full_addr) {
     }
     const uintptr_t base = reinterpret_cast<uintptr_t>(gdx_rdram);
     return (full_addr >= base) && (full_addr < base + GDX_RDRAM_SIZE);
+}
+
+/* True when a pointer's low32 falls on a PORT BSS ALIAS object: a dummy host
+ * definition that stands in for N64 storage whose LIVE bytes are elsewhere.
+ * These are the two known aliases:
+ *  - D_1000000 (GfxPool dummy defined in decomp_port.c): game code WRITES
+ *    matrices through gGfxPool-> (the live, double-buffered pool the segment-1
+ *    table points at) but emits DL references as &D_1000000.member (racer.c
+ *    gSPMatrix modelviews, camera.c:3415 the PROJECTION matrix). Pre-wide,
+ *    the truncated low32 resolved through TryResolveAddress's D_1000000
+ *    host-range special case to gSegments[1]+offset. A wide packet carries the
+ *    dummy's REAL host address, so the w1IsHostPointer fast path read the
+ *    never-written dummy instead: zero projection/modelview matrices ==> every
+ *    3D triangle collapses while the matrix-free 2D texrect pipeline survives
+ *    (the "2D works / 3D fully dead" blackout, graphics wave W1/W2).
+ *  - D_2000000 (segment-2 BSS base, 1-byte LinkStubs token): live storage is
+ *    D_80225800 via ResolvePortBssAlias. Taken verbatim it is also misaligned
+ *    ((low32 & 7) != 0), so kOpMtx zeroed it and every frame fell back to the
+ *    identity matrix ([datafail] op=DA raw=AAA694AC, W2).
+ * Route these back through the low32 resolver exactly like the asset
+ * placeholders in IsAssetPlaceholderPointer (campaign soak fix 3). */
+bool IsPortBssAliasPointer(uint32_t low32) {
+    if (low32 == Low32(reinterpret_cast<uintptr_t>(D_2000000))) {
+        return true;
+    }
+    const uintptr_t d1Base = reinterpret_cast<uintptr_t>(D_1000000);
+    const uint32_t d1Low = Low32(d1Base);
+    const HostRange* r = gHostRanges.data();
+    const size_t n = gHostRanges.size();
+    for (size_t i = 0; i < n; i++) {
+        if (r[i].begin == d1Base) {
+            return (low32 >= d1Low) && (static_cast<size_t>(low32 - d1Low) < r[i].size);
+        }
+    }
+    return false;
 }
 
 /* These containment scans run for nearly every translated command/pointer,
@@ -886,7 +1076,19 @@ bool DisplayListUsesF3D(const N64Gfx* source, size_t limit, size_t stride, bool 
     return false;
 }
 
-bool ResolveRegisteredHostPointer(uint32_t raw, ResolvedAddress& out) {
+// Forward-declared: defined later in this file, needed here for the
+// requiredBytes readability check added to ResolveRegisteredHostPointer.
+size_t ReadableByteLimit(uintptr_t address);
+
+bool ResolveRegisteredHostPointer(uint32_t raw, ResolvedAddress& out, size_t requiredBytes = 1) {
+    // GDX_LEGACY_RESOLVE quarantine (see the block above kFallbackIdentityMtx):
+    // this is the "registered-host low32-window match" guess G2 explicitly does
+    // NOT reproduce (G2ResolvePhysical only does the deterministic RDRAM-arena
+    // subset). Disabling the flag makes this branch behave as if it never
+    // matched, same as if it were deleted.
+    if (!LegacyResolveEnabled()) {
+        return false;
+    }
     for (const HostRange& range : gHostRanges) {
         if ((range.begin == 0) || (range.size == 0)) {
             continue;
@@ -894,33 +1096,156 @@ bool ResolveRegisteredHostPointer(uint32_t raw, ResolvedAddress& out) {
 
         const uint32_t baseLow = Low32(range.begin);
         const uint32_t offset = raw - baseLow;
-        if (offset < range.size) {
-            out.full = range.begin + offset;
-            out.segmented = false;
+        /* requiredBytes audit (2026-07-08): previously accepted any range whose
+           low32 window merely CONTAINED the start byte, with no check that
+           requiredBytes fit before the range's end, and no page-level
+           readability confirmation -- and it committed to the FIRST matching
+           range in registration order even when that match was coincidental.
+           gHostRanges can have low32 windows that overlap by chance for an
+           unrelated raw value, so validate both the declared size and the real
+           mapped pages, and keep scanning on failure instead of trusting the
+           first hit. This is one of the "wrong-but-readable" resolution gaps
+           suspected as the remaining cause of vertex/matrix garbage loads. */
+        if (offset < range.size && requiredBytes <= range.size - offset) {
+            const uintptr_t full = range.begin + offset;
+            if (ReadableByteLimit(full) >= requiredBytes) {
+                out.full = full;
+                out.segmented = false;
+                RecordLegacyResolveHit(LegacyResolveBranch::kRegisteredHostLow32, raw, gLegacyResolveCurrentOp);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Phase G2: binary N64 (8-byte) -> wide 16-byte boundary converter + cache.
+//
+// A narrow N64-format list (EK disk asset, ROM blob, or RDRAM-decoded segment)
+// is converted ONCE to the wide layout the Phase G1 fast path consumes and
+// cached across frames. The per-frame path then reads a wide source (stride 16,
+// resolver-free) instead of re-parsing the narrow list and guessing pointers.
+//
+// Wiring is LAZY: the redirect lives in EnqueueList, so every narrow list the
+// draw-time walk reaches -- root or sub-DL -- is converted+cached on first
+// encounter, and sub-DL recursion falls out of the existing walk (each sub-DL is
+// itself an EnqueueList that hits the same hook). See n64_gfx_convert.{h,cpp}.
+// ---------------------------------------------------------------------------
+gdx::GfxWideCache gWideCache;
+// (gConvertEpoch is defined earlier, near the framebuffer globals.)
+// Runtime kill switch (GDX_G2_CONVERT=0 disables the converter and restores the
+// pure narrow path). Default ON. Lets the next runtime-verification session flip
+// the boundary off instantly without a rebuild if a regression appears.
+bool gG2ConvertEnabled = true;
+bool gG2ConvertInit = false;
+// Dialect (F3D vs F3DEX2) of each converted wide buffer, keyed by its exact data
+// pointer. ProcessList consults this instead of re-deriving the dialect from the
+// wide stream: the converted buffer loses its source segment's dialect tag, and
+// the opcode-scan fallback can misclassify F3DEX2 setup DLs whose bytes contain
+// 0xB8 before 0xDF (the exact case the segment-tag table guards -- see comment
+// above GdxSegmentDialect). Recorded before enqueue, so the value for a live
+// buffer is always current at read time.
+std::unordered_map<const void*, bool> gConvertedWideIsF3d;
+
+bool G2ResolvePhysical(void* /*user*/, uint32_t raw, size_t required_bytes, uintptr_t* out_host) {
+    // Deterministic RDRAM-arena resolution ONLY -- the exact non-guessing subset
+    // of TryResolveAddress (KSEG0/KSEG1 physical + bare physical offset). It never
+    // does the registered-host low32 window match or the high-32 reconstruction;
+    // those are the guesses G2 removes, not reproduces. A physical RDRAM address
+    // is correct by construction (the literal address the game stored), so a
+    // 1-byte readability gate suffices -- it cannot be "wrong-but-readable".
+    if (gdx_rdram == nullptr) {
+        return false;
+    }
+    const uintptr_t base = reinterpret_cast<uintptr_t>(gdx_rdram);
+    if (raw >= 0x80000000u && raw <= 0xBFFFFFFFu) {
+        const uint32_t phys = raw & 0x1FFFFFFFu;
+        if (phys < static_cast<uint32_t>(GDX_RDRAM_SIZE)) {
+            const uintptr_t full = base + phys;
+            if (ReadableByteLimit(full) >= required_bytes) {
+                *out_host = full;
+                return true;
+            }
+        }
+        return false;
+    }
+    if ((raw >= static_cast<uint32_t>(GDX_RDRAM_GFXPOOL_OFFSET)) &&
+        (raw < static_cast<uint32_t>(GDX_RDRAM_SIZE))) {
+        const uintptr_t full = base + raw;
+        if (ReadableByteLimit(full) >= required_bytes) {
+            *out_host = full;
             return true;
         }
     }
     return false;
 }
 
+void EnsureG2ConvertInit() {
+    if (gG2ConvertInit) {
+        return;
+    }
+    gG2ConvertInit = true;
+    const char* env = std::getenv("GDX_G2_CONVERT");
+    gG2ConvertEnabled = (env == nullptr) || (env[0] != '0');
+    gdx::ConvertContext ctx;
+    ctx.resolve_physical = &G2ResolvePhysical;
+    ctx.user = nullptr;
+    gWideCache.SetContext(ctx);
+}
+
+uint64_t G2StampFor(const N64Gfx* src) {
+    // Two disjoint stamp namespaces so an RDRAM DMA never collides with an asset
+    // epoch. RDRAM-backed lists are mutable (course loads overwrite the arena):
+    // key them on the DMA generation so any write rebuilds them. Asset/ROM lists
+    // are immutable once decoded (a reload takes a fresh heap address = new key):
+    // key them on the coarse asset epoch, high bit set to separate the spaces.
+    if (IsRdramHostPointer(reinterpret_cast<uintptr_t>(src))) {
+        return gDmaGeneration;
+    }
+    return 0x8000000000000000ull | static_cast<uint64_t>(gConvertEpoch);
+}
+
 bool ResolveGeneratedAssetStub(uint32_t raw, ResolvedAddress& out) {
-    uint32_t offset = 0;
-    const uintptr_t base = EnsureAssetSegmentForSymbol(raw, &offset);
-    if (base == 0) {
+    AssetSegmentLookup lookup = {};
+    if (!LookupAssetSegment(raw, lookup)) {
         return false;
     }
 
-    out.full = base + offset;
-
-    AssetSegmentLookup lookup = {};
-    if (LookupAssetSegment(raw, lookup)) {
-        out.segment = lookup.segment;
-        out.offset = lookup.offset;
-        out.segmented = true;
-    } else {
-        out.offset = offset;
-        out.segmented = false;
+    /* Live-carve preference, segment 0x0A ONLY (2026-07-10, early-race floor
+     * root cause): interior venue-bank pointers low32-match whichever venue's
+     * suffixed stub range happens to contain them (the stubs alias in low32),
+     * so the per-symbol heap image can be a DIFFERENT venue's texture bank --
+     * the frames 1-43 wrong-venue floor. The slot-0x0A carve is rotated by
+     * gdx_load_venue_texture_segment (the authority) and every venue shares
+     * the same bank*0x1000 layout, so resolving live is venue-correct by
+     * construction. Deliberately NOT generalized to other segments: routing
+     * seg-4/7 placeholder textures to the rdram carve strips their o2r
+     * delivery eligibility (the SETTIMG path's !IsRdramHostPointer gate) and
+     * puts them on the raw-copy path with per-frame dma-generation staleness
+     * refreshes -- the 2026-07-10 regression run (whole HUD + vehicles
+     * garbled, unplayable FPS). The rank digits gain nothing from the live
+     * carve either: [digit-carve] proved gSegments[4]+0x13DE0 is zero at race
+     * time (the console's runtime fill has no port equivalent yet). */
+    if (lookup.segment == 0x0Au) {
+        const uintptr_t live = gSegments[0x0A];
+        if (live != 0 && ReadableByteLimit(live + lookup.offset) >= 1) {
+            out.full = live + lookup.offset;
+            out.segment = lookup.segment;
+            out.offset = lookup.offset;
+            out.segmented = true;
+            return true;
+        }
     }
+
+    const uintptr_t base = EnsureAssetSegmentImage(lookup);
+    if (base == 0) {
+        return false;
+    }
+    out.full = base + lookup.offset;
+    out.segment = lookup.segment;
+    out.offset = lookup.offset;
+    out.segmented = true;
     return true;
 }
 
@@ -953,6 +1278,35 @@ bool ResolvePortBssAlias(uint32_t raw, ResolvedAddress& out) {
  * N * 0x1000 (the suffixed per-venue symbols confirm the stride). Exact-base
  * match only: the stubs are packed 1 byte apart, so interior spans would
  * collide with the next symbol. */
+/* Phase G1 regression fix (2026-07-09): game-BUILT wide DLs carry the REAL
+   host addresses of generated 1-byte asset stubs (port/gen/LinkStubs.c)
+   whenever a compile-time table stores asset symbols — course.c's road/wall
+   material table (course.c:101-112) stores the venue banks D_A000000..
+   D_A008000 directly. The wide host-pointer fast path took those addresses
+   verbatim (the EXE module is a registered host range), so the track floor,
+   walls and tunnel sampled EXE data-section bytes: black where the stub
+   neighborhood is zeroed, striped garbage otherwise, changing per BUILD with
+   the module layout. The low32 resolver already knows these identities
+   (ResolveVenueBankAlias / ResolveGeneratedAssetStub) but wide pointers never
+   reach it. Exact full-address membership inside the module range only — a
+   genuine data pointer cannot false-match because the stub's address IS the
+   full address being compared. Returns 0 when `full` is not a known stub. */
+bool ResolveVenueBankAlias(uint32_t raw, ResolvedAddress& out); // fwd decl (defined below)
+uintptr_t ResolveWideAssetStubPointer(uintptr_t full, uintptr_t moduleBegin, uintptr_t moduleEnd) {
+    if (full == 0 || moduleBegin == 0 || full < moduleBegin || full >= moduleEnd) {
+        return 0;
+    }
+    const uint32_t low = Low32(full);
+    ResolvedAddress out = {};
+    if (ResolveVenueBankAlias(low, out)) {
+        return out.full;
+    }
+    if (ResolveGeneratedAssetStub(low, out)) {
+        return out.full;
+    }
+    return 0;
+}
+
 bool ResolveVenueBankAlias(uint32_t raw, ResolvedAddress& out) {
     if (gSegments[0x0A] == 0) {
         return false;
@@ -1161,12 +1515,35 @@ uintptr_t MakePersistentVtxCopy(uintptr_t source, size_t count) {
         return 0;
     }
     size_t requiredBytes = count * 16;
+
+    /* Defense in depth for the machine vertex-spike bug (#3): callers are now
+       expected to have validated `requiredBytes` bytes are readable at `source`
+       via TranslateDataPointer(..., requiredBytes) before reaching here, but an
+       under-validated resolution (e.g. only 1 byte proven readable) previously
+       let this loop walk past the end of the real vertex buffer into unrelated
+       host memory -- one garbage vertex is a visible "spike" (stretched
+       polygon). Clamp defensively and zero the tail so a residual gap can never
+       turn into an out-of-bounds host read again, and log it so the true
+       source of any remaining spikes is still visible. */
+    const size_t readable = ReadableByteLimit(source);
+    size_t safeCount = count;
+    if (readable < requiredBytes) {
+        safeCount = readable / 16;
+        static int sVtxClampLogs = 0;
+        if (sVtxClampLogs < 40) {
+            ++sVtxClampLogs;
+            gdx_port_logf("[vtx-clamp] source=%p requested=%zu(%zuB) readable=%zuB clampedCount=%zu\n",
+                          reinterpret_cast<void*>(source), count, requiredBytes, readable, safeCount);
+        }
+    }
+
     auto alloc = std::make_unique<uint8_t[]>(requiredBytes);
     uint8_t* out = alloc.get();
+    std::memset(out, 0, requiredBytes);
     gPersistentAllocations.push_back(std::move(alloc));
-    
+
     const uint8_t* in = reinterpret_cast<const uint8_t*>(source);
-    for (size_t i = 0; i < count; i++) {
+    for (size_t i = 0; i < safeCount; i++) {
         uint16_t* out_s = reinterpret_cast<uint16_t*>(out + i * 16);
         const uint16_t* in_s = reinterpret_cast<const uint16_t*>(in + i * 16);
         out_s[0] = Byteswap16(in_s[0]);
@@ -1179,6 +1556,25 @@ uintptr_t MakePersistentVtxCopy(uintptr_t source, size_t count) {
         out[i * 16 + 13] = in[i * 16 + 13];
         out[i * 16 + 14] = in[i * 16 + 14];
         out[i * 16 + 15] = in[i * 16 + 15];
+    }
+    return reinterpret_cast<uintptr_t>(out);
+}
+
+/* Big-endian static Mtx data (asset/heap sources) word-swapped for the
+   interpreter, which reads matrices as host-order u32 words. Host-built
+   matrices (Matrix_ToMtx's j^1 layout) must NOT pass through here. */
+uintptr_t MakePersistentMtxCopy(uintptr_t source) {
+    if (source == 0) {
+        return 0;
+    }
+    auto alloc = std::make_unique<uint8_t[]>(64);
+    uint8_t* out = alloc.get();
+    gPersistentAllocations.push_back(std::move(alloc));
+
+    const uint32_t* in_w = reinterpret_cast<const uint32_t*>(source);
+    uint32_t* out_w = reinterpret_cast<uint32_t*>(out);
+    for (size_t i = 0; i < 16; i++) {
+        out_w[i] = Byteswap32(in_w[i]);
     }
     return reinterpret_cast<uintptr_t>(out);
 }
@@ -1281,6 +1677,12 @@ class N64DisplayListAdapter {
     }
 
     uintptr_t EnqueueList(const N64Gfx* source, size_t explicitLimit) {
+        // Phase G2 lazy boundary: if `source` is a narrow N64-format list, convert
+        // it to the wide layout once (cached) and enqueue the wide buffer instead,
+        // so ProcessList takes the resolver-free fast path. No-op for sources that
+        // are already wide (game-emitted or previously converted).
+        source = GetOrBuildConvertedWide(source, explicitLimit);
+
         auto cached = mLists.find(source);
         if (cached != mLists.end()) return reinterpret_cast<uintptr_t>(cached->second->commands.data());
 
@@ -1312,6 +1714,94 @@ class N64DisplayListAdapter {
     size_t CommandStrideForSource(const N64Gfx* source) const {
         const uintptr_t ptr = reinterpret_cast<uintptr_t>(source);
         return (IsRawN64HostPointer(ptr) || IsHostN64CommandPointer(ptr)) ? kN64GfxStride : kHostBuiltGfxStride;
+    }
+
+    // Phase G2: return a wide 16-byte version of `source`, converting+caching on
+    // first encounter. `ioLimit` is updated to the wide command count. Returns
+    // `source` unchanged (and leaves ioLimit alone) when conversion is disabled,
+    // the source is already wide, or its extent is unknown -- in which case the
+    // caller falls back to the original narrow machinery.
+    const N64Gfx* GetOrBuildConvertedWide(const N64Gfx* source, size_t& ioLimit) {
+        EnsureG2ConvertInit();
+        if (!gG2ConvertEnabled || source == nullptr) {
+            return source;
+        }
+        const size_t stride = CommandStrideForSource(source);
+        if (stride != kN64GfxStride) {
+            return source;  // already wide (game-emitted, or a converted buffer)
+        }
+
+        // Bound the walk exactly as the narrow path would.
+        size_t narrowLimit = (ioLimit != 0) ? ioLimit : KnownCommandLimit(source);
+        const size_t knownLimit = KnownCommandLimit(source);
+        if (knownLimit != 0) {
+            narrowLimit = (narrowLimit != 0) ? std::min(narrowLimit, knownLimit) : knownLimit;
+        }
+        if (narrowLimit == 0) {
+            return source;  // unknown extent -> leave to the narrow path
+        }
+
+        // Decide endianness and dialect the SAME way ProcessList would, so the
+        // converted value path is byte-identical and the pointer classification
+        // matches. The dialect decision is recorded so ProcessList reuses it
+        // rather than re-deriving it (and possibly misclassifying) from the
+        // dialect-tagless wide buffer.
+        const bool isBig = CommandSourceIsBigEndian(source, stride);
+        const GdxSegmentUcode dialect = GdxAssetPointerDialect(reinterpret_cast<uintptr_t>(source));
+        const bool isF3d =
+            (dialect == GdxSegmentUcode::F3D)      ? true
+            : (dialect == GdxSegmentUcode::F3DEX2) ? false
+            : (IsF3DAssetPointer(reinterpret_cast<uintptr_t>(source)) ||
+               DisplayListUsesF3D(source, narrowLimit, stride, isBig));
+
+        const std::vector<gdx::WideGfx>& wide =
+            gWideCache.GetOrBuild(source, narrowLimit, isBig, isF3d, G2StampFor(source));
+        if (wide.empty()) {
+            return source;
+        }
+
+        const N64Gfx* wideSrc = reinterpret_cast<const N64Gfx*>(wide.data());
+        /* [dl-census] (2026-07-10, graphics-audit phase 4): one line per UNIQUE
+           narrow list converted by G2 across the whole session (menus included).
+           Names which asset families' display lists take the binary route --
+           the pause-menu/decoration suspects -- with an ASLR-stable identity
+           where the source is module-resident. */
+        {
+            static uintptr_t sDlCensusSeen[48] = {};
+            static int sDlCensusCount = 0;
+            const uintptr_t srcAddr = reinterpret_cast<uintptr_t>(source);
+            bool dlDup = false;
+            for (int dc = 0; dc < sDlCensusCount; dc++) {
+                if (sDlCensusSeen[dc] == srcAddr) {
+                    dlDup = true;
+                    break;
+                }
+            }
+            if (!dlDup && sDlCensusCount < 48) {
+                sDlCensusSeen[sDlCensusCount++] = srcAddr;
+                uint64_t prefVA = 0;
+                if (mModuleBegin != 0 && srcAddr >= mModuleBegin && srcAddr < mModuleEnd) {
+                    prefVA = kPreferredImageBaseVA + (srcAddr - mModuleBegin);
+                }
+                const char* cls = IsRdramHostPointer(srcAddr) ? "rdram"
+                                  : (prefVA != 0)             ? "module"
+                                                              : "other";
+                gdx_port_logf("[dl-census] narrow src=%p cls=%s prefVA=%011llX limit=%zu isBig=%d f3d=%d\n",
+                              reinterpret_cast<const void*>(source), cls,
+                              static_cast<unsigned long long>(prefVA), narrowLimit,
+                              isBig ? 1 : 0, isF3d ? 1 : 0);
+            }
+        }
+        // The dialect map is re-recorded here before any ProcessList read of this
+        // exact buffer, so clearing it when it grows large is always safe (a stale
+        // rebuilt buffer's old address is never read again). Bounds lifetime
+        // growth from in-place rebuilds that relocate a cached list's storage.
+        if (gConvertedWideIsF3d.size() > 8192) {
+            gConvertedWideIsF3d.clear();
+        }
+        gConvertedWideIsF3d[wideSrc] = isF3d;
+        ioLimit = wide.size();
+        return wideSrc;
     }
 
     bool CommandSourceIsBigEndian(const N64Gfx* source, size_t stride) const {
@@ -1437,8 +1927,20 @@ class N64DisplayListAdapter {
         const uint32_t d1000000_low = Low32(reinterpret_cast<uintptr_t>(D_1000000));
         for (const HostRange& range : gHostRanges) {
             if (range.begin == reinterpret_cast<uintptr_t>(D_1000000)) {
-                if (raw >= d1000000_low && (raw - d1000000_low) < range.size) {
-                    out.full = static_cast<uintptr_t>(gSegments[1]) + (raw - d1000000_low);
+                /* requiredBytes audit (2026-07-08): this only proved the START of
+                   the candidate offset was inside D_1000000's range, never that
+                   requiredBytes actually fit before the end of the buffer -- the
+                   same short-read hazard already fixed for the other candidate
+                   paths in this function, but missed here. D_1000000 is the huge
+                   static data blob that also backs per-player/machine structures
+                   (e.g. &D_1000000.unk_21988[playerIndex], the G_MTX source
+                   confirmed in the countdown-face investigation), so a matrix or
+                   vertex load landing near the tail of this buffer could silently
+                   walk past it into unrelated memory -- a plausible source of the
+                   still-visible machine vertex spikes. */
+                const size_t offset = static_cast<size_t>(raw - d1000000_low);
+                if (raw >= d1000000_low && offset <= range.size && requiredBytes <= range.size - offset) {
+                    out.full = static_cast<uintptr_t>(gSegments[1]) + offset;
                     out.segmented = false;
                     return true;
                 }
@@ -1477,7 +1979,7 @@ class N64DisplayListAdapter {
             }
         }
 
-        if (ResolveRegisteredHostPointer(raw, out)) {
+        if (ResolveRegisteredHostPointer(raw, out, requiredBytes)) {
             return true;
         }
 
@@ -1495,8 +1997,12 @@ class N64DisplayListAdapter {
                64-bit host pointer whose low32 happens to fall in 0x80-0x9F
                (e.g. 0x933AEF70 from heap 0x20A933AEF70) looks identical.
                Try reconstructing it against known high-32 windows before
-               giving up; texture loads feed garbage into TMEM otherwise. */
-            {
+               giving up; texture loads feed garbage into TMEM otherwise.
+               GDX_LEGACY_RESOLVE quarantine: this "high-32 reconstruction" is
+               a guess (see the quarantine block above kFallbackIdentityMtx) --
+               the deterministic RDRAM strip above already covers the
+               non-guessing case. */
+            if (LegacyResolveEnabled()) {
                 const uintptr_t highCandidates[] = {
                     reinterpret_cast<uintptr_t>(mRootBegin) & 0xFFFFFFFF00000000ULL,
                     mModuleBegin & 0xFFFFFFFF00000000ULL,
@@ -1509,6 +2015,7 @@ class N64DisplayListAdapter {
                     if (ReadableByteLimit(full) >= requiredBytes) {
                         out.full = full;
                         out.segmented = false;
+                        RecordLegacyResolveHit(LegacyResolveBranch::kKseg0High32, raw, gLegacyResolveCurrentOp);
                         return true;
                     }
                 }
@@ -1521,6 +2028,7 @@ class N64DisplayListAdapter {
                     if (ReadableByteLimit(full) >= requiredBytes) {
                         out.full = full;
                         out.segmented = false;
+                        RecordLegacyResolveHit(LegacyResolveBranch::kKseg0High32, raw, gLegacyResolveCurrentOp);
                         return true;
                     }
                 }
@@ -1558,6 +2066,11 @@ class N64DisplayListAdapter {
            depending on the caller. Bounds + readability checks prevent small
            immediates from matching. */
         constexpr uintptr_t kPhysicalAddressMask = 0xFFFFFFFFu;
+        // GDX_LEGACY_RESOLVE quarantine: tryPhysicalWindow/tryAllPhysicalWindows
+        // reconstruct a full pointer by substituting a KNOWN range's high32 onto
+        // `raw`'s low32 -- a guess (see the quarantine block above
+        // kFallbackIdentityMtx). The gate lives in tryAllPhysicalWindows so both
+        // call sites below are covered by a single check.
         const auto tryPhysicalWindow = [&](uintptr_t begin, uintptr_t end) -> bool {
             if ((begin == 0) || (end <= begin)) {
                 return false;
@@ -1582,9 +2095,13 @@ class N64DisplayListAdapter {
             }
             out.full = full;
             out.segmented = false;
+            RecordLegacyResolveHit(LegacyResolveBranch::kPhysicalWindow, raw, gLegacyResolveCurrentOp);
             return true;
         };
         const auto tryAllPhysicalWindows = [&]() -> bool {
+            if (!LegacyResolveEnabled()) {
+                return false;
+            }
             if (tryPhysicalWindow(mModuleBegin, mModuleEnd)) return true;
             for (const HostRange& range : gHostRanges) {
                 if ((range.begin == 0) || (range.size == 0) ||
@@ -1604,11 +2121,14 @@ class N64DisplayListAdapter {
          * referencing DL's own window as a last resort, accepting it only when the
          * result is readable AND lies within one allocation region of the source
          * so it can never false-match unrelated memory elsewhere in the window. */
+        // GDX_LEGACY_RESOLVE quarantine: trySourceWindow is explicitly a
+        // "last resort" guess (see the quarantine block above
+        // kFallbackIdentityMtx) -- gated the same as the other branches.
         const auto trySourceWindow = [&]() -> bool {
             // A/B escape hatch: GDX_DIAG_NO_SRCWIN=1 disables the source-window
             // matrix reconstruction so regressions can be bisected without a rebuild.
             static const bool sSrcWinDisabled = std::getenv("GDX_DIAG_NO_SRCWIN") != nullptr;
-            if (sSrcWinDisabled || (sourceHint == 0)) return false;
+            if (!LegacyResolveEnabled() || sSrcWinDisabled || (sourceHint == 0)) return false;
             uintptr_t full = (sourceHint & ~kPhysicalAddressMask) | static_cast<uintptr_t>(raw);
             const uintptr_t lo = (full < sourceHint) ? full : sourceHint;
             const uintptr_t hi = (full < sourceHint) ? sourceHint : full;
@@ -1617,6 +2137,7 @@ class N64DisplayListAdapter {
             if (ReadableByteLimit(full) < requiredBytes) return false;
             out.full = full;
             out.segmented = false;
+            RecordLegacyResolveHit(LegacyResolveBranch::kSourceWindow, raw, gLegacyResolveCurrentOp);
             return true;
         };
 
@@ -1649,47 +2170,89 @@ class N64DisplayListAdapter {
             return true;
         }
 
-        bool found = false;
-        ResolvedAddress best = {};
-        uint32_t bestOffset = UINT32_MAX;
+        /* Ambiguous cross-segment fallback (audited 2026-07-08): this used to pick
+           whichever registered segment produced the numerically SMALLEST low32
+           offset for `raw`, with no readability check at all. When the raw
+           value's own top-byte segment is stale/unregistered this frame (e.g. a
+           race decoration or machine part referencing a segment that has not
+           been (re)pointed yet), a completely unrelated segment could "win" this
+           race purely by low32 coincidence -- and the winner was accepted even
+           if the resulting address was unreadable or, worse, readable-but-wrong
+           (garbage bytes from someone else's buffer). That is a plausible source
+           of the wrong-but-readable vertex/matrix loads behind the still-visible
+           spike/mesh-explosion reports even after the requiredBytes fix, which
+           only guarded against SHORT reads, not WRONG-but-long-enough ones.
+           Fix: gather every segment whose low32 offset is in range, sort by
+           offset ascending, and accept the first candidate that actually proves
+           readable for requiredBytes -- falling through to the next-closest
+           segment instead of blindly trusting the closest one.
+           GDX_LEGACY_RESOLVE quarantine: this whole block is the "ambiguous
+           cross-segment fallback" guess (see the quarantine block above
+           kFallbackIdentityMtx) -- gated as a unit. */
+        if (LegacyResolveEnabled()) {
+            struct SegCandidate {
+                uint8_t segment;
+                uint32_t offset;
+                uintptr_t full;
+            };
+            SegCandidate candidates[kGfxSegmentCount];
+            int candidateCount = 0;
 
-        for (uint8_t segment = 0; segment < kGfxSegmentCount; segment++) {
-            const uintptr_t base = gSegments[segment];
-            if (base == 0) {
-                continue;
+            for (uint8_t segment = 0; segment < kGfxSegmentCount; segment++) {
+                const uintptr_t base = gSegments[segment];
+                if (base == 0) {
+                    continue;
+                }
+
+                const uint32_t baseLow = static_cast<uint32_t>(base);
+                const uint32_t offset = raw - baseLow;
+                if (offset < kSegmentOffsetLimit) {
+                    candidates[candidateCount++] = SegCandidate{ segment, offset, base + offset };
+                }
             }
 
-            const uint32_t baseLow = static_cast<uint32_t>(base);
-            const uint32_t offset = raw - baseLow;
-            if ((offset < kSegmentOffsetLimit) && (offset < bestOffset)) {
-                best.full = base + offset;
-                best.segment = segment;
-                best.offset = offset;
-                best.segmented = true;
-                bestOffset = offset;
-                found = true;
+            std::sort(candidates, candidates + candidateCount,
+                      [](const SegCandidate& a, const SegCandidate& b) { return a.offset < b.offset; });
+
+            for (int i = 0; i < candidateCount; i++) {
+                if (ReadableByteLimit(candidates[i].full) >= requiredBytes) {
+                    out.full = candidates[i].full;
+                    out.segment = candidates[i].segment;
+                    out.offset = candidates[i].offset;
+                    out.segmented = true;
+                    RecordLegacyResolveHit(LegacyResolveBranch::kCrossSegmentFallback, raw, gLegacyResolveCurrentOp);
+                    return true;
+                }
             }
         }
 
-        if (found) {
-            out = best;
-            return true;
-        }
-
-        if (mModuleBegin != 0) {
+        // GDX_LEGACY_RESOLVE quarantine: mModuleBegin high-32 reconstruction guess.
+        if (LegacyResolveEnabled() && (mModuleBegin != 0)) {
             uintptr_t full = (mModuleBegin & 0xFFFFFFFF00000000ULL) | static_cast<uintptr_t>(raw);
             if (full < mModuleBegin) {
                 full += 0x100000000ULL;
             }
 
-            if ((full >= mModuleBegin) && (full < mModuleEnd)) {
+            /* Vertex-spike root cause (#3), confirmed by [vtx-spike] runtime evidence:
+               this reconstruction only checked that `full` falls inside the overall
+               module's mapped address RANGE, never that `requiredBytes` are actually
+               readable from it. A candidate landing 5 bytes from the end of a mapped
+               region (e.g. right before an unmapped/guard page) would "succeed" here
+               and then a 58-vertex (928-byte) MakePersistentVtxCopy walked hundreds of
+               bytes into unrelated/unmapped memory -- one or more garbage vertices,
+               the visible stretched-polygon "spike". Require the full payload to be
+               readable, matching the other candidate paths in this function. */
+            if ((full >= mModuleBegin) && (full < mModuleEnd) &&
+                (ReadableByteLimit(full) >= requiredBytes)) {
                 out.full = full;
                 out.segmented = false;
+                RecordLegacyResolveHit(LegacyResolveBranch::kModuleHigh32, raw, gLegacyResolveCurrentOp);
                 return true;
             }
         }
 
-        if (raw >= 0x10000000) {
+        // GDX_LEGACY_RESOLVE quarantine: raw>=0x10000000 highCandidates guess scan.
+        if (LegacyResolveEnabled() && (raw >= 0x10000000)) {
             const uintptr_t highCandidates[] = {
                 reinterpret_cast<uintptr_t>(mRootBegin) & 0xFFFFFFFF00000000ULL,
                 mModuleBegin & 0xFFFFFFFF00000000ULL,
@@ -1716,10 +2279,14 @@ class N64DisplayListAdapter {
                     continue;
                 }
 
+                // Same vertex-spike fix as the mModuleBegin block above: a 1-byte
+                // IsReadableAddress() check let a candidate a few bytes from the end
+                // of its region "succeed" for a much larger vertex/matrix payload.
                 const uintptr_t full = high | static_cast<uintptr_t>(raw);
-                if (IsReadableAddress(full)) {
+                if (ReadableByteLimit(full) >= requiredBytes) {
                     out.full = full;
                     out.segmented = false;
+                    RecordLegacyResolveHit(LegacyResolveBranch::kRawHigh32Scan, raw, gLegacyResolveCurrentOp);
                     return true;
                 }
             }
@@ -1736,9 +2303,10 @@ class N64DisplayListAdapter {
                     continue;
                 }
                 const uintptr_t full = high | static_cast<uintptr_t>(raw);
-                if (IsReadableAddress(full)) {
+                if (ReadableByteLimit(full) >= requiredBytes) {
                     out.full = full;
                     out.segmented = false;
+                    RecordLegacyResolveHit(LegacyResolveBranch::kRawHigh32Scan, raw, gLegacyResolveCurrentOp);
                     return true;
                 }
             }
@@ -1782,8 +2350,19 @@ class N64DisplayListAdapter {
             return IsReadableAddress(resolved.full) ? resolved.full : 0;
         }
 
+        // GDX_LEGACY_RESOLVE quarantine: treats the bare low32 as a literal host
+        // pointer -- only "works" if the host allocation happens to sit under
+        // 4 GB, which is not guaranteed on any 64-bit target. A guess like the
+        // others above (see the quarantine block above kFallbackIdentityMtx).
+        if (!LegacyResolveEnabled()) {
+            return 0;
+        }
         const uintptr_t direct = static_cast<uintptr_t>(raw);
-        return IsReadableAddress(direct) ? direct : 0;
+        if (IsReadableAddress(direct)) {
+            RecordLegacyResolveHit(LegacyResolveBranch::kDirectCast, raw, gLegacyResolveCurrentOp);
+            return direct;
+        }
+        return 0;
     }
 
     static uint64_t TextureBytesForPixels(uint64_t pixels, uint32_t size) {
@@ -1838,14 +2417,34 @@ class N64DisplayListAdapter {
     }
 
     size_t EstimateRawTextureCopyBytes(const N64Gfx* source, size_t index, size_t limit, size_t stride, bool isBig) const {
-        const N64Gfx setImg = ReadCommand(source, index, stride, isBig);
+        /* Wide-layout w1 fix (2026-07-10, rank-gadget confetti root cause):
+           ReadCommand is an 8-byte reader (w1 at offset +4). A wide 16-byte
+           packet stores w1 at offset +8; offset +4 is zero padding. The main
+           ProcessList loop compensates (memcpy from +8) but this scan never
+           did, so every w1-derived load extent (LOADBLOCK lrs, LOADTILE
+           lrt/lrs, TLUT count) read as 0 on wide lists -- the estimate
+           collapsed to kMinRawTextureCopyBytes (8) and LUS decoded a full
+           tile out of an 8-byte copy (the HUD rank digits' confetti). w0 is
+           at offset 0 in both layouts and needs no correction. */
+        const bool sourceIsWide = (stride == kHostBuiltGfxStride);
+        const auto readScanCommand = [&](size_t i) {
+            N64Gfx command = ReadCommand(source, i, stride, isBig);
+            if (sourceIsWide) {
+                uintptr_t w1full = 0;
+                std::memcpy(&w1full, reinterpret_cast<const uint8_t*>(source) + i * stride + 8,
+                            sizeof(w1full));
+                command.w1 = static_cast<uint32_t>(w1full);
+            }
+            return command;
+        };
+        const N64Gfx setImg = readScanCommand(index);
         const uint32_t size = (setImg.w0 >> 19) & 0x3;
         const uint32_t imageWidth = (setImg.w0 & 0xFFF) + 1;
         uint64_t required = kMinRawTextureCopyBytes;
 
         const size_t scanEnd = std::min(limit, index + 1 + kTextureLoadScanCommandLimit);
         for (size_t i = index + 1; i < scanEnd; i++) {
-            const N64Gfx command = ReadCommand(source, i, stride, isBig);
+            const N64Gfx command = readScanCommand(i);
             switch (Opcode(command.w0)) {
                 case kOpSetTextureImage:
                 case kOpEndDl:
@@ -1888,6 +2487,24 @@ class N64DisplayListAdapter {
             return 0;
         }
 
+        /* [digit-carve] one-shot (2026-07-10): the rank digits
+           (aPositionDigitTexs, seg4+0x13DE0) are ZERO-FILLED in ROM -- the
+           console composes/loads them at runtime. This dump decides whether
+           the port's carve receives that runtime content (nonzero => the
+           live-carve resolver fix alone renders the gadget) or stays zero
+           (=> an EK/asset fill gap remains and the digits will be invisible
+           until that loader is found). */
+        if (gGdxRaceActive != 0 && gSegments[4] != 0) {
+            static bool sDigitCarveLogged = false;
+            if (!sDigitCarveLogged) {
+                sDigitCarveLogged = true;
+                const uint8_t* d = reinterpret_cast<const uint8_t*>(gSegments[4]) + 0x13DE0;
+                gdx_port_logf("[digit-carve] gSegments[4]+13DE0: "
+                              "%02X%02X%02X%02X%02X%02X%02X%02X %02X%02X%02X%02X%02X%02X%02X%02X\n",
+                              d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+                              d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
+            }
+        }
         // How much data can we safely read from `translated`?
         // VirtualQuery (ReadableByteLimit) is ground truth for Windows page regions.
         // For the 8MB RDRAM calloc the entire region is one VirtualAlloc block, so
@@ -1912,18 +2529,6 @@ class N64DisplayListAdapter {
         
         // Always clamp to what is actually readable to avoid page faults
         required = std::min(required, readable);
-
-        const N64Gfx setImg = ReadCommand(source, index, stride, isBig);
-        const uint32_t extractedFmt = (setImg.w0 >> 21) & 0x7;
-        const uint32_t extractedSize = (setImg.w0 >> 19) & 0x3;
-
-        static int sTextureCopyPrints = 0;
-        if (sTextureCopyPrints < 16) {
-            const uint32_t width = (setImg.w0 & 0xFFF) + 1;
-            gdx_port_logf("[texdiag] setimg raw=%08X host=%p fmt=%u siz=%u width=%u copy=%zu readable=%zu\n",
-                          raw, reinterpret_cast<const void*>(translated), extractedFmt, extractedSize, width, required, readable);
-            sTextureCopyPrints++;
-        }
 
         bool textureCopyRefreshed = false;
         uintptr_t outPtr = MakePersistentRawTextureCopy(translated, required, &textureCopyRefreshed);
@@ -1971,7 +2576,8 @@ class N64DisplayListAdapter {
         return true;
     }
 
-    uintptr_t TranslateDisplayListPointer(uint32_t raw, const N64Gfx* parentSource = nullptr, size_t parentIndex = 0) {
+    uintptr_t TranslateDisplayListPointer(uint32_t raw, const N64Gfx* parentSource = nullptr, size_t parentIndex = 0,
+                                          const N64Gfx* directTarget = nullptr) {
         /*
          * Resolve the exact token first. Generated asset symbols are one-byte
          * host stubs and are not necessarily 8-byte aligned; masking them first
@@ -1979,8 +2585,14 @@ class N64DisplayListAdapter {
          *
          * Genuine N64 DL addresses still get the hardware-compatible alignment
          * fallback, but only when the exact candidate is absent or invalid.
+         *
+         * Phase G1: a wide (host-built) parent already carries the real host
+         * pointer to the sub-DL in directTarget. Use it verbatim — no low32
+         * reconstruction, no alignment guessing — but still validate it and run
+         * it through EnqueueList so the sub-list gets converted to F3DGfx (the
+         * interpreter cannot consume a raw wide-decomp Gfx list directly).
          */
-        const N64Gfx* target = ResolveDisplayListSource(raw);
+        const N64Gfx* target = (directTarget != nullptr) ? directTarget : ResolveDisplayListSource(raw);
         const auto isValidTarget = [this](const N64Gfx* candidate) {
             if (candidate == nullptr) {
                 return false;
@@ -1989,7 +2601,7 @@ class N64DisplayListAdapter {
             return (candidateLimit != 0) && LooksLikeDisplayList(candidate, candidateLimit);
         };
 
-        if (!isValidTarget(target)) {
+        if (directTarget == nullptr && !isValidTarget(target)) {
             const uint32_t alignedRaw = raw & ~static_cast<uint32_t>(7u);
             if (alignedRaw != raw) {
                 const N64Gfx* alignedTarget = ResolveDisplayListSource(alignedRaw);
@@ -2001,14 +2613,22 @@ class N64DisplayListAdapter {
         }
 
         if (target == nullptr) {
-            static int sMissingDlPrints = 0;
-            if (sMissingDlPrints < 200) {
-                ++sMissingDlPrints;
+            /* Split the print budget by race phase: a single global budget is
+               exhausted by menu/transition frames long before a race starts, so
+               a missing race-time DL (e.g. the finish-line start arc) was never
+               logged. Same anti-pattern fixed for [bigtri]; mirror it here. */
+            static int sMissingDlPrintsMenu = 0;
+            static int sMissingDlPrintsRace = 0;
+            int& missingBudget = (gGdxRaceActive != 0) ? sMissingDlPrintsRace : sMissingDlPrintsMenu;
+            const int missingCap = (gGdxRaceActive != 0) ? 400 : 60;
+            if (missingBudget < missingCap) {
+                ++missingBudget;
                 const uintptr_t parent = reinterpret_cast<uintptr_t>(parentSource);
                 const size_t parentStride = parentSource ? CommandStrideForSource(parentSource) : kN64GfxStride;
                 const N64Gfx parentCmd = parentSource ? ReadRawCommand(parentSource, parentIndex, parentStride) : N64Gfx{};
-                gdx_port_logf("[gdl-miss] raw=%08X parent=%p index=%zu w0=%08X "
+                gdx_port_logf("[gdl-miss] race=%d raw=%08X parent=%p index=%zu w0=%08X "
                               "seg0=%p seg1=%p seg2=%p seg3=%p seg8=%p\n",
+                              gGdxRaceActive,
                               raw,
                               reinterpret_cast<const void*>(parent),
                               parentIndex,
@@ -2048,17 +2668,23 @@ class N64DisplayListAdapter {
 
         const size_t limit = KnownCommandLimit(target);
         if ((limit == 0) || !LooksLikeDisplayList(target, limit)) {
-            static int sBadDlPrints = 0;
-            if (sBadDlPrints < 200) {
-                ++sBadDlPrints;
+            /* Race-phase-split budget (see [gdl-miss] above): keep race-time bad
+               DLs visible instead of being drowned by menu frames. */
+            static int sBadDlPrintsMenu = 0;
+            static int sBadDlPrintsRace = 0;
+            int& badBudget = (gGdxRaceActive != 0) ? sBadDlPrintsRace : sBadDlPrintsMenu;
+            const int badCap = (gGdxRaceActive != 0) ? 400 : 60;
+            if (badBudget < badCap) {
+                ++badBudget;
                 const uint32_t alignedRaw = raw & ~7u;
                 const N64Gfx* alignedTarget = (alignedRaw != raw) ? ResolveDisplayListSource(alignedRaw) : nullptr;
                 const size_t targetStride = CommandStrideForSource(target);
                 const N64Gfx first = (limit > 0) ? ReadCommand(target, 0, targetStride, CommandSourceIsBigEndian(target, targetStride)) : N64Gfx{};
                 const size_t parentStride = parentSource ? CommandStrideForSource(parentSource) : kN64GfxStride;
                 const N64Gfx parentCmd = parentSource ? ReadRawCommand(parentSource, parentIndex, parentStride) : N64Gfx{};
-                gdx_port_logf("[gdl-bad] raw=%08X target=%p limit=%zu first=%08X "
+                gdx_port_logf("[gdl-bad] race=%d raw=%08X target=%p limit=%zu first=%08X "
                               "alignedRaw=%08X aligned=%p alignedFirst=%08X parent=%p index=%zu w0=%08X\n",
+                              gGdxRaceActive,
                               raw,
                               reinterpret_cast<const void*>(target),
                               limit,
@@ -2138,7 +2764,32 @@ class N64DisplayListAdapter {
   public:
     Fast::F3DGfx* ConvertRoot() {
         if (mRootBegin == nullptr) return nullptr;
-        EnqueueList(mRootBegin, RootCommandLimit(mRootBegin));
+        const size_t rootLimit = RootCommandLimit(mRootBegin);
+        /* CRASH FAILSAFE (campaign soak fix, 2026-07-08): a ROOT display list
+           that does not validate must render NOTHING -- it must never be fed
+           to the interpreter, which would execute arbitrary host memory as GBI
+           commands (the first-frame [gfxfail] bad=1 crash). Sub-DLs are already
+           routed to mNoopList when they fail LooksLikeDisplayList (see
+           TranslateDisplayListPointer), but the ROOT is enqueued directly and
+           bypassed that guard. The N64 task DL is always terminated by
+           gSPEndDisplayList (Gfx_FullSync), so a well-formed root always
+           satisfies LooksLikeDisplayList well within the scan limit; a
+           truncated/garbage/zeroed root does not -> skip the whole frame. */
+        if (rootLimit == 0 ||
+            ReadableByteLimit(reinterpret_cast<uintptr_t>(mRootBegin)) <
+                CommandStrideForSource(mRootBegin) ||
+            !LooksLikeDisplayList(mRootBegin, rootLimit)) {
+            static int sRootRejectLogs = 0;
+            if (sRootRejectLogs < 16) {
+                ++sRootRejectLogs;
+                gdx_port_logf("[gfxfail] ROOT rejected: ptr=%p limit=%zu readable=%zuB "
+                              "-- rendering nothing this frame\n",
+                              reinterpret_cast<const void*>(mRootBegin), rootLimit,
+                              ReadableByteLimit(reinterpret_cast<uintptr_t>(mRootBegin)));
+            }
+            return nullptr;
+        }
+        EnqueueList(mRootBegin, rootLimit);
         while (!mWorkQueue.empty()) {
             QueueItem item = mWorkQueue.back();
             mWorkQueue.pop_back();
@@ -2151,6 +2802,22 @@ class N64DisplayListAdapter {
         if (mStats != nullptr) mStats->convertedLists++;
         item.listPtr->commands.reserve(item.limit);
 
+        /* Segment-4 probe: hud_gfx (countdown faces, start arc) now has real
+           backing, yet those elements still don't draw. Log every DL translated
+           from inside the segment-4 window so the next run proves whether the
+           countdown display lists are reached at all (vs. resolving elsewhere
+           or never being emitted). */
+        {
+            static int sSeg4Probes = 0;
+            const uintptr_t seg4Base = gSegments[4];
+            const uintptr_t src = reinterpret_cast<uintptr_t>(item.source);
+            if (seg4Base != 0 && src >= seg4Base && src < seg4Base + 0x29EA0 && sSeg4Probes < 12) {
+                ++sSeg4Probes;
+                gdx_port_logf("[seg4] DL translated from seg4+0x%X limit=%zu\n",
+                              static_cast<unsigned>(src - seg4Base), item.limit);
+            }
+        }
+
         /* RDRAM/ROM-loaded asset pointers use 8-byte N64 command slots. Some loaded
          * GFX ranges are already fixup-swapped to host endian, while untagged ROM GFX
          * ranges remain big-endian; detect endian from the command stream itself.
@@ -2160,10 +2827,16 @@ class N64DisplayListAdapter {
         const bool isBig = CommandSourceIsBigEndian(item.source, stride);
         // Prefer the segment-tag table: DLs inside a tagged asset segment have a
         // known dialect and must never fall back to the opcode-scan heuristics.
+        // Phase G2: for a converted wide buffer the source segment's dialect tag
+        // is gone, so consult the dialect the converter recorded for it FIRST --
+        // re-deriving it from the wide stream would risk the exact F3DEX2/F3D
+        // misclassification the tag table exists to prevent.
         const GdxSegmentUcode sourceDialect =
             GdxAssetPointerDialect(reinterpret_cast<uintptr_t>(item.source));
+        const auto convertedDialect = gConvertedWideIsF3d.find(item.source);
         const bool isF3DSource =
-            (sourceDialect == GdxSegmentUcode::F3D)    ? true
+            (convertedDialect != gConvertedWideIsF3d.end()) ? convertedDialect->second
+            : (sourceDialect == GdxSegmentUcode::F3D)    ? true
             : (sourceDialect == GdxSegmentUcode::F3DEX2) ? false
             : (IsF3DAssetPointer(reinterpret_cast<uintptr_t>(item.source)) ||
                DisplayListUsesF3D(item.source, item.limit, stride, isBig));
@@ -2191,29 +2864,93 @@ class N64DisplayListAdapter {
         }
 
         /* Set while an unsupported microcode (e.g. L3DEX2, the line ucode Course
-           Edit loads for its track lines) is active: its commands have different
-           semantics, so running them through the F3DEX2 interpreter produces
-           garbage frames (the Course Edit flicker). Drop everything until the
-           display list loads a supported microcode again. */
+           Edit loads for its track lines) is active: its SP-side commands (vertex
+           loads, G_LINE3D, matrix/DL/segment ops at op < 0xE0) have semantics the
+           F3DEX2 interpreter doesn't implement, so running them through it
+           produces garbage frames. Drop those until the display list loads a
+           supported microcode again. */
         bool skipUnsupportedUcode = false;
+
+        // Phase G1: host-built display lists carry a FULL pointer-width w1.
+        // The decomp Gfx type under PORT is { u32 w0; <pad>; uintptr_t w1; } = 16
+        // bytes, so the pointer-carrying word lives at byte offset 8, not 4.
+        // ReadCommand() only recovers 8 bytes (w0 @0, a 32-bit w1 @4 == padding
+        // on wide packets), so for wide sources we pull the real 64-bit word here
+        // and fix in.w1 to its low 32 bits (all the operand parsing below still
+        // expects the 32-bit token). Narrow N64/ROM/RDRAM lists are unchanged.
+        const bool sourceIsWide =
+            (stride == kHostBuiltGfxStride) && (kHostBuiltGfxStride > kN64GfxStride);
 
         for (size_t i = 0; i < item.limit; i++) {
             N64Gfx in = ReadCommand(item.source, i, stride, isBig);
+            uintptr_t w1full;
+            if (sourceIsWide) {
+                std::memcpy(&w1full,
+                            reinterpret_cast<const uint8_t*>(item.source) + i * stride + 8,
+                            sizeof(w1full));
+                in.w1 = static_cast<uint32_t>(w1full);
+            } else {
+                w1full = in.w1;
+            }
+            /* A wide packet whose pointer word has any high bits set is a REAL
+             * host pointer the game already resolved (Phase G1) — use it verbatim
+             * and skip the low32-reconstruction guesswork (the disease this phase
+             * removes). A wide packet with high bits zero holds a 32-bit VALUE or
+             * a segmented address, which still flows through the segment table /
+             * value path below exactly as before. Narrow sources never set high
+             * bits, so this is always false for them. */
+            bool w1IsHostPointer =
+                sourceIsWide && ((static_cast<uint64_t>(w1full) >> 32) != 0);
+            /* EXCEPTION to the "high bits set => real host pointer" rule: the
+             * game references runtime-loaded segmented assets (setup_gfx render-
+             * mode DLs via gSPDisplayList(&D_3000050), vertex data via
+             * gSPVertex(&D_3000xxx)) through 1-byte BSS PLACEHOLDER symbols. G1's
+             * wide gSPDisplayList/gSPVertex pack the full host address of that
+             * placeholder, so high32 is set and it LOOKS like a real host
+             * pointer -- but the placeholder is a 1-byte object; the real DL/
+             * vertex bytes live in the loaded segment image. Taking it verbatim
+             * branches the interpreter into the 1-byte stub and reads adjacent
+             * BSS as commands: odd branch targets, a G_GEOMETRYMODE word
+             * (0xD9680800) misread as a vertex pointer, and a count=0xF0 garbage
+             * G_VTX -- the boot/title-phase crash (campaign soak fix 3). Route
+             * these back through the low32 resolver, which maps the placeholder
+             * to the loaded segment via ResolveGeneratedAssetStub exactly as the
+             * pre-wide build did. Only the placeholder's own low32 is affected;
+             * genuine runtime host pointers (GfxPool sub-DLs, persistent vertex
+             * copies) are never registered in the asset map and are unchanged. */
+            if (w1IsHostPointer &&
+                (IsAssetPlaceholderPointer(in.w1) || IsPortBssAliasPointer(in.w1))) {
+                w1IsHostPointer = false;
+            }
             const uint8_t op = Opcode(in.w0);
-            /* Keep 0xDD (a ucode reload ends the skip) and ENDDL (0xDF EX2 /
-               0xB8 F3D — dropping the terminator would leave the translated
-               list unterminated and the interpreter would run off its end).
+            // GDX_LEGACY_RESOLVE instrumentation: tag any guessing branch that
+            // fires while resolving this command's pointer(s) with the opcode
+            // that triggered it (see the quarantine block above
+            // kFallbackIdentityMtx). Free functions (ResolveRegisteredHostPointer,
+            // FallbackDataPointer) read this global instead of a threaded param.
+            gLegacyResolveCurrentOp = op;
+            /* Keep 0xDD (a ucode reload ends the skip), ENDDL (0xDF EX2 / 0xB8
+               F3D — dropping the terminator would leave the translated list
+               unterminated and the interpreter would run off its end), AND any
+               RDP command (op >= 0xE0: SETCIMG/SETZIMG/SETSCISSOR/SETPRIMCOLOR/
+               SETCOMBINE/FILLRECT/tile loads/...). RDP commands are executed by
+               the RDP hardware, not the active RSP microcode, so on real N64
+               hardware they run identically whether F3DEX2 or L3DEX2 is loaded;
+               dropping them left the color image / scissor / prim color / combine
+               state stale for whatever the game draws right after the L3DEX2
+               section (course_edit/191080.c reloads F3DEX2 and keeps drawing
+               HUD/gadget content into the same viewport), which is a second,
+               independent source of the reported Course Edit flicker beyond the
+               missing line geometry itself.
                Deliberately NOT counted in skippedDataCommands: that counter
                drives the per-frame [datafail] log line, and an intentional
                line-ucode skip would spam it every Course Edit frame. */
-            if (skipUnsupportedUcode && op != 0xDD && op != 0xDF && op != 0xB8) {
+            if (skipUnsupportedUcode && op != 0xDD && op != 0xDF && op != 0xB8 && op < 0xE0) {
                 continue;
             }
             if (diagThisList && i < 24) {
                 gdx_port_logf("[setupdl]   #%02zu %08X %08X op=%02X\n", i, in.w0, in.w1, op);
             }
-            LogTexturePipelineCommand(item.source, i, item.limit, stride, in.w0, in.w1, isBig);
-
             /* TEXRECT coord probe: log first 8 TEXRECTs unconditionally to diagnose zoom. */
             if (op == 0xE4 || op == 0xE5) {
                 static int sTRectProbe = 0;
@@ -2232,6 +2969,38 @@ class N64DisplayListAdapter {
             uintptr_t outW1 = static_cast<uintptr_t>(in.w1);
             if (mStats != nullptr) mStats->opCounts[op]++;
 
+            /* #16 unconditional raw-value trace: the count==4-gated [rect] probe
+               never matched the countdown draw's known raw pointers (captured
+               decomp-side), even though gfxdiag shows this list's vtx/mtx commands
+               being processed with no miss/bad/skip counts. Dump EVERY vtx/mtx raw
+               w0/w1 seen during the race so the exact command stream can be
+               diffed against the decomp-side low32 values without a count filter
+               that could itself be hiding the match (e.g. wrong endianness making
+               the parsed count something other than 4). */
+            {
+                static const bool sDiagCountdownRaw = std::getenv("GDX_DIAG_COUNTDOWN") != nullptr;
+                // Gate on the arm flag (set decomp-side the instant the countdown
+                // draw code runs) instead of gGdxRaceActive: that flag stays 1 for
+                // the whole race, so a fixed-size trace filled up long before the
+                // countdown ever appeared. Keep capturing a little after arming
+                // too (car doesn't stop generating HUD each frame).
+                if (sDiagCountdownRaw && gGdxCountdownProbeArm != 0 && (op == kOpVtx || op == kOpMtx)) {
+                    static int sRawTraceCount = 0;
+                    static FILE* sRawTraceFile = nullptr;
+                    if (sRawTraceCount == 0) {
+                        sRawTraceFile = fopen("vtx-mtx-trace.txt", "w");
+                    }
+                    if (sRawTraceFile != nullptr && sRawTraceCount < 400000) {
+                        ++sRawTraceCount;
+                        fprintf(sRawTraceFile, "op=%02X w0=%08X w1=%08X f3d=%d big=%d src=%p i=%zu\n",
+                                op, in.w0, in.w1, (int)isF3DSource, (int)isBig, item.source, i);
+                        if ((sRawTraceCount % 500) == 0) {
+                            fflush(sRawTraceFile);
+                        }
+                    }
+                }
+            }
+
             switch (op) {
                 case kOpVtx:
                     // F3D uses opcode 0x01 for G_MTX (not G_VTX). Remap to kOpMtx so Fast3D
@@ -2248,28 +3017,289 @@ class N64DisplayListAdapter {
                         outW0 = (static_cast<uintptr_t>(kOpMtx) << 24) |
                                 static_cast<uintptr_t>(encoded);
                     }
-                    outW1 = TranslateDataPointer(in.w1);
+                    {
+                        /* Vertex-spike root cause (#3): TranslateDataPointer used to be
+                           called with its default requiredBytes=1, so the resolver only
+                           proved the FIRST byte of the vertex buffer readable while
+                           MakePersistentVtxCopy below unconditionally read numVtx*16
+                           bytes. An ambiguous/near-miss resolution (segment-offset
+                           guess, physical-window reconstruction) could pass that 1-byte
+                           gate yet be wrong or short past byte 0 -- one garbage vertex
+                           is a visible stretched-polygon "spike". Require the FULL
+                           vertex payload to be readable before accepting a candidate. */
+                        const uint32_t vtxCount = (!isF3DSource) ? ((in.w0 >> 12) & 0xFFu) : 0u;
+                        const size_t vtxRequiredBytes =
+                            (vtxCount != 0) ? (static_cast<size_t>(vtxCount) * 16u) : 1u;
+                        /* Bridge asymmetry fix (2026-07-08): the G_MTX case below passes
+                           preferPhysical=!isF3DSource and sourceHint=item.source, but this
+                           G_VTX case never did, so trySourceWindow() -- explicitly written
+                           to reconstruct "a host-built display list and the
+                           matrices/vertices it references [that] are almost always
+                           allocated together in the same 4GB low32 window" -- was never
+                           even attempted for vertex loads. Mirror the matrix call so
+                           vertex buffers get the same last-resort reconstruction. */
+                        outW1 = w1IsHostPointer
+                                    ? w1full
+                                    : TranslateDataPointer(in.w1, vtxRequiredBytes, /*preferPhysical=*/!isF3DSource,
+                                                      reinterpret_cast<uintptr_t>(item.source));
+                        /* [vtx-census] (2026-07-11, interior-stub-aliasing fix
+                           verification): one line per UNIQUE vertex source, NOT
+                           race-gated (machine select is a primary target).
+                           Logs the resolution class and CONTENT fingerprint at
+                           +0x10 -- the failure family this verifies is
+                           readable-but-zero/aliased data, which the failsafe
+                           probes below can never see. */
+                        {
+                            static uint32_t sVtxCensusSeen[48] = {};
+                            static int sVtxCensusCount = 0;
+                            bool vcDup = false;
+                            for (int vc = 0; vc < sVtxCensusCount; vc++) {
+                                if (sVtxCensusSeen[vc] == in.w1) {
+                                    vcDup = true;
+                                    break;
+                                }
+                            }
+                            /* Retargeted 2026-07-11: general sources burned the
+                               budget before race time twice. Segment-8 raws
+                               (the decoration family, e.g. 0x08017388) are the
+                               open investigation — census those exclusively. */
+                            if (!vcDup && sVtxCensusCount < 48 && outW1 != 0 &&
+                                ((in.w1 >> 24) & 0xFFu) == 0x08u) {
+                                sVtxCensusSeen[sVtxCensusCount++] = in.w1;
+                                const char* vcls = IsRdramHostPointer(outW1) ? "rdram"
+                                                   : (mModuleBegin != 0 && outW1 >= mModuleBegin &&
+                                                      outW1 < mModuleEnd)   ? "module"
+                                                                             : "heap";
+                                uint8_t vfp[8] = {};
+                                if (ReadableByteLimit(outW1 + 0x10) >= sizeof(vfp)) {
+                                    std::memcpy(vfp, reinterpret_cast<const void*>(outW1 + 0x10), sizeof(vfp));
+                                }
+                                gdx_port_logf("[vtx-census] raw=%08X host=%d out=%p cls=%s n=%u "
+                                              "fp8=%02X%02X%02X%02X%02X%02X%02X%02X\n",
+                                              in.w1, w1IsHostPointer ? 1 : 0,
+                                              reinterpret_cast<void*>(outW1), vcls, vtxCount,
+                                              vfp[0], vfp[1], vfp[2], vfp[3], vfp[4], vfp[5], vfp[6], vfp[7]);
+                            }
+                        }
+                        // Always on (2026-07-08): was gated behind GDX_DIAG_VTX, so a
+                        // user run without that env var set captured zero [vtx-spike]/
+                        // [vtx-dropped] evidence even while the visible spikes/mesh
+                        // explosions kept happening. The per-frame cost is one branch
+                        // plus (when a race is active) a capped set of log lines, so
+                        // there is no reason to require manual opt-in for this.
+                        if (gGdxRaceActive != 0 && vtxCount != 0) {
+                            if (outW1 != 0) {
+                                const size_t readable = ReadableByteLimit(outW1);
+                                static int sVtxSpikeLogs = 0;
+                                if (readable < vtxRequiredBytes && sVtxSpikeLogs < 40) {
+                                    ++sVtxSpikeLogs;
+                                    gdx_port_logf("[vtx-spike] raw=%08X resolved=%p need=%zuB readable=%zuB count=%u src=%p\n",
+                                                  in.w1, reinterpret_cast<void*>(outW1), vtxRequiredBytes, readable,
+                                                  vtxCount, item.source);
+                                }
+                            } else {
+                                /* The strict requiredBytes gate rejected every candidate.
+                                   Log what the OLD requiredBytes=1 rule would have
+                                   accepted, to show whether this DL is the source of a
+                                   spike that has now been turned into a dropped-vertex
+                                   pop instead (safer, but still worth knowing about). */
+                                const uintptr_t loose = TranslateDataPointer(in.w1, 1);
+                                static int sVtxDroppedLogs = 0;
+                                if (sVtxDroppedLogs < 40) {
+                                    ++sVtxDroppedLogs;
+                                    gdx_port_logf("[vtx-dropped] raw=%08X count=%u need=%zuB "
+                                                  "looseResolve=%p looseReadable=%zuB src=%p\n",
+                                                  in.w1, vtxCount, vtxRequiredBytes,
+                                                  reinterpret_cast<void*>(loose),
+                                                  loose ? ReadableByteLimit(loose) : 0u, item.source);
+                                }
+                            }
+                        }
+                    }
                     if (outW1 != 0 && isBig && !isF3DSource) {
                         outW1 = MakePersistentVtxCopy(outW1, (outW0 >> 12) & 0xFF);
+                    } else if (outW1 != 0 && isBig && isF3DSource) {
+                        /* This command was just remapped to G_MTX: big-endian
+                           static Mtx data needs the word-swapped copy. */
+                        outW1 = MakePersistentMtxCopy(outW1);
                     }
                     if (outW1 != 0) {
                         outW1 = NormalizeLusDirectPointer(outW1);
+                    }
+                    /* CRASH FAILSAFE (campaign soak fix, 2026-07-08): host-built
+                       little-endian display lists (the GfxPool root and its
+                       sub-DLs) skip MakePersistentVtxCopy -- which is the ONLY
+                       vertex path that clamps the read to the readable region --
+                       so an under-validated / truncated / legacy-guessed vertex
+                       pointer reached the interpreter verbatim and was
+                       dereferenced in GfxSpVertex (interpreter.cpp), faulting on
+                       the first real frame after the boot-logo hold. The
+                       [vtx-spike] probe above only LOGGED this; it never stopped
+                       the garbage pointer. Never hand the interpreter a vertex
+                       pointer whose full payload is not readable: substitute the
+                       zeroed, fully-readable kFallbackVertices buffer (a benign
+                       degenerate load) for a real F3DEX2 vertex load, or drop a
+                       remapped F3D matrix pointer to 0 (the interpreter tolerates
+                       a null matrix, same as the [mtx-dropped] path). */
+                    if (outW1 != 0) {
+                        const size_t vtxNeedBytes =
+                            isF3DSource ? 64u
+                                        : static_cast<size_t>((in.w0 >> 12) & 0xFFu) * 16u;
+                        if (vtxNeedBytes != 0 && ReadableByteLimit(outW1) < vtxNeedBytes) {
+                            static int sVtxFailsafeLogs = 0;
+                            if (sVtxFailsafeLogs < 40) {
+                                ++sVtxFailsafeLogs;
+                                gdx_port_logf("[vtx-failsafe] raw=%08X resolved=%p need=%zuB "
+                                              "readable=%zuB f3d=%d src=%p -> %s\n",
+                                              in.w1, reinterpret_cast<void*>(outW1), vtxNeedBytes,
+                                              ReadableByteLimit(outW1), (int)isF3DSource, item.source,
+                                              isF3DSource ? "dropped" : "fallback-vertices");
+                            }
+                            outW1 = isF3DSource
+                                        ? 0u
+                                        : reinterpret_cast<uintptr_t>(kFallbackVertices);
+                        }
+                    }
+                    /* #16 phase 3: publish the resolved host pointer the instant this
+                       command's raw low32 matches the digit quad's tagged pointer
+                       (set decomp-side in racer.c right before gSPVertex(gfx++,
+                       D_400AA28, 4, 0)). interpreter.cpp's GfxSpVertex compares its
+                       own vertex pointer argument against this to know precisely
+                       when the digit quad itself loads, instead of the coarse
+                       arm flag matching whatever triangle happens to run first. */
+                    if (gGdxCountdownProbeArm != 0 && gGdxCountdownProbeVtxLow32 != 0 &&
+                        in.w1 == gGdxCountdownProbeVtxLow32 && outW1 != 0) {
+                        gGdxCountdownProbeResolvedVtx = outW1;
+                    }
+                    /* Countdown-quad probe (#16): the "3,2,1,GO" HUD quad is drawn as a
+                       4-vertex textured rect (gSPVertex(gfx++, D_400AA28, 4, 0)) built
+                       inside a 3D billboard positioned by a G_MTX load right before it.
+                       Dump ob/tc for every 4-vertex load seen while a race is active so
+                       the countdown draw's raw pointer (captured decomp-side via
+                       gdx_cki("[countdown] ...")) can be grepped out of this same log to
+                       see whether its object-space rect is sane (small ob magnitude,
+                       tc spanning the 32x32 texture) or garbage/degenerate (all-zero,
+                       NaN-adjacent, or wildly out of range). */
+                    {
+                        static const bool sDiagCountdown = std::getenv("GDX_DIAG_COUNTDOWN") != nullptr;
+                        // Gated on the arm flag, not gGdxRaceActive: the blanket race
+                        // gate let ~60 unrelated 4-vertex HUD quads (portraits, other
+                        // sprites) exhaust the log cap minutes before the countdown
+                        // ever ran, so this probe never actually captured the quad it
+                        // was written for. Arming near the real event fixes that.
+                        if (sDiagCountdown && gGdxCountdownProbeArm != 0 && !isF3DSource &&
+                            (((in.w0 >> 12) & 0xFFu) == 4u) && outW1 != 0) {
+                            static int sRectLogs = 0;
+                            if (sRectLogs < 200) {
+                                ++sRectLogs;
+                                // Read the raw N64 Vtx_t layout by hand (ob[3] s16, flag u16,
+                                // tc[2] s16, cn[4] u8 = 16 bytes/vertex) -- same convention
+                                // MakePersistentVtxCopy already uses -- rather than depending
+                                // on a Vtx_t type possibly not visible/ODR-safe in this TU.
+                                const uint8_t* base = reinterpret_cast<const uint8_t*>(outW1);
+                                const auto ob = [&](int v, int c) {
+                                    int16_t x;
+                                    std::memcpy(&x, base + v * 16 + c * 2, sizeof(x));
+                                    return x;
+                                };
+                                const auto tc = [&](int v, int c) {
+                                    int16_t x;
+                                    std::memcpy(&x, base + v * 16 + 8 + c * 2, sizeof(x));
+                                    return x;
+                                };
+                                gdx_port_logf("[rect] raw=%08X resolved=%p "
+                                              "v0=(%d,%d,%d tc=%d,%d) v1=(%d,%d,%d tc=%d,%d) "
+                                              "v2=(%d,%d,%d tc=%d,%d) v3=(%d,%d,%d tc=%d,%d)\n",
+                                              in.w1, reinterpret_cast<void*>(outW1),
+                                              ob(0,0), ob(0,1), ob(0,2), tc(0,0), tc(0,1),
+                                              ob(1,0), ob(1,1), ob(1,2), tc(1,0), tc(1,1),
+                                              ob(2,0), ob(2,1), ob(2,2), tc(2,0), tc(2,1),
+                                              ob(3,0), ob(3,1), ob(3,2), tc(3,0), tc(3,1));
+                            }
+                        }
                     }
                     break;
 
                 case kOpMtx:
-                    outW1 = TranslateDataPointer(in.w1, 64, /*preferPhysical=*/!isF3DSource,
+                    outW1 = w1IsHostPointer
+                                ? w1full
+                                : TranslateDataPointer(in.w1, 64, /*preferPhysical=*/!isF3DSource,
                                                  reinterpret_cast<uintptr_t>(item.source));
                     if ((outW1 & 7u) != 0) {
                         outW1 = 0;
                     }
+                    {
+                        // Matrix resolution probe (#3): unlike the vertex paths above,
+                        // this call already requires the full 64-byte Mtx to be
+                        // readable, so a dropped resolution here (rather than a
+                        // garbage read) is the expected failure mode. Log it so a
+                        // human tester can correlate dropped machine matrices with
+                        // observed z-fighting/punch-through during races.
+                        // Always on (2026-07-08): see the [vtx-spike]/[vtx-dropped] note
+                        // above -- GDX_DIAG_VTX required manual setup the user never did.
+                        if (gGdxRaceActive != 0 && outW1 == 0 && in.w1 != 0) {
+                            static int sMtxDroppedLogs = 0;
+                            if (sMtxDroppedLogs < 40) {
+                                ++sMtxDroppedLogs;
+                                gdx_port_logf("[mtx-dropped] raw=%08X f3d=%d big=%d src=%p\n",
+                                              in.w1, (int)isF3DSource, (int)isBig, item.source);
+                            }
+                        }
+                    }
                     if (outW1 != 0) {
+                        /* Same byte-order proxy as the G_VTX paths: matrices
+                           referenced from big-endian DLs are static asset Mtx
+                           data and need word-swapping for the interpreter's
+                           host-order reads; host-built DLs reference
+                           Matrix_ToMtx output, which is already host-order. */
+                        if (isBig) {
+                            outW1 = MakePersistentMtxCopy(outW1);
+                        }
                         outW1 = NormalizeLusDirectPointer(outW1);
+                    }
+                    /* CRASH FAILSAFE (campaign soak fix, 2026-07-08): the
+                       w1IsHostPointer fast path above takes w1full verbatim with
+                       no readability check, and the resolver path can return an
+                       under-validated candidate. A matrix load dereferences 64
+                       bytes in the interpreter, so drop any matrix pointer whose
+                       full 64 bytes are not readable (0 is the established
+                       dropped-matrix convention the interpreter tolerates). */
+                    if (outW1 != 0 && ReadableByteLimit(outW1) < 64u) {
+                        static int sMtxFailsafeLogs = 0;
+                        if (sMtxFailsafeLogs < 40) {
+                            ++sMtxFailsafeLogs;
+                            gdx_port_logf("[mtx-failsafe] raw=%08X resolved=%p readable=%zuB "
+                                          "src=%p -> dropped\n",
+                                          in.w1, reinterpret_cast<void*>(outW1),
+                                          ReadableByteLimit(outW1), item.source);
+                        }
+                        outW1 = 0u;
+                    }
+                    // #16 countdown-matrix content probe: dump the resolved 64-byte
+                    // Mtx as raw hex words, armed on the same flag as the [rect]
+                    // probe, to sanity-check the countdown billboard's modelview
+                    // matrix for degenerate (all-zero) or wildly-out-of-range values
+                    // instead of just confirming the pointer resolved.
+                    {
+                        static const bool sDiagCountdownMtx = std::getenv("GDX_DIAG_COUNTDOWN") != nullptr;
+                        if (sDiagCountdownMtx && gGdxCountdownProbeArm != 0 && outW1 != 0) {
+                            static int sMtxContentLogs = 0;
+                            if (sMtxContentLogs < 200) {
+                                ++sMtxContentLogs;
+                                const uint32_t* w = reinterpret_cast<const uint32_t*>(outW1);
+                                gdx_port_logf("[mtx-content] raw=%08X resolved=%p "
+                                              "%08X %08X %08X %08X %08X %08X %08X %08X "
+                                              "%08X %08X %08X %08X %08X %08X %08X %08X\n",
+                                              in.w1, reinterpret_cast<void*>(outW1),
+                                              w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
+                                              w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
+                            }
+                        }
                     }
                     break;
 
                 case kOpMovemem:
-                    outW1 = TranslateDataPointer(in.w1);
+                    outW1 = w1IsHostPointer ? w1full : TranslateDataPointer(in.w1);
                     if (outW1 != 0) {
                         outW1 = NormalizeLusDirectPointer(outW1);
                     }
@@ -2277,7 +3307,7 @@ class N64DisplayListAdapter {
 
                 case kOpSetColorImage:
                 case kOpSetDepthImage:
-                    outW1 = TranslateDataPointer(in.w1);
+                    outW1 = w1IsHostPointer ? w1full : TranslateDataPointer(in.w1);
                     if (outW1 == 0) outW1 = MakeFramebufferToken(in.w1);
                     if (op == kOpSetColorImage && outW1 != 0 && mStats != nullptr) {
                         bool alreadySeen = false;
@@ -2295,23 +3325,136 @@ class N64DisplayListAdapter {
 
                 case kOpSetTextureImage:
                     {
-                        const uintptr_t translated = TranslateDataPointer(in.w1);
+                        const uintptr_t translated =
+                            w1IsHostPointer ? w1full : TranslateDataPointer(in.w1);
                         // Only emit the O2R filepath opcode for BSS-stub textures (asset-segment
                         // symbols with a 1:1 O2R resource). RDRAM-backed textures are contiguous
                         // multi-tile buffers where the game issues many G_LOADBLOCKs with
                         // increasing ULS offsets across the full region — the O2R resource only
                         // covers the first tile and causes out-of-bounds reads for later bands.
                         // Those textures must go through the raw-copy path (1MB slice of RDRAM).
-                        const char* o2rKey = (translated != 0 && !IsRdramHostPointer(translated))
+                        const char* o2rKey = (!w1IsHostPointer && translated != 0 && !IsRdramHostPointer(translated))
                                                  ? gdx_lookup_asset_segment_o2r_key(in.w1)
                                                  : nullptr;
+                        const char* texCensusPath = "rawcopy"; /* [tex-census] delivery classification */
                         if (o2rKey) {
+                            texCensusPath = "o2r";
                             outW0 = (outW0 & 0x00FFFFFFu) | (static_cast<uintptr_t>(kOpSetTextureImageOtrFilepath) << 24);
                             outW1 = reinterpret_cast<uintptr_t>(o2rKey);
+                        } else if (w1IsHostPointer) {
+                            // Phase G1: real host pointer to texel data — use directly,
+                            // UNLESS it is a generated asset stub (see
+                            // ResolveWideAssetStubPointer): stubs must be re-routed to
+                            // the decoded asset image or the sampler reads EXE data.
+                            const uintptr_t stubResolved =
+                                ResolveWideAssetStubPointer(w1full, mModuleBegin, mModuleEnd);
+                            // Leftover census: a module-range texture pointer that BOTH
+                            // stub resolvers miss is almost certainly an unbound stub
+                            // (LinkStubs symbol with no AssetBindings entry / venue bank
+                            // beyond the alias table) — i.e., the next visual-garbage
+                            // candidate. Enumerate them so a single soak run names every
+                            // remaining broken texture source.
+                            if (stubResolved == 0 && w1full >= mModuleBegin && w1full < mModuleEnd) {
+                                // One line per UNIQUE address: real module-resident
+                                // arrays (e.g. sCourseMinimapPalette, sampled every
+                                // frame) are legitimate and must not drown the budget
+                                // that should be naming actual unresolved stubs.
+                                static uintptr_t sStubMissSeen[24] = {};
+                                static int sStubMissCount = 0;
+                                bool alreadySeen = false;
+                                for (int s = 0; s < sStubMissCount; s++) {
+                                    if (sStubMissSeen[s] == w1full) {
+                                        alreadySeen = true;
+                                        break;
+                                    }
+                                }
+                                if (!alreadySeen && sStubMissCount < 24) {
+                                    sStubMissSeen[sStubMissCount++] = w1full;
+                                    /* Emit the ASLR-stable identity too: the low32
+                                       alone is useless against the .map because the
+                                       base is randomized each run. modOff/prefVA
+                                       (imageBase + moduleOffset) resolve to the exact
+                                       symbol deterministically -- e.g. this run's
+                                       E3BAE880 -> prefVA 0x14134E880 =
+                                       sMachineWeightDigitCompTexInfos+0x420, a real
+                                       module array for which verbatim is by design. */
+                                    const uintptr_t modOff = w1full - mModuleBegin;
+                                    gdx_port_logf("[stub-miss] SETTIMG module ptr %p (low32=%08X) "
+                                                  "modOff=%08llX prefVA=%011llX unresolved -- taken verbatim\n",
+                                                  reinterpret_cast<void*>(w1full), Low32(w1full),
+                                                  static_cast<unsigned long long>(modOff),
+                                                  static_cast<unsigned long long>(kPreferredImageBaseVA + modOff));
+                                }
+                            }
+                            texCensusPath = (stubResolved != 0) ? "widestub" : "hostptr";
+                            outW1 = NormalizeLusDirectPointer(stubResolved != 0 ? stubResolved : w1full);
                         } else {
                             outW1 = TranslateTexturePointer(in.w1, item.source, i, item.limit, isBig, stride);
                             if (outW1 != 0) {
                                 outW1 = NormalizeLusDirectPointer(outW1);
+                            }
+                        }
+                        /* [tex-census] (2026-07-10, graphics-audit phase 4): one line
+                           per UNIQUE SETTIMG source across the WHOLE session (NOT
+                           race-gated -- pause menu / machine select / menus are audit
+                           targets). Pairs every on-screen texture with its delivery
+                           path and the first bytes LUS consumes, mirroring the audio
+                           [sample-census]. Fingerprint at +0x20 to skip transparent
+                           glyph corners when the buffer is large enough. */
+                        {
+                            /* 2026-07-10 recalibration: 160 unique slots burned out in
+                               the first 8s of boot (all RGBA/I) and the pause-menu CI
+                               textures -- the audit's primary target -- never logged.
+                               512 general slots + a RESERVED pool for CI-format (fmt=2)
+                               sources, which always log regardless of the general cap. */
+                            static uint32_t sTexCensusSeen[512] = {};
+                            static int sTexCensusCount = 0;
+                            static uint32_t sTexCensusCiSeen[64] = {};
+                            static int sTexCensusCiCount = 0;
+                            const uint32_t cw0 = static_cast<uint32_t>(in.w0);
+                            const uint32_t cFmt = (cw0 >> 21) & 0x7;
+                            bool censusDup = false;
+                            for (int tc = 0; tc < sTexCensusCount; tc++) {
+                                if (sTexCensusSeen[tc] == in.w1) {
+                                    censusDup = true;
+                                    break;
+                                }
+                            }
+                            for (int tc = 0; !censusDup && tc < sTexCensusCiCount; tc++) {
+                                if (sTexCensusCiSeen[tc] == in.w1) {
+                                    censusDup = true;
+                                    break;
+                                }
+                            }
+                            const bool censusHasBudget =
+                                (sTexCensusCount < 512) ||
+                                (cFmt == 2u && sTexCensusCiCount < 64);
+                            if (!censusDup && censusHasBudget) {
+                                if (sTexCensusCount < 512) {
+                                    sTexCensusSeen[sTexCensusCount++] = in.w1;
+                                } else if (cFmt == 2u && sTexCensusCiCount < 64) {
+                                    sTexCensusCiSeen[sTexCensusCiCount++] = in.w1;
+                                }
+                                const uint32_t cSiz = (cw0 >> 19) & 0x3;
+                                const uint32_t cWidth = (cw0 & 0xFFF) + 1;
+                                if (o2rKey) {
+                                    gdx_port_logf("[tex-census] raw=%08X path=o2r fmt=%u siz=%u w=%u key=%s\n",
+                                                  in.w1, cFmt, cSiz, cWidth, o2rKey);
+                                } else {
+                                    uint8_t cfp[8] = {};
+                                    uintptr_t fpAt = outW1;
+                                    if (fpAt != 0 && ReadableByteLimit(fpAt) >= 0x28) {
+                                        fpAt += 0x20;
+                                    }
+                                    if (fpAt != 0 && ReadableByteLimit(fpAt) >= sizeof(cfp)) {
+                                        std::memcpy(cfp, reinterpret_cast<const void*>(fpAt), sizeof(cfp));
+                                    }
+                                    gdx_port_logf("[tex-census] raw=%08X path=%s fmt=%u siz=%u w=%u out=%p "
+                                                  "fp8=%02X%02X%02X%02X%02X%02X%02X%02X\n",
+                                                  in.w1, texCensusPath, cFmt, cSiz, cWidth,
+                                                  reinterpret_cast<void*>(outW1),
+                                                  cfp[0], cfp[1], cfp[2], cfp[3], cfp[4], cfp[5], cfp[6], cfp[7]);
+                                }
                             }
                         }
                         // Resolution-audit probe. Classifies the RESOLVED SOURCE
@@ -2384,30 +3527,92 @@ class N64DisplayListAdapter {
                     break;
 
                 case kOpDl:
-                    outW1 = TranslateDisplayListPointer(in.w1, item.source, i);
+                    outW1 = TranslateDisplayListPointer(
+                        in.w1, item.source, i,
+                        w1IsHostPointer ? reinterpret_cast<const N64Gfx*>(w1full) : nullptr);
                     break;
 
                 case kOpMoveword:
                     if (WordParam(in.w0) == kMovewordSegmentIndex) {
                         const uint8_t segIdx = static_cast<uint8_t>((in.w0 & 0xFFFF) / 4);
-                        uintptr_t translated = TranslateDataPointer(in.w1);
-                        if (translated == 0 && in.w1 == 0 && gdx_rdram != nullptr) {
-                            translated = reinterpret_cast<uintptr_t>(gdx_rdram);
+                        /* Phase G1 / soak-fix-2: gSPSegment(seg, base) packs the segment
+                           BASE through the WIDENED gDma1p macro (F3DEX_GBI_2 -> _GFXW1_PTR),
+                           so a game-emitted wide list carries the FULL host pointer in
+                           w1full. The segment table is the CENTRAL base for ALL segmented
+                           addressing; reading the truncated low32 (in.w1) and running it
+                           through the legacy resolver here (the [legacy-resolve]
+                           reghost_low32 op=DB hits in the soak log) truncated every segment
+                           base and cascaded into zero-byte texture copies (gray rects),
+                           garbage vertex/matrix bases, and noop'd DL roots. Take the real
+                           host pointer verbatim, resolver-free, exactly like the other
+                           w1IsHostPointer pointer opcodes (VTX/MTX/MOVEMEM/DL/SETTIMG). */
+                        uintptr_t translated;
+                        if (w1IsHostPointer) {
+                            translated = w1full;
+                        } else {
+                            translated = TranslateDataPointer(in.w1);
+                            if (translated == 0 && in.w1 == 0 && gdx_rdram != nullptr) {
+                                translated = reinterpret_cast<uintptr_t>(gdx_rdram);
+                            }
                         }
                         if (translated != 0 && segIdx < kGfxSegmentCount) {
                             const uintptr_t normalized = NormalizeLusDirectPointer(translated);
-                            /* Segment 0x0A feeds the road texture bank alias; a mid-race
-                               repoint swaps every road texture, so make it visible. */
-                            if (segIdx == 0x0A && gSegments[segIdx] != normalized) {
-                                static int sSeg10RepointLogs = 0;
-                                if (sSeg10RepointLogs < 32) {
-                                    ++sSeg10RepointLogs;
-                                    gdx_port_logf("[segment] moveword repoints seg 0x0A: %p -> %p (raw=%08X)\n",
+                            /* In-DL segment repoints were invisible in the log (only the
+                               CPU-side setters print [seg] lines), which made "element
+                               draws through an unset/stale segment" bugs undiagnosable.
+                               Log the first few repoints of EVERY segment. */
+                            if (gSegments[segIdx] != normalized) {
+                                static int sSegRepointLogs[kGfxSegmentCount] = {};
+                                if (sSegRepointLogs[segIdx] < 6) {
+                                    ++sSegRepointLogs[segIdx];
+                                    gdx_port_logf("[seg-dl] moveword seg=%X raw=%08X %p -> %p\n", segIdx, in.w1,
                                                   reinterpret_cast<void*>(gSegments[segIdx]),
-                                                  reinterpret_cast<void*>(normalized), in.w1);
+                                                  reinterpret_cast<void*>(normalized));
+                                }
+                                /* Early-race floor probe (2026-07-09, defect A): course-select's
+                                   thumbnail carousel alone burns the 6-slot sSegRepointLogs[0x0A]
+                                   budget above (5 venue-cycle repoints + 1 boot-time repoint,
+                                   confirmed in the 21:10 soak log) before the race is ever entered,
+                                   so any repoint of the venue-bank segment (0x0A) DURING the first
+                                   race frames is invisible. That segment is what
+                                   ResolveVenueBankAlias (n64_gfx_bridge.cpp above) resolves
+                                   course.c's road/wall material stubs through, and
+                                   MakePersistentRawTextureCopy keys its cache on the resolved
+                                   `source` pointer -- if gSegments[0x0A] is transiently wrong for
+                                   the opening frames (e.g. still holding the course-select
+                                   thumbnail's RDRAM-mirror target) that would produce a
+                                   first-created cache entry from the WRONG source (garbage), and
+                                   once the segment settles to the correct venue base a NEW,
+                                   correctly-sourced cache entry takes over -- a "self heal" that
+                                   is not staleness re-detection but a different cache key. This
+                                   probe is scoped to the race window and keyed independently of
+                                   the budget above so it survives past course-select; look for
+                                   "[seg-dl-race] seg=A" lines and compare their timestamps against
+                                   the observed garbage-to-correct transition (~13s to ~22s of race
+                                   time) on the next soak run. */
+                                if (segIdx == 0x0A && gGdxRaceActive != 0) {
+                                    static int sSegARaceRepointLogs = 0;
+                                    if (sSegARaceRepointLogs < 32) {
+                                        ++sSegARaceRepointLogs;
+                                        gdx_port_logf(
+                                            "[seg-dl-race] seg=A raw=%08X %p -> %p (race-scoped, unbudgeted by "
+                                            "course-select)\n",
+                                            in.w1, reinterpret_cast<void*>(gSegments[segIdx]),
+                                            reinterpret_cast<void*>(normalized));
+                                    }
                                 }
                             }
                             gSegments[segIdx] = normalized;
+                        } else if (in.w1 != 0 && segIdx < kGfxSegmentCount) {
+                            /* A segment repoint we could NOT translate: the segment keeps
+                               its stale base and everything drawn through it afterwards is
+                               missing or garbage. This must never be silent. */
+                            static int sSegFailLogs = 0;
+                            if (sSegFailLogs < 24) {
+                                ++sSegFailLogs;
+                                gdx_port_logf("[seg-dl] moveword FAILED seg=%X raw=%08X (stale base %p kept)\n",
+                                              segIdx, in.w1, reinterpret_cast<void*>(gSegments[segIdx]));
+                            }
                         }
                         outW1 = (segIdx < kGfxSegmentCount) ? gSegments[segIdx] : static_cast<uintptr_t>(in.w1);
                     }
@@ -2421,7 +3626,7 @@ class N64DisplayListAdapter {
                     }
                     // F3DEX2 uses 0xD6 for G_DMA_IO. F3DFLX loads its per-vertex
                     // reflection-alpha lookup table through this command.
-                    outW1 = TranslateDataPointer(in.w1);
+                    outW1 = w1IsHostPointer ? w1full : TranslateDataPointer(in.w1);
                     if (outW1 == 0) {
                         if (mStats != nullptr) {
                             mStats->skippedDataCommands++;
@@ -2439,8 +3644,10 @@ class N64DisplayListAdapter {
                        corrupted into no-op display-list pointers. */
                     if ((i + 1 < item.limit) &&
                         (Opcode(ReadCommand(item.source, i + 1, stride, isBig).w0) == kOpBranchZ) &&
-                        IsResolvableDisplayList(in.w1)) {
-                        outW1 = TranslateDisplayListPointer(in.w1, item.source, i);
+                        (w1IsHostPointer || IsResolvableDisplayList(in.w1))) {
+                        outW1 = TranslateDisplayListPointer(
+                            in.w1, item.source, i,
+                            w1IsHostPointer ? reinterpret_cast<const N64Gfx*>(w1full) : nullptr);
                     }
                     break;
 
@@ -2458,9 +3665,19 @@ class N64DisplayListAdapter {
                        host addresses move every build. Compare within the
                        512MB physical window so recognition is layout- and
                        transform-independent (an exact-low32 match here once
-                       broke per-build: machine select lost every model). */
-                    const auto matchesUcodeText = [raw = in.w1](const void* symbol) {
-                        const uint32_t symbolLow = Low32(reinterpret_cast<uintptr_t>(symbol));
+                       broke per-build: machine select lost every model).
+                       Graphics wave W1: when the packet is WIDE and carries a
+                       full host pointer (w1IsHostPointer), match the FULL
+                       pointer exactly against the stub symbol first — that is
+                       unambiguous. The low29 window stays as the only test for
+                       narrow/truncated sources. */
+                    const auto matchesUcodeText = [raw = in.w1, w1IsHostPointer,
+                                                   w1full](const void* symbol) {
+                        const uintptr_t symbolAddr = reinterpret_cast<uintptr_t>(symbol);
+                        if (w1IsHostPointer) {
+                            return w1full == symbolAddr;
+                        }
+                        const uint32_t symbolLow = Low32(symbolAddr);
                         return ((raw ^ symbolLow) & 0x1FFFFFFFu) == 0;
                     };
 
@@ -2479,16 +3696,22 @@ class N64DisplayListAdapter {
                     } else if (matchesUcodeText(gspF3DFLX2_Rej_fifoTextStart)) {
                         variant = Fast::F3dex2Variant::FZeroFlxReject;
                     } else if (matchesUcodeText(gspL3DEX2_fifoTextStart)) {
-                        /* L3DEX2 line microcode (Course Edit track lines): its
-                           command semantics have no interpreter support, and
-                           running them through F3DEX2 produced garbage frames
-                           (Course Edit flicker). Skip its section until a
-                           supported microcode is loaded again. */
+                        /* L3DEX2 line microcode (Course Edit track lines, menu
+                           track previews): its command semantics have no
+                           interpreter support, and running them through F3DEX2
+                           produced garbage frames (Course Edit flicker). Skip
+                           its section until a supported microcode is loaded
+                           again. Counted in l3dexUcodeSkips (NOT
+                           unknownUcodeSwitches): this skip is deliberate and
+                           benign; sharing the unknown counter masked genuine
+                           match failures (graphics wave W1 ambiguity, resolved:
+                           the per-menu-frame unknown=1 raw=AA96A670 was
+                           low32(gspL3DEX2_fifoTextStart), i.e. this skip). */
                         skipUnsupportedUcode = true;
                         if (mStats != nullptr) {
-                            mStats->unknownUcodeSwitches++;
-                            if (mStats->firstUnknownUcodeRaw == 0) {
-                                mStats->firstUnknownUcodeRaw = in.w1;
+                            mStats->l3dexUcodeSkips++;
+                            if (mStats->firstL3dexUcodeRaw == 0) {
+                                mStats->firstL3dexUcodeRaw = in.w1;
                             }
                         }
                         continue;
@@ -2579,7 +3802,7 @@ class N64DisplayListAdapter {
 
                         uintptr_t addr = TranslateDataPointer(in.w1, std::max<size_t>(xferSize, 1u));
                         if (addr == 0) {
-                            addr = FallbackDataPointer(kOpMovemem);
+                            addr = FallbackDataPointer(kOpMovemem, in.w1);
                         }
                         if (addr == 0) {
                             if (mStats != nullptr) mStats->skippedDataCommands++;
@@ -2613,9 +3836,18 @@ class N64DisplayListAdapter {
                         outW0 = (outW0 & 0x00FFFFFFu) | (static_cast<uintptr_t>(kOpMoveword) << 24);
                         if (WordParam(in.w0) == kMovewordSegmentIndex) {
                             const uint8_t segIdx = static_cast<uint8_t>((in.w0 & 0xFFFF) / 4);
-                            uintptr_t translated = TranslateDataPointer(in.w1);
-                            if (translated == 0 && in.w1 == 0 && gdx_rdram != nullptr) {
-                                translated = reinterpret_cast<uintptr_t>(gdx_rdram);
+                            /* Same full-width segment base as kOpMoveword above: a converted
+                               wide F3D list (Phase G2) may commit a genuine >4GB host base to
+                               w1full, so honor w1IsHostPointer before falling back to the
+                               narrow-token resolver. */
+                            uintptr_t translated;
+                            if (w1IsHostPointer) {
+                                translated = w1full;
+                            } else {
+                                translated = TranslateDataPointer(in.w1);
+                                if (translated == 0 && in.w1 == 0 && gdx_rdram != nullptr) {
+                                    translated = reinterpret_cast<uintptr_t>(gdx_rdram);
+                                }
                             }
                             if (translated != 0 && segIdx < kGfxSegmentCount) {
                                 gSegments[segIdx] = NormalizeLusDirectPointer(translated);
@@ -2700,11 +3932,53 @@ class N64DisplayListAdapter {
                         const uint8_t n = (len >= 16u) ? static_cast<uint8_t>(len / 16u) : 1u;
                         const uint8_t par = static_cast<uint8_t>((in.w0 >> 16) & 0xFFu);
                         const uint8_t v0 = par & 0x0Fu;
-                        outW1 = TranslateDataPointer(in.w1);
+                        /* Vertex-spike root cause (#3): this path is the one the
+                           original author already tagged as the source of "the
+                           machine-part and decoration vertex-spike geometry" below,
+                           but TranslateDataPointer was still only asked to prove 1
+                           byte readable while MakePersistentVtxCopy unconditionally
+                           reads n*16 bytes. Require the full payload up front so an
+                           ambiguous/near-miss resolution can't slip a garbage vertex
+                           into a machine model. */
+                        const size_t vtxRequiredBytes = static_cast<size_t>(n) * 16u;
+                        /* Same trySourceWindow() asymmetry fix as the F3DEX2 G_VTX case
+                           above: pass sourceHint so a legacy-F3D vertex load can still be
+                           reconstructed from its own referencing DL's window. isF3DSource
+                           is always true on this path, so preferPhysical stays false
+                           (unchanged) -- only sourceHint is new here. */
+                        outW1 = TranslateDataPointer(in.w1, vtxRequiredBytes, /*preferPhysical=*/!isF3DSource,
+                                                      reinterpret_cast<uintptr_t>(item.source));
+                        // Always on (2026-07-08): see the [vtx-spike]/[vtx-dropped] note
+                        // in the F3DEX2 G_VTX case above -- this legacy F3D path is the
+                        // one the original author tagged as the source of machine-part
+                        // and decoration vertex-spike geometry, so it especially cannot
+                        // be left opt-in behind an env var the user never set.
+                        if (gGdxRaceActive != 0) {
+                            if (outW1 == 0) {
+                                const uintptr_t loose = TranslateDataPointer(in.w1, 1);
+                                static int sVtxF3DDroppedLogs = 0;
+                                if (sVtxF3DDroppedLogs < 40) {
+                                    ++sVtxF3DDroppedLogs;
+                                    gdx_port_logf("[vtx-dropped-f3d] raw=%08X n=%u need=%zuB "
+                                                  "looseResolve=%p looseReadable=%zuB src=%p\n",
+                                                  in.w1, n, vtxRequiredBytes,
+                                                  reinterpret_cast<void*>(loose),
+                                                  loose ? ReadableByteLimit(loose) : 0u, item.source);
+                                }
+                            }
+                        }
                         if (outW1 != 0) {
+                            /* F3D vertex payloads share the DL's byte order, same
+                               as the EX2 path above: big-endian sources need the
+                               swapped persistent copy or the interpreter reads
+                               byte-swapped s16 coordinates (the machine-part and
+                               decoration vertex-spike geometry). */
+                            if (isBig) {
+                                outW1 = MakePersistentVtxCopy(outW1, n);
+                            }
                             outW1 = NormalizeLusDirectPointer(outW1);
                         } else {
-                            outW1 = FallbackDataPointer(kOpVtx);
+                            outW1 = FallbackDataPointer(kOpVtx, in.w1);
                             if (outW1 == 0) {
                                 if (mStats != nullptr) mStats->skippedDataCommands++;
                                 continue;
@@ -2721,7 +3995,7 @@ class N64DisplayListAdapter {
             }
 
             if (outW1 == 0 && (op == kOpVtx || op == kOpMtx || op == kOpMovemem || op == kOpSetTextureImage)) {
-                outW1 = FallbackDataPointer(op);
+                outW1 = FallbackDataPointer(op, in.w1);
                 if (outW1 != 0) {
                     if (mStats != nullptr) {
                         if (mStats->fallbackDataCommands == 0) {
@@ -2753,7 +4027,13 @@ class N64DisplayListAdapter {
                 if (op == kOpSetTextureImage) mStats->textureCopies++;
             }
 
-            if (op == kOpEndDl) return;
+            /* Both terminators must stop translation. Only stopping on the EX2
+               terminator let lists ending in F3D 0xB8 (notably lone-0xB8 "empty
+               part" DLs in segment 3) run past their end into adjacent EX2
+               sub-lists while still classified F3D, converting G_TRI2 (0x06)
+               commands into bogus G_DL branches (the raw=0x00000406-family
+               [gdl-bad] class). */
+            if (op == kOpEndDl || op == 0xB8u) return;
         }
 
         item.listPtr->commands.push_back(MakeLusGfx(static_cast<uintptr_t>(kOpEndDl) << 24, 0));
@@ -2824,12 +4104,368 @@ extern "C" void gdx_register_n64_framebuffer(void* cpuAddr, unsigned int width, 
     }
 }
 
+/* Shared RGBA5551 -> 24bpp BMP writer for one-shot diagnostic dumps
+   (transition capture, VI-fallback frame). Pixels are host-order u16, top-down. */
+static void DumpRgba16Bmp(const char* filename, const uint16_t* pixels, unsigned int width,
+                          unsigned int height) {
+    std::FILE* f = std::fopen(filename, "wb");
+    if (f == nullptr) {
+        gdx_port_logf("[dump] BMP write failed: %s\n", filename);
+        return;
+    }
+    const unsigned int rowBytes = (width * 3u + 3u) & ~3u;
+    const unsigned int imageBytes = rowBytes * height;
+    const unsigned int fileBytes = 14u + 40u + imageBytes;
+    unsigned char header[54] = { 0 };
+    header[0] = 'B'; header[1] = 'M';
+    header[2] = static_cast<unsigned char>(fileBytes);
+    header[3] = static_cast<unsigned char>(fileBytes >> 8);
+    header[4] = static_cast<unsigned char>(fileBytes >> 16);
+    header[5] = static_cast<unsigned char>(fileBytes >> 24);
+    header[10] = 54;
+    header[14] = 40;
+    header[18] = static_cast<unsigned char>(width);
+    header[19] = static_cast<unsigned char>(width >> 8);
+    header[20] = static_cast<unsigned char>(width >> 16);
+    header[21] = static_cast<unsigned char>(width >> 24);
+    header[22] = static_cast<unsigned char>(height);
+    header[23] = static_cast<unsigned char>(height >> 8);
+    header[24] = static_cast<unsigned char>(height >> 16);
+    header[25] = static_cast<unsigned char>(height >> 24);
+    header[26] = 1;
+    header[28] = 24;
+    std::fwrite(header, 1, sizeof(header), f);
+    std::vector<unsigned char> row(rowBytes, 0);
+    for (unsigned int y = 0; y < height; y++) {
+        const uint16_t* srcRow = pixels + static_cast<size_t>(height - 1 - y) * width;
+        for (unsigned int x = 0; x < width; x++) {
+            const uint16_t p = srcRow[x];
+            const unsigned char r5 = (p >> 11) & 0x1F;
+            const unsigned char g5 = (p >> 6) & 0x1F;
+            const unsigned char b5 = (p >> 1) & 0x1F;
+            row[x * 3 + 2] = static_cast<unsigned char>((r5 << 3) | (r5 >> 2));
+            row[x * 3 + 1] = static_cast<unsigned char>((g5 << 3) | (g5 >> 2));
+            row[x * 3 + 0] = static_cast<unsigned char>((b5 << 3) | (b5 >> 2));
+        }
+        std::fwrite(row.data(), 1, rowBytes, f);
+    }
+    std::fclose(f);
+}
+
 extern "C" void gdx_vi_set_next_framebuffer(void* cpuAddr) {
     gViNextFramebuffer = reinterpret_cast<uintptr_t>(cpuAddr);
 }
 
 extern "C" void gdx_vi_set_current_framebuffer(void* cpuAddr) {
     gViCurrentFramebuffer = reinterpret_cast<uintptr_t>(cpuAddr);
+}
+
+/* Shared RGBA5551 fullscreen compositor (framebuffer coherence).
+ *
+ * Uploads a 320x240 RGBA5551 CPU framebuffer as one host RGBA32 texture and draws
+ * a single copy-mode rectangle over the whole screen. The caller MUST have already
+ * established the frame (rapi StartFrame + StartDrawToFramebuffer + ClearFramebuffer).
+ * Used by BOTH the VI-scanout fallback below (whole-frame present when no task ran)
+ * and the boot-logo seed hook (background drawn under a task's content). Setting
+ * loaded_texture directly (as GfxDpImageRectangle does for backgrounds) uploads all
+ * 320x240 in one UploadTexture with no TMEM strip loop. */
+static void SeedFramebufferQuad(Fast::Interpreter* interp, const uint16_t* srcPixels) {
+    constexpr uint32_t kFbW = 320; // SCREEN_WIDTH  (decomp/include/macros.h)
+    constexpr uint32_t kFbH = 240; // SCREEN_HEIGHT
+    constexpr uint32_t kPixels = kFbW * kFbH;
+
+    static uint8_t sConverted[kPixels * 4];
+    gdx_convert_rgba5551_to_rgba8888(srcPixels, sConverted, kPixels);
+
+    // Source-content probe: the seed/VI quad can only show what the CPU put in
+    // the framebuffer. "Boot logo invisible with seeding enabled" needs this
+    // one number to split loader-side (count==0: the game never blitted the
+    // logo — port feature gap in the IPL/logo path) from renderer-side
+    // (count>0: the quad draw itself is broken).
+    {
+        static int sSeedContentLogs = 0;
+        if (sSeedContentLogs < 10) {
+            ++sSeedContentLogs;
+            size_t nonZero = 0;
+            size_t nonBackground = 0; // pixels != 0x0001 (the RGBA5551 cleared-black
+                                      // value): distinguishes real blitted content
+                                      // (boot logo) from a bare clear — "all nonzero"
+                                      // alone cannot (0x0001 counts as nonzero).
+            for (size_t k = 0; k < kPixels; k++) {
+                if (srcPixels[k] != 0) {
+                    ++nonZero;
+                }
+                if (srcPixels[k] != 0 && srcPixels[k] != 0x0001) {
+                    ++nonBackground;
+                }
+            }
+            gdx_port_logf("[seed] quad source %p nonzero=%zu nonbg=%zu/%u\n",
+                          reinterpret_cast<const void*>(srcPixels), nonZero, nonBackground, kPixels);
+        }
+    }
+
+    interp->mRdp->viewport_or_scissor_changed = true;
+    interp->mRenderingState.viewport = {};
+    interp->mRenderingState.scissor = {};
+
+    // Boot-phase frames run before the game ever sets an RDP scissor, leaving
+    // it 0x0 ([gpustate] sc=0.0,0.0 0.0x0.0) — the interpreter clips every
+    // rectangle against it, so the quad was drawn and fully scissored away
+    // (vifallback-frame.bmp: solid black while the source FB held the logo).
+    // Establish the full-screen scissor this draw needs; coords are 10.2 fixed.
+    interp->GfxDpSetScissor(0 /*G_SC_NON_INTERLACE*/, 0, 0, kFbW << 2, kFbH << 2);
+
+    constexpr int kTile = 0;
+    auto& tile = interp->mRdp->texture_tile[kTile];
+    tile.fmt = G_IM_FMT_RGBA;
+    tile.siz = G_IM_SIZ_32b;
+    tile.cms = G_TX_CLAMP;
+    tile.cmt = G_TX_CLAMP;
+    tile.masks = G_TX_NOMASK;
+    tile.maskt = G_TX_NOMASK;
+    tile.shifts = 0;
+    tile.shiftt = 0;
+    tile.uls = 0.0f;
+    tile.ult = 0.0f;
+    tile.lrs = static_cast<float>((kFbW - 1) * 4);
+    tile.lrt = static_cast<float>((kFbH - 1) * 4);
+    tile.tmem = 0;
+    tile.tmem_index = 0;
+    tile.palette = 0;
+    // Nonzero to pass ImportTexture's zero-line guard; the draw derives width/height
+    // from loaded_texture's line/size below.
+    tile.line_size_bytes = kFbW * 2;
+
+    Fast::LoadedTexture& loaded = interp->mRdp->loaded_texture[0];
+    loaded = Fast::LoadedTexture{};
+    loaded.addr = sConverted;
+    loaded.orig_size_bytes = kPixels * 4;
+    loaded.size_bytes = kPixels * 4;
+    loaded.full_image_line_size_bytes = kFbW * 4;
+    loaded.line_size_bytes = kFbW * 4;
+    loaded.tex_flags = 0;
+    loaded.masked = false;
+    loaded.blended = false;
+
+    interp->mRdp->first_tile_index = kTile;
+    interp->mRdp->textures_changed[0] = true;
+    interp->mRdp->textures_changed[1] = true;
+
+    // The converted buffer lives at a fixed address, so evict any cache entry from a
+    // previous present — otherwise ImportTexture would serve a stale upload and a
+    // CPU-animated screen would freeze.
+    interp->TextureCacheDelete(sConverted);
+
+    // Copy cycle: GfxDpTextureRectangle auto-applies a TEXEL0 passthrough combine and
+    // point filtering (dsdx=0x0400 = 1 texel/pixel, so 320 texels -> 320px).
+    interp->GfxSpSetOtherMode(G_MDSFT_CYCLETYPE + 32, 2, static_cast<uint64_t>(G_CYC_COPY) << 32);
+    interp->GfxDpTextureRectangle(0, 0, (kFbW - 1) << G_TEXTURE_IMAGE_FRAC, (kFbH - 1) << G_TEXTURE_IMAGE_FRAC,
+                                  kTile, 0, 0, 0x0400, 0x0400, false);
+    interp->Flush();
+}
+
+extern "C" int gGameMode; // decomp global; GET_MODE = (gGameMode & 0x1F), GAMEMODE_TITLE == 0
+
+// Persistent framebuffer holding a copy of the most recently completed game
+// frame. Written at the end of every gdx_gfx_run task AND at the end of the
+// VI-scanout fallback presenter (gdx_vi_present_fallback), so a transition
+// snapshot taken during/after a boot-phase VI-fallback frame still sees a
+// fresh mirror instead of a stale/empty one. Read by
+// gdx_read_current_framebuffer (the game's transition snapshot). Declared
+// this early (rather than immediately above gdx_gfx_run) so the VI-fallback
+// presenter, which runs first in file order, can also write it.
+static int gFrameMirrorFb = -1;
+static bool gFrameMirrorValid = false;
+
+// Shared epilogue for gdx_gfx_run and gdx_vi_present_fallback: refresh the persistent
+// GPU-side frame mirror that transition snapshots read from (gdx_read_current_framebuffer).
+// Both callers reach this point after producing a complete frame through the interpreter —
+// one via a real GFX task, the other via the VI-scanout fallback quad — and the mirror
+// update itself was byte-for-byte identical in both, so it now lives in one place instead
+// of two copies that could silently drift. GPU->GPU copy, no CPU stall.
+static void GdxUpdateFrameMirror(const std::shared_ptr<Fast::Interpreter>& interp) {
+    if (gFrameMirrorFb < 0) {
+        gFrameMirrorFb = interp->CreateFrameBuffer(320, 240, 320, 240, 1, false);
+    }
+    if (gFrameMirrorFb >= 0) {
+        interp->CopyFrameBuffer(gFrameMirrorFb, 0, false, nullptr);
+        gFrameMirrorValid = true;
+    }
+}
+
+/* PORT boot-logo seed (framebuffer coherence, campaign-soak-fix-4).
+ *
+ * Registered as the interpreter's after-clear hook (Interpreter::SetPortAfterClearHook)
+ * ONLY when GDX_SEED_BOOT_LOGO is enabled (see gdx_gfx_run). It runs on the
+ * freshly-cleared canvas, BEFORE the frame's task commands, so the CPU-written VI
+ * framebuffer (the boot logo blitted by func_806F33D0 / func_80069F5C, which no RDP
+ * task renders) shows as a background UNDER the task's overlay content instead of a
+ * black canvas. Gated to the boot/title phase (GAMEMODE_TITLE) so it can never
+ * affect gameplay/menus. This complements the already-present GPU->CPU readback for
+ * transitions (gdx_read_current_framebuffer). Left opt-in because it cannot be
+ * runtime-validated without a launch; enabling it in a soak validates the logo. */
+/* Graphics wave W6: the hook is now registered UNCONDITIONALLY (removing any
+   registration-order/env-timing question); the opt-in gate lives here, per
+   call, on a cached env check. Set by gdx_gfx_run's first-frame env probe. */
+static bool gSeedBootLogoEnabled = false;
+
+static void SeedBootLogoAfterClear(Fast::Interpreter* interp) {
+    if (!gSeedBootLogoEnabled) {
+        return; // Opt-in via GDX_SEED_BOOT_LOGO (see gdx_gfx_run).
+    }
+    if ((gGameMode & 0x1F) != 0) {
+        return; // Boot/title phase only.
+    }
+    const uintptr_t fbAddr = gViCurrentFramebuffer;
+    if (fbAddr == 0) {
+        return; // No framebuffer presented yet.
+    }
+    SeedFramebufferQuad(interp, reinterpret_cast<const uint16_t*>(fbAddr));
+}
+
+/* VI-scanout fallback (boot-logo black screen fix, host-side).
+ *
+ * On the N64 the VI chip scans out whatever u16 pixels sit in the framebuffer
+ * RDRAM, regardless of who wrote them. F-Zero X's boot N64/64DD logo is drawn
+ * that way: sys_main.c's func_806F33D0 / func_80069F5C CPU-blit pixels straight
+ * into a gFrameBuffers[] FrameBuffer (see decomp/include/gfx.h: a union whose
+ * `u16 array[240][320]` view is RGBA5551) with NO RDP graphics task ever
+ * submitted, then the boot code osViSwapBuffer()s that buffer and holds it on
+ * screen for ~3.8s (sys_gfx.c Game_ThreadEntry) while nothing is drawn.
+ *
+ * This port's presentation is task-driven — everything visible comes from
+ * interp->Run() rendering a parsed F3D display list — so a framebuffer nothing
+ * draws through that pipeline shows only the (black) GL/D3D render target. This
+ * function is the missing "VI reads raw memory" fallback.
+ *
+ * Design (learned from a prior failed attempt — do not regress):
+ *  - It runs on the HOST/render side (called from main.cpp's frame loop after
+ *    gdx_dispatch()), inside the window's already-open StartFrame/EndFrame
+ *    bracket — NOT injected from a game fiber, which had no valid frame context
+ *    and rendered nothing.
+ *  - It is cheap: a single 320x240 texture upload + one fullscreen quad, no
+ *    per-call GPU sync (no ReadFramebuffer, no extra EndFrame — the host loop's
+ *    EndFrame presents), so it never stalls the audio fiber.
+ *  - When a real GFX task rendered this frame (gHostFrameGfxTaskRan), it is a
+ *    single boolean check and immediate return — zero cost during gameplay.
+ *
+ * The pixels are converted RGBA5551 -> RGBA8888 on the CPU
+ * (gdx_convert_rgba5551_to_rgba8888) and uploaded as one RGBA32 texture; the
+ * interpreter's own texture-rectangle path (GfxDpTextureRectangle) then draws
+ * the quad, reusing its tested VBO/shader/viewport machinery. Uploading the
+ * full frame in one shot (rather than the old 4 KB-TMEM strip blit) is why the
+ * tile's loaded_texture fields are set directly here instead of via
+ * GfxDpLoadTile — the emulated TMEM only bounds LoadTile, not import.
+ */
+extern "C" void gdx_vi_present_fallback(void) {
+    // A real GFX task already produced this host frame: nothing to do. Clear the
+    // flag for the next frame. This is the hot path once gameplay is rendering.
+    if (gHostFrameGfxTaskRan) {
+        gHostFrameGfxTaskRan = false;
+        return;
+    }
+
+    const uintptr_t fbAddr = gViCurrentFramebuffer;
+    if (fbAddr == 0) {
+        return; // No framebuffer has been presented yet.
+    }
+
+    // Cache the window pointer once (same rationale as gdx_gfx_run): avoid a
+    // per-frame refcount touch on the Context's window shared_ptr.
+    static Fast::Fast3dWindow* sFallbackWindow = nullptr;
+    if (sFallbackWindow == nullptr) {
+        auto ctx = Ship::Context::GetInstance();
+        if (ctx == nullptr) {
+            return;
+        }
+        auto wnd = ctx->GetWindow();
+        sFallbackWindow = static_cast<Fast::Fast3dWindow*>(wnd.get());
+    }
+    Fast::Fast3dWindow* fw = sFallbackWindow;
+    if (fw == nullptr) {
+        return;
+    }
+    auto interp = fw->GetInterpreterWeak().lock();
+    if (!interp) {
+        return;
+    }
+    Fast::GfxRenderingAPI* rapi = interp->GetCurrentRenderingAPI();
+    if (rapi == nullptr) {
+        return;
+    }
+
+    // --- Frame prologue: exactly what Interpreter::Run() establishes before a
+    //     task's commands. The host's w->StartFrame() only ran interp->StartFrame()
+    //     (which set mRendersToFb / framebuffer params); the rapi frame + draw
+    //     target + clear are done by Run(), which is not called this frame. ---
+    interp->SpReset();
+    rapi->UpdateFramebufferParameters(0, interp->mGfxCurrentWindowDimensions.width,
+                                      interp->mGfxCurrentWindowDimensions.height, 1, false, true, true,
+                                      !interp->mRendersToFb);
+    rapi->StartFrame();
+    rapi->StartDrawToFramebuffer(interp->mRendersToFb ? interp->mGameFb : 0,
+                                 interp->mNativeDimensions.height != 0
+                                     ? static_cast<float>(interp->mCurDimensions.height) / interp->mNativeDimensions.height
+                                     : 1.0f);
+    rapi->ClearFramebuffer(true, true);
+
+    // Convert + upload the VI framebuffer's CPU-written RGBA5551 pixels and draw
+    // them as one fullscreen copy-mode rectangle. The pointer tracked at
+    // osViSwapBuffer time is a real host pointer, read directly as u16.
+    SeedFramebufferQuad(interp.get(), reinterpret_cast<const uint16_t*>(fbAddr));
+
+    // --- Frame epilogue: same as Run(). When rendering to an offscreen game FB
+    //     (resolution multiplier / MSAA), publish it for the GUI compositor. ---
+    interp->mGfxFrameBuffer = 0;
+    if (interp->mRendersToFb) {
+        rapi->StartDrawToFramebuffer(0, 1);
+        rapi->ClearFramebuffer(true, true);
+        if (interp->mMsaaLevel > 1) {
+            if (!interp->ViewportMatchesRendererResolution()) {
+                rapi->ResolveMSAAColorBuffer(interp->mGameFbMsaaResolved, interp->mGameFb);
+                interp->mGfxFrameBuffer =
+                    reinterpret_cast<uintptr_t>(rapi->GetFramebufferTextureId(interp->mGameFbMsaaResolved));
+            } else {
+                rapi->ResolveMSAAColorBuffer(0, interp->mGameFb);
+            }
+        } else {
+            interp->mGfxFrameBuffer = reinterpret_cast<uintptr_t>(rapi->GetFramebufferTextureId(interp->mGameFb));
+        }
+    }
+    // The host loop's w->EndFrame() presents this frame — do NOT EndFrame here.
+
+    static int sFallbackLogs = 0;
+    if (sFallbackLogs < 8) {
+        ++sFallbackLogs;
+        gdx_port_logf("[vifallback] presented VI framebuffer fb=%p (%ux%u, rendersToFb=%d)\n",
+                      reinterpret_cast<void*>(fbAddr), 320u, 240u, static_cast<int>(interp->mRendersToFb));
+    }
+
+    // Transition snapshot mirror: identical to the update done at the tail of
+    // gdx_gfx_run. Boot-phase frames are often presented entirely through this
+    // VI-scanout fallback (no GFX task runs), so without this the mirror stays
+    // stale/empty until the first real task, and any transition snapshot taken
+    // during/after boot reads garbage.
+    GdxUpdateFrameMirror(interp);
+
+    // Boot-logo verdict probe: dump ONE composed fallback frame (read back from
+    // the mirror just updated above) to vifallback-frame.bmp. The FB source is
+    // proven to hold the logo texels ([seed] nonbg=5304) yet the screen shows
+    // black — this dump splits "the composed frame lacks the logo" (quad draw
+    // broken) from "the frame has it" (presentation-side). Dumped on the 30th
+    // fallback frame so the logo blit (a few frames in) has certainly run.
+    {
+        static int sFallbackFrames = 0;
+        static bool sFallbackDumped = false;
+        ++sFallbackFrames;
+        if (!sFallbackDumped && sFallbackFrames == 30 && gFrameMirrorFb >= 0) {
+            sFallbackDumped = true;
+            static uint16_t sDumpPixels[320 * 240];
+            interp->GetCurrentRenderingAPI()->ReadFramebufferToCPU(gFrameMirrorFb, 320, 240, sDumpPixels);
+            DumpRgba16Bmp("vifallback-frame.bmp", sDumpPixels, 320, 240);
+            gdx_port_logf("[vifallback] frame 30 dumped to vifallback-frame.bmp\n");
+        }
+    }
 }
 
 extern "C" void gdx_set_native_rgba16_texture_range(void* ptr, size_t size, int enabled) {
@@ -2983,6 +4619,10 @@ extern "C" void* gdx_resolve_module_host_address(unsigned int addr) {
     return nullptr;
 }
 
+// gFrameMirrorFb / gFrameMirrorValid are declared near the top of this file
+// (just after the gGameMode extern) so gdx_vi_present_fallback can also
+// write them; see the comment there.
+
 extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
     // The Fast3dWindow is created once at startup and lives for the whole
     // program. Fetch it once and cache the raw pointer instead of copying the
@@ -3000,6 +4640,81 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
     }
     Fast::Fast3dWindow* fw = sCachedWindow;
     if (fw == nullptr) { return; }
+
+    // Deep-audit M1: advance the G2 wide-conversion cache's frame counter once
+    // per real GFX task and let it sweep stale entries when it has grown past
+    // its watermark (see GfxWideCache::BeginFrame). gWideCache stays self-
+    // contained (no logging dependency of its own, so it still builds/unit-
+    // tests standalone); the bridge does the one-line log here instead.
+    {
+        const size_t evicted = gWideCache.BeginFrame();
+        if (evicted != 0) {
+            gdx_port_logf("[g2] evicted %zu stale conversions\n", evicted);
+        }
+    }
+
+    // Graphics wave W6: register the boot-logo seed hook ALWAYS and gate the
+    // behavior per call inside SeedBootLogoAfterClear (gSeedBootLogoEnabled).
+    // The env state is logged UNCONDITIONALLY so a soak log always shows what
+    // the process actually saw. GetEnvironmentVariableA is used instead of
+    // std::getenv: getenv reads the CRT's startup snapshot of the environment,
+    // which can miss variables in edge cases (env changed after CRT init, or a
+    // launcher passing a custom environment block); the Win32 call reads the
+    // live process environment directly.
+    static bool sSeedHookChecked = false;
+    if (!sSeedHookChecked) {
+        sSeedHookChecked = true;
+        char seedValue[32] = { 0 };
+        bool seedPresent = false;
+#ifdef _WIN32
+        const DWORD seedLen =
+            GetEnvironmentVariableA("GDX_SEED_BOOT_LOGO", seedValue, sizeof(seedValue));
+        seedPresent = (seedLen > 0 && seedLen < sizeof(seedValue));
+#else
+        if (const char* seedEnv = std::getenv("GDX_SEED_BOOT_LOGO")) {
+            std::snprintf(seedValue, sizeof(seedValue), "%s", seedEnv);
+            seedPresent = true;
+        }
+#endif
+        gSeedBootLogoEnabled = seedPresent && seedValue[0] != '0';
+        // Shell-proof fallback: the env var route failed silently in user soak
+        // runs (PowerShell `set` does not export; double-click launches carry
+        // no shell env at all). A command-line switch survives every launch
+        // method.
+        bool seedFromArg = false;
+#ifdef _WIN32
+        {
+            const char* cmd = GetCommandLineA();
+            if (cmd != nullptr) {
+                if (!gSeedBootLogoEnabled && std::strstr(cmd, "--seed-boot-logo") != nullptr) {
+                    gSeedBootLogoEnabled = true;
+                    seedFromArg = true;
+                }
+                // Forward the TEXEL1 A/B bisect switch to the interpreter's
+                // getenv probe (interpreter.cpp, GDX_DIAG_TEXEL1_FROM_BASE).
+                // This runs before the interpreter's first material import,
+                // so the CRT env update is seen by its one-time static check.
+                if (std::strstr(cmd, "--diag-texel1-base") != nullptr) {
+                    _putenv("GDX_DIAG_TEXEL1_FROM_BASE=1");
+                    gdx_port_logf("[seed] --diag-texel1-base: TEXEL1 forced to base tile for this run\n");
+                }
+                // Forward the SETTIMG race-trace probe (classifies + fingerprints
+                // every resolved texture source during a race into
+                // settimg-trace.txt) so it works from any launch method.
+                if (std::strstr(cmd, "--diag-settimg") != nullptr) {
+                    _putenv("GDX_DIAG_SETTIMG=1");
+                    gdx_port_logf("[seed] --diag-settimg: SETTIMG race trace enabled\n");
+                }
+            }
+        }
+#endif
+        gdx_port_logf("[seed] GDX_SEED_BOOT_LOGO=%s%s (seeding %s)\n",
+                      seedPresent ? seedValue : "<unset>",
+                      seedFromArg ? " arg=--seed-boot-logo" : "",
+                      gSeedBootLogoEnabled ? "ENABLED" : "disabled");
+        Fast::Interpreter::SetPortAfterClearHook(&SeedBootLogoAfterClear);
+    }
+
     // All three task variants share F3DEX2 command encoding. Their semantic
     // differences are carried separately so the base opcode table stays valid.
     fw->SetRendererUCode(ucode_f3dex2);
@@ -3050,6 +4765,16 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
         }
         gdx_port_logf("[bridge-init] DL root: ptr=%p size=%zu isBig=%d taskUcode=%d\n",
                       dl, dl_size, static_cast<int>(isBigEndian), static_cast<int>(taskUcode));
+        /* Graphics wave W1: one-shot dump of every ucode stub symbol's low32 so
+           any [gfxdiag] ucode_raw / ucode_l3d_raw value in this log is
+           attributable to a symbol without a PDB lookup. */
+        gdx_port_logf("[bridge-init] ucode stubs: F3DEX2=%08X F3DLX2_Rej=%08X "
+                      "F3DEX2_Rej=%08X F3DFLX2_Rej=%08X L3DEX2=%08X\n",
+                      Low32(reinterpret_cast<uintptr_t>(gspF3DEX2_fifoTextStart)),
+                      Low32(reinterpret_cast<uintptr_t>(gspF3DLX2_Rej_fifoTextStart)),
+                      Low32(reinterpret_cast<uintptr_t>(gspF3DEX2_Rej_fifoTextStart)),
+                      Low32(reinterpret_cast<uintptr_t>(gspF3DFLX2_Rej_fifoTextStart)),
+                      Low32(reinterpret_cast<uintptr_t>(gspL3DEX2_fifoTextStart)));
     }
 
     static uint64_t sDiagFrames = 0;
@@ -3057,15 +4782,18 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
         sDiagFrames < 8 || (sDiagFrames % 120) == 0 ||
         stats.noopDisplayLists != 0 || stats.fallbackDataCommands != 0 ||
         stats.skippedDataCommands != 0 || stats.textureCopyBytes != 0 ||
-        stats.ucodeSwitches != 0 || stats.unknownUcodeSwitches != 0;
+        stats.ucodeSwitches != 0 || stats.unknownUcodeSwitches != 0 ||
+        stats.l3dexUcodeSkips != 0;
     if (shouldLogDiagnostics) {
+        if (gdx_diag_verbose())
         gdx_port_logf("[gfxdiag] lists=%zu f3d_lists=%zu cmds=%zu noop_dl=%zu noop_raw=%08X "
                       "miss_dl=%zu miss_raw=%08X bad_dl=%zu bad_raw=%08X "
                       "fallback_data=%zu skip_data=%zu skip_tex=%zu "
                       "tex_copy_bytes=%zu vtx=%zu mtx=%zu dl=%zu teximg=%zu settile=%zu "
                       "tlut=%zu loadblk=%zu loadtile=%zu tilesize=%zu texrect=%zu fillrect=%zu "
                       "setcimg=%zu setzimg=%zu tris=%zu end=%zu "
-                      "ucode_switch=%zu ucode_unknown=%zu ucode_raw=%08X size=%zu\n",
+                      "ucode_switch=%zu ucode_unknown=%zu ucode_raw=%08X "
+                      "ucode_l3d_skip=%zu ucode_l3d_raw=%08X size=%zu\n",
                       stats.convertedLists, stats.f3dLists, stats.commandsOut,
                       stats.noopDisplayLists, stats.firstNoopDlRaw,
                       stats.missingDisplayLists, stats.firstMissingDlRaw,
@@ -3079,7 +4807,8 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
                       stats.opCounts[0x05] + stats.opCounts[0x06] + stats.opCounts[0x07] + stats.opCounts[0xBF],
                       stats.opCounts[kOpEndDl],
                       stats.ucodeSwitches, stats.unknownUcodeSwitches,
-                      stats.firstUnknownUcodeRaw, dl_size);
+                      stats.firstUnknownUcodeRaw,
+                      stats.l3dexUcodeSkips, stats.firstL3dexUcodeRaw, dl_size);
         if (stats.noopDisplayLists != 0) {
             gdx_port_logf("[gfxfail] "
                           "miss=%zu raw=%08X parent=%p pidx=%zu pstride=%zu pbig=%d pf3d=%d "
@@ -3127,6 +4856,9 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
     }
     sDiagFrames++;
 
+    /* Cache eviction stays BEFORE Run so an in-place content refresh takes
+       effect on the frame that produced it (LUS re-imports from the updated
+       copy). The retired BUFFERS are freed after Run instead — see below. */
     if (!gPendingTextureCacheDeletes.empty()) {
         std::sort(gPendingTextureCacheDeletes.begin(), gPendingTextureCacheDeletes.end());
         gPendingTextureCacheDeletes.erase(
@@ -3136,19 +4868,57 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
             interp->TextureCacheDelete(reinterpret_cast<const uint8_t*>(ptr));
         }
         gPendingTextureCacheDeletes.clear();
-        gPersistentAllocations.clear();
     }
 
     interp->ResetGeometryDiagnostics();
     interp->Run(reinterpret_cast<Gfx*>(converted), {});
+    // A real GFX task produced this host frame — the VI-scanout fallback must
+    // not also draw over it (see gdx_vi_present_fallback).
+    gHostFrameGfxTaskRan = true;
+
+    /* Retired-buffer FREE moved AFTER Run (2026-07-10): a texture copy that
+       resizes during this frame's ProcessList moves its old buffer into
+       gPersistentAllocations, but the converted command stream built above
+       may still carry that old buffer's pointer as a texture source.
+       Freeing before Run served the interpreter a dangling pointer for one
+       frame per resize (MSVC debug heap 0xDD fill). Freeing after the frame
+       has drawn is always safe: the next frame re-translates and re-imports
+       from the live copies. */
+    gPersistentAllocations.clear();
+
+    // Transition snapshot mirror: with a DX11 flip-model swapchain the
+    // backbuffer contents are undefined after present, so
+    // gdx_read_current_framebuffer cannot read last frame's pixels out of
+    // fb 0 on demand (observed as all-zero transition captures). Keep a
+    // persistent GPU-side copy of every completed game frame instead; the
+    // transition readback samples this mirror.
+    GdxUpdateFrameMirror(interp);
+
     const Fast::GeometryDiagnostics& geometry = interp->GetGeometryDiagnostics();
-    static int sBigTriPrints = 0;
-    if (geometry.bigTriangles != 0 && sBigTriPrints < 60) {
-        ++sBigTriPrints;
+    /* Print-budget split (2026-07-08): a single global sBigTriPrints<60 cap was
+       shared across the whole process lifetime, including the machine-select/
+       track-preview screens that run for many seconds before a race starts.
+       Those screens routinely emit >60 frames with a surviving oversized
+       triangle (that's the documented normal case for the Reject ucode there),
+       so the entire diagnostic budget was silently exhausted before the race
+       - and hence the actual course decorations/machines the user is reporting
+       spikes on - ever produced a single [bigtri] line. Give race-active
+       frames their own, much larger budget so a live run always captures
+       this evidence regardless of what happened on earlier menu screens. */
+    static int sBigTriPrintsMenu = 0;
+    static int sBigTriPrintsRace = 0;
+    constexpr int kBigTriMenuCap = 20;
+    constexpr int kBigTriRaceCap = 4000;
+    const bool bigTriRaceActive = gGdxRaceActive != 0;
+    int& bigTriPrints = bigTriRaceActive ? sBigTriPrintsRace : sBigTriPrintsMenu;
+    const int bigTriCap = bigTriRaceActive ? kBigTriRaceCap : kBigTriMenuCap;
+    if (gdx_diag_verbose() && geometry.bigTriangles != 0 && bigTriPrints < bigTriCap) {
+        ++bigTriPrints;
         gdx_port_logf(
-            "[bigtri] ucode=%d count=%llu v0=(%.1f,%.1f,%.1f,%.2f) v1=(%.1f,%.1f,%.1f,%.2f) "
+            "[bigtri] race=%d ucode=%d count=%llu v0=(%.1f,%.1f,%.1f,%.2f) v1=(%.1f,%.1f,%.1f,%.2f) "
             "v2=(%.1f,%.1f,%.1f,%.2f) geo=%08X combine=%016llX tile=%u tex=%p "
             "vp=%.1f,%.1f %.1fx%.1f\n",
+            (int)bigTriRaceActive,
             static_cast<int>(taskUcode),
             static_cast<unsigned long long>(geometry.bigTriangles),
             geometry.bigTriX[0], geometry.bigTriY[0], geometry.bigTriZ[0], geometry.bigTriW[0],
@@ -3203,7 +4973,7 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
             interp->mRdp->color_image_address, interp->mRdp->z_buf_address,
             interp->mRdp->color_image_address == interp->mRdp->z_buf_address,
             static_cast<int>(interp->mRendersToFb), static_cast<int>(interp->mFbActive));
-        if (geometry.variantSwitches != 0) {
+        if (gdx_diag_verbose() && geometry.variantSwitches != 0) {
             gdx_port_logf(
                 "[phasegeom] switches=%llu pre_flx_vtx=%llu pre_flx_tri=%llu "
                 "pre_flx_emit=%llu pre_flx_draws=%llu pre_flx_gpu_tri=%llu "
@@ -3332,6 +5102,90 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
     }
 }
 
+/* Graphics wave W5 instrumentation: log what the transition readback actually
+   hands the game (dimensions, which source path fed it, offset of the first
+   nonzero pixel) and dump the FIRST capture to transition-capture.bmp
+   (RGBA5551 -> 24bpp, bottom-up) next to the exe, so the next soak shows
+   exactly what the game receives instead of guessing. */
+static void LogAndDumpTransitionCapture(const uint16_t* pixels, unsigned int width,
+                                        unsigned int height, const char* sourcePath) {
+    // Budget split (2026-07-09): 8 was consumed entirely by boot-phase
+    // captures (VI-fallback frames + the title/logo transitions), so the
+    // menu-transition captures a soak actually cares about never got logged.
+    // Raised so later, more interesting captures still show up.
+    static int sCaptureCount = 0;
+    static bool sDumped = false;
+    if (pixels == nullptr || sCaptureCount >= 24) {
+        return;
+    }
+    ++sCaptureCount;
+
+    const size_t pixelCount = static_cast<size_t>(width) * height;
+    long long firstNonZero = -1;
+    for (size_t i = 0; i < pixelCount; i++) {
+        if (pixels[i] != 0) {
+            firstNonZero = static_cast<long long>(i);
+            break;
+        }
+    }
+    gdx_port_logf("[transition] capture #%d %ux%u source=%s mode=%d firstNonZeroPx=%lld%s\n",
+                  sCaptureCount, width, height, sourcePath, (gGameMode & 0x1F), firstNonZero,
+                  sDumped ? "" : " dump=transition-capture.bmp");
+
+    if (sDumped) {
+        return;
+    }
+    sDumped = true;
+
+    std::FILE* f = std::fopen("transition-capture.bmp", "wb");
+    if (f == nullptr) {
+        gdx_port_logf("[transition] BMP dump failed: fopen errno path\n");
+        return;
+    }
+    const unsigned int rowBytes = (width * 3u + 3u) & ~3u;
+    const unsigned int imageBytes = rowBytes * height;
+    const unsigned int fileBytes = 14u + 40u + imageBytes;
+    unsigned char header[54] = { 0 };
+    header[0] = 'B'; header[1] = 'M';
+    header[2] = static_cast<unsigned char>(fileBytes);
+    header[3] = static_cast<unsigned char>(fileBytes >> 8);
+    header[4] = static_cast<unsigned char>(fileBytes >> 16);
+    header[5] = static_cast<unsigned char>(fileBytes >> 24);
+    header[10] = 54; // pixel data offset
+    header[14] = 40; // BITMAPINFOHEADER size
+    header[18] = static_cast<unsigned char>(width);
+    header[19] = static_cast<unsigned char>(width >> 8);
+    header[20] = static_cast<unsigned char>(width >> 16);
+    header[21] = static_cast<unsigned char>(width >> 24);
+    header[22] = static_cast<unsigned char>(height);
+    header[23] = static_cast<unsigned char>(height >> 8);
+    header[24] = static_cast<unsigned char>(height >> 16);
+    header[25] = static_cast<unsigned char>(height >> 24);
+    header[26] = 1;  // planes
+    header[28] = 24; // bpp
+    std::fwrite(header, 1, sizeof(header), f);
+
+    std::vector<unsigned char> row(rowBytes, 0);
+    for (unsigned int y = 0; y < height; y++) {
+        // BMP rows are bottom-up; N64 framebuffer is top-down.
+        const uint16_t* src = pixels + static_cast<size_t>(height - 1 - y) * width;
+        for (unsigned int x = 0; x < width; x++) {
+            // N64 RGBA5551: RRRRRGGG GGBBBBBA (big-endian u16 already decoded to
+            // host order by the readback/mirror path).
+            const uint16_t p = src[x];
+            const unsigned char r5 = (p >> 11) & 0x1F;
+            const unsigned char g5 = (p >> 6) & 0x1F;
+            const unsigned char b5 = (p >> 1) & 0x1F;
+            row[x * 3 + 2] = static_cast<unsigned char>((r5 << 3) | (r5 >> 2));
+            row[x * 3 + 1] = static_cast<unsigned char>((g5 << 3) | (g5 >> 2));
+            row[x * 3 + 0] = static_cast<unsigned char>((b5 << 3) | (b5 >> 2));
+        }
+        std::fwrite(row.data(), 1, rowBytes, f);
+    }
+    std::fclose(f);
+    gdx_port_logf("[transition] first capture dumped to transition-capture.bmp\n");
+}
+
 extern "C" int gdx_read_current_framebuffer(void* rgba16Buffer, unsigned int width, unsigned int height) {
     if (rgba16Buffer == nullptr || width == 0 || height == 0) {
         return 0;
@@ -3353,23 +5207,58 @@ extern "C" int gdx_read_current_framebuffer(void* rgba16Buffer, unsigned int wid
                                   [requestedAddress](const N64FramebufferInfo& info) {
                                       return info.address == requestedAddress;
                                   });
-    // Every completed graphics task is mirrored into its N64 CIMG buffer.
-    // Preserve that buffer's own historical contents when the transition asks
-    // for a framebuffer that is not the most recently rendered host target.
-    if (requested != gN64Framebuffers.end() && requested->valid &&
+    // The persistent frame mirror IS the last completed frame — exactly what a
+    // transition snapshot wants — so when it exists it is authoritative and the
+    // "preserve this buffer's historical contents" early-return must not fire:
+    // that path previously served bytes poisoned by an earlier all-zero boot
+    // capture (requested->valid was set even though the readback produced
+    // nothing), which kept transitions black forever after.
+    const bool mirrorAvailable = (gFrameMirrorFb >= 0 && gFrameMirrorValid);
+    if (!mirrorAvailable && requested != gN64Framebuffers.end() && requested->valid &&
         requestedAddress != gLastRenderedFramebuffer) {
+        LogAndDumpTransitionCapture(static_cast<const uint16_t*>(rgba16Buffer), width, height,
+                                    "preserved-mirror");
         return 1;
     }
 
     interp->Flush();
-    const int framebuffer = interp->mRendersToFb ? interp->mGameFb : 0;
-    interp->GetCurrentRenderingAPI()->ReadFramebufferToCPU(
-        framebuffer, width, height, static_cast<uint16_t*>(rgba16Buffer));
-    if (requested != gN64Framebuffers.end()) {
+    const auto hasContent = [](const uint16_t* px, unsigned int w, unsigned int h) {
+        const size_t count = static_cast<size_t>(w) * h;
+        for (size_t k = 0; k < count; k++) {
+            if (px[k] != 0) {
+                return true;
+            }
+        }
+        return false;
+    };
+    // Prefer the persistent frame mirror (a real framebuffer with its own
+    // texture, copied GPU->GPU before present). Reading fb 0 after present is
+    // undefined on DX11 flip-model swapchains. If the mirror somehow has no
+    // content yet (nothing presented), fall back to the direct read rather
+    // than serving zeros.
+    const char* sourcePath = "none";
+    uint16_t* out = static_cast<uint16_t*>(rgba16Buffer);
+    bool gotContent = false;
+    if (mirrorAvailable) {
+        interp->GetCurrentRenderingAPI()->ReadFramebufferToCPU(gFrameMirrorFb, width, height, out);
+        sourcePath = "frame-mirror";
+        gotContent = hasContent(out, width, height);
+    }
+    if (!gotContent) {
+        const int direct = interp->mRendersToFb ? interp->mGameFb : 0;
+        interp->GetCurrentRenderingAPI()->ReadFramebufferToCPU(direct, width, height, out);
+        sourcePath = interp->mRendersToFb ? "host-fb-game" : "host-fb-0";
+        gotContent = hasContent(out, width, height);
+    }
+    // Only publish this buffer as a valid frame source when it actually holds
+    // pixels — an all-zero capture must never poison the preserved path or the
+    // dirty-range tracking.
+    if (gotContent && requested != gN64Framebuffers.end()) {
         requested->valid = true;
         gLastRenderedFramebuffer = requestedAddress;
         RecordHostWrite(requestedAddress,
                         static_cast<size_t>(width) * height * sizeof(uint16_t));
     }
+    LogAndDumpTransitionCapture(static_cast<const uint16_t*>(rgba16Buffer), width, height, sourcePath);
     return 1;
 }
