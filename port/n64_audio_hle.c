@@ -171,6 +171,39 @@ enum {
 #define GDX_DMEM_SIZE 0x1000u
 #define GDX_DMEM_MASK (GDX_DMEM_SIZE - 1u)
 static uint8_t sDmem[GDX_DMEM_SIZE];
+/* [spike] last-writer tracker (grain, round 4): every DMEM write records the opcode
+   that made it, per 16-byte block, so a spike found at interleave time can NAME its
+   writer instead of us inferring one. 0xFF = never written this session. */
+static uint8_t sDmemLastOp[GDX_DMEM_SIZE >> 4];
+static uint8_t sDmemCurOp = 0xFF;
+
+/* File-based audio-stage bypass toggles (grain ear-localization). Env vars proved
+   unreliable in the owner's shell, so read flags ONCE from gdx-audio-debug.txt next
+   to the exe. Space/newline-separated keywords, any subset:
+     nofilter  -- skip the per-voice A_FILTER (8-tap FIR)
+     flatvol   -- envmixer applies constant volume per tick (no 8-block ramp staircase)
+     noreverb  -- skip the reverb wet->dry return
+     nointerl  -- skip the nParts==2 "best-guess decimation" path
+   The owner enables ONE at a time and reports which kills the grain. */
+static int GdxAudioDbg(void) {
+    static int sFlags = -1;
+    if (sFlags == -1) {
+        FILE* f = fopen("gdx-audio-debug.txt", "r");
+        sFlags = 0;
+        if (f != NULL) {
+            char buf[256];
+            size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+            buf[n] = '\0';
+            fclose(f);
+            if (strstr(buf, "nofilter") != NULL) sFlags |= 1;
+            if (strstr(buf, "flatvol") != NULL) sFlags |= 2;
+            if (strstr(buf, "noreverb") != NULL) sFlags |= 4;
+            if (strstr(buf, "nointerl") != NULL) sFlags |= 8;
+        }
+        gdx_port_logf("[audio] stage-bypass flags = 0x%X (gdx-audio-debug.txt)\n", (unsigned)sFlags);
+    }
+    return sFlags;
+}
 
 // Private ADPCM codebook scratch. aLoadADPCM's DMA target is a fixed *internal* ucode location
 // never exposed through the C ABI (the command carries no DMEM parameter), so this interpreter
@@ -198,6 +231,7 @@ static int16_t DmemGetS16(uint32_t byteOffset) {
 
 static void DmemSetS16(uint32_t byteOffset, int16_t v) {
     memcpy(&sDmem[byteOffset & GDX_DMEM_MASK & ~1u], &v, sizeof(v));
+    sDmemLastOp[(byteOffset & GDX_DMEM_MASK) >> 4] = sDmemCurOp;
 }
 
 static uint8_t DmemGetU8(uint32_t byteOffset) {
@@ -206,6 +240,7 @@ static uint8_t DmemGetU8(uint32_t byteOffset) {
 
 static void DmemSetU8(uint32_t byteOffset, uint8_t v) {
     sDmem[byteOffset & GDX_DMEM_MASK] = v;
+    sDmemLastOp[(byteOffset & GDX_DMEM_MASK) >> 4] = sDmemCurOp;
 }
 
 // ---- ADPCM codebook access: per-predictor block is `8 * order` shorts (verified against
@@ -252,6 +287,7 @@ static const int16_t* sPendingLoopState = NULL;
    A_ADPCM capture can attribute its decode to a sample. */
 static uintptr_t sPcmCapLastSrc = 0;
 static uint32_t sPcmCapLastRaw = 0;
+static int sDecCapCount = 0; /* [dec-cap] per-frame VADPCM capture budget */
 
 /* ---- [rs-cap] probe (garbage-sounding gained notes: booster / low-health).
    Offline census proved all 53 cart-streamed SE samples are valid ADPCM at rest and
@@ -488,6 +524,67 @@ static void RunAdpcm(const GdxBufDesc* buf, uint32_t flags, int16_t* state, cons
         hist1 = (int32_t)clHist1;
         hist2 = (int32_t)clHist2;
 
+        /* [dec-cap] history entering this frame (newer, older) -- seeds the offline
+           BLOCK-form VADPCM decode identically. */
+        int16_t capPreNewer = clHist1;
+        int16_t capPreOlder = clHist2;
+
+        /* GDX_BLOCK_ADPCM=1: hardware-accurate BLOCK-convolution VADPCM decode (grain
+           root cause A/B). The default sequential form below truncates (>>11) every
+           sample and feeds the truncated value back, accumulating signal-correlated
+           quantization noise the real RSP does not -- measured ~-55dB, present on
+           every frame (the "film grain"). This path instead computes each 8-sample
+           sub-block from its ENTRY history using the full book columns + intra-block
+           residual convolution, truncating ONCE per output, matching the block form.
+           Only the standard 4-bit codec; small-ADPCM keeps the sequential path. */
+        {
+            /* DEFAULT ON (2026-07-11): block-convolution is the hardware-correct decode;
+               the env-var A/B silently no-op'd (var never reached the process), so the
+               grain test was never actually run. Flip to default-on and log it
+               unconditionally so the log PROVES which path executed; GDX_SEQ_ADPCM=1
+               forces the old sequential path for revert/comparison. */
+            static int sBlockAdpcm = -1;
+            if (sBlockAdpcm == -1) {
+                const char* e = getenv("GDX_SEQ_ADPCM");
+                sBlockAdpcm = (e != NULL && e[0] == '1') ? 0 : 1;
+                gdx_port_logf("[audio] VADPCM decode = %s\n",
+                              sBlockAdpcm ? "block-convolution (hardware-correct)" : "sequential (GDX_SEQ_ADPCM=1)");
+            }
+            if (sBlockAdpcm && !smallAdpcm) {
+                int32_t eH2 = (int32_t)clHist2; /* sub-block entry history: older */
+                int32_t eH1 = (int32_t)clHist1; /* newer */
+                uint32_t sub;
+                for (sub = 0; sub < 2u; sub++) {
+                    int32_t e[8];
+                    uint32_t i, k;
+                    for (i = 0; i < 8u; i++) {
+                        uint32_t si = sub * 8u + i;
+                        uint8_t bv = DmemGetU8(inCursor + 1u + (si / 2u));
+                        int32_t nib = (si % 2u == 0u) ? ((bv >> 4) & 0xF) : (bv & 0xF);
+                        if (nib & 0x8) nib -= 16;
+                        e[i] = nib << shift;
+                    }
+                    int16_t sblk[8];
+                    for (i = 0; i < 8u; i++) {
+                        int64_t acc = (int64_t)BookCoef(predIdx, 0, i) * (int64_t)eH2 +
+                                      (int64_t)BookCoef(predIdx, 1, i) * (int64_t)eH1;
+                        for (k = 0; k < i; k++) {
+                            acc += (int64_t)BookCoef(predIdx, 1, i - 1u - k) * (int64_t)e[k];
+                        }
+                        acc += (int64_t)e[i] << 11;
+                        sblk[i] = ClampS16((int32_t)(acc >> 11));
+                        DmemSetS16(outCursor + (sub * 8u + i) * 2u, sblk[i]);
+                        decoded++;
+                    }
+                    eH2 = sblk[6];
+                    eH1 = sblk[7];
+                }
+                clHist2 = (int16_t)eH2;
+                clHist1 = (int16_t)eH1;
+                goto frame_done; /* skip the sequential path */
+            }
+        }
+
         for (s = 0; s < 16u; s++) {
             int32_t nibble;
             int32_t residual;
@@ -561,6 +658,43 @@ static void RunAdpcm(const GdxBufDesc* buf, uint32_t flags, int16_t* state, cons
             decoded++;
         }
 
+        /* [dec-cap] full per-frame capture (grain root cause: sequential-IIR vs
+           block-convolution VADPCM). Dumps everything an offline decoder needs to
+           reproduce this exact frame with the CORRECT block form and compare to the
+           port's sequential output: predictor+scale, the 8 compressed data bytes,
+           the pre-frame history (older/newer), the full 16-coef book for this
+           predictor, and the 16 samples the port produced. Race-gated, capped.
+           Only full (4-bit) ADPCM; raw source id lets offline filter the grain
+           sample (65134-byte one-shot BGM). */
+        {
+            extern int gGdxRaceActive;
+            if (gGdxRaceActive && !smallAdpcm && sDecCapCount < 12) {
+                char dbuf[64], bbuf[160], obuf[160];
+                int dp = 0, bp = 0, op = 0;
+                uint32_t z;
+                sDecCapCount++;
+                for (z = 0; z < 8u; z++) {
+                    dp += snprintf(dbuf + dp, sizeof(dbuf) - (size_t)dp, "%02X",
+                                   DmemGetU8(inCursor + 1u + z));
+                }
+                for (z = 0; z < 8u; z++) {
+                    bp += snprintf(bbuf + bp, sizeof(bbuf) - (size_t)bp, "%04X %04X ",
+                                   (uint16_t)BookCoef(predIdx, 0, z), (uint16_t)BookCoef(predIdx, 1, z));
+                }
+                for (z = 0; z < 16u; z++) {
+                    op += snprintf(obuf + op, sizeof(obuf) - (size_t)op, "%04X ",
+                                   (uint16_t)DmemGetS16(outCursor + z * 2u));
+                }
+                gdx_port_logf("[dec-cap] raw=%08X pred=%u shift=%u preOlder=%04X preNewer=%04X\n",
+                              sPcmCapLastRaw, (unsigned)predIdx, (unsigned)shift,
+                              (uint16_t)capPreOlder, (uint16_t)capPreNewer);
+                gdx_port_logf("[dec-cap]  data=%s\n", dbuf);
+                gdx_port_logf("[dec-cap]  book=%s\n", bbuf);
+                gdx_port_logf("[dec-cap]  out=%s\n", obuf);
+            }
+        }
+
+    frame_done: /* block-convolution path (GDX_BLOCK_ADPCM) rejoins here */
         inCursor += frameBytes;
         outCursor += 32u; /* 16 samples * 2 bytes */
     }
@@ -953,6 +1087,7 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
         uint32_t w0 = cmds[i].w0;
         uint32_t w1 = cmds[i].w1;
         uint32_t op = (w0 >> 24) & 0xFFu;
+        sDmemCurOp = (uint8_t)op; /* [spike] last-writer attribution */
 
         switch (op) {
             case GDX_A_SPNOOP:
@@ -1007,6 +1142,29 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                        source so the ADPCM capture below can name its input. */
                     sPcmCapLastSrc = (uintptr_t)src;
                     sPcmCapLastRaw = w1;
+                    /* [spike] mix-stage bisection: scan the LOADED region -- a spike
+                       here means the corruption arrived FROM RDRAM (reverb ring
+                       content, resample state area, etc.), i.e. it was created on a
+                       PREVIOUS tick's save side, not by this tick's mixing.
+                       Gate LOWERED to >=0x20 (workflow RANK 2): the reverb ring wrap
+                       splits a tick into pieces as small as 0x10, and the old >=0x100
+                       gate left every wrap tick's small piece UNSCANNED -- the one
+                       proven route for unscanned wet content to reach the dry buses.
+                       0x20 (16 samples) is the floor for a meaningful strict-spike
+                       scan; compressed ADPCM chunk loads land at dmemDest < 0x580
+                       (staging grows down from 0x940), so gate on the wet range too
+                       to avoid false positives from compressed bytes. */
+                    if (size >= 0x20u && dmemDest >= 0xC80u) {
+                        static int sSpikeLogsLoadbuff = 0;
+                        if (sSpikeLogsLoadbuff < 16) {
+                            int si = GdxSpikeScan(dmemDest, size / 2u);
+                            if (si >= 0) {
+                                sSpikeLogsLoadbuff++;
+                                gdx_port_logf("[spike] loadbuff at=%d dmem=%04X size=%04X raw=%08X\n",
+                                              si, dmemDest, size, w1);
+                            }
+                        }
+                    }
                 }
                 break;
             }
@@ -1257,11 +1415,54 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 uint32_t dmemOut = w1 & 0xFFFFu;
                 uint32_t numSamples = count8 * 8u;
                 uint32_t k;
+                /* GDX_NO_REVERB=1 A/B kill switch (port-side, RELIABLE getenv -- the
+                   decomp-side version at synthesis.c:587 silently no-ops because the
+                   decomp TU's getenv returns NULL, so the reverb wet->dry return kept
+                   running and the "grain persists with reverb off" test was invalid).
+                   Skip ONLY the reverb wet->dry return (dmemOut==LEFT_CH 0x940); the
+                   decay mix 0xC80->0xC80 and all note mixes are untouched. */
+                {
+                    static int sNoReverb = -1;
+                    if (sNoReverb == -1) {
+                        const char* e = getenv("GDX_NO_REVERB");
+                        sNoReverb = (e != NULL && e[0] == '1') ? 1 : 0;
+                        if (sNoReverb) {
+                            gdx_port_logf("[audio] GDX_NO_REVERB=1: reverb wet->dry return DISABLED\n");
+                        }
+                    }
+                    if ((sNoReverb || (GdxAudioDbg() & 4)) && dmemOut == 0x940u) {
+                        break;
+                    }
+                }
                 for (k = 0; k < numSamples; k++) {
                     int32_t in = DmemGetS16(dmemIn + k * 2u);
                     int32_t out = DmemGetS16(dmemOut + k * 2u);
                     out = out + ((in * gain) >> 15);
                     DmemSetS16(dmemOut + k * 2u, ClampS16(out));
+                }
+                /* [spike] MASTER BISECTION (grain, workflow verdict): scan the dry bus
+                   immediately after the reverb wet->dry return (dmemOut==LEFT_CH 0x940,
+                   the only A_MIXER writing a dry bus; the decay mix is 0xC80->0xC80).
+                   The two surviving candidates split HERE:
+                     - spike present now  => reverb TRANSPORTED a pre-existing spike
+                       (RANK 2: unscanned wrap-tick wet content) -- it entered before
+                       any note ran. Also scan the mixer's INPUT to prove it arrived
+                       already-bad vs was created by this op's clamp.
+                     - clean now, spiked at interleave => injected DURING note mixing
+                       (RANK 5 op-19 path: envmixer scan-window vs interleave-read
+                       mismatch). Names which branch to chase without a second run. */
+                if (dmemOut == 0x940u) {
+                    static int sSpikeLogsRvbRet = 0;
+                    if (sSpikeLogsRvbRet < 12) {
+                        int so = GdxSpikeScan(dmemOut, numSamples);
+                        int siN = GdxSpikeScan(dmemIn, numSamples);
+                        if (so >= 0 || siN >= 0) {
+                            sSpikeLogsRvbRet++;
+                            gdx_port_logf("[spike] reverb-return dryOut=%d wetIn=%d "
+                                          "(out=%04X in=%04X n=%u)\n",
+                                          so, siN, dmemOut, dmemIn, numSamples);
+                        }
+                    }
                 }
                 break;
             }
@@ -1305,9 +1506,14 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                     int sl = GdxSpikeScan(dmemL, numSamples);
                     int sr = GdxSpikeScan(dmemR, numSamples);
                     if (sl >= 0 || sr >= 0) {
+                        uint8_t wl = (sl >= 0) ? sDmemLastOp[((dmemL + (uint32_t)sl * 2u) & GDX_DMEM_MASK) >> 4]
+                                               : 0xFF;
+                        uint8_t wr = (sr >= 0) ? sDmemLastOp[((dmemR + (uint32_t)sr * 2u) & GDX_DMEM_MASK) >> 4]
+                                               : 0xFF;
                         sSpikeLogsInterleave++;
-                        gdx_port_logf("[spike] pre-interleave L=%d R=%d dmemL=%04X dmemR=%04X n=%u\n",
-                                      sl, sr, dmemL, dmemR, numSamples);
+                        gdx_port_logf("[spike] pre-interleave L=%d R=%d dmemL=%04X dmemR=%04X n=%u "
+                                      "lastOpL=%u lastOpR=%u\n",
+                                      sl, sr, dmemL, dmemR, numSamples, wl, wr);
                     }
                 }
                 uint32_t k;
@@ -1326,6 +1532,12 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 uint32_t dmemOut = w1 & 0xFFFFu;
                 uint32_t k;
                 sRsCapInterlPending = 1; /* [rs-cap] nParts==2 marker for the next resample */
+                if (GdxAudioDbg() & 8) { /* nointerl bypass: straight copy, no decimation */
+                    for (k = 0; k < numSamples; k++) {
+                        DmemSetS16(dmemOut + k * 2u, DmemGetS16(dmemIn + k * 2u));
+                    }
+                    break;
+                }
                 for (k = 0; k < numSamples; k++) {
                     DmemSetS16(dmemOut + k * 2u, DmemGetS16(dmemIn + k * 4u));
                 }
@@ -1390,6 +1602,13 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 uint32_t sIdx = 0;
                 uint32_t blk;
 
+                /* flatvol bypass: zero the per-block ramp so the whole tick uses one
+                   constant volume -- tests whether the 8-block volume staircase is the
+                   grain (grain A/B). */
+                if (GdxAudioDbg() & 2) {
+                    envRampLeft = envRampRight = envRampReverb = 0;
+                }
+
                 if (swapLR) {
                     uint32_t tmp = dryLeftDmem; dryLeftDmem = dryRightDmem; dryRightDmem = tmp;
                 }
@@ -1435,6 +1654,36 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                     curVolL += envRampLeft;
                     curVolR += envRampRight;
                     curReverb += envRampReverb;
+                }
+                /* [spike] mix-stage bisection (grain, round 3): post-resample is now
+                   clean but pre-interleave still spikes -- scan this op's own INPUT and
+                   all four output buses so one run says whether the corruption arrives
+                   WITH the source (upstream, e.g. DMEM_TEMP after filter/comb), is
+                   injected by this op, or was already sitting on a bus (reverb return /
+                   earlier voice accumulation). */
+                {
+                    static int sSpikeLogsEnvmix = 0;
+                    if (sSpikeLogsEnvmix < 12) {
+                        int si = GdxSpikeScan(dmemSrc, sampleCount);
+                        int sdl = GdxSpikeScan(dryLeftDmem, sampleCount);
+                        int sdr = GdxSpikeScan(dryRightDmem, sampleCount);
+                        int swl = GdxSpikeScan(wetLeftDmem, sampleCount);
+                        int swr = GdxSpikeScan(wetRightDmem, sampleCount);
+                        if (si >= 0 || sdl >= 0 || sdr >= 0 || swl >= 0 || swr >= 0) {
+                            sSpikeLogsEnvmix++;
+                            /* NOTE-PATH BISECTION: when the envmixer's SOURCE (DMEM_TEMP)
+                               carries the spike, name the op that last wrote that sample
+                               via the last-writer tracker: 5=A_RESAMPLE, 7=A_FILTER,
+                               14=A_HILOGAIN. Resample-clean-but-src-spiked was the whole
+                               puzzle; this says whether filter or hilogain injects it. */
+                            uint8_t srcWriter = (si >= 0)
+                                ? sDmemLastOp[((dmemSrc + (uint32_t)si * 2u) & GDX_DMEM_MASK) >> 4]
+                                : 0xFF;
+                            gdx_port_logf("[spike] envmixer src=%d dryL=%d dryR=%d wetL=%d wetR=%d "
+                                          "(dmemSrc=%04X n=%u) srcWriter=%u\n",
+                                          si, sdl, sdr, swl, swr, dmemSrc, sampleCount, srcWriter);
+                        }
+                    }
                 }
                 break;
             }
@@ -1487,6 +1736,8 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                         pendingFilterHaveCoef = 1;
                     }
                     pendingFilterSizeBytes = countOrBuf;
+                } else if (GdxAudioDbg() & 1) {
+                    /* nofilter bypass: leave the note buffer unfiltered (grain A/B). */
                 } else {
                     int16_t* state = (int16_t*)GdxAudioResolveAddr(w1, "FILTER-state");
                     RunFilter(countOrBuf, pendingFilterSizeBytes, f, state,
