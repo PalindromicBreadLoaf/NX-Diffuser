@@ -20,6 +20,8 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <dbghelp.h> /* crash-handler symbolization (PDB ships with Debug builds) */
+#pragma comment(lib, "Dbghelp.lib")
 #endif
 
 #include <stddef.h>
@@ -254,6 +256,45 @@ static LONG WINAPI gdx_crash_vectored_handler(EXCEPTION_POINTERS* info) {
         "[crash] UNHANDLED EXCEPTION code=0x%08X pc=%p thread_id=%d fault_addr=%p access=%s\n",
         (unsigned) rec->ExceptionCode, (void*) rec->ExceptionAddress, threadId, faultAddr,
         (isWrite < 0) ? "n/a" : (isWrite ? "write" : "read"));
+
+    /* Best-effort symbolization (course-edit 80%-crash investigation): Debug builds
+       ship the PDB next to the exe, so a raw pc can be named right here instead of
+       hand-mapping ASLR'd addresses across runs. Everything below is optional
+       diagnostics -- any failure just leaves the raw-pc line above as before. */
+    {
+        static int sSymInit = 0;
+        HANDLE proc = GetCurrentProcess();
+        DWORD64 pc = (DWORD64) (uintptr_t) rec->ExceptionAddress;
+        char symBuf[sizeof(SYMBOL_INFO) + 256];
+        SYMBOL_INFO* sym = (SYMBOL_INFO*) symBuf;
+        DWORD64 disp = 0;
+        IMAGEHLP_LINE64 line;
+        DWORD lineDisp = 0;
+        HMODULE mod = NULL;
+
+        if (!sSymInit) {
+            sSymInit = 1;
+            SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+            SymInitialize(proc, NULL, TRUE);
+        }
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR) rec->ExceptionAddress, &mod)) {
+            gdx_port_logf("[crash]   module_base=%p rva=0x%llX\n", (void*) mod,
+                          (unsigned long long) (pc - (DWORD64) (uintptr_t) mod));
+        }
+        memset(symBuf, 0, sizeof(symBuf));
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 255;
+        if (SymFromAddr(proc, pc, &disp, sym)) {
+            gdx_port_logf("[crash]   at %s+0x%llX\n", sym->Name, (unsigned long long) disp);
+        }
+        memset(&line, 0, sizeof(line));
+        line.SizeOfStruct = sizeof(IMAGEHLP_LINE64);
+        if (SymGetLineFromAddr64(proc, pc, &lineDisp, &line)) {
+            gdx_port_logf("[crash]   %s:%lu\n", line.FileName, (unsigned long) line.LineNumber);
+        }
+    }
 
     return EXCEPTION_CONTINUE_SEARCH; // do not swallow the fault, only log it
 }
