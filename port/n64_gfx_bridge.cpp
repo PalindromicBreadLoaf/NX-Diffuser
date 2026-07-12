@@ -2922,6 +2922,26 @@ class N64DisplayListAdapter {
                 (IsAssetPlaceholderPointer(in.w1) || IsPortBssAliasPointer(in.w1))) {
                 w1IsHostPointer = false;
             }
+            /* Second EXCEPTION: high32 == 0xFFFFFFFF is a SIGN-EXTENDED 32-bit value,
+             * not a host pointer -- Windows user space never has an all-ones top half
+             * (that's kernel range). Course-edit entry crash (2026-07-11, symbolized:
+             * GfxDpLoadBlock memcpy from 0xFFFFFFFFF8694130): decomp code widened a
+             * bit31-set token through a signed cast into the wide list, the verbatim
+             * rule accepted it, and LUS copied from kernel space -- the 80%-of-entries
+             * AV. Strip to the low32 and route through the segment/low32 resolver
+             * exactly like a narrow-source command: if the token's owning range is
+             * registered the texture resolves correctly (pre-wide behavior); if not,
+             * the existing unresolved fallbacks draw nothing instead of crashing. */
+            if (w1IsHostPointer && (static_cast<uint64_t>(w1full) >> 32) == 0xFFFFFFFFull) {
+                static int sSignExtLogs = 0;
+                if (sSignExtLogs < 8) {
+                    sSignExtLogs++;
+                    gdx_port_logf("[signext] wide w1=%016llX op=%02X routed to low32 resolver\n",
+                                  static_cast<unsigned long long>(w1full),
+                                  static_cast<unsigned>(Opcode(in.w0)));
+                }
+                w1IsHostPointer = false;
+            }
             const uint8_t op = Opcode(in.w0);
             // GDX_LEGACY_RESOLVE instrumentation: tag any guessing branch that
             // fires while resolving this command's pointer(s) with the opcode
@@ -3454,6 +3474,24 @@ class N64DisplayListAdapter {
                                                   in.w1, texCensusPath, cFmt, cSiz, cWidth,
                                                   reinterpret_cast<void*>(outW1),
                                                   cfp[0], cfp[1], cfp[2], cfp[3], cfp[4], cfp[5], cfp[6], cfp[7]);
+                                    /* [ci-dump] (options/pause CI-cell investigation, scope item A):
+                                       for CI-format sources, the discriminator between "delivered
+                                       wrong" and "interpreted wrong" is the raw tile bytes at the
+                                       address LUS will consume -- 32 bytes from offset 0 (CI text
+                                       tiles are small; the +0x20 fingerprint skip would overshoot).
+                                       Compared offline against the same tile decoded from ROM. */
+                                    if (cFmt == 2u && outW1 != 0 && ReadableByteLimit(outW1) >= 32) {
+                                        const uint8_t* cd = reinterpret_cast<const uint8_t*>(outW1);
+                                        gdx_port_logf("[ci-dump] raw=%08X b0=%02X%02X%02X%02X%02X%02X%02X%02X"
+                                                      "%02X%02X%02X%02X%02X%02X%02X%02X "
+                                                      "b16=%02X%02X%02X%02X%02X%02X%02X%02X"
+                                                      "%02X%02X%02X%02X%02X%02X%02X%02X\n",
+                                                      in.w1,
+                                                      cd[0], cd[1], cd[2], cd[3], cd[4], cd[5], cd[6], cd[7],
+                                                      cd[8], cd[9], cd[10], cd[11], cd[12], cd[13], cd[14], cd[15],
+                                                      cd[16], cd[17], cd[18], cd[19], cd[20], cd[21], cd[22], cd[23],
+                                                      cd[24], cd[25], cd[26], cd[27], cd[28], cd[29], cd[30], cd[31]);
+                                    }
                                 }
                             }
                         }
