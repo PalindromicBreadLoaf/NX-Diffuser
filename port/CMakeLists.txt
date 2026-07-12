@@ -158,6 +158,30 @@ if(MSVC)
     target_compile_options(gdiffuser_game PRIVATE /W0 /w14715 /w14716)
 endif()
 
+# cxd4 RSP interpreter (LLE audio), vendored under rsp/cxd4 (CC0). Built as a static lib
+# so its C89 sources compile with isolated (quiet) flags and its module-level globals
+# (DRAM/DMEM/CR/conf/run_task/message/...) stay out of the game TUs. gdx_audio_lle.c
+# drives it through gdx_rsp_driver.h. NOTE: gdx_rsp_boot_tests compiles its own copy of
+# these sources with -DSP_EXECUTE_LOG (instruction hook), so this lib is game-only.
+add_library(cxd4_rsp STATIC
+    rsp/cxd4/gdx_rsp_driver.c
+    rsp/cxd4/su.c
+    rsp/cxd4/vu/add.c
+    rsp/cxd4/vu/divide.c
+    rsp/cxd4/vu/logical.c
+    rsp/cxd4/vu/multiply.c
+    rsp/cxd4/vu/select.c
+    rsp/cxd4/vu/vu.c)
+target_include_directories(cxd4_rsp PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/rsp/cxd4")
+# SP_EXECUTE_LOG enables cxd4's per-instruction hook so the driver's watchdog
+# (gdx_rsp_driver.c step_SP_commands) can longjmp out of a runaway/mis-marshalled task
+# instead of spinning the audio thread forever.
+target_compile_definitions(cxd4_rsp PRIVATE SP_EXECUTE_LOG=1)
+if(MSVC)
+    target_compile_options(cxd4_rsp PRIVATE /W0)
+    target_compile_definitions(cxd4_rsp PRIVATE _CRT_SECURE_NO_WARNINGS=1)
+endif()
+
 # Main executable.
 add_executable(G-Diffuser
     main.cpp
@@ -175,6 +199,9 @@ add_executable(G-Diffuser
                                 # M_AUDTASK hook); host-side file, standard C, not part of
                                 # gdiffuser_game (no decomp headers needed -- see its own
                                 # header comment for why).
+    gdx_audio_lle.c            # LLE audio dispatch (branch lle-audio): file-toggled seam that
+                                # routes M_AUDTASK to the real aspMain ucode on the cxd4 RSP
+                                # (cxd4_rsp lib) via a per-tick memory-model bridge, else HLE.
     gdx_audio_thread.cpp       # Phase 3: dedicated SoH-style std::thread that owns per-tick
                                 # audio production (replaces the cooperative-fiber-driven path
                                 # for silence-hole elimination). See its header comment for the
@@ -226,6 +253,9 @@ target_include_directories(G-Diffuser PRIVATE
     "${DECOMP}/src"
     "${CMAKE_CURRENT_SOURCE_DIR}/../torch/lib/libmio0"  # S5: mio0.h + utils.h for mio0_wrap.c and mio0.c
 )
+
+# cxd4 RSP interpreter for LLE audio (gdx_audio_lle.c -> gdx_rsp_driver.h).
+target_link_libraries(G-Diffuser PRIVATE cxd4_rsp)
 
 # Link libultraship when built from the top-level project (it provides the libultra HLE:
 # os* threading/messaging, VI, controller, Fast3D).
@@ -312,4 +342,32 @@ if(TARGET libultraship)
         "${CMAKE_SOURCE_DIR}/libultraship/include"
     )
     target_link_libraries(resource_smoketest PRIVATE libultraship)
+endif()
+
+# LLE audio core boot test (branch lle-audio): standalone console exe compiling the
+# vendored cxd4 RSP interpreter (rsp/cxd4/su.c + vu/*.c) with the thin driver shim
+# (rsp/cxd4/gdx_rsp_driver.c) and rsp/tests/rsp_boot_test.c. Proves the interpreter
+# boots and executes the REAL aspMain audio microcode (rsp/aspmain_text.bin) with the
+# correct IMEM BE->LE byte-swap, DMEM big-endian storage, and OSTask boot contract.
+# SP_EXECUTE_LOG enables cxd4's per-instruction hook so the test can bound the run and
+# inspect the executed stream. No game objects, no libultraship. Skips gracefully if the
+# ROM-extracted ucode blobs are absent. See docs/LLE_IMPL_STATE.md.
+add_executable(gdx_rsp_boot_tests
+    rsp/tests/rsp_boot_test.c
+    rsp/cxd4/gdx_rsp_driver.c
+    rsp/cxd4/su.c
+    rsp/cxd4/vu/add.c
+    rsp/cxd4/vu/divide.c
+    rsp/cxd4/vu/logical.c
+    rsp/cxd4/vu/multiply.c
+    rsp/cxd4/vu/select.c
+    rsp/cxd4/vu/vu.c)
+target_include_directories(gdx_rsp_boot_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/rsp/cxd4")
+target_compile_definitions(gdx_rsp_boot_tests PRIVATE
+    SP_EXECUTE_LOG=1
+    GDX_RSP_TEST_STEP_HOOK=1   # test provides its own step_SP_commands; exclude the driver's watchdog one
+    _CRT_SECURE_NO_WARNINGS=1
+    "RSP_BLOB_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/rsp\"")
+if(MSVC)
+    target_compile_options(gdx_rsp_boot_tests PRIVATE /W3)
 endif()

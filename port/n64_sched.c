@@ -535,6 +535,8 @@ void osSpTaskLoad(OSTask* tp) {
    the task's own data_ptr is NOT subject to the Acmd-word pointer-truncation hazard (only the
    command payload is). */
 extern void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes);
+/* LLE dispatch seam (port/gdx_audio_lle.c): file-toggled real-RSP path, HLE fallback. */
+extern void gdx_audio_lle_run(const void* dataPtr, unsigned int dataSizeBytes);
 
 /* ------------------------------------------------------------------------------------------
  * Phase 3 (port/gdx_audio_thread.cpp): dedicated-thread audio production entry point.
@@ -615,7 +617,7 @@ int gdx_audio_produce_one_tick(void) {
         return 0;
     }
 
-    gdx_audio_hle_run(task->task.t.data_ptr, (unsigned int) task->task.t.data_size);
+    gdx_audio_lle_run(task->task.t.data_ptr, (unsigned int) task->task.t.data_size);
     return 1;
 }
 
@@ -626,7 +628,7 @@ void osSpTaskStartGo(OSTask* tp) {
        interpreter instead; anything else (neither GFX nor AUDIO) is acked so the game's
        scheduler still advances, then return. */
     if (tp->t.type == M_AUDTASK) {
-        gdx_audio_hle_run(tp->t.data_ptr, tp->t.data_size);
+        gdx_audio_lle_run(tp->t.data_ptr, tp->t.data_size);
         osSendMesg(&gMainThreadMesgQueue, (OSMesg)(uintptr_t)EVENT_MESG_SP, OS_MESG_NOBLOCK);
         osSendMesg(&D_800DCAC8, (OSMesg)(uintptr_t)0x2A, OS_MESG_NOBLOCK);
         return;
