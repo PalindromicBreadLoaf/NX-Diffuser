@@ -185,6 +185,10 @@ endif()
 # Main executable.
 add_executable(G-Diffuser
     main.cpp
+    gdx_menu.cpp               # In-game ImGui enhancement menu (F1). Pure port-side wiring against
+                                # LUS's ImGui + CVar API; uses the libultraship include dirs the
+                                # G-Diffuser target already has (see target_include_directories +
+                                # target_link_libraries(libultraship) below).
     input_bridge.c
     n64_gfx_bridge.cpp
     n64_gfx_convert.cpp        # G2: binary N64 (8-byte) -> wide 16-byte boundary
@@ -206,11 +210,29 @@ add_executable(G-Diffuser
                                 # audio production (replaces the cooperative-fiber-driven path
                                 # for silence-hole elimination). See its header comment for the
                                 # full cross-thread touchpoint enumeration and design notes.
+    gdx_frame_pacer.c          # Optional wall-clock host-loop pacer (default OFF): holds the
+                                # loop to the N64 NTSC field rate when
+                                # gEnhancements.Graphics.FramePacing is enabled. libultraship's
+                                # Fast3D backend already paces EndFrame() to 60fps, so this is
+                                # opt-in. Standalone C (windows.h + a local CVarGetInteger extern,
+                                # same boundary idiom as input_bridge.c).
+    gdx_savestate.c            # In-session RAM quick-save/load infrastructure (default OFF via
+                                # gEnhancements.Gameplay.SaveStates). Snapshots gdx_rdram at the
+                                # frame-loop yield boundary under the audio lock. NOTE: RDRAM-only —
+                                # a full rewind also needs the decomp .data/.bss (native BSS holds
+                                # the race state); dormant until that design lands. See its header.
     shims.c
     AssetLoader.cpp
     resource/ResourceFactories.cpp
     rom_buffer.cpp
     sram_buffer.cpp
+    gdx_ghost_io.c             # Ghost replay import/export (.gdg): host-side serializer over the
+                                # game's own GhostRecord/GhostData + Save_*/checksum routines
+                                # (mirror structs + raw externs, same boundary idiom as
+                                # sram_buffer.cpp). Called from the Practice tab in gdx_menu.cpp.
+    gdx_ghost_window.cpp       # Ghost Browser GuiWindow (Practice tab): read-only table of the saved
+                                # SRAM ghost + Export button. Same PORT/DECOMP boundary idiom; reuses
+                                # gdx_ghost_io's exporter. Registered via AddGuiWindow in main.cpp.
     mio0_wrap.c
     "${CMAKE_CURRENT_SOURCE_DIR}/../torch/lib/libmio0/mio0.c"
     $<TARGET_OBJECTS:gdiffuser_game>)

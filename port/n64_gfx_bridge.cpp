@@ -392,6 +392,17 @@ uintptr_t gViCurrentFramebuffer = 0;
 uintptr_t gViNextFramebuffer = 0;
 uintptr_t gLastRenderedFramebuffer = 0;
 
+/* Track F (title->menu wipe band) diagnostic scope. Transition_SetBackgroundBuffer
+ * records the just-captured/registered transition background buffer here (via the
+ * extern-C gdx_diag_note_transition_capture below). The SETTIMG host-pointer path
+ * then logs, once per unique source inside this span, whether the byteswap-applying
+ * native-RGBA16 range covers it -- the exact "log IsNativeRgba16Range(source) for
+ * the SETTIMG that draws the transition capture" step MASTER_SCOPE Track F calls
+ * for. Zero size = no active transition capture, so the probe costs nothing during
+ * normal rendering and can never affect a non-transition texture. */
+uintptr_t gDiagTransitionCaptureBegin = 0;
+size_t gDiagTransitionCaptureSize = 0;
+
 // Phase G2 coarse asset epoch: bumped whenever an asset/ROM-backed segment image
 // is (re)decoded (EnsureAssetSegmentImage). Declared here -- ahead of that
 // function -- so it can invalidate converted lists built against an old image.
@@ -3406,6 +3417,36 @@ class N64DisplayListAdapter {
                                                   static_cast<unsigned long long>(kPreferredImageBaseVA + modOff));
                                 }
                             }
+                            /* [transition-cap] Track F probe (guarded): when this
+                               SETTIMG source is the recorded transition capture
+                               buffer, report whether the byteswap-applying native
+                               RGBA16 range covers it. native=1 => the host-endian
+                               (little) capture IS swapped for the big-endian
+                               RGBA5551 reader (correct, no band); native=0 => it is
+                               read raw => red/blue swap + bit-shift = the title->menu
+                               noise band. One line per unique source; the gate is
+                               zero-size outside a transition so gameplay pays nothing
+                               and no non-transition texture is ever touched. */
+                            if (gDiagTransitionCaptureSize != 0 &&
+                                w1full >= gDiagTransitionCaptureBegin &&
+                                w1full < gDiagTransitionCaptureBegin + gDiagTransitionCaptureSize) {
+                                static uintptr_t sTransCapSeen[8] = {};
+                                static int sTransCapSeenCount = 0;
+                                bool capSeen = false;
+                                for (int s = 0; s < sTransCapSeenCount; s++) {
+                                    if (sTransCapSeen[s] == w1full) {
+                                        capSeen = true;
+                                        break;
+                                    }
+                                }
+                                if (!capSeen && sTransCapSeenCount < 8) {
+                                    sTransCapSeen[sTransCapSeenCount++] = w1full;
+                                    const bool nativeApplied = IsNativeRgba16Range(w1full, 2);
+                                    gdx_port_logf("[transition-cap] SETTIMG src=%p native=%d "
+                                                  "(1=byteswapped/correct, 0=raw/red-blue-swap band)\n",
+                                                  reinterpret_cast<void*>(w1full), nativeApplied ? 1 : 0);
+                                }
+                            }
                             texCensusPath = (stubResolved != 0) ? "widestub" : "hostptr";
                             outW1 = NormalizeLusDirectPointer(stubResolved != 0 ? stubResolved : w1full);
                         } else {
@@ -4519,6 +4560,17 @@ extern "C" void gdx_set_native_rgba16_texture_range(void* ptr, size_t size, int 
         gdx_record_dma_load(static_cast<uint32_t>(begin - reinterpret_cast<uintptr_t>(gdx_rdram)), 0,
                             static_cast<uint32_t>(std::min<size_t>(size, UINT32_MAX)));
     }
+}
+
+/* Track F probe hook (see gDiagTransitionCaptureBegin). Called by
+ * Transition_SetBackgroundBuffer immediately after it registers the captured
+ * background buffer as a native-RGBA16 range, so the SETTIMG probe can report
+ * whether that same buffer is byteswapped when the wipe/phased-strips draw reads
+ * it. Pure diagnostic bookkeeping: it records an address span, never alters
+ * rendering. Pass size 0 to clear the scope. */
+extern "C" void gdx_diag_note_transition_capture(void* ptr, size_t size) {
+    gDiagTransitionCaptureBegin = reinterpret_cast<uintptr_t>(ptr);
+    gDiagTransitionCaptureSize = (ptr != nullptr) ? size : 0;
 }
 
 extern "C" void gdx_register_main_module_range(void) {

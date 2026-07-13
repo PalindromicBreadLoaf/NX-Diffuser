@@ -112,6 +112,12 @@
 extern void* gdx_resolve_registered_host_address(unsigned int addr);
 extern void* gdx_resolve_module_host_address(unsigned int addr);
 
+/* ---- LUS console-variable read (C ABI, defined in libultraship) ----
+ * Declared here so this C TU need not pull the C++ bridge header -- the exact same pattern
+ * gdx_audio_lle.c uses for the LLE engine toggle. Backs the live reverb kill switch below
+ * (gEnhancements.Audio.Reverb). */
+extern int CVarGetInteger(const char* name, int defaultValue);
+
 static void* GdxAudioResolveAddr(uint32_t raw, const char* what) {
     void* p;
     static int sMissLogs = 0;
@@ -1415,22 +1421,35 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 uint32_t dmemOut = w1 & 0xFFFFu;
                 uint32_t numSamples = count8 * 8u;
                 uint32_t k;
-                /* GDX_NO_REVERB=1 A/B kill switch (port-side, RELIABLE getenv -- the
-                   decomp-side version at synthesis.c:587 silently no-ops because the
-                   decomp TU's getenv returns NULL, so the reverb wet->dry return kept
-                   running and the "grain persists with reverb off" test was invalid).
-                   Skip ONLY the reverb wet->dry return (dmemOut==LEFT_CH 0x940); the
-                   decay mix 0xC80->0xC80 and all note mixes are untouched. */
+                /* Reverb kill switch. Skip ONLY the reverb wet->dry return (dmemOut==LEFT_CH
+                   0x940); the decay mix 0xC80->0xC80 and all note mixes are untouched. Reverb is
+                   turned OFF by ANY of three independent sources:
+                     (1) gEnhancements.Audio.Reverb CVar (ImGui Audio tab, F1 > Audio > Reverb):
+                         reverb OFF when the CVar is 0. Default 1 = ON, so behavior is unchanged if
+                         the menu is never touched (bit-exact default). Read LIVE each call (benign
+                         int race with the main-thread menu write -- same live-CVar pattern as
+                         gdx_audio_lle.c's engine toggle and os.cpp's low-pass), so a menu toggle
+                         applies without a restart. NOTE: this is the HLE reverb only. Under the
+                         default LLE engine the reverb is the ucode's own and this A_MIXER path is
+                         not taken, so the toggle has no audible effect there -- it is still wired
+                         correctly for the HLE fallback path.
+                     (2) GDX_NO_REVERB=1 env var: kept as the RELIABLE A/B dev fallback (the
+                         decomp-side toggle at synthesis.c:587 silently no-ops because that TU's
+                         getenv returns NULL). Cached once.
+                     (3) The GdxAudioDbg()&4 debug bit, exactly as before. */
                 {
-                    static int sNoReverb = -1;
-                    if (sNoReverb == -1) {
+                    static int sNoReverbEnv = -1;
+                    int reverbOff; /* declared at block top (project C style; see gdx_audio_lle.c) */
+                    if (sNoReverbEnv == -1) {
                         const char* e = getenv("GDX_NO_REVERB");
-                        sNoReverb = (e != NULL && e[0] == '1') ? 1 : 0;
-                        if (sNoReverb) {
+                        sNoReverbEnv = (e != NULL && e[0] == '1') ? 1 : 0;
+                        if (sNoReverbEnv) {
                             gdx_port_logf("[audio] GDX_NO_REVERB=1: reverb wet->dry return DISABLED\n");
                         }
                     }
-                    if ((sNoReverb || (GdxAudioDbg() & 4)) && dmemOut == 0x940u) {
+                    /* Live CVar read: reverb OFF when the CVar is 0 (default 1 = on). */
+                    reverbOff = sNoReverbEnv || !CVarGetInteger("gEnhancements.Audio.Reverb", 1);
+                    if ((reverbOff || (GdxAudioDbg() & 4)) && dmemOut == 0x940u) {
                         break;
                     }
                 }

@@ -108,18 +108,17 @@ extern int gdx_diag_verbose(void);
 /* ==========================================================================
  * Toggle (UNCHANGED -- keep the HLE fallback exactly as it was)
  * ========================================================================== */
+/* LUS console-variable read (C ABI, defined in libultraship). Declared here so this C TU
+ * doesn't pull the C++ bridge header. */
+extern int CVarGetInteger(const char* name, int defaultValue);
+
 static int gdx_audio_lle_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        FILE* f = fopen("gdx-audio-lle.txt", "rb");
-        cached = 1;                     /* default: LLE on -- the confirmed audio path */
-        if (f) {
-            int c = fgetc(f);
-            cached = (c != '0');        /* a file whose first byte is '0' forces the HLE fallback */
-            fclose(f);
-        }
-    }
-    return cached;
+    /* Live from the ImGui Audio tab (F1 > Audio > Engine): gEnhancements.Audio.LLE
+     * (1 = LLE, 0 = HLE). Read each tick on the audio thread; the CVar is pre-registered at
+     * boot so a concurrent menu write is a benign int-value race (worst case one tick sees the
+     * old value). Default 1 = LLE on -- the owner-confirmed audio path -- so behavior is
+     * unchanged if the menu is never touched. */
+    return CVarGetInteger("gEnhancements.Audio.LLE", 1) != 0;
 }
 
 /* ==========================================================================
