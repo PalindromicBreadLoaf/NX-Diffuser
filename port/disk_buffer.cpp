@@ -12,6 +12,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include <unistd.h> // readlink
 #endif
 
 extern "C" {
@@ -24,6 +26,17 @@ unsigned char* gdx_ddipl_buffer = nullptr;
 unsigned int gdx_ddipl_size = 0;
 
 void gdx_ek_assets_fill(const unsigned char* disk, unsigned long long diskSize);
+// Durable disk-save sidecar (port/disk_savefile.cpp). init computes the pristine
+// fingerprint and loads any existing sidecar; apply replays saved dirty ranges
+// over the freshly loaded image. Declared here (host TU boundary) rather than via
+// the decomp side; see disk_savefile.h.
+void gdx_disk_save_init(const char* diskName, const unsigned char* pristine, unsigned int size);
+void gdx_disk_save_apply(unsigned char* buffer);
+// Post-fill fixup for the fan-translated EK disk's re-authored Create-Machine
+// label sub-block (port/gdx_ek_disk_overrides.c). Overwrites three garbled I8
+// heading/caption glyphs with authored English ones. No-op for Course Edit
+// (its icons decode correctly at the generated offsets — see that file).
+void gdx_ek_disk_overrides_apply(void);
 void gdx_leo_on_disk_loaded(const unsigned char* disk);
 
 // 64DD boot-logo source texture (decomp/assets/yaml/jp/ek/boot_logo.yaml,
@@ -126,9 +139,12 @@ static void gdx_dir_of(const char* path, char* outDir, size_t outSize) {
     outDir[len] = '\0';
 }
 
-#ifdef _WIN32
 static void gdx_exe_dir(char* outDir, size_t outSize) {
     outDir[0] = '\0';
+    if (outSize == 0) {
+        return;
+    }
+#ifdef _WIN32
     wchar_t exePath[MAX_PATH] = {};
     if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) == 0) {
         return;
@@ -139,8 +155,24 @@ static void gdx_exe_dir(char* outDir, size_t outSize) {
     }
     slash[1] = L'\0';
     WideCharToMultiByte(CP_UTF8, 0, exePath, -1, outDir, static_cast<int>(outSize), nullptr, nullptr);
-}
+#else
+    char exePath[4096];
+    ssize_t n = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+    if (n <= 0) {
+        return;
+    }
+    exePath[n] = '\0';
+    char* slash = strrchr(exePath, '/');
+    if (slash == nullptr) {
+        return;
+    }
+    slash[1] = '\0'; // keep trailing separator
+    if (strlen(exePath) >= outSize) {
+        return;
+    }
+    strcpy(outDir, exePath);
 #endif
+}
 
 int gdx_disk_load(void) {
     if (gdx_disk_buffer != nullptr) {
@@ -177,9 +209,7 @@ int gdx_disk_load(void) {
     char romDir[1024] = {};
     gdx_dir_of(gdx_rom_path, romDir, sizeof(romDir));
     char exeDir[1024] = {};
-#ifdef _WIN32
     gdx_exe_dir(exeDir, sizeof(exeDir));
-#endif
 
     struct SearchLocation {
         const char* dir;
@@ -207,6 +237,16 @@ int gdx_disk_load(void) {
                 fclose(f);
                 continue;
             }
+            /* Codebase-audit P2: gdx_leo_on_disk_loaded and LeoReadDiskID read the
+               LBA-14 disk ID and system area at fixed offsets with no size guard,
+               and gdx_ek_assets_fill walks generated diskOffset tables. A truncated
+               .ndd would OOB-read immediately. Retail 64DD images are ~64.9 MB;
+               require a sane minimum before handing the buffer to those consumers. */
+            if (sz < (long)(60u * 1024u * 1024u)) {
+                gdx_port_logf("[leo] REJECTED %s: %ld bytes (truncated .ndd image, need ~64.9 MB)\n", path, sz);
+                fclose(f);
+                continue;
+            }
             unsigned char* buf = static_cast<unsigned char*>(malloc(static_cast<size_t>(sz)));
             if (buf == nullptr) {
                 fclose(f);
@@ -224,6 +264,7 @@ int gdx_disk_load(void) {
                           loc.why, jpRom ? "JP (matches cartridge ROM)" : "US/unknown (default preference)");
             gdx_leo_on_disk_loaded(gdx_disk_buffer);
             gdx_ek_assets_fill(gdx_disk_buffer, static_cast<unsigned long long>(gdx_disk_size));
+            gdx_ek_disk_overrides_apply();
 
             /* Host byte order for the boot-logo texels (2026-07-09): the fill
                above copies raw BIG-ENDIAN disk bytes, but func_806F33D0
@@ -242,6 +283,16 @@ int gdx_disk_load(void) {
             }
 
             gdx_ddipl_load();
+
+            // Durable disk save: gdx_disk_buffer is still the PRISTINE file bytes
+            // here -- gdx_ek_assets_fill and gdx_leo_on_disk_loaded take it as
+            // const, and gdx_ek_disk_overrides_apply patches decoded C arrays, not
+            // the disk buffer -- so its CRC64 fingerprint is the pristine one. init
+            // records that fingerprint and loads any matching sidecar; apply then
+            // replays the saved dirty ranges over the image so prior saves come
+            // back. The sidecar mirrors the loaded disk's file name.
+            gdx_disk_save_init(diskNames[i], gdx_disk_buffer, gdx_disk_size);
+            gdx_disk_save_apply(gdx_disk_buffer);
             return 1;
         }
     }

@@ -8,6 +8,17 @@ endif()
 set(DECOMP "${CMAKE_CURRENT_SOURCE_DIR}/../decomp")
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+# Warning flag set for the port's own (non-decomp, non-vendored) targets under GCC/Clang. The
+# decomp game library and the vendored cxd4 RSP interpreter stay quiet (-w) since they are not
+# ours to fix; the port-authored TUs get -Wall minus the unused-parameter noise (many host shims
+# intentionally ignore parameters). No -Werror here: a Linux first-configure should surface
+# warnings without failing the build.
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang" OR CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set(GDX_PORT_WARN_FLAGS -Wall -Wno-unused-parameter)
+else()
+    set(GDX_PORT_WARN_FLAGS "")
+endif()
+
 # Decomp game C compiled for PC. Exclude:
 #   libultra/* (libultraship provides most) EXCEPT gu/ (matrix/gfx math) and os/ (the real
 #   N64 cooperative scheduler — R6 Starship-style: we run the decomp's own thread scheduler
@@ -122,11 +133,21 @@ if(GDX_EXPANSION_KIT)
     target_sources(gdiffuser_game PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/n64_leo.c"            # EK: 64DD drive backed by disk image
         "${CMAKE_CURRENT_SOURCE_DIR}/gen/EkAssetBindings.c" # EK: disk asset symbol defs + fill
-        "${CMAKE_CURRENT_SOURCE_DIR}/gen/EkLinkStubs.c")   # EK: deferred-subsystem placeholders
+        "${CMAKE_CURRENT_SOURCE_DIR}/gen/EkLinkStubs.c"    # EK: deferred-subsystem placeholders
+        "${CMAKE_CURRENT_SOURCE_DIR}/gdx_ek_disk_overrides.c") # EK: post-fill translated-disk label fixups
     # MFS_VERSION=1 (version B) and BUILD_VERSION=VERSION_J (2.0J libultra API
     # shapes, e.g. 3-arg __osSetHWIntrRoutine) match the decomp Makefile's EK
     # configuration; sethwinterrupt.c and the headers are both gated on it.
     target_compile_definitions(gdiffuser_game PRIVATE EXPANSION_KIT=1 MFS_VERSION=1 BUILD_VERSION=VERSION_J)
+endif()
+
+# Cooperative-context (fiber) backend for the R6 scheduler (n64_sched.c calls the
+# gdx_fiber.h abstraction). Win32 fibers on Windows, POSIX ucontext elsewhere.
+# Exactly one backend is compiled per platform.
+if(WIN32)
+    target_sources(gdiffuser_game PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/gdx_fiber_win32.c")
+else()
+    target_sources(gdiffuser_game PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/gdx_fiber_ucontext.c")
 endif()
 
 target_include_directories(gdiffuser_game PRIVATE
@@ -156,6 +177,33 @@ target_compile_definitions(gdiffuser_game PRIVATE
 #   handed 0x18 to the audio loader as a buffer pointer).
 if(MSVC)
     target_compile_options(gdiffuser_game PRIVATE /W0 /w14715 /w14716)
+else()
+    # GCC/Clang (Linux): the decomp C is IDO-era and noisy, so silence warnings like /W0 --
+    # but keep the "non-void function falls off the end" class FATAL. On MSVC that is the
+    # /w14715 /w14716 promotion (a real x64 crash source: garbage left in the return register);
+    # -Werror=return-type is the GCC/Clang equivalent. Everything else stays quiet.
+    # GCC 14+ additionally promotes int-conversion / incompatible-pointer-types /
+    # implicit-function-declaration to HARD ERRORS by default, and -w does not downgrade
+    # default-errors. The decomp's IDO-era code freely mixes pointers and 32-bit integers
+    # (uintptr_t round-trips through u32 fields, N64-address arithmetic) -- authentic decomp
+    # behavior that MSVC's /W0 accepted. Downgrade those classes back to (silenced) warnings.
+    # -fcommon: the generated asset bindings and the decomp asset TUs both carry tentative
+    # definitions of the same symbols; MSVC and pre-GCC-10 merged them (the decomp relies on
+    # it). Modern GCC defaults -fno-common and hard-errors the duplicate definitions.
+    # -fno-strict-aliasing / -fwrapv are LOAD-BEARING at -O2/-O3, not stylistic. This is authentic
+    # IDO-era decomp C: it type-puns constantly (the AudioCmd union written through void** casts in
+    # AudioThread_QueueCmd, uintptr_t<->u32 round-trips, N64-address arithmetic) and assumes MIPS
+    # two's-complement wraparound. GCC's default -fstrict-aliasing (TBAA) and signed-overflow-is-UB
+    # assumptions treat all of that as undefined and MISCOMPILE it at -O3 while leaving -O0 correct.
+    # Measured symptom: the Linux Release build synthesized near-silent audio (ai-tap rms 482 vs the
+    # Debug build's 2498) because the audio command path was optimized away, while Debug was healthy.
+    # -O0 Debug never exposed it. Every serious N64 decomp port disables both. Keep these on ALL
+    # build types so a Release build can never diverge from Debug on this class of UB again.
+    target_compile_options(gdiffuser_game PRIVATE -w -Werror=return-type -fcommon
+        -fno-strict-aliasing -fwrapv
+        -Wno-error=int-conversion
+        -Wno-error=incompatible-pointer-types
+        -Wno-error=implicit-function-declaration)
 endif()
 
 # cxd4 RSP interpreter (LLE audio), vendored under rsp/cxd4 (CC0). Built as a static lib
@@ -180,11 +228,18 @@ target_compile_definitions(cxd4_rsp PRIVATE SP_EXECUTE_LOG=1)
 if(MSVC)
     target_compile_options(cxd4_rsp PRIVATE /W0)
     target_compile_definitions(cxd4_rsp PRIVATE _CRT_SECURE_NO_WARNINGS=1)
+else()
+    # Vendored C89 CC0 interpreter: keep quiet like /W0. -fno-strict-aliasing / -fwrapv for the same
+    # reason as gdiffuser_game above: this bit-exact RSP core type-puns DMEM/registers and relies on
+    # defined integer wraparound in its vector ops; -O3 TBAA/overflow assumptions would miscompile it.
+    target_compile_options(cxd4_rsp PRIVATE -w -fno-strict-aliasing -fwrapv)
+    target_compile_definitions(cxd4_rsp PRIVATE _CRT_SECURE_NO_WARNINGS=1)
 endif()
 
 # Main executable.
 add_executable(G-Diffuser
     main.cpp
+    gdx_gui.cpp                # Fast3D GUI font setup for the modern full-screen menu.
     gdx_menu.cpp               # In-game ImGui enhancement menu (F1). Pure port-side wiring against
                                 # LUS's ImGui + CVar API; uses the libultraship include dirs the
                                 # G-Diffuser target already has (see target_include_directories +
@@ -224,15 +279,27 @@ add_executable(G-Diffuser
     shims.c
     AssetLoader.cpp
     resource/ResourceFactories.cpp
+    gdx_firstboot.cpp          # First-boot setup wizard + per-user data directory resolution. Runs
+                                # before libultraship init to acquire/validate the ROM, EK disk, and
+                                # 64DD IPL, copy them into %APPDATA%/G-Diffuser (or a portable dir),
+                                # and boot straight to the game thereafter. See docs/FIRST_BOOT_DESIGN.md.
     rom_buffer.cpp
     sram_buffer.cpp
-    gdx_ghost_io.c             # Ghost replay import/export (.gdg): host-side serializer over the
-                                # game's own GhostRecord/GhostData + Save_*/checksum routines
-                                # (mirror structs + raw externs, same boundary idiom as
-                                # sram_buffer.cpp). Called from the Practice tab in gdx_menu.cpp.
-    gdx_ghost_window.cpp       # Ghost Browser GuiWindow (Practice tab): read-only table of the saved
-                                # SRAM ghost + Export button. Same PORT/DECOMP boundary idiom; reuses
-                                # gdx_ghost_io's exporter. Registered via AddGuiWindow in main.cpp.
+    disk_savefile.cpp          # Durable 64DD disk-save sidecar: copy-on-write dirty-LBA journal
+                                # next to the exe (saves/<disk>.gdd). Records disk writes and
+                                # replays them over a freshly loaded pristine .ndd at boot, so the
+                                # user's .ndd is never mutated. Also hosts the D6 format guard.
+    gdx_ghost_io.c             # GDG1 import/export plus the per-exact-course host player-ghost
+                                # library. Uses the game's checksum/conversion routines and keeps
+                                # the vanilla SRAM slot as a compatibility mirror.
+    gdx_ghost_window.cpp       # Ghost Browser GuiWindow: table/export UI for every validated player
+                                # ghost in the host library. Registered via AddGuiWindow in main.cpp.
+    gdx_input_viewer.cpp       # Draggable N64 input overlay using the state seen by the game.
+    gdx_imgui_nav.cpp          # Feeds ImGui menu navigation from the SDL controller directly, so a
+                                # raw DualSense (invisible to ImGui's Win32/XInput backend) can open
+                                # and drive the menu on every platform. Gated on gControlNav.
+    gdx_workshop.cpp           # Workshop W0: texture-pack override shim, decoded-texture dump
+                                # (vendored stb_image_write), and hot reload. All CVar-gated OFF.
     mio0_wrap.c
     "${CMAKE_CURRENT_SOURCE_DIR}/../torch/lib/libmio0/mio0.c"
     $<TARGET_OBJECTS:gdiffuser_game>)
@@ -256,17 +323,34 @@ endif()
 
 file(GLOB_RECURSE GDIFFUSER_F3D_SHADER_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/libultraship/src/fast/shaders/*")
+file(GLOB_RECURSE GDIFFUSER_GUI_TEXTURE_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/textures/*.png")
 set(GDIFFUSER_F3D_O2R "${CMAKE_CURRENT_BINARY_DIR}/f3d.o2r")
 add_custom_command(
     OUTPUT "${GDIFFUSER_F3D_O2R}"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/gen_f3d_o2r.py" "${GDIFFUSER_F3D_O2R}"
-    DEPENDS "${CMAKE_SOURCE_DIR}/tools/gen_f3d_o2r.py" ${GDIFFUSER_F3D_SHADER_SOURCES}
-    COMMENT "Generating Fast3D shader archive f3d.o2r"
+    DEPENDS "${CMAKE_SOURCE_DIR}/tools/gen_f3d_o2r.py"
+            ${GDIFFUSER_F3D_SHADER_SOURCES}
+            ${GDIFFUSER_GUI_TEXTURE_SOURCES}
+    COMMENT "Generating Fast3D shader and GUI texture archive f3d.o2r"
     VERBATIM)
 add_custom_target(gdiffuser_f3d_o2r DEPENDS "${GDIFFUSER_F3D_O2R}")
 add_dependencies(G-Diffuser gdiffuser_f3d_o2r)
 add_custom_command(TARGET G-Diffuser POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${GDIFFUSER_F3D_O2R}" "$<TARGET_FILE_DIR:G-Diffuser>/f3d.o2r"
+    VERBATIM)
+
+# The modern menu uses the same readable UI/monospace pairing as SoH. Keep the assets loose beside
+# the executable so GdxFast3dGui can add them to ImGui's atlas before the renderer uploads it.
+set(GDIFFUSER_GUI_FONT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts")
+add_custom_command(TARGET G-Diffuser POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:G-Diffuser>/fonts"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${GDIFFUSER_GUI_FONT_DIR}/Montserrat-Regular.ttf"
+            "${GDIFFUSER_GUI_FONT_DIR}/Inconsolata-Regular.ttf"
+            "${GDIFFUSER_GUI_FONT_DIR}/Montserrat-OFL.txt"
+            "${GDIFFUSER_GUI_FONT_DIR}/Inconsolata-OFL.txt"
+            "$<TARGET_FILE_DIR:G-Diffuser>/fonts"
     VERBATIM)
 
 target_include_directories(G-Diffuser PRIVATE
@@ -282,7 +366,34 @@ target_link_libraries(G-Diffuser PRIVATE cxd4_rsp)
 # Link libultraship when built from the top-level project (it provides the libultra HLE:
 # os* threading/messaging, VI, controller, Fast3D).
 if(WIN32)
+    # Win32-only host deps: user32 (MessageBox) + Comdlg32 (GetOpenFileName ROM picker).
     target_link_libraries(G-Diffuser PRIVATE user32 Comdlg32)
+else()
+    # POSIX host deps: pthread (ucontext fiber backend uses pthread_self; audio thread is
+    # std::thread) and dl (dladdr in n64_gfx_bridge.cpp's GetMainModuleRange; -ldl is needed on
+    # older glibc, harmless on newer where it folds into libc). ucontext itself lives in libc.
+    find_package(Threads REQUIRED)
+    target_link_libraries(G-Diffuser PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+endif()
+
+# Port-authored warning flags under GCC/Clang (no-op on MSVC; the port keeps its MSVC /W tuning
+# in the per-target blocks below).
+if(GDX_PORT_WARN_FLAGS)
+    target_compile_options(G-Diffuser PRIVATE ${GDX_PORT_WARN_FLAGS})
+endif()
+# Same UB-hardening as gdiffuser_game/cxd4_rsp: the port glue reinterprets N64 RDRAM through host
+# pointers (gdx_rdram + offset), widens 4-byte N64 pointers to host width, and resolves registered
+# host ranges by bit-pattern -- all strict-aliasing-sensitive. Disable TBAA and signed-overflow
+# assumptions here too so the -O3 Release port glue can't miscompile that the way the audio path did.
+if(NOT MSVC)
+    target_compile_options(G-Diffuser PRIVATE -fno-strict-aliasing -fwrapv)
+    # CRITICAL Linux audio fix (engram audio/linux-silent-binary-poison): the decomp's N64 libultra
+    # sinf/cosf were being EXPORTED from the executable's .dynsym (WEAK/DEFAULT) and interposing the
+    # sinf/cosf that libSDL3's audio resampler imports -> silent/garbled game audio that also distorted
+    # the shared PipeWire sink. This version script localizes sinf/cosf so libSDL3 uses glibc's; the
+    # decomp keeps its own via static resolution. See port/gdx_hide_libm.map for the full writeup.
+    target_link_options(G-Diffuser PRIVATE
+        "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/gdx_hide_libm.map")
 endif()
 if(TARGET libultraship)
     target_link_libraries(G-Diffuser PRIVATE libultraship)
@@ -306,6 +417,9 @@ add_executable(gdx_dsp_tests
     n64_audio_hle.c)
 if(MSVC)
     target_compile_options(gdx_dsp_tests PRIVATE /W3)
+elseif(GDX_PORT_WARN_FLAGS)
+    target_compile_options(gdx_dsp_tests PRIVATE ${GDX_PORT_WARN_FLAGS})
+    target_link_libraries(gdx_dsp_tests PRIVATE m) # sin/floor: libm is separate on UNIX
 endif()
 
 # VI-scanout fallback unit test: standalone console exe compiling gdx_vi_convert.c
@@ -318,6 +432,8 @@ add_executable(gdx_vi_fallback_tests
     gdx_vi_convert.c)
 if(MSVC)
     target_compile_options(gdx_vi_fallback_tests PRIVATE /W3)
+elseif(GDX_PORT_WARN_FLAGS)
+    target_compile_options(gdx_vi_fallback_tests PRIVATE ${GDX_PORT_WARN_FLAGS})
 endif()
 
 # Phase G1 wide-Gfx packing test: standalone console exe compiling ONLY the real
@@ -336,6 +452,8 @@ target_compile_definitions(gdx_gfx_pack_tests PRIVATE
     VERSION_US=1)
 if(MSVC)
     target_compile_options(gdx_gfx_pack_tests PRIVATE /W3)
+elseif(GDX_PORT_WARN_FLAGS)
+    target_compile_options(gdx_gfx_pack_tests PRIVATE ${GDX_PORT_WARN_FLAGS})
 endif()
 
 # Phase G2 binary-DL converter test: standalone console exe compiling the real
@@ -352,6 +470,8 @@ add_executable(gdx_gfx_convert_tests
 target_include_directories(gdx_gfx_convert_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 if(MSVC)
     target_compile_options(gdx_gfx_convert_tests PRIVATE /W3)
+elseif(GDX_PORT_WARN_FLAGS)
+    target_compile_options(gdx_gfx_convert_tests PRIVATE ${GDX_PORT_WARN_FLAGS})
 endif()
 
 # R1 resource smoke test: links libultraship ONLY (no game objects), so it builds and runs
@@ -392,4 +512,7 @@ target_compile_definitions(gdx_rsp_boot_tests PRIVATE
     "RSP_BLOB_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/rsp\"")
 if(MSVC)
     target_compile_options(gdx_rsp_boot_tests PRIVATE /W3)
+else()
+    # Vendored C89 cxd4 sources dominate this target: keep quiet.
+    target_compile_options(gdx_rsp_boot_tests PRIVATE -w)
 endif()

@@ -1,0 +1,92 @@
+/* port/disk_savefile.h -- durable 64DD disk-save sidecar (copy-on-write dirty-LBA journal).
+ *
+ * The port's 64DD "drive" is a linear disk image loaded into gdx_disk_buffer
+ * (port/disk_buffer.cpp). Game writes (Course Edit saves, MFS RAM-area formats,
+ * ghost autosaves that land on disk) update that in-memory image but were
+ * previously lost on exit. This module makes them durable WITHOUT ever mutating
+ * the user's pristine .ndd file: it records only the dirty byte ranges into a
+ * small sidecar next to the executable ("saves/<diskFileName>.gdd") and replays
+ * them over a freshly loaded pristine image at the next boot.
+ *
+ * Design: copy-on-write journal. The pristine .ndd is the immutable base; the
+ * sidecar is a coalesced list of {byteOffset, length, data} records covering
+ * exactly the ranges the game has written since the base was authored. A
+ * CRC64 fingerprint of the pristine image is stored in the sidecar header so a
+ * sidecar is NEVER applied to a disk it was not created against.
+ *
+ * This is a host-CRT translation unit (part of the G-Diffuser executable target,
+ * like port/sram_buffer.cpp and port/gdx_ghost_io.c), so it can freely use the
+ * standard C/C++ file API. The decomp game object library never sees fopen/FILE;
+ * it only reaches the two decomp-facing entry points (gdx_disk_save_mark_dirty
+ * from port/n64_leo.c's write path, and the format guard below) through raw C
+ * externs, the same boundary idiom sram_buffer.cpp uses. The path discipline and
+ * the _WIN32 / POSIX split mirror port/gdx_ghost_io.c so this stays Linux-ready.
+ */
+#ifndef GDX_DISK_SAVEFILE_H
+#define GDX_DISK_SAVEFILE_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Compute the pristine disk fingerprint, resolve the sidecar path
+ * (saves/<diskName>.gdd next to the exe) and load + validate any existing
+ * sidecar into the in-memory journal. `pristine` must point at the freshly
+ * loaded, UNMODIFIED disk bytes (the CRC64 fingerprint is taken from them).
+ * `diskName` is the base file name of the loaded .ndd; the sidecar mirrors it.
+ * On any validation failure the loader falls back .gdd then .gdd.bak then
+ * pristine-only, logging one line per outcome. A mismatched sidecar is ignored. */
+void gdx_disk_save_init(const char* diskName, const unsigned char* pristine, unsigned int size);
+
+/* Replay the loaded journal records over `buffer` (the freshly loaded pristine
+ * image, i.e. gdx_disk_buffer). No-op when the journal is empty. */
+void gdx_disk_save_apply(unsigned char* buffer);
+
+/* Record a dirty byte range written to the disk image. Coalesces overlapping
+ * and adjacent ranges. Arms the debounced flush (see gdx_disk_save_tick). */
+void gdx_disk_save_mark_dirty(unsigned int offset, const void* data, unsigned int len);
+
+/* Atomically persist the current journal to saves/<name>.gdd (temp + rename,
+ * rolling the previous file to .gdd.bak). Normally driven by the debounce tick;
+ * exposed for explicit/forced flushes. */
+void gdx_disk_save_flush(void);
+
+/* Per-host-frame debounce tick. Flushes the journal once a write burst has
+ * drained (no new mark_dirty for a short window), coalescing one game save into
+ * one atomic sidecar write. Call once per frame from the host loop. */
+void gdx_disk_save_tick(void);
+
+/* Host format guard (D6). Returns non-zero only when a disk-formatting write is
+ * permitted. Default FALSE: the port refuses to auto-format an uninitialized or
+ * foreign MFS RAM area on its own, which would fire unprompted and overwrite the
+ * user's prior sidecar content. Called from the decomp EK format sites. */
+int gdx_disk_allow_format(void);
+
+/* Always-on, rate-limited refusal log for the D6 format guard. Callable from the
+ * decomp EK translation units (which cannot include the host logging header). */
+void gdx_disk_log_format_refused(void);
+
+/* ── Workshop menu status getters (read-only introspection of the sidecar) ──
+ * These back the "DD Save" subsection of the Workshop tab. All are cheap and
+ * safe to call every frame from the ImGui draw. */
+
+/* Non-zero when a valid sidecar (.gdd or its .bak) was loaded this boot. */
+int gdx_disk_sidecar_present(void);
+
+/* Number of coalesced dirty-range records currently in the journal. */
+int gdx_disk_sidecar_record_count(void);
+
+/* Non-zero when the most recent flush attempt succeeded (1 initially, since a
+ * fresh journal with nothing to flush is "not failed"). */
+int gdx_disk_last_flush_ok(void);
+
+/* Non-zero when the MFS RAM area was found uninitialized AND the D6 guard
+ * refused an auto-format at least once this boot -- i.e. the "Initialize DD
+ * save area" button should be offered. */
+int gdx_disk_format_refused_this_boot(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* GDX_DISK_SAVEFILE_H */

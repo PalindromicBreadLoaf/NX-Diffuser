@@ -53,3 +53,4 @@ docs/
 # Session build/scratch artifacts
 build_x64/
 __pycache__/
+.allyrc

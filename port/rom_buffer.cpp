@@ -11,6 +11,10 @@
 #include <windows.h>
 #include <commdlg.h>
 #include <cwchar>
+#else
+#include <strings.h> // strcasecmp
+#include <unistd.h>   // readlink
+#define _stricmp strcasecmp
 #endif
 
 extern "C" {
@@ -42,11 +46,29 @@ static void load_rom_from_file(FILE* f, const char* displayPath) {
         fclose(f);
         return;
     }
+    /* Codebase-audit P1: fixed-offset consumers (segment loads, setup_gfx at
+       0x17B1E0, course_track_gfx, EK asset tables) assume a complete image and
+       read high ROM offsets without per-read bounds checks. A truncated or
+       partial download would boot past the null-buffer guard and OOB-read the
+       heap on the first venue load. F-Zero X images are exactly 16 MiB; also
+       require the big-endian z64 magic word (0x80371240) so a byte-swapped or
+       foreign file is refused with a clear log line instead of garbage. */
+    if (szl < (long)(16u * 1024u * 1024u)) {
+        gdx_port_logf("[rom] REJECTED %s: %ld bytes (need a complete 16 MiB .z64 image)\n", displayPath, szl);
+        fclose(f);
+        return;
+    }
     size_t sz = (size_t)szl;
     uint8_t* buf = (uint8_t*)malloc(sz);
     if (!buf) { fclose(f); return; }
     if (fread(buf, 1, sz, f) != sz) { free(buf); fclose(f); return; }
     fclose(f);
+    if (buf[0] != 0x80 || buf[1] != 0x37 || buf[2] != 0x12 || buf[3] != 0x40) {
+        gdx_port_logf("[rom] REJECTED %s: not a big-endian .z64 image (magic %02X%02X%02X%02X)\n", displayPath,
+                      buf[0], buf[1], buf[2], buf[3]);
+        free(buf);
+        return;
+    }
     gdx_rom_buffer = buf;
     gdx_rom_size   = sz;
     strncpy(gdx_rom_path, displayPath, sizeof(gdx_rom_path) - 1);
@@ -125,6 +147,35 @@ static void load_rom_next_to_exe(void) {
         wcscpy_s(path, exePath);
         wcscat_s(path, candidate);
         load_rom_w(path);
+        if (gdx_rom_buffer) {
+            return;
+        }
+    }
+#else
+    // POSIX: resolve the executable directory via /proc/self/exe and probe the same candidate
+    // ROM names beside it (the native file picker is Windows-only; the CLI arg and FZEROX_ROM
+    // env fallbacks in gdx_init_rom are already portable).
+    char exePath[4096];
+    ssize_t n = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+    if (n <= 0) {
+        return;
+    }
+    exePath[n] = '\0';
+    char* slash = strrchr(exePath, '/');
+    if (slash == nullptr) {
+        return;
+    }
+    slash[1] = '\0'; // keep trailing separator
+
+    const char* candidates[] = {
+        "baserom.us.rev0.z64",
+        "fzerox.z64",
+        "f-zero-x.z64",
+    };
+    for (const char* candidate : candidates) {
+        char path[4096 + 32];
+        snprintf(path, sizeof(path), "%s%s", exePath, candidate);
+        load_rom(path);
         if (gdx_rom_buffer) {
             return;
         }

@@ -1,0 +1,75 @@
+#include "gdx_gui.h"
+
+#include <imgui.h>
+
+#include "ship/Context.h"
+#include "ship/window/gui/Fonts.h"
+#include "ship/window/gui/IconsFontAwesome4.h"
+
+namespace {
+
+ImFont* sFontStandard = nullptr;
+ImFont* sFontLarge = nullptr;
+ImFont* sFontMono = nullptr;
+
+ImFont* LoadFontWithIcons(const std::string& path, float size) {
+    ImGuiIO& io = ImGui::GetIO();
+    ImFontConfig textConfig;
+    textConfig.OversampleH = 2;
+    textConfig.OversampleV = 2;
+
+    ImFont* font = io.Fonts->AddFontFromFileTTF(path.c_str(), size, &textConfig);
+    if (font == nullptr) {
+        return nullptr;
+    }
+
+    static const ImWchar iconRanges[] = { ICON_MIN_FA, ICON_MAX_16_FA, 0 };
+    ImFontConfig iconConfig;
+    iconConfig.MergeMode = true;
+    iconConfig.PixelSnapH = true;
+    iconConfig.GlyphMinAdvanceX = size * 2.0f / 3.0f;
+    io.Fonts->AddFontFromMemoryCompressedBase85TTF(fontawesome_compressed_data_base85, size * 2.0f / 3.0f,
+                                                   &iconConfig, iconRanges);
+    return font;
+}
+
+} // namespace
+
+void GdxFast3dGui::ImGuiWMInit() {
+    // The platform backend is initialized first. The renderer backend is initialized after this
+    // virtual returns, so fonts added here are included in its first font-atlas upload.
+    Fast::Fast3dGui::ImGuiWMInit();
+
+    const std::string fontRoot = Ship::Context::GetPathRelativeToAppDirectory("fonts/");
+    sFontStandard = LoadFontWithIcons(fontRoot + "Montserrat-Regular.ttf", 18.0f);
+    sFontLarge = LoadFontWithIcons(fontRoot + "Montserrat-Regular.ttf", 22.0f);
+    sFontMono = LoadFontWithIcons(fontRoot + "Inconsolata-Regular.ttf", 17.0f);
+
+    // Missing loose assets must never prevent the port from booting. The normal ImGui default font
+    // already includes Font Awesome through LibUltraShip, so it is a complete fallback.
+    ImFont* fallback = ImGui::GetIO().Fonts->Fonts.empty() ? nullptr : ImGui::GetIO().Fonts->Fonts[0];
+    if (sFontStandard == nullptr) {
+        sFontStandard = fallback;
+    }
+    if (sFontLarge == nullptr) {
+        sFontLarge = sFontStandard;
+    }
+    if (sFontMono == nullptr) {
+        sFontMono = sFontStandard;
+    }
+    if (sFontStandard != nullptr) {
+        ImGui::GetIO().FontDefault = sFontStandard;
+    }
+}
+
+ImFont* GdxGuiFontStandard() {
+    return sFontStandard;
+}
+
+ImFont* GdxGuiFontLarge() {
+    return sFontLarge;
+}
+
+ImFont* GdxGuiFontMono() {
+    return sFontMono;
+}

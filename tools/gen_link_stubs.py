@@ -48,6 +48,8 @@ def yaml_table_sizes():
 # Symbols we implement for real elsewhere (shims.c, decomp_port.c) — never stub these.
 EXCLUDE = {
     "Arena_Allocate", "Arena_StartInit", "Arena_DefaultStartInit", "Arena_EndInit",
+    # Real MIO0 decoded-size reader in decomp/src/game/object.c.
+    "func_800AA6BC",
     # R6: decomp's libultra/os/*.c is now compiled (real N64 cooperative scheduler) — these
     # are DEFINED by the decomp, so they must not be stubbed (would be duplicate symbols).
     "osCreateThread", "osStartThread", "osStopThread", "osDestroyThread", "osYieldThread",

@@ -48,6 +48,27 @@ int gdx_audio_thread_active(void);
 void gdx_audio_ctx_lock(void);
 void gdx_audio_ctx_unlock(void);
 
+// Lock-free thread-cmd ring that carries gAudioCtx.threadCmdProcQueue's (readPos<<8 | writePos)
+// tokens between the game/host thread (producer — AudioThread_ScheduleProcessCmds) and this audio
+// thread (consumer — AudioThread_CreateTaskImpl's drain loop), replacing that ONE cross-thread
+// queue's decomp osSendMesg/osRecvMesg so the audio thread never touches libultra's run
+// queue/waiter lists. See gdx_audio_thread.cpp's CmdRing comment for the full rationale (fixes the
+// Release 64DD-boot SIGABRT, engram crash/release-64dd-mfs-abort). Both keep the osSendMesg/
+// osRecvMesg OS_MESG_NOBLOCK return convention: 0 = success, -1 = full (push) / empty (pop).
+int gdx_audio_cmdring_push(unsigned int token);
+int gdx_audio_cmdring_pop(unsigned int* out);
+
+// Replaces AudioThread_CreateTaskImpl's per-tick osSendMesg to gAudioCtx.taskStartQueue (decomp/
+// src/audio/disk/lib/thread.c). That queue has NO consumer in this port (AudioThread_WaitForAudioTask
+// is never called), and the send was the LAST decomp osSendMesg the dedicated audio OS thread still
+// executed every tick — the residual Release 64DD-boot SIGABRT (audio-thread osSendMesg concurrent
+// with the boot fiber's SLMFSLoad->LeoSpdlMotor osSendMesg -> glibc heap/list abort; engram
+// crash/release-64dd-residual, #1832). Now a plain atomic counter that touches zero libultra
+// scheduler state. The accessors are diagnostic only (no consumer today).
+void gdx_audio_taskstart_post(unsigned int token);
+unsigned int gdx_audio_taskstart_count(void);
+unsigned int gdx_audio_taskstart_last_token(void);
+
 #ifdef __cplusplus
 }
 #endif

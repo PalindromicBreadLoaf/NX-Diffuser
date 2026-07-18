@@ -16,12 +16,18 @@
 #include "PR/ucode.h"
 #include "fzx_thread.h"    // THREAD_ID_IDLE
 #include "n64_gfx_bridge.h"
+#include "gdx_fiber.h"     // cooperative context abstraction (Win32 fibers / POSIX ucontext)
+
+#include <stdint.h> // uintptr_t (MSVC leaks it transitively; GCC/glibc does not)
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <dbghelp.h> /* crash-handler symbolization (PDB ships with Debug builds) */
 #pragma comment(lib, "Dbghelp.lib")
+#else
+#include <sched.h>     /* sched_yield() for the audio-thread affinity spin-guard */
+#include <pthread.h>   /* gdx_mq_lock: cross-OS-thread message-queue guard */
 #endif
 
 #include <stddef.h>
@@ -38,26 +44,126 @@
 
 typedef struct {
     OSThread* thread;
-    void*     fiber;
+    GdxFiber* fiber;
     void (*entry)(void*);
     void*     arg;
 } GdxThreadFiber;
 
 static GdxThreadFiber sThreads[GDX_MAX_THREADS];
 static int            sThreadCount = 0;
-static void*          sHostFiber = NULL;
+static GdxFiber*      sHostFiber = NULL;
 
-#ifdef _WIN32
 // Phase 3 (port/gdx_audio_thread.cpp): the OS thread ID that called gdx_sched_init() (i.e. the
-// one that converted itself to a fiber via ConvertThreadToFiber and therefore owns every fiber
-// in sThreads[]/sHostFiber). Win32 fibers are only valid on the thread that created/converted
-// them -- SwitchToFiber from any OTHER real OS thread corrupts or crashes. Recorded so
-// __osEnqueueAndYield (below) can detect the dedicated audio thread ever reaching a blocking
+// one that converted itself to a fiber via gdx_fiber_convert_thread and therefore owns every
+// fiber in sThreads[]/sHostFiber). Cooperative contexts are only valid on the thread that
+// created/converted them -- switching from any OTHER real OS thread corrupts or crashes. Recorded
+// so __osEnqueueAndYield (below) can detect the dedicated audio thread ever reaching a blocking
 // osRecvMesg/osSendMesg wait and refuse to touch the fiber scheduler instead of crashing. See
 // gdx_audio_thread.cpp's header comment ("A SECOND, SEPARATE HAZARD...") for the full analysis
 // of why/when this could theoretically happen and why it is not expected to in practice.
-static DWORD sHostThreadId = 0;
+// Sourced from gdx_fiber_current_thread_id() so the guard survives on both backends.
+static unsigned long sHostThreadId = 0;
+
+// ---------------------------------------------------------------------------------------------
+// Cross-OS-thread message-queue guard.
+//
+// The dedicated audio OS thread (port/gdx_audio_thread.cpp) runs decomp code that calls
+// osSendMesg/osRecvMesg. Their wake path (osStartThread(__osPopThread(&mq->mtqueue))) mutates the
+// global __osRunQueue and the per-queue waiter lists — state that is thread-affine to the host
+// fiber scheduler. __osDisableInt is a no-op here, so nothing serialized those mutations against
+// the host thread's fibers: the 64DD boot thread and the audio thread corrupted the run queue
+// concurrently (nondeterministic SIGABRT/SIGSEGV inside osSendMesg on Linux Release, where the
+// dedicated audio thread is active during EK disk boot).
+//
+// The guard has two parts, used by the PORT paths in sendmesg.c/recvmesg.c/jammesg.c:
+//  - gdx_mq_lock()/gdx_mq_unlock(): one process-wide lock making the queue DATA mutations
+//    (msg[], first, validCount) atomic between the host thread and the audio thread. Never held
+//    across a fiber switch (the blocking paths release it before __osEnqueueAndYield).
+//  - gdx_sched_defer_wake(): on a NON-host thread the wake is recorded instead of performed;
+//    gdx_sched_drain_deferred_wakes() (host loop, right before gdx_dispatch) re-checks the waiter
+//    list and enqueues the woken thread on the run queue from the host thread. Deferral is
+//    UNCONDITIONAL on non-host sends (not gated on a visible waiter) so the classic lost-wakeup
+//    window — consumer checks empty, producer sends before the consumer enqueues itself — closes:
+//    the pending defer re-checks the waiter list after the consumer has parked.
+// ---------------------------------------------------------------------------------------------
+#ifdef _WIN32
+static SRWLOCK sMqLock = SRWLOCK_INIT; /* statically initialized: the audio thread starts before gdx_sched_init() */
+void gdx_mq_lock(void) {
+    AcquireSRWLockExclusive(&sMqLock);
+}
+void gdx_mq_unlock(void) {
+    ReleaseSRWLockExclusive(&sMqLock);
+}
+#else
+static pthread_mutex_t sMqMutex = PTHREAD_MUTEX_INITIALIZER;
+void gdx_mq_lock(void) {
+    pthread_mutex_lock(&sMqMutex);
+}
+void gdx_mq_unlock(void) {
+    pthread_mutex_unlock(&sMqMutex);
+}
 #endif
+
+int gdx_sched_on_host_thread(void) {
+    /* Before gdx_sched_init() records the host id, no game fibers exist and no thread can be
+       parked on a queue, so treating every caller as "host" is safe. */
+    return sHostThreadId == 0 || gdx_fiber_current_thread_id() == sHostThreadId;
+}
+
+#define GDX_DEFERRED_WAKES 128
+static OSThread** sDeferredWakes[GDX_DEFERRED_WAKES];
+static int sDeferredWakeCount = 0;
+
+/* Caller holds gdx_mq_lock. Coalesced: the audio thread defers on EVERY cross-thread send
+   (see sendmesg.c), which floods the ring with duplicates of the same handful of queues —
+   one pending entry per distinct wait list is enough, because the drain wakes every eligible
+   waiter on it. Distinct wait lists are bounded by the number of message queues, so the ring
+   cannot realistically overflow once deduplicated. */
+void gdx_sched_defer_wake(OSThread** waitList) {
+    int i;
+    for (i = 0; i < sDeferredWakeCount; i++) {
+        if (sDeferredWakes[i] == waitList) {
+            return;
+        }
+    }
+    if (sDeferredWakeCount < GDX_DEFERRED_WAKES) {
+        sDeferredWakes[sDeferredWakeCount++] = waitList;
+    } else {
+        static int sOverflowLogs = 0;
+        if (sOverflowLogs < 4) {
+            sOverflowLogs++;
+            gdx_port_logf("[sched] WARNING: deferred-wake ring overflow — a cross-thread mesg "
+                          "wake was dropped\n");
+        }
+    }
+}
+
+/* Host thread only (main loop, before gdx_dispatch). Enqueue-only: osStartThread would dispatch
+   fibers immediately when __osRunningThread is NULL; the imminent gdx_dispatch runs them at the
+   frame's normal point instead. Wakes EVERY waiter on each deferred list (coalescing loses the
+   send count): a spuriously woken thread re-checks its queue condition in osSendMesg/osRecvMesg's
+   while loop and re-parks — standard condvar-broadcast semantics, safe by construction. */
+void gdx_sched_drain_deferred_wakes(void) {
+    OSThread** lists[GDX_DEFERRED_WAKES];
+    int n;
+    int i;
+
+    gdx_mq_lock();
+    n = sDeferredWakeCount;
+    for (i = 0; i < n; i++) {
+        lists[i] = sDeferredWakes[i];
+    }
+    sDeferredWakeCount = 0;
+
+    for (i = 0; i < n; i++) {
+        while (*lists[i] != NULL && (*lists[i])->next != NULL && (*lists[i])->state == OS_STATE_WAITING) {
+            OSThread* t = __osPopThread(lists[i]);
+            t->state = OS_STATE_RUNNABLE;
+            __osEnqueueThread(&__osRunQueue, t);
+        }
+    }
+    gdx_mq_unlock();
+}
 
 static GdxThreadFiber* gdx_find(OSThread* t) {
     int i;
@@ -105,20 +211,19 @@ OSThread* __osPopThread(OSThread** queue) {
 // ---------------------------------------------------------------------------------------------
 // Fiber trampoline + context switch.
 // ---------------------------------------------------------------------------------------------
-#ifdef _WIN32
-static void __stdcall gdx_fiber_main(void* param) {
+// Portable GdxFiberEntry: receives the GdxThreadFiber* passed at creation, runs the decomp
+// thread's real entry, then reschedules. __osCleanupThread never returns here (it dispatches to
+// another context), so this function does not fall off its end in practice.
+static void gdx_fiber_main(void* param) {
     GdxThreadFiber* tf = (GdxThreadFiber*) param;
     gdx_port_logf("[sched] thread id=%d entry\n", (int) tf->thread->id);
     tf->entry(tf->arg);
     __osCleanupThread(); // entry returned -> thread is done
 }
-#endif
 
-static void* gdx_get_fiber(GdxThreadFiber* tf) {
+static GdxFiber* gdx_get_fiber(GdxThreadFiber* tf) {
     if (tf->fiber == NULL) {
-#ifdef _WIN32
-        tf->fiber = CreateFiber(0, gdx_fiber_main, tf);
-#endif
+        tf->fiber = gdx_fiber_create(gdx_fiber_main, tf, 0 /* default 1 MB stack */);
     }
     return tf->fiber;
 }
@@ -130,7 +235,7 @@ void __osDispatchThread(void) {
 
     if (t == (OSThread*) &__osThreadTail) {
         __osRunningThread = NULL;
-        SwitchToFiber(sHostFiber);
+        gdx_fiber_switch(sHostFiber);
         return;
     }
 
@@ -144,33 +249,36 @@ void __osDispatchThread(void) {
             gdx_port_logf("[sched] FATAL: dispatch unknown thread id=%d\n", (int) t->id);
             return;
         }
-        SwitchToFiber(gdx_get_fiber(tf));
+        gdx_fiber_switch(gdx_get_fiber(tf));
     }
 }
 
 // Enqueue the running thread onto `queue` (if any), then switch to the next runnable thread.
 void __osEnqueueAndYield(OSThread** queue) {
-#ifdef _WIN32
     // Phase 3 safety net (see sHostThreadId's comment above): a blocking osRecvMesg/osSendMesg
     // wait reached from the dedicated audio thread (port/gdx_audio_thread.cpp) must NOT touch
-    // __osRunningThread/__osRunQueue or SwitchToFiber -- both are host-fiber-thread-affine and
-    // doing so from here would corrupt or crash the scheduler. Log once (rate-limited) and
+    // __osRunningThread/__osRunQueue or gdx_fiber_switch -- all are host-context-thread-affine
+    // and doing so from here would corrupt or crash the scheduler. Log once (rate-limited) and
     // spin-yield instead: safe, if inefficient, until whatever this call was waiting on shows
     // up (expected in practice -- this port's DMA completions are synchronous, so the queue
     // this call is waiting on should never actually be empty when reached from the audio
-    // thread; see gdx_audio_thread.cpp for the full reasoning).
-    if (sHostThreadId != 0 && GetCurrentThreadId() != sHostThreadId) {
+    // thread; see gdx_audio_thread.cpp for the full reasoning). Portable across both fiber
+    // backends via gdx_fiber_current_thread_id().
+    if (sHostThreadId != 0 && gdx_fiber_current_thread_id() != sHostThreadId) {
         static int sForeignYieldLogs = 0;
         if (sForeignYieldLogs < 8) {
             sForeignYieldLogs++;
             gdx_port_logf("[sched] WARNING: __osEnqueueAndYield called from non-host thread id=%lu "
                           "(host=%lu) -- spin-yielding instead of dispatching\n",
-                          (unsigned long) GetCurrentThreadId(), (unsigned long) sHostThreadId);
+                          gdx_fiber_current_thread_id(), sHostThreadId);
         }
+#ifdef _WIN32
         Sleep(0);
+#else
+        sched_yield();
+#endif
         return;
     }
-#endif
     if (queue != NULL) {
         __osEnqueueThread(queue, __osRunningThread);
     }
@@ -303,9 +411,9 @@ static LONG WINAPI gdx_crash_vectored_handler(EXCEPTION_POINTERS* info) {
 // Convert the main OS thread into a fiber so the scheduler can switch to/from it. Call once
 // before bootproc().
 void gdx_sched_init(void) {
+    sHostFiber = gdx_fiber_convert_thread();
+    sHostThreadId = gdx_fiber_current_thread_id();
 #ifdef _WIN32
-    sHostFiber = ConvertThreadToFiber(NULL);
-    sHostThreadId = GetCurrentThreadId();
     AddVectoredExceptionHandler(1 /* call first */, gdx_crash_vectored_handler);
 #endif
     gdx_port_logf("[sched] host fiber ready\n");
@@ -313,9 +421,7 @@ void gdx_sched_init(void) {
 
 // Called by the (port-patched) idle thread's spin: hand the CPU back to the host loop.
 void gdx_yield_to_host(void) {
-#ifdef _WIN32
-    SwitchToFiber(sHostFiber);
-#endif
+    gdx_fiber_switch(sHostFiber);
 }
 
 // Diagnostic log helper for decomp .c files that can't include <stdio.h> (libc/stdint.h clash).
@@ -323,6 +429,18 @@ void gdx_yield_to_host(void) {
 // GDX_CK checkpoints and func_800690FC's entry trace; a burst more during every game-mode
 // transition from game.c's GMI_* checkpoints) -- see the comment on gdx_trace_enabled() in
 // port_log.h for why they're gated off by default (GDX_TRACE=1 re-enables them).
+/* GDX-DEBUG-2026-07-15: real (non-inline) extern printf-style logger so the bounded
+   [GDX-DBG ...] probes in transition.c (decomp) and interpreter.cpp (libultraship) can
+   link against a single symbol -- gdx_port_logf is static inline (header-only) and does
+   not export. Always on (mirrors gdx_port_logf's own ungated boot/one-shot behaviour).
+   Remove together with the probes it serves. */
+void gdx_dbg_logf(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    gdx_port_vlogf(fmt, args);
+    va_end(args);
+}
+
 void gdx_ck(const char* s) {
     if (!gdx_trace_enabled()) return;
     gdx_port_logf("%s\n", s);
@@ -520,9 +638,7 @@ void gdx_yield(void) {
     __osRunningThread->state = OS_STATE_RUNNABLE;
     __osEnqueueThread(&__osRunQueue, __osRunningThread);
     __osRunningThread = NULL;
-#ifdef _WIN32
-    SwitchToFiber(sHostFiber);
-#endif
+    gdx_fiber_switch(sHostFiber);
 }
 
 // Host: run runnable game threads until the game goes quiescent (all blocked / yielded to host).

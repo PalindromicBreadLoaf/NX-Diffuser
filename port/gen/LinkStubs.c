@@ -244,8 +244,9 @@ long __osSetFpcCsr() { return 0; }
 long __osSetSR() { return 0; }
 long __osSiRawReadIo() { return 0; }
 long __osSiRawWriteIo() { return 0; }
+#ifdef _WIN32 /* MSVC has no bzero; glibc provides it (with a size_t signature that would conflict) */
 void bzero(void* ptr, int n) { memset(ptr, 0, n); }
-long func_800AA6BC() { return 0; }
+#endif
 #ifndef EXPANSION_KIT /* real definitions in leo/mfs (mfs_ram.c) under EK */
 long func_i1_8040428C() { return 0; }
 long func_i1_804046F0() { return 0; }

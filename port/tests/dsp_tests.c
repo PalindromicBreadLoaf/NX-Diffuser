@@ -10,11 +10,13 @@
 // which interprets a stream of 8-byte {w0,w1} "Acmd" command words (the same ABI documented in
 // decomp/include/PR/abi.h) against a process-static 4KB DMEM scratch buffer and process-static
 // ADPCM codebook/loop-history side buffers -- there is no dependency on any decomp header or any
-// other port TU to exercise it. The ONLY external dependency the file has (besides libc) is two
-// extern "C" pointer resolvers, normally defined in n64_gfx_bridge.cpp:
+// other port TU to exercise it. Its external dependencies (besides libc) are two pointer resolvers,
+// normally defined in n64_gfx_bridge.cpp:
 //     void* gdx_resolve_registered_host_address(unsigned int addr);
 //     void* gdx_resolve_module_host_address(unsigned int addr);
 // which turn a truncated 32-bit "address" carried in an Acmd word back into a real host pointer.
+// It also uses CVarGetInteger for optional audio enhancements; the harness returns each requested
+// default so the black-box tests continue to exercise stock DSP behavior.
 //
 // Rather than invasively extracting the DSP kernels (RunAdpcm/RunResample/RunFilter are static,
 // and ENVMIXER's math lives inline in the opcode-dispatch switch, not its own function -- pulling
@@ -172,6 +174,11 @@ void* gdx_resolve_registered_host_address(unsigned int addr) {
 void* gdx_resolve_module_host_address(unsigned int addr) {
     (void)addr;
     return NULL; /* not used by this harness: every address we hand out is a registered region */
+}
+
+int CVarGetInteger(const char* name, int defaultValue) {
+    (void)name;
+    return defaultValue;
 }
 
 // ---- The interpreter's real entry point (no header declares this; n64_audio_hle.c defines it

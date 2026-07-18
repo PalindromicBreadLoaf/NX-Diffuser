@@ -7,6 +7,7 @@
 #include "ship/Context.h"
 #include "ship/resource/ResourceManager.h"
 #include "ship/audio/AudioPlayer.h"
+#include "ship/audio/Audio.h"  // Ship::Audio + AudioBackend (startup audio-backend selection)
 #include "resource/ResourceFactories.h"
 // LUS's concrete N64 ControlDeck (creates the 4 controller ports + LUS::Controller instances,
 // registers the standard N64 button set + default keyboard/gamepad mappings, and implements
@@ -18,21 +19,27 @@
 #include "libultraship/libultra/controller.h"  // OSContPad + MAXCONTROLLERS (for gdx_lus_read_pad)
 #include "libultraship/bridge/consolevariablebridge.h"  // CVarGetInteger (audio buffer-frames CVar)
 #include "fast/Fast3dWindow.h"
-#include "fast/Fast3dGui.h"
+#include "ship/debug/Console.h"
 #include "ship/window/gui/GuiWindow.h"
 // In-game enhancement menu (F1) + the reusable LUS windows it surfaces. Purely additive:
-// without these the port registers no menu bar / windows and F1 opens nothing.
-#include "gdx_menu.h"                                   // GdxMenuBar (port/gdx_menu.{h,cpp})
+// without these the port registers no menu / windows and F1 opens nothing.
+#include "gdx_gui.h"                                    // Fast3D GUI with bundled menu fonts
+#include "gdx_menu.h"                                   // GdxMenu (port/gdx_menu.{h,cpp})
 #include "libultraship/window/gui/GfxDebuggerWindow.h"  // LUS::GfxDebuggerWindow (Developer tab)
 #include "libultraship/window/gui/InputEditorWindow.h"  // LUS::InputEditorWindow (Controls tab)
 #include "gdx_ghost_window.h"                            // GdxGhostWindow (Practice tab — saved-ghost browser)
+#include "gdx_input_viewer.h"                            // GdxInputViewer (Settings tab + overlay)
+#include "gdx_imgui_nav.h"                               // SDL-controller -> ImGui menu navigation feed
 #include "port_log.h"
 #include "rom_buffer.h"
+#include "gdx_firstboot.h"  // first-boot setup + per-user data directory (runs before LUS init)
 #include "gdx_audio_thread.h"
 #include "gdx_frame_pacer.h"  // optional wall-clock 60Hz pacer (gEnhancements.Graphics.FramePacing)
 #include "gdx_savestate.h"    // in-session RAM quick-save/load infrastructure (default OFF; see file)
 #include <SDL2/SDL.h>  // SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER): enable gamepad auto-detection
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -46,14 +53,18 @@
 extern "C" void GDiffuser_LoadAllAssets(void); // generated asset binding loader (R2)
 extern "C" void bootproc(void);                // decomp boot entry (src/sys/sys_main.c)
 extern "C" void gdx_sched_init(void);          // R6: init cooperative fiber scheduler (host fiber)
+extern "C" void gdx_sched_drain_deferred_wakes(void); // cross-thread mesg wakes -> run queue (host)
 extern "C" void gdx_init_rom(int argc, char** argv); // S5: load ROM into host buffer
 extern "C" void gdx_vi_tick(void);             // R6: advance VI + post retrace (wakes Main thread)
 extern "C" void gdx_dispatch(void);            // R6: run game threads until quiescent
 extern "C" void gdx_vi_present_fallback(void); // VI-scanout fallback: present CPU-drawn framebuffers
 extern "C" void gdx_controller_poll(void);     // PORT: host keyboard -> decomp controller globals
+extern "C" void gdx_fixed_aspect_tick(void);   // input_bridge: force 4:3 rendering for the EK editors
 extern "C" void gdx_rdram_init(void);          // n64-rdram-buffer: allocate 8MB RDRAM before bootproc
 extern "C" void gdx_register_host_range(void* ptr, size_t size); // n64_gfx_bridge: expose range for TryResolveAddress
 extern "C" void gdx_register_main_module_range(void); // n64_gfx_bridge: resolve low32 EXE/BSS segment tokens
+extern "C" void gdx_game_request_reset(void); // game.c: schedule a title reset at the game-flow boundary
+extern "C" void gdx_disk_save_tick(void);      // disk_savefile: debounced flush of the 64DD save sidecar
 
 static void logStep(const char* s) {
     gdx_port_logf("[G-Diffuser] %s\n", s);
@@ -144,6 +155,46 @@ static void addArchiveCandidateRoots(std::vector<std::filesystem::path>& roots, 
     }
 }
 
+// Workshop W0: is a mod pack disabled by the user? gEnhancements.Workshop.DisabledPacks is a
+// comma-joined list of pack basenames (e.g. "20-portraits.o2r,legacy.o2r") persisted by the
+// Workshop menu. Matching is case-insensitive on the basename. Mounting a pack is always safe (a
+// pack with no matching keys is inert); this list lets the user keep a pack on disk but out of the
+// load set without deleting it.
+static bool workshopPackDisabled(const std::string& basename) {
+    const char* raw = CVarGetString("gEnhancements.Workshop.DisabledPacks", "");
+    if (raw == nullptr || raw[0] == '\0') {
+        return false;
+    }
+    auto lower = [](std::string s) {
+        for (char& c : s) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        return s;
+    };
+    const std::string target = lower(basename);
+    std::string list = raw;
+    size_t start = 0;
+    while (start <= list.size()) {
+        size_t comma = list.find(',', start);
+        const size_t end = (comma == std::string::npos) ? list.size() : comma;
+        std::string token = list.substr(start, end - start);
+        // Trim surrounding whitespace.
+        size_t b = token.find_first_not_of(" \t");
+        size_t e = token.find_last_not_of(" \t");
+        if (b != std::string::npos) {
+            token = token.substr(b, e - b + 1);
+            if (lower(token) == target) {
+                return true;
+            }
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return false;
+}
+
 static std::vector<std::string> findArchivePaths(const char* argv0) {
     std::vector<std::filesystem::path> roots;
     std::error_code ec;
@@ -169,10 +220,65 @@ static std::vector<std::string> findArchivePaths(const char* argv0) {
         archives.push_back("generic.o2r");
     }
 
+    // Workshop W0: append mods/*.o2r after the base archives. ArchiveManager registers files
+    // last-wins, so a later archive overrides a same-path resource in an earlier one -- load order
+    // is priority order. Scanning in case-insensitive lexicographic order gives users deterministic
+    // control via a numeric filename prefix ("10-hifonts.o2r"). The first candidate root that has a
+    // mods/ directory wins, matching the base-archive resolution above. Mounting is never gated by a
+    // CVar (an unmatched pack is inert); the Tier-B texture-pack shim is the actual behavior switch.
+    for (const auto& root : roots) {
+        const auto modsDir = root / "mods";
+        if (!std::filesystem::is_directory(modsDir, ec)) {
+            ec.clear();
+            continue;
+        }
+        std::vector<std::pair<std::string, std::string>> mods; // (sortKeyLower, absolutePath)
+        for (const auto& entry : std::filesystem::directory_iterator(modsDir, ec)) {
+            if (!entry.is_regular_file(ec)) {
+                continue;
+            }
+            std::string ext = entry.path().extension().string();
+            std::string extLower = ext;
+            for (char& c : extLower) {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+            if (extLower != ".o2r") {
+                continue;
+            }
+            const std::string basename = entry.path().filename().string();
+            std::string keyLower = basename;
+            for (char& c : keyLower) {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+            if (workshopPackDisabled(basename)) {
+                gdx_port_logf("[workshop] pack: %s (disabled)\n", basename.c_str());
+                continue;
+            }
+            mods.emplace_back(keyLower, std::filesystem::absolute(entry.path(), ec).string());
+        }
+        std::sort(mods.begin(), mods.end());
+        for (const auto& [keyLower, path] : mods) {
+            archives.push_back(path);
+            gdx_port_logf("[workshop] pack: %s\n",
+                          std::filesystem::path(path).filename().string().c_str());
+        }
+        break; // first root with a mods/ dir wins, like the base archives
+    }
+
     return archives;
 }
 
 int main(int argc, char** argv) {
+    // First-boot setup + per-user data directory. MUST run before any libultraship path resolution
+    // (below) so config, logs, the disk image, and the IPL ROM consolidate into the resolved data
+    // directory. In the dev/portable layout (ROM next to the exe) this shows no wizard and leaves the
+    // working directory untouched — it only resolves the ROM path so the ROM picker stays suppressed
+    // for a headless launch. See port/gdx_firstboot.{h,cpp} + docs/FIRST_BOOT_DESIGN.md.
+    gdx::FirstBootResult firstBoot = gdx::FirstBootRun((argc > 0) ? argv[0] : nullptr);
+    if (firstBoot.status == gdx::FirstBootStatus::Aborted) {
+        return 1;
+    }
+
     logStep("CreateUninitializedInstance");
     auto ctx = Ship::Context::CreateUninitializedInstance("G-Diffuser", "gdiffuser",
                                                           "gdiffuser.cfg.json");
@@ -220,17 +326,27 @@ int main(int argc, char** argv) {
     // (called by AddGuiWindow) registers commands via Context::GetConsole().
     logStep("InitCrashHandler");      ctx->InitCrashHandler();
     logStep("InitConsole");           ctx->InitConsole();
+    ctx->GetConsole()->AddCommand(
+        "reset",
+        { [](std::shared_ptr<Ship::Console>, std::vector<std::string>, std::string* output) {
+             gdx_game_request_reset();
+             if (output != nullptr) {
+                 *output = "Game reset requested.";
+             }
+             return 0;
+         },
+          "Reset the game to the title screen.", {} });
 
     // Now resource manager + console exist — safe to build and init the window.
-    logStep("construct Fast3dGui");
-    auto gui = std::make_shared<Fast::Fast3dGui>(std::vector<std::shared_ptr<Ship::GuiWindow>>());
+    logStep("construct GdxFast3dGui");
+    auto gui = std::make_shared<GdxFast3dGui>(std::vector<std::shared_ptr<Ship::GuiWindow>>());
     logStep("construct Fast3dWindow(gui)");
     auto window = std::make_shared<Fast::Fast3dWindow>(gui);
     logStep("InitWindow");            ctx->InitWindow(window);
 
     // ── In-game enhancement menu (F1) ────────────────────────────────────────────────────────
     // The Window + Gui exist now (InitWindow inited the Gui). Register the reusable LUS dev/input
-    // windows that the Gui ctor does NOT auto-add, then install the port's menu bar. This is what
+    // windows that the Gui ctor does NOT auto-add, then install the port's full-screen menu. This is what
     // makes F1 actually open a menu: libultraship already wires the F1 / Esc / Gamepad-Back toggle
     // (Gui.cpp:206-213), but the port previously passed an empty window vector (above) and set no
     // menu bar. Purely additive — nothing below runs until the user presses F1.
@@ -255,15 +371,41 @@ int main(int argc, char** argv) {
 
         // Ghost Browser: GdxGhostWindow (port/gdx_ghost_window.{h,cpp}). Registered name
         // "Ghost Browser", visibility CVar "gEnhancements.Practice.GhostBrowserOpen" (default 0 =
-        // hidden, applied by the GuiWindow two-arg ctor). Toggled from the Practice menu. A read-only
-        // browser of the single persisted SRAM ghost + an Export-to-.gdg affordance.
+        // hidden, applied by the GuiWindow two-arg ctor). Toggled from the Practice menu. Browses the
+        // per-course PC player-ghost library and exports the selected entry to .gdg.
         pgui->AddGuiWindow(
             std::make_shared<GdxGhostWindow>("gEnhancements.Practice.GhostBrowserOpen", "Ghost Browser"));
 
-        // Install the menu bar (Gui::SetMenuBar calls its Init() — Gui.cpp:355). The GdxMenuBar
-        // ctor pins visibility to "gOpenMenuBar" (the CVar the F1 toggle flips) and registers the
-        // port's gEnhancements.* CVars at their 1:1 defaults.
-        pgui->SetMenuBar(std::make_shared<GdxMenuBar>());
+        // Input Viewer: a native N64 overlay fed from the exact mapped state seen by the game.
+        pgui->AddGuiWindow(std::make_shared<GdxInputViewer>());
+
+#ifndef _WIN32
+        // Frame-pacing default is platform-specific. On Windows the DXGI backend's own sleep+spin
+        // limiter reliably holds EndFrame() to 60fps, so the port pacer stays OFF (stock behavior).
+        // On Linux the Fast3D SDL2 limiter (SyncFramerateWithTime) sleeps with a *relative*
+        // nanosleep() and no EINTR retry, so a signal can cut the sleep short every frame and the
+        // loop free-runs at the panel refresh (e.g. 144Hz on the ROG Ally -> ~2.4x game speed).
+        // Default the robust wall-clock pacer (clock_nanosleep TIMER_ABSTIME, EINTR-safe) ON here.
+        //
+        // This runs BEFORE the GdxMenu ctor registers the CVar: RegisterInteger only sets a value
+        // when the CVar does not yet exist, so a value already loaded from the user's config (their
+        // explicit toggle) still wins, while a fresh config gets the pacer enabled by default.
+        CVarRegisterInteger("gEnhancements.Graphics.FramePacing", 1);
+        // One-time migration: configs written before this default flipped have FramePacing:0
+        // persisted (the old cross-platform default), which the register above cannot override —
+        // so those Linux users would still free-run at the panel refresh (144Hz). Flip it ON once;
+        // the marker preserves any later deliberate OFF. Same pattern as gControlNav.
+        if (CVarGetInteger("gdx.Migrations.LinuxFramePacingOn", 0) == 0) {
+            CVarSetInteger("gdx.Migrations.LinuxFramePacingOn", 1);
+            CVarSetInteger("gEnhancements.Graphics.FramePacing", 1);
+            CVarSave();
+        }
+#endif
+
+        // Install the full-screen menu (Gui::SetMenu calls Init()). The GdxMenu ctor pins
+        // visibility to "gOpenMenuBar" for configuration compatibility and registers the port's
+        // gEnhancements.* CVars at their 1:1 defaults.
+        pgui->SetMenu(std::make_shared<GdxMenu>());
     }
 
     logStep("InitAudio");
@@ -291,6 +433,35 @@ int main(int argc, char** argv) {
         }
         audioSettings.DesiredBuffered = bufferFrames;
         ctx->InitAudio(audioSettings);
+
+        // SoH-style audio backend selection. CVar gEnhancements.Audio.Backend:
+        //   0 = Auto (default) -> keep libultraship's per-platform default (WASAPI on Windows,
+        //                         SDL on Linux) exactly as ctx->InitAudio just chose it. No
+        //                         behavior change on a stock config.
+        //   1 = WASAPI, 2 = SDL -> override the active backend at startup, but only if that
+        //                          backend is actually available on this platform (the Audio
+        //                          subsystem builds the available list per-OS), so selecting
+        //                          WASAPI on Linux is a no-op rather than a failure. The menu
+        //                          combo (Audio tab) writes this CVar; it applies on restart.
+        CVarRegisterInteger("gEnhancements.Audio.Backend", 0);
+        int backendSel = CVarGetInteger("gEnhancements.Audio.Backend", 0);
+        if (backendSel != 0) {
+            auto audio = ctx->GetAudio();
+            if (audio != nullptr) {
+                Ship::AudioBackend want = Ship::AudioBackend::SDL;
+                if (backendSel == 1) {
+                    want = Ship::AudioBackend::WASAPI;
+                } else if (backendSel == 2) {
+                    want = Ship::AudioBackend::SDL;
+                }
+                auto avail = audio->GetAvailableAudioBackends();
+                bool available =
+                    avail != nullptr && std::find(avail->begin(), avail->end(), want) != avail->end();
+                if (available && audio->GetCurrentAudioBackend() != want) {
+                    audio->SetCurrentAudioBackend(want);
+                }
+            }
+        }
     }
     logStep("InitEventSystem");       ctx->InitEventSystem();
     logStep("InitFileDropMgr");       ctx->InitFileDropMgr();
@@ -312,7 +483,18 @@ int main(int argc, char** argv) {
     gdx_sched_init();
 
     logStep("gdx_init_rom() — load ROM asset buffer");
-    gdx_init_rom(argc, argv);
+    {
+        // Inject the first-boot-resolved ROM path as a trailing synthetic argv entry. rom_buffer.cpp
+        // step 1 scans args in order and returns on the first that loads, so a real command-line ROM
+        // (lower index) still wins; the injected path is only reached as the fallback. Loading via the
+        // CLI-arg branch returns BEFORE rom_buffer's interactive picker, keeping the launch headless
+        // and automatic once setup is complete. firstBoot.romPath outlives this call (declared above).
+        std::vector<char*> romArgv(argv, argv + argc);
+        if (!firstBoot.romPath.empty()) {
+            romArgv.push_back(const_cast<char*>(firstBoot.romPath.c_str()));
+        }
+        gdx_init_rom(static_cast<int>(romArgv.size()), romArgv.data());
+    }
 
     // Block the game from starting without a ROM — a null buffer causes silent DMA
     // zero-fills that corrupt game state and produce non-obvious crashes downstream.
@@ -358,14 +540,26 @@ int main(int argc, char** argv) {
     while (w != nullptr && w->IsRunning()) {
         w->HandleEvents();
         gdx_controller_poll();
+        // Publish the editor fixed-aspect state before this frame's gfx task runs (gdx_dispatch
+        // below): Course Edit / Create Machine render through the stock 4:3 pillarbox path. No-op
+        // CVar-wise except on game-mode transitions. See gdx_fixed_aspect_tick in input_bridge.c.
+        gdx_fixed_aspect_tick();
         gdx_vi_tick();   // advance VI framebuffer + post retrace -> wakes the Main scheduler thread
         // Phase 3: wake the dedicated audio thread once per rendered frame (it also self-pumps
         // every 5ms independently, so a lost/late notify here is not a correctness issue --
         // see gdx_audio_thread.cpp). No-op when the kill switch reverts to the fiber path.
         gdx_audio_thread_notify_frame();
         w->GetMouseStateManager()->StartFrame();
+        // Feed ImGui menu navigation from the SDL controller BEFORE StartDraw() runs ImGui's
+        // NewFrame, so a raw DualSense (which ImGui's Win32/XInput backend cannot see) can open and
+        // drive the menu on every platform. No-op unless gControlNav is enabled. See gdx_imgui_nav.
+        gdx_imgui_nav_tick();
         w->GetGui()->StartDraw();
         w->StartFrame(); // must precede gdx_dispatch: Run() needs an initialized frame
+        // Cross-thread message wakes recorded by the dedicated audio thread (sendmesg.c PORT
+        // path) become runnable here, on the host thread, right before the threads dispatch.
+        // See the guard block in n64_sched.c.
+        gdx_sched_drain_deferred_wakes();
         gdx_dispatch();  // run the decomp's game threads cooperatively until they block again
         // In-session save-state boundary hook. gdx_dispatch() has just drained the run queue,
         // so every decomp game fiber is parked at its retrace/message wait -- the one point where
@@ -373,16 +567,22 @@ int main(int argc, char** argv) {
         // serialized inside via gdx_audio_ctx_lock). Strict no-op unless
         // gEnhancements.Gameplay.SaveStates is enabled. See port/gdx_savestate.{h,c}.
         gdx_savestate_tick();
+        // Durable 64DD disk-save flush. A game disk write (Course Edit save, MFS
+        // format) marked the sidecar dirty via gdx_disk_save_mark_dirty; this
+        // debounced tick persists it atomically once the write burst has drained.
+        // No-op when nothing is pending. See port/disk_savefile.{h,cpp}.
+        gdx_disk_save_tick();
         // VI-scanout fallback: if no GFX task rendered this frame (boot logo phase
         // or any CPU-drawn screen), present the current VI framebuffer's pixels.
         // Cheap no-op when a real frame was produced.
         gdx_vi_present_fallback();
         w->GetGui()->EndDraw();
         w->EndFrame();
-        // Optional port-level wall-clock pacer. No-op unless
-        // gEnhancements.Graphics.FramePacing is enabled (default OFF): libultraship's
-        // Fast3D backend already limits EndFrame() to ~60fps. When on, holds the loop
-        // to the N64 NTSC field rate (~59.94Hz). See port/gdx_frame_pacer.{h,c}.
+        // Port-level wall-clock pacer, gated on gEnhancements.Graphics.FramePacing. Default is
+        // platform-specific: OFF on Windows (the DXGI backend already limits EndFrame() to ~60fps)
+        // and ON on Linux (the SDL2 limiter is signal-fragile and lets the loop free-run at the
+        // panel refresh -- see gdx_frame_pacer.{h,c}). When on, holds the loop to the N64 NTSC
+        // field rate (~59.94Hz).
         gdx_frame_pacer_tick();
     }
     logStep("window closed; exiting");

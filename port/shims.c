@@ -56,9 +56,12 @@ int LeoTestUnitReady(unsigned char* status) {
 }
 #endif
 
-// libc: BSD byte-compare not in the MSVC CRT.
+// libc: BSD byte-compare not in the MSVC CRT. glibc provides both natively (with size_t
+// signatures that would conflict), so these shims are Windows-only.
+#ifdef _WIN32
 int bcmp(const void* a, const void* b, int n) { return memcmp(a, b, (size_t)n); }
 void bcopy(const void* src, void* dst, int n) { memmove(dst, src, (size_t)n); }
+#endif
 
 // Host CRT wrappers for decomp-side code. The gdiffuser_game object target must not include
 // MSVC system headers, so it calls these wrappers instead of relying on implicit CRT prototypes.

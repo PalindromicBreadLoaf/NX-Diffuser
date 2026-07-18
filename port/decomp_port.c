@@ -57,6 +57,7 @@ static size_t Gdx_RomOffset(u32 addr) {
 // ---- RDRAM init + bump allocator -------------------------------------------
 
 extern void gdx_register_host_range(void* ptr, size_t size); // defined in n64_gfx_bridge.cpp
+extern void gdx_register_host_wide_command_range(void* ptr, size_t size);
 extern GfxPool D_1000000; // defined below; forward-declared here so gdx_rdram_init() can reference it
 extern GfxPool D_8024DCE0[2];
 
@@ -86,6 +87,19 @@ void gdx_rdram_init(void) {
     gdx_register_host_range(gdx_rdram, GDX_RDRAM_SIZE);
     gdx_register_host_range(&D_1000000, sizeof(D_1000000));
     gdx_register_host_range(D_8024DCE0, sizeof(D_8024DCE0));
+    // The audio heap arena: every AudioHeap_Alloc* pool (including the aiBuffers the
+    // audio HLE's A_LOADBUFF/A_SAVEBUFF ops address by truncated low32) carves from
+    // this BSS block. It was never registered — on Windows the module-range
+    // reconstruction happened to cover it, but on Linux PIE the module range does
+    // not reach this BSS tail, every LOADBUFF/SAVEBUFF resolved NULL, the ops were
+    // skipped, and the synthesized output stayed all-zero (the "no audio on Linux"
+    // defect). Registration makes the resolution explicit on every platform.
+    // Size MUST match the PORT declaration in decomp/src/audio/disk/lib/audio.h
+    // ("extern u8 gAudioHeap[0x2ECA00 * 4]" — enlarged 4x on host builds).
+    {
+        extern unsigned char gAudioHeap[];
+        gdx_register_host_range(gAudioHeap, (size_t)0x2ECA00 * 4);
+    }
 
     {
         extern void gdx_cki(const char*, int);
@@ -198,6 +212,14 @@ void* gdx_rdram_peek_raw(size_t size, size_t align) {
    later calls rewind to it. */
 static size_t gdx_rdram_mode_baseline = 0;
 static int gdx_rdram_baseline_set = 0;
+
+#ifdef PORT
+/* Base-game glyph/texture decode cache (object.c: D_800E33E0[] keyed by asset,
+   value = decoded buffer pointer; count D_800E3A20). func_80077D44() invalidates
+   it by zeroing the count only — cheap and safe to call on every rewind. */
+extern void func_80077D44(void);
+#endif
+
 void gdx_rdram_mode_reset(void) {
     if (!gdx_rdram_baseline_set) {
         gdx_rdram_baseline_set = 1;
@@ -205,6 +227,27 @@ void gdx_rdram_mode_reset(void) {
         return;
     }
     gdx_rdram_bump = gdx_rdram_mode_baseline;
+
+#ifdef PORT
+    /* SCRAMBLED-TEXT FIX (docs/investigation/2026-07-17/SCRAMBLED_TEXT.md).
+       The glyph/texture decode cache stores HOST pointers (gdx_rdram + offset)
+       into this bump arena. Rewinding the bump here re-issues those exact offsets
+       to the next mode's decodes, so any cache entry that survives the rewind now
+       maps a glyph key to memory holding a DIFFERENT glyph's bytes. On a cache HIT
+       the decode is skipped and the stale pointer is served verbatim -> crisp but
+       wrong letters (CAPTAIN FALCON -> C3OP3IC, SILENCE, editor node/warning text),
+       consistent per screen and random across runs.
+
+       The decomp resets the cache only on the func_80079EC8 transition path
+       (object.c:1417); the reload path func_80079F1C (game.c:883) rewinds objects
+       but NOT the cache, leaving stale host pointers into a reused arena. Because
+       the bump arena is rewound ONLY through here (Arena_StartInit and
+       Arena_DefaultStartInit both route to gdx_rdram_mode_reset; gdx_rdram_alloc_raw
+       only advances), invalidating the cache on every rewind makes the two atomic
+       regardless of which decomp path triggered the transition — no cache entry can
+       ever outlive the memory it points into. */
+    func_80077D44();
+#endif
 }
 
 // ---- Physical <-> Virtual address translation (PORT) -----------------------
@@ -463,6 +506,12 @@ void Segment_LoadAssets(void) {
  */
 extern uintptr_t gSegment1B8550VramStart;
 extern uintptr_t gSegment1E23F0VramStart;
+extern uintptr_t gSegment22B0A0VramStart;
+extern uintptr_t gSegment22B0A0VramEnd;
+extern uintptr_t gGdxMachineModelsVramStart;
+extern uintptr_t gGdxMachineModelsVramEnd;
+extern uintptr_t gGdxCourseEditTexturesVramStart;
+extern uintptr_t gGdxCourseEditTexturesVramEnd;
 
 /* Deep-audit / Phase 4 hitch fix: gSegment1B8550 (seg4) and gSegment1E23F0 (seg7) are two FIXED
    host buffers reused across every mode transition -- only their CONTENT rotates among a small,
@@ -480,8 +529,16 @@ extern uintptr_t gSegment1E23F0VramStart;
    cheap Segment_SetAddress-only path the `default:` case already took. */
 typedef enum { GDX_SEG4_CONTENT_NONE, GDX_SEG4_CONTENT_HUD_GFX, GDX_SEG4_CONTENT_CREATE_MACHINE } GdxSeg4Content;
 typedef enum { GDX_SEG7_CONTENT_NONE, GDX_SEG7_CONTENT_MACHINE_GLOBAL, GDX_SEG7_CONTENT_EK_TEXTURES } GdxSeg7Content;
+typedef enum {
+    GDX_SEG9_CONTENT_NONE,
+    GDX_SEG9_CONTENT_MACHINE_MODELS,
+    GDX_SEG9_CONTENT_COURSE_EDIT
+} GdxSeg9Content;
 static GdxSeg4Content sGdxSeg4Resident = GDX_SEG4_CONTENT_NONE;
 static GdxSeg7Content sGdxSeg7Resident = GDX_SEG7_CONTENT_NONE;
+static GdxSeg9Content sGdxSeg9Resident = GDX_SEG9_CONTENT_NONE;
+static GdxSeg9Content sGdxSeg9Active = GDX_SEG9_CONTENT_NONE;
+static size_t sGdxSeg9ActiveSize = 0;
 
 /* Carve byte-order pass (2026-07-11, served-copy family): the carves these
    loaders fill are what gSegments[4]/[7] serve at draw time, but only the
@@ -494,7 +551,17 @@ static GdxSeg7Content sGdxSeg7Resident = GDX_SEG7_CONTENT_NONE;
    with images that have no fixup entries (create_machine, EK textures) are
    no-ops by construction. */
 extern void gdx_fixup_asset_segment_image(unsigned char segment, unsigned int rom_base,
-                                          unsigned char* data, unsigned int size);
+                                           unsigned char* data, unsigned int size);
+extern void gdx_register_asset_segment_command_ranges(unsigned char segment, unsigned int rom_base,
+                                                       unsigned char* data, unsigned int size);
+#ifdef EXPANSION_KIT
+extern unsigned char* gdx_disk_buffer;
+extern unsigned int gdx_disk_size;
+extern unsigned int gdx_ek_segment_image_size(unsigned char segment);
+extern int gdx_ek_segment_image_fill(unsigned char segment, const unsigned char* disk,
+                                     unsigned long long diskSize, unsigned char* dest,
+                                     unsigned int capacity);
+#endif
 
 static void gdx_load_seg4_if_needed(GdxSeg4Content want, unsigned char* romStart, size_t size,
                                      const char* label) {
@@ -530,6 +597,144 @@ static void gdx_load_seg7_if_needed(GdxSeg7Content want, unsigned char* romStart
         gdx_ck("[transition] seg7 reload skipped (already resident)");
     }
     Segment_SetAddress(7, gSegment1E23F0VramStart);
+}
+
+/* Segment 9 is mode-owned on the original game: decoded cartridge
+ * machine_models for Create Machine and the machine-settings/cutscene modes,
+ * but disk-resident course_edit_textures for Course Edit. The console loader
+ * that performed this switch is excluded from the port build, and treating all
+ * 0x09xxxxxx tokens as globally interchangeable makes the two layouts collide.
+ * Keep the ownership explicit and expose a narrow resolver hook so the graphics
+ * bridge can prefer the active image before its global generated-asset ranges. */
+static int gdx_activate_machine_models_segment9(void) {
+    unsigned char* dest = (unsigned char*)osPhysicalToVirtual(gGdxMachineModelsVramStart);
+    size_t capacity = (size_t)(gGdxMachineModelsVramEnd - gGdxMachineModelsVramStart);
+    const size_t romStart = (size_t)PORT_machine_models_ROM_START;
+
+    if (dest == NULL || capacity == 0 || gdx_rom_buffer == NULL || romStart + 8u > gdx_rom_size ||
+        gdx_rom_buffer[romStart + 0] != 'M' || gdx_rom_buffer[romStart + 1] != 'I' ||
+        gdx_rom_buffer[romStart + 2] != 'O' || gdx_rom_buffer[romStart + 3] != '0') {
+        gdx_ck("[segment] segment 9 machine_models source/capacity invalid");
+        return 0;
+    }
+
+    if (sGdxSeg9Resident != GDX_SEG9_CONTENT_MACHINE_MODELS) {
+        /* Codebase-audit P3: the MIO0 header's decoded size (big-endian u32 at +4)
+         * was previously trusted implicitly; a corrupt ROM could decompress past the
+         * RDRAM carve. Check it against the carve capacity before decoding (the EK
+         * disk path below already does the equivalent required>capacity check). */
+        {
+            unsigned int decodedSize = ((unsigned int)gdx_rom_buffer[romStart + 4] << 24) |
+                                       ((unsigned int)gdx_rom_buffer[romStart + 5] << 16) |
+                                       ((unsigned int)gdx_rom_buffer[romStart + 6] << 8) |
+                                       (unsigned int)gdx_rom_buffer[romStart + 7];
+            if (decodedSize > capacity) {
+                gdx_ck("[segment] segment 9 machine_models MIO0 decoded size exceeds carve capacity");
+                return 0;
+            }
+        }
+        mio0Decode(gdx_rom_buffer + romStart, dest);
+        gdx_fixup_asset_segment_image(0x09u, (unsigned int)PORT_machine_models_ROM_START,
+                                      dest, (unsigned int)capacity);
+        gdx_register_asset_segment_command_ranges(0x09u,
+                                                   (unsigned int)PORT_machine_models_ROM_START,
+                                                   dest, (unsigned int)capacity);
+        sGdxSeg9Resident = GDX_SEG9_CONTENT_MACHINE_MODELS;
+        gdx_ck("[transition] seg9 reload: machine_models");
+    } else {
+        gdx_ck("[transition] seg9 reload skipped (machine_models resident)");
+    }
+
+    gSegment22B0A0VramStart = gGdxMachineModelsVramStart;
+    gSegment22B0A0VramEnd = gGdxMachineModelsVramEnd;
+    Segment_SetAddress(9, gSegment22B0A0VramStart);
+    sGdxSeg9Active = GDX_SEG9_CONTENT_MACHINE_MODELS;
+    sGdxSeg9ActiveSize = capacity;
+    return 1;
+}
+
+#ifdef EXPANSION_KIT
+static int gdx_activate_course_edit_segment9(void) {
+    unsigned char* dest = (unsigned char*)osPhysicalToVirtual(gGdxCourseEditTexturesVramStart);
+    size_t capacity = (size_t)(gGdxCourseEditTexturesVramEnd - gGdxCourseEditTexturesVramStart);
+    size_t required = (size_t)gdx_ek_segment_image_size(9u);
+
+    if (dest == NULL || capacity == 0 || required == 0 || required > capacity ||
+        !gdx_ek_segment_image_fill(9u, gdx_disk_buffer, (unsigned long long)gdx_disk_size,
+                                   dest, (unsigned int)capacity)) {
+        gdx_ck("[segment] segment 9 course_edit_textures fill failed");
+        return 0;
+    }
+
+    if (sGdxSeg9Resident != GDX_SEG9_CONTENT_COURSE_EDIT) {
+        gdx_ck("[transition] seg9 reload: course_edit_textures");
+    } else {
+        gdx_ck("[transition] seg9 reload: course_edit_textures refreshed");
+    }
+    sGdxSeg9Resident = GDX_SEG9_CONTENT_COURSE_EDIT;
+    gSegment22B0A0VramStart = gGdxCourseEditTexturesVramStart;
+    gSegment22B0A0VramEnd = gGdxCourseEditTexturesVramEnd;
+    Segment_SetAddress(9, gSegment22B0A0VramStart);
+    sGdxSeg9Active = GDX_SEG9_CONTENT_COURSE_EDIT;
+    sGdxSeg9ActiveSize = required;
+    return 1;
+}
+#endif
+
+static void gdx_load_segment9_for_mode(void) {
+    int loaded = 0;
+
+    switch (gGameMode) {
+        case GAMEMODE_CREATE_MACHINE:
+        case GAMEMODE_GP_END_CS:
+        case GAMEMODE_LX_MACHINE_SETTINGS:
+        case GAMEMODE_LX_GP_RACE_NEXT_MACHINE_SETTINGS:
+            loaded = gdx_activate_machine_models_segment9();
+            break;
+#ifdef EXPANSION_KIT
+        case GAMEMODE_COURSE_EDIT:
+            loaded = gdx_activate_course_edit_segment9();
+            break;
+#endif
+        default:
+            break;
+    }
+
+    if (!loaded) {
+        /* Match the console default path: keep the last segment address/content
+         * resident, but do not make it authoritative outside a mode that owns
+         * segment 9. */
+        sGdxSeg9Active = GDX_SEG9_CONTENT_NONE;
+        sGdxSeg9ActiveSize = 0;
+        Segment_SetAddress(9, gSegment22B0A0VramStart);
+    }
+}
+
+int gdx_resolve_mode_segment9(unsigned int raw, size_t requiredBytes, uintptr_t* outAddress) {
+    uintptr_t hostBase;
+    size_t offset;
+
+    if (outAddress == NULL || sGdxSeg9Active == GDX_SEG9_CONTENT_NONE) {
+        return 0;
+    }
+
+    hostBase = (uintptr_t)osPhysicalToVirtual(gSegment22B0A0VramStart);
+    if ((raw >> 24) == 9u) {
+        offset = (size_t)(raw & 0x00FFFFFFu);
+    } else {
+        /* Course Edit stores some pointers after C's 64-bit host address has
+         * passed through an N64-sized command word.  Resolve that truncation
+         * only inside the exact buffer owned by the active segment-9 mode;
+         * never reconstruct arbitrary process pointers from their high bits. */
+        offset = (size_t)(unsigned int)(raw - (unsigned int)hostBase);
+    }
+
+    if (offset > sGdxSeg9ActiveSize || requiredBytes > sGdxSeg9ActiveSize - offset) {
+        return 0;
+    }
+
+    *outAddress = hostBase + offset;
+    return 1;
 }
 
 static void gdx_load_mode_segments(void) {
@@ -585,6 +790,8 @@ static void gdx_load_mode_segments(void) {
             break;
     }
 
+    gdx_load_segment9_for_mode();
+
     if (sModeSegLogs < 12) {
         sModeSegLogs++;
         gdx_cki("[segment] mode segments loaded for gameMode", (int)GET_MODE(gGameMode));
@@ -609,6 +816,10 @@ void Segment_LoadOverlays(void) {
         for (i = 0; i < workBufferSize; i++) {
             ((u8*)D_80128C90)[i] = 0;
         }
+        /* This scratch allocation is in RDRAM, but its two Gfx subarrays are
+         * written by recompiled PORT code and therefore use 16-byte host Gfx
+         * packets rather than the original 8-byte N64 layout. */
+        gdx_register_host_wide_command_range(D_80128C90, workBufferSize);
     }
 #endif
     gdx_load_mode_segments();

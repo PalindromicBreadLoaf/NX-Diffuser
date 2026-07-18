@@ -2,16 +2,16 @@
 #define GDIFFUSER_GDX_GHOST_IO_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* port/gdx_ghost_io.h -- .gdg ghost replay import/export (G-Diffuser Practice tab).
  *
- * Lets a player save the game's single-slot SRAM ghost (the one built by the vanilla
- * "Save Ghost" prompt and by the G-Diffuser autosave-on-record feature, both of which
- * call Save_SaveGhost -- see decomp/src/overlays/ovl_i3/menus.c's Menus_AttemptSaveGhost
- * and Gdx_AutosaveGhostOnRecord) out to a portable file, and load one back in.
+ * Provides the portable GDG1 container plus G-Diffuser's host-side multi-ghost library. The
+ * vanilla single SRAM slot remains intact for compatibility, but it is no longer the only durable
+ * location: every distinct validated player replay can coexist under `ghosts/` and up to three
+ * entries per exact encoded course can be selected as Time Attack opponents.
  *
- * SCOPE (v1): the single base-course SRAM ghost only (courses 0..23, gSaveContext.
- * ghostSave -- decomp/include/fzx_save.h:74-119). This intentionally does NOT touch the
+ * SCOPE: base-course player ghosts (courses 0..23). This intentionally does NOT touch the
  * 64DD/Expansion-Kit per-course ghost cache (COURSE_CONTEXT()->ghostSave[i], DDSave_*
  * in decomp/src/overlays/ovl_i2/dd_save.c) -- that path is dead on the port (no real 64DD
  * drive) and is out of scope for this ticket. docs/ONLINE_ECOSYSTEM_BLUEPRINT.md:223-278
@@ -78,21 +78,18 @@
  *      func_i2_80101590) is in range [0, 24) and matches the header's courseId.
  *   5. ghostType is one of the defined GhostType values (fzx_save.h:7-13), excluding
  *      GHOST_NONE (0), which marks an empty slot, not a real ghost.
+ *   6. GhostData.replayInfo.size does not exceed the fixed 16,200-byte replay buffer.
  *
- * OVERWRITE POLICY on import: the SRAM ghost slot is single-slot (one ghost total,
- * whichever course it was last saved for -- see Save_LoadGhostInfo / GhostRecord.
- * encodedCourseIndex). Import queries the slot the same way Gdx_AutosaveGhostOnRecord
- * does (Save_LoadGhostInfo): an empty/self-healed slot is always free to write; an
- * occupied slot may only be overwritten if it already holds a ghost for the SAME course
- * as the file being imported (an explicit, user-initiated action). A different course's
- * ghost is NEVER silently replaced -- import fails with GDX_GHOST_ERR_COURSE_MISMATCH
- * and nothing is written.
+ * OVERWRITE POLICY on import: a validated PLAYER ghost is deduplicated by a stable fingerprint of
+ * its complete payload and installed alongside other replays for its exact course. The SRAM
+ * compatibility slot is updated only when empty or when it already holds the same encoded course;
+ * a different course is preserved without making the import fail.
+ * Non-player containers retain the legacy SRAM-only behavior and never enter the player library.
  *
- * PERSISTENCE: a successful import writes through Save_WriteGhostRecord /
- * Save_WriteGhostData -- the same two calls Save_SaveGhost makes, and therefore the same
- * port/sram_buffer.cpp write-through path to fzerox.sav the autosave-on-record feature
- * uses (Gdx_AutosaveGhostOnRecord, decomp/src/overlays/ovl_i3/menus.c). Import
- * deliberately writes the raw record/data verbatim instead of routing through a runtime
+ * SRAM MIRRORING: when compatible, import writes through Save_WriteGhostRecord /
+ * Save_WriteGhostData -- the same two calls Save_SaveGhost makes and therefore the same
+ * port/sram_buffer.cpp write-through path to fzerox.sav. Import deliberately writes the raw
+ * record/data verbatim instead of routing through a runtime
  * Ghost struct the way Save_SaveGhost(courseIndex, Ghost*) does: Save_SaveGhostRecord
  * (save.c:1283-1328) always zeroes GhostRecord.trackName/unk_12 when building a record
  * from a Ghost, so round-tripping through that path would not reproduce the exact
@@ -100,10 +97,9 @@
  * export byte-identical for every field, not just the ones a live gameplay save bothers
  * to preserve.
  *
- * ROUND TRIP: exporting the current SRAM ghost and immediately re-importing that exact
- * file reproduces the SRAM slot byte-for-byte (same checksum-valid GhostRecord +
- * GhostData), because both directions move the same 0x3FC0-byte payload verbatim through
- * Save_Read* and Save_Write* -- no field is renamed, dropped, or defaulted in between.
+ * ROUND TRIP: exporting the current SRAM ghost and re-importing it preserves the exact GDG1
+ * payload byte-for-byte. The SRAM slot is reproduced too when it is empty or already represents
+ * that encoded course; otherwise the import remains library-only so another course is not evicted.
  */
 
 #ifdef __cplusplus
@@ -131,15 +127,43 @@ extern "C" {
 #define GDX_GHOST_ERR_BAD_COURSE (-8)        /* course out of range, or header/payload disagree */
 #define GDX_GHOST_ERR_BAD_GHOST_TYPE (-9)    /* ghostType is GHOST_NONE or out of range */
 #define GDX_GHOST_ERR_NO_GHOST (-10)         /* export: SRAM slot is empty */
-#define GDX_GHOST_ERR_COURSE_MISMATCH (-11)  /* export: wrong course requested; import:
-                                                 slot already holds a DIFFERENT course's
-                                                 ghost -- never silently overwritten */
+#define GDX_GHOST_ERR_COURSE_MISMATCH (-11)  /* export: wrong course requested; non-player import:
+                                                 SRAM holds a different course */
+#define GDX_GHOST_ERR_SELECTION_FULL (-12)   /* three opponents are already selected for this course */
+#define GDX_GHOST_ERR_NOT_FOUND (-13)        /* requested library fingerprint is absent */
 
 /* Suggested default file name for the Practice tab's Export/Import buttons (matches the
  * "ghost_export.gdg next to the exe" default from the feature's design notes). Callers
  * are free to use any path (e.g. from a save-file dialog); this is only a convenience
  * default, not a requirement -- gdx_ghost_export/gdx_ghost_import accept any path. */
 #define GDX_GHOST_DEFAULT_FILENAME "ghost_export.gdg"
+
+/* The PC port keeps multiple player ghosts per exact encoded course in a host-side library. The
+ * full encodedCourseIndex is part of every key, so replays recorded against different course
+ * geometry can never be selected accidentally. A 64-bit payload fingerprint gives every distinct
+ * replay a stable local identity. The original SRAM slot remains intact for save compatibility;
+ * it is archived before any vanilla overwrite and continues to be read by the base game.
+ *
+ * Library files are ordinary validated GDG1 containers stored under `ghosts/` next to the
+ * executable. Staff ghosts are deliberately not staged from this library: their ROM/EK unlock and
+ * loading paths remain the base game's source of truth.
+ */
+#define GDX_GHOST_LIBRARY_MAX_ENTRIES 128
+
+typedef struct GdxGhostLibraryEntry {
+    uint64_t ghostId;
+    int32_t courseIndex;
+    int32_t encodedCourseIndex;
+    int32_t raceTime;
+    int32_t replayChecksum;
+    int32_t lapTimes[3];
+    uint16_t ghostType;
+    uint8_t character;
+    uint8_t bodyR;
+    uint8_t bodyG;
+    uint8_t bodyB;
+    uint8_t selected;
+} GdxGhostLibraryEntry;
 
 /* Exports the single SRAM ghost slot to a .gdg file at `path` (created/overwritten).
  *
@@ -152,14 +176,46 @@ extern "C" {
  */
 int gdx_ghost_export(int courseIndex, const char* path);
 
-/* Imports a .gdg file at `path` and installs it into the single SRAM ghost slot.
+/* Imports a .gdg file at `path`. Player ghosts enter the exact-course PC library and are mirrored
+ * into SRAM only when doing so does not evict a different encoded course.
  *
  * Returns GDX_GHOST_OK (0) on success, or a negative GDX_GHOST_ERR_* code. On any
- * failure the SRAM ghost slot and fzerox.sav are left completely untouched -- see the
- * VALIDATION and OVERWRITE POLICY sections above for exactly what is checked and when a
- * course conflict is refused rather than silently overwritten.
+ * validation failure the library, SRAM ghost slot, and fzerox.sav are left untouched.
  */
 int gdx_ghost_import(const char* path);
+
+/* Archives the current checksum-valid PLAYER ghost from the vanilla SRAM slot. Exact duplicates
+ * are ignored; distinct same-course replays coexist. */
+int gdx_ghost_library_archive_sram(void);
+
+/* Persists a runtime decomp Ghost for its exact encoded course. Exact duplicates are ignored;
+ * distinct replays coexist.
+ * `ghost` must point to the real decomp Ghost layout (decomp/include/unk_structs.h). This is the
+ * port/decomp boundary used by Save_SaveGhost and autosave-on-record. */
+int gdx_ghost_library_save_player(int courseIndex, const void* ghost);
+
+/* Compatibility queries for one exact course. When several entries exist these return/load the
+ * fastest valid replay. New gameplay staging should use gdx_ghost_library_load_selected(). */
+int gdx_ghost_library_get_player_info(int32_t encodedCourseIndex, GdxGhostLibraryEntry* outEntry);
+int gdx_ghost_library_get_player_stats(int32_t encodedCourseIndex, int32_t* outRaceTime,
+                                       int32_t* outReplayChecksum);
+int gdx_ghost_library_load_player(int32_t encodedCourseIndex, void* outGhost);
+int gdx_ghost_library_has_player(int32_t encodedCourseIndex);
+
+/* Enumerates all checksum-valid player ghosts currently in the library, sorted by base course and
+ * then encoded course. Returns the total copied count (0..capacity), or a negative error code. */
+int gdx_ghost_library_list(GdxGhostLibraryEntry* entries, int capacity);
+
+/* Selects the exact local/imported opponents used by Time Attack. Selection is persisted in a
+ * small atomic host file, scoped per exact encoded course, and capped at the engine-native three
+ * simultaneous ghosts. load_selected writes a contiguous array of real decomp Ghost objects and
+ * returns the number loaded (0..capacity), or a negative error code. */
+int gdx_ghost_library_set_selected(int32_t encodedCourseIndex, uint64_t ghostId, int selected);
+int gdx_ghost_library_selected_count(int32_t encodedCourseIndex);
+int gdx_ghost_library_load_selected(int32_t encodedCourseIndex, void* outGhosts, int capacity);
+
+/* Exports one exact fingerprinted library entry to an arbitrary GDG1 path. */
+int gdx_ghost_library_export(int32_t encodedCourseIndex, uint64_t ghostId, const char* path);
 
 /* Convenience helper: fills `outPath` (a UTF-8/ANSI, NUL-terminated path, at most
  * `outCap` bytes including the terminator) with a default .gdg path -- on Windows, the

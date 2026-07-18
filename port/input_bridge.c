@@ -39,7 +39,7 @@
 
 #include "PR/os_pfs.h"
 #include "controller.h"
-#include "fzx_game.h" // GameMode / GameModeChangeState / MenuChangeMode enums + GET_MODE (fast restart)
+#include "fzx_game.h" // GameMode values + GET_MODE (in-race safety checks)
 #include "port_log.h"
 
 #include <stdbool.h>
@@ -50,6 +50,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#else
+#include <time.h>
 #endif
 
 #ifdef errno
@@ -92,15 +94,26 @@ static void gdx_ensure_controller_connected(void) {
 }
 
 /* Scripted input for headless/automated test runs: if gdx-autoinput.txt sits
-   next to the exe, each line is "<seconds_since_boot> <button>" (START, A, B,
-   UP, DOWN, LEFT, RIGHT). The named button is held for 0.25s starting at that
-   time. Real (LUS-sourced) input still works and is OR'd on top. */
-static u16 gdx_autoinput_buttons(void) {
+   next to the exe, each line is "<seconds_since_boot> <input>". Button names
+   are START/A/B/UP/DOWN/LEFT/RIGHT; analog menu navigation uses STICK_UP,
+   STICK_DOWN, STICK_LEFT, and STICK_RIGHT. Each input is held for 0.25s.
+   Real (LUS-sourced) input still works and is combined with the script. */
+/* Monotonic milliseconds for the autoinput clock (host-agnostic). */
+static unsigned long long gdx_autoinput_now_ms(void) {
 #ifdef _WIN32
+    return (unsigned long long) GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long) ts.tv_sec * 1000ull + (unsigned long long) (ts.tv_nsec / 1000000);
+#endif
+}
+
+static void gdx_autoinput_apply(u16* io_buttons, s8* io_stick_x, s8* io_stick_y) {
     static int s_state = -1; /* -1 unread, 0 absent, 1 loaded */
-    static struct { double at; u16 btn; } s_events[64];
+    static struct { double at; u16 btn; s8 stick_x; s8 stick_y; } s_events[64];
     static int s_count = 0;
-    static ULONGLONG s_start = 0;
+    static unsigned long long s_start = 0;
 
     if (s_state == -1) {
         FILE* f = fopen("gdx-autoinput.txt", "r");
@@ -110,6 +123,8 @@ static u16 gdx_autoinput_buttons(void) {
             double at;
             while (s_count < 64 && fscanf(f, "%lf %15s", &at, name) == 2) {
                 u16 b = 0;
+                s8 x = 0;
+                s8 y = 0;
                 if (strcmp(name, "START") == 0) b = BTN_START;
                 else if (strcmp(name, "A") == 0) b = BTN_A;
                 else if (strcmp(name, "B") == 0) b = BTN_B;
@@ -117,59 +132,44 @@ static u16 gdx_autoinput_buttons(void) {
                 else if (strcmp(name, "DOWN") == 0) b = BTN_DOWN;
                 else if (strcmp(name, "LEFT") == 0) b = BTN_LEFT;
                 else if (strcmp(name, "RIGHT") == 0) b = BTN_RIGHT;
-                if (b != 0) {
+                else if (strcmp(name, "STICK_UP") == 0) y = 80;
+                else if (strcmp(name, "STICK_DOWN") == 0) y = -80;
+                else if (strcmp(name, "STICK_LEFT") == 0) x = -80;
+                else if (strcmp(name, "STICK_RIGHT") == 0) x = 80;
+                if (b != 0 || x != 0 || y != 0) {
                     s_events[s_count].at = at;
                     s_events[s_count].btn = b;
+                    s_events[s_count].stick_x = x;
+                    s_events[s_count].stick_y = y;
                     s_count++;
                 }
             }
             fclose(f);
             s_state = 1;
-            s_start = GetTickCount64();
+            s_start = gdx_autoinput_now_ms();
             gdx_port_logf("[input] autoinput script loaded: %d events\n", s_count);
         }
     }
     if (s_state != 1) {
-        return 0;
+        return;
     }
     {
-        double now = (double) (GetTickCount64() - s_start) / 1000.0;
-        u16 buttons = 0;
+        double now = (double) (gdx_autoinput_now_ms() - s_start) / 1000.0;
         int i;
         for (i = 0; i < s_count; i++) {
             if (now >= s_events[i].at && now < s_events[i].at + 0.25) {
-                buttons |= s_events[i].btn;
+                *io_buttons |= s_events[i].btn;
+                if (s_events[i].stick_x != 0) *io_stick_x = s_events[i].stick_x;
+                if (s_events[i].stick_y != 0) *io_stick_y = s_events[i].stick_y;
             }
         }
-        return buttons;
     }
-#else
-    return 0;
-#endif
 }
 
-// ── Fast restart (hold-to-retry) ────────────────────────────────────────────────────────────────
-// Opt-in QoL: holding a deliberate button combo for a short dwell during a race triggers the
-// game's OWN race retry -- the exact path the pause-menu RETRY uses. The pause menu sets
-// gMenuChangeMode = MENU_CHANGE_RETRY (decomp/src/overlays/ovl_i3/menus.c:272); the mode driver
-// func_800690FC -> func_80068BC0 (decomp/src/game/game.c:200-211) turns that into
-// GAMEMODE_CHANGE_START_RELOAD, a fast IN-PLACE race re-init (Racer_Init/Camera_Init via
-// func_i2_80103A70 -- no Segment_LoadOverlays/Segment_LoadAssets/Course_Init). The records screen's
-// auto-retry writes the same global (records.c:502), confirming a bare write is the sanctioned
-// trigger. We replicate exactly that write, gated so it only fires during stable racing.
-//
-// Runs on the host thread inside gdx_controller_poll(), BEFORE gdx_dispatch() runs the game fibers
-// (the same single-threaded seam that owns gControllers[0]) -- no synchronization needed. The game
-// resets gMenuChangeMode to INACTIVE every tick (game.c:504) after func_80068BC0 consumes it, so a
-// per-frame write behaves identically to the pause menu's.
-
-// Decomp game-mode state (decomp/src/game/game.c). Declared extern (not via a decomp umbrella
-// header) to keep this TU's include surface minimal.
-extern s32 gGameMode;            // :9   current mode (may carry the F3D gfx-mode bits, mask 0xC000)
-extern s32 gQueuedGameMode;      // :10  requested next mode (== gGameMode when idle)
-extern s16 gGameModeChangeState; // :38  GAMEMODE_UPDATE (0) when no mode change is in flight
-extern s16 gMenuChangeMode;      // :39  one-shot menu-request mailbox, consumed each tick
-extern s8  gGamePaused;          // :15  nonzero while the pause menu owns input
+// Decomp race state. Kept behind small C helpers so every photo-mode consumer uses the same
+// definition and the ImGui ghost importer can avoid writing persistence while a race is live.
+extern s32 gGameMode;
+extern s8 gGamePaused;
 
 // libultraship consolevariablebridge.h (extern "C", API_EXPORT). Declared locally -- same pattern
 // as gdx_lus_read_pad above -- to avoid pulling a LUS/C++ umbrella header into this decomp-
@@ -201,53 +201,98 @@ int gdx_input_in_gameplay(void) {
     return gdx_gamemode_is_race(gGameMode);
 }
 
-// Per-frame hold detector. `buttons` is the already-resolved N64 bitmask the game will see this
-// tick (controller->buttonCurrent). When Fast restart is enabled and the combo is held for the
-// configured dwell during stable racing, request the game's retry exactly once per hold.
-static void gdx_fast_restart_tick(u16 buttons) {
-    // Deliberate 3-button combo, unlikely to be held for a full second in normal play (and the
-    // feature is opt-in). Deliberately excludes START (that would open the pause menu). Rebind by
-    // editing this mask.
-    static const u16 kFastRestartCombo = BTN_L | BTN_R | BTN_Z; // 0x2030
-    static int sHeldFrames = 0;
-    static int sFired = 0;
-    int holdMs;
-    int needFrames;
+int gdx_photo_mode_active(void) {
+    return CVarGetInteger("gEnhancements.Practice.PhotoMode", 0) && (gGamePaused != 0);
+}
 
-    // Off, not in a real race, a mode change already in flight, or paused -> reset and bail. The
-    // (gGameMode == gQueuedGameMode && gGameModeChangeState == GAMEMODE_UPDATE) pair is exactly the
-    // condition under which func_80068BC0 will honor the write (game.c:197-201,500-502); gating on
-    // it avoids setting the mailbox on a frame where it would be discarded.
-    if (!CVarGetInteger("gEnhancements.Gameplay.FastRestart", 0) ||
-        !gdx_gamemode_is_race(gGameMode) ||
-        gGameMode != gQueuedGameMode ||
-        gGameModeChangeState != GAMEMODE_UPDATE ||
-        gGamePaused != 0 ||
-        (buttons & kFastRestartCombo) != kFastRestartCombo) {
-        sHeldFrames = 0;
-        sFired = 0;
-        return;
-    }
+// Shared predicate for the true-widescreen 2D UI slice. Anchor/stretch extra-geometry-mode
+// emitters in decomp draw code must gate on this at the call site so that CVar-off builds emit
+// a bit-identical display list to stock, instead of relying solely on the interpreter's own
+// CVar check when it consumes the mode bits (defense in depth; see GfxDrawRectangle).
+int gdx_widescreen_ui_active(void) {
+    return CVarGetInteger("gEnhancements.Graphics.Widescreen", 1) &&
+           CVarGetInteger("gEnhancements.Graphics.WidescreenUI", 0);
+}
 
-    holdMs = CVarGetInteger("gEnhancements.Gameplay.FastRestartHoldMs", 1000);
-    if (holdMs < 100) {
-        holdMs = 100;
-    }
-    // One poll == one game tick, and F-Zero X is natively 60Hz, so convert the dwell at 60 ticks/s.
-    // (An uncapped host frame rate shortens the wall-clock dwell proportionally -- acceptable for an
-    // opt-in toggle; the 1000ms default = ~60 ticks feels like ~1s at the native rate.)
-    needFrames = holdMs * 60 / 1000;
-    if (needFrames < 1) {
-        needFrames = 1;
-    }
+// The Expansion Kit editors are 4:3-authored 2D/3D composites: their 3D layers (Course Edit's
+// canvas through the shared Background/Course/Racer_Draw path, Create Machine's preview and
+// parts grid) would otherwise pick up the global hor+ widescreen vertex correction while their
+// 2D layers stay pillarboxed, splitting one screen across two aspect ratios. Publish a runtime
+// flag the renderer folds into its existing Widescreen==0 pillarbox path (AdjXForAspectRatio,
+// StartFrame's forced offscreen target, and Fast3dGui::DrawGame's centered 4:3 composite), so
+// editor frames render exactly like the stock 4:3 mode regardless of the widescreen settings.
+// The Create Machine ENTRY sub-mode (the EK "SELECT MACHINE" screen) is excepted: its
+// full-width background gradient is an approved widescreen scope (machine_create.c).
+// CVar writes are cheap but not free -- publish only on change.
+//
+// STALENESS CONTRACT (2026-07-16 squeeze audit): the per-frame tick below reads gGameMode as of
+// the END of the previous dispatch, but the game flips gGameMode MID-dispatch (game.c mode-flip)
+// and renders the new mode's transition in the same dispatch. The flip frame therefore rendered
+// with a stale flag -- one whole menu frame pillarboxed on every editor exit (owner-visible
+// "tries to do 4:3" on main menu -> Cup Select). gdx_fixed_aspect_publish() is therefore ALSO
+// called from the decomp's mode-flip site under PORT so consumers that read the CVar live
+// (Transition_Draw, Fast3dGui::DrawGame) and the interpreter's per-task re-latch see the
+// post-flip truth within the same frame.
+// The flag is a plain process global in libultraship (interpreter.cpp), NOT a CVar: the
+// 2026-07-16 audit found the old CVar form persisted as 1 into the owner's Debug
+// gdiffuser.cfg.json (saved while inside an editor), pillarboxing pre-tick boot frames.
+// Runtime state never belongs in the config file.
+// True iff a given raw game mode must render stock 4:3 (the EK editors). The Create Machine
+// ENTRY sub-mode (SELECT MACHINE) is excepted -- its full-width background is an approved
+// widescreen scope -- so it also depends on gWorksMachineMode.
+static int gdx_mode_forces_fixed_aspect(s32 gamemode) {
+    extern s32 gWorksMachineMode; // decomp/src/overlays/machine_create/machine_create.h
+    s32 mode = GET_MODE(gamemode);
+    return (mode == GAMEMODE_COURSE_EDIT) ||
+           ((mode == GAMEMODE_CREATE_MACHINE) && (gWorksMachineMode != 28 /* MACHINE_MODE_ENTRY */));
+}
 
-    if (sHeldFrames < needFrames) {
-        sHeldFrames++;
+void gdx_fixed_aspect_publish(void) {
+    extern void gdx_set_force_fixed_aspect(int on); // libultraship interpreter.cpp
+    extern s32 gQueuedGameMode;                     // decomp/src/game/game.c
+
+    // TRANSIENT CUP-SELECT SQUEEZE FIX (obs #1758): evaluate the flag on the mode that will
+    // actually RENDER this dispatch, not on the mode currently latched in gGameMode.
+    //
+    // The game flips gGameMode = gQueuedGameMode MID-dispatch (game.c) and then renders the NEW
+    // mode's appear transition in that SAME dispatch. The renderer, however, commits its
+    // whole-frame pillarbox target from the PRE-dispatch flag (interpreter.cpp StartFrame), and
+    // that target is NOT recomputed after the mid-dispatch flip. So on an editor->menu flip the
+    // pre-dispatch tick still sees the OLD editor mode, forces 4:3, and the destination menu
+    // frame gets composited into a centered 4:3 pillarbox for one frame -- the owner-visible
+    // "squeeze then normal" on Main Menu -> Cup Select after having been in an editor. Because
+    // the flag is republished from the flip site too, the value ends up oscillating across the
+    // transition (stale editor 1 on the flip frame, 0 the next) rather than staying stable.
+    //
+    // While a mode change is pending (gGameMode != gQueuedGameMode) the frame shown after the
+    // flip is gQueuedGameMode, and the outgoing mode's remaining frames are hidden under the
+    // transition wipe (Transition_HideSet), so keying on the DESTINATION mode makes the flag
+    // stable across the whole transition and never pillarboxes an incoming menu. Settled frames
+    // (no pending change) key on gGameMode exactly as before, so a real editor in steady state
+    // -- and the Create Machine sub-mode toggles, which never change gGameMode -- is still forced
+    // to 4:3. This is the low-risk gate documented in #1758 (it can render the outgoing screen in
+    // the destination aspect during its wipe, which is covered, instead of squeezing the menu).
+    s32 effectiveMode = (gGameMode != gQueuedGameMode) ? gQueuedGameMode : gGameMode;
+    gdx_set_force_fixed_aspect(gdx_mode_forces_fixed_aspect(effectiveMode));
+}
+
+void gdx_fixed_aspect_tick(void) {
+    gdx_fixed_aspect_publish();
+}
+
+// Read-only bridge used by the ImGui input viewer. It exposes the exact mapped N64 state already
+// delivered to the game, rather than polling SDL/ControlDeck a second time from the GUI pass.
+int gdx_input_viewer_state(u16* out_buttons, s8* out_stick_x, s8* out_stick_y) {
+    if (out_buttons != NULL) {
+        *out_buttons = gControllers[0].buttonCurrent;
     }
-    if (!sFired && sHeldFrames >= needFrames) {
-        gMenuChangeMode = MENU_CHANGE_RETRY; // consumed next tick by func_80068BC0 (game.c:201)
-        sFired = 1;
+    if (out_stick_x != NULL) {
+        *out_stick_x = gControllers[0].stickX;
     }
+    if (out_stick_y != NULL) {
+        *out_stick_y = gControllers[0].stickY;
+    }
+    return gControllers[0].errno == 0;
 }
 
 void gdx_controller_poll(void) {
@@ -258,9 +303,6 @@ void gdx_controller_poll(void) {
     s8 stick_x = 0;
     s8 stick_y = 0;
     u8 stick = 0;
-
-    // Scripted test input (OR'd on top of real input).
-    buttons |= gdx_autoinput_buttons();
 
     // ── Read the mapped controller state for port 0 from the LUS ControlDeck ──────────────────
     // gdx_lus_read_pad() (main.cpp) pumps SDL + reads every LUS device mapped to port 0 into a
@@ -279,6 +321,10 @@ void gdx_controller_poll(void) {
         }
     }
 
+    // Scripted test input is applied last so analog events are not overwritten
+    // by the real controller read above.
+    gdx_autoinput_apply(&buttons, &stick_x, &stick_y);
+
     // ── Derive the digital stick direction from the analog stick ──────────────────────────────
     // Mirrors the decomp's own SI-read logic (decomp/src/sys/controller.c:119-133): a direction
     // latches once the axis passes ±50 (of 80). N64 convention: +Y is UP, -Y is DOWN. The game
@@ -294,33 +340,83 @@ void gdx_controller_poll(void) {
         stick |= STICK_UP;
     }
 
-    // ── Write decomp globals + compute edges (unchanged from the original bridge) ──────────────
-    controller->buttonPrev = controller->buttonCurrent;
-    controller->buttonCurrent = buttons & CONT_MASK;
-    u16 button_diff = controller->buttonPrev ^ controller->buttonCurrent;
-    controller->buttonPressed = button_diff & controller->buttonCurrent;
-    controller->buttonReleased = button_diff & controller->buttonPrev;
+    // ── Write decomp globals + compute edges, ALIGNED TO THE GAME FRAME ────────────────────────
+    // gdx_controller_poll() runs once per HOST frame (main.cpp loop, ~60Hz). But screens that set
+    // a VI retrace divider run their game loop SLOWER: the scheduler (sys_main.c:428) posts the
+    // game's frame tick only every D_800CCFB8-th VI. The Expansion Kit Course Edit / Create
+    // Machine editors set D_800CCFBC=3 (19DD60.c:193), so their game loop consumes input at ~20Hz.
+    //
+    // If pressed/released EDGES are computed every host frame (as the original bridge did), a press
+    // edge that lands on a host frame the game skips is lost -> the editor felt "unresponsive"
+    // (owner report). Fix: ACCUMULATE press/release edges across every host frame, and only
+    // finalize them (and advance the prev baseline + retrigger counter) on the host frame that the
+    // scheduler will deliver a game tick on. That host frame is predicted from the same divider
+    // counters the scheduler uses: it posts the tick this VI when (++D_800CCFB0 - D_800CCFB4) >=
+    // D_800CCFB8. gdx_controller_poll runs before that increment, so the predicate is
+    // (D_800CCFB0 + 1 - D_800CCFB4) >= D_800CCFB8. For default screens (divider 1) this is true
+    // every frame -> behaviour identical to the original per-frame edges (no regression).
+    // Because accumulators only reset on a game boundary, no rising/falling edge is ever dropped.
+    extern s32 D_800CCFB0, D_800CCFB4, D_800CCFB8;
 
-    controller->stickPrev = controller->stickCurrent;
+    const u16 cur_buttons = buttons & CONT_MASK;
+    const u8 cur_stick = stick;
+
+    static int s_have_baseline = 0;
+    static u16 s_prev_host_buttons = 0;
+    static u8 s_prev_host_stick = 0;
+    static u16 s_accum_pressed = 0, s_accum_released = 0;
+    static u8 s_accum_stick_pressed = 0, s_accum_stick_released = 0;
+    static u16 s_prev_game_buttons = 0;
+    static u8 s_prev_game_stick = 0;
+
+    // Accumulate every transition seen since the last game-frame boundary.
+    s_accum_pressed |= (u16)(cur_buttons & ~s_prev_host_buttons);
+    s_accum_released |= (u16)(s_prev_host_buttons & ~cur_buttons);
+    s_accum_stick_pressed |= (u8)(cur_stick & ~s_prev_host_stick);
+    s_accum_stick_released |= (u8)(s_prev_host_stick & ~cur_stick);
+    s_prev_host_buttons = cur_buttons;
+    s_prev_host_stick = cur_stick;
+
+    // Always expose the freshest raw state (the game reads *current on its tick).
+    controller->buttonCurrent = cur_buttons;
     controller->stickX = stick_x;
     controller->stickY = stick_y;
-    controller->stickCurrent = stick;
-    u8 stick_diff = controller->stickPrev ^ controller->stickCurrent;
-    controller->stickPressed = stick_diff & controller->stickCurrent;
-    controller->stickReleased = stick_diff & controller->stickPrev;
+    controller->stickCurrent = cur_stick;
 
-    controller->retriggerCurrentButtonPress = false;
-    if (((controller->buttonCurrent != 0) || (controller->stickCurrent != 0)) &&
-        (controller->buttonPrev == controller->buttonCurrent) &&
-        (controller->stickPrev == controller->stickCurrent)) {
-        controller->sameInputsHeldCounter++;
-        if ((controller->sameInputsHeldCounter >= 15) &&
-            (((controller->sameInputsHeldCounter - 15) % 5) == 0)) {
-            controller->retriggerCurrentButtonPress = true;
+    const s32 divider = (D_800CCFB8 > 0) ? D_800CCFB8 : 1;
+    const int game_boundary = !s_have_baseline || ((D_800CCFB0 + 1 - D_800CCFB4) >= divider);
+    if (game_boundary) {
+        s_have_baseline = 1;
+        controller->buttonPrev = s_prev_game_buttons;
+        controller->buttonPressed = s_accum_pressed;
+        controller->buttonReleased = s_accum_released;
+        controller->stickPrev = s_prev_game_stick;
+        controller->stickPressed = s_accum_stick_pressed;
+        controller->stickReleased = s_accum_stick_released;
+
+        controller->retriggerCurrentButtonPress = false;
+        if (((cur_buttons != 0) || (cur_stick != 0)) &&
+            (s_prev_game_buttons == cur_buttons) &&
+            (s_prev_game_stick == cur_stick)) {
+            controller->sameInputsHeldCounter++;
+            if ((controller->sameInputsHeldCounter >= 15) &&
+                (((controller->sameInputsHeldCounter - 15) % 5) == 0)) {
+                controller->retriggerCurrentButtonPress = true;
+            }
+        } else {
+            controller->sameInputsHeldCounter = 0;
         }
-    } else {
-        controller->sameInputsHeldCounter = 0;
+
+        // Advance the game-frame baseline and clear the per-boundary accumulators.
+        s_prev_game_buttons = cur_buttons;
+        s_prev_game_stick = cur_stick;
+        s_accum_pressed = 0;
+        s_accum_released = 0;
+        s_accum_stick_pressed = 0;
+        s_accum_stick_released = 0;
     }
+    // Non-boundary host frames: leave buttonPressed/Released/prev/retrigger untouched. The game
+    // only reads them on its tick (which is a boundary frame), so stale values are never consumed.
 
     gSharedController.errno = 0;
     gSharedController.buttonPrev = controller->buttonPrev;
@@ -335,9 +431,4 @@ void gdx_controller_poll(void) {
     gSharedController.stickReleased = controller->stickReleased;
     gSharedController.retriggerCurrentButtonPress = controller->retriggerCurrentButtonPress;
     gSharedController.sameInputsHeldCounter = controller->sameInputsHeldCounter;
-
-    // ── Fast restart (hold-to-retry) ──────────────────────────────────────────────────────────
-    // Opt-in: hold L+R+Z during a race to trigger the game's own retry. Reads the resolved pad we
-    // just wrote; a no-op unless gEnhancements.Gameplay.FastRestart is enabled (default off).
-    gdx_fast_restart_tick(controller->buttonCurrent);
 }

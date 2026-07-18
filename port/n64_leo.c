@@ -25,6 +25,11 @@ extern unsigned char* gdx_disk_buffer;
 extern unsigned int gdx_disk_size;
 extern int gdx_disk_load(void);
 
+/* Durable disk-save sidecar (port/disk_savefile.cpp). Raw extern -- this decomp
+   TU cannot include the host header. Records the exact dirty byte range of every
+   disk write so it survives to the next boot without mutating the pristine .ndd. */
+extern void gdx_disk_save_mark_dirty(unsigned int offset, const void* data, unsigned int len);
+
 /* leo/lib internals: the pure translation files (leotranslat.c, leoutil.c,
    leo_tbl.c) index their zone tables by disk type. Read from the loaded
    image's system area by gdx_leo_on_disk_loaded(). */
@@ -100,17 +105,20 @@ u32 LeoDriveExist(void) {
     return gdx_disk_load() ? 1u : 0u;
 }
 
-s32 LeoCreateLeoManager(OSPri comPri, OSPri intPri, OSMesgQueue* mq, u32 cmdBufSize) {
-    (void)comPri; (void)intPri; (void)mq; (void)cmdBufSize;
+/* Signatures must match PR/leo.h exactly (OSMesg* cmdBuf, s32 cmdMsgCnt): GCC rejects the
+ * OSMesgQueue-pointer / u32 spelling this stub previously used (MSVC tolerated the
+ * pointer-type mismatch). The parameters are ignored either way. */
+s32 LeoCreateLeoManager(OSPri comPri, OSPri intPri, OSMesg* cmdBuf, s32 cmdMsgCnt) {
+    (void)comPri; (void)intPri; (void)cmdBuf; (void)cmdMsgCnt;
     return gdx_disk_load() ? LEO_ERROR_GOOD : LEO_ERROR_DRIVE_NOT_READY;
 }
 
-s32 LeoCJCreateLeoManager(OSPri comPri, OSPri intPri, OSMesgQueue* mq, u32 cmdBufSize) {
-    return LeoCreateLeoManager(comPri, intPri, mq, cmdBufSize);
+s32 LeoCJCreateLeoManager(OSPri comPri, OSPri intPri, OSMesg* cmdBuf, s32 cmdMsgCnt) {
+    return LeoCreateLeoManager(comPri, intPri, cmdBuf, cmdMsgCnt);
 }
 
-s32 LeoCACreateLeoManager(OSPri comPri, OSPri intPri, OSMesgQueue* mq, u32 cmdBufSize) {
-    return LeoCreateLeoManager(comPri, intPri, mq, cmdBufSize);
+s32 LeoCACreateLeoManager(OSPri comPri, OSPri intPri, OSMesg* cmdBuf, s32 cmdMsgCnt) {
+    return LeoCreateLeoManager(comPri, intPri, cmdBuf, cmdMsgCnt);
 }
 
 s32 LeoClearQueue(void) {
@@ -163,9 +171,14 @@ s32 LeoReadWrite(LEOCmd* cmdBlock, s32 direction, u32 LBA, void* buffer, u32 nLB
     if (direction == OS_READ) {
         bcopy(gdx_disk_buffer + offset, buffer, bytes);
     } else {
-        /* Writes (saves to disk) update the in-memory image only; persisting
-           edited courses to host storage arrives with the save-support slice. */
+        /* Writes (saves to disk) update the in-memory image, then record the
+           exact dirty byte range in the durable sidecar (port/disk_savefile.cpp).
+           The pristine .ndd is never touched; the recorded ranges are replayed
+           over a freshly loaded pristine image at the next boot. The debounced
+           flush (gdx_disk_save_tick, host loop) coalesces one save burst into one
+           atomic sidecar write. */
         bcopy(buffer, gdx_disk_buffer + offset, bytes);
+        gdx_disk_save_mark_dirty((unsigned int) offset, buffer, (unsigned int) bytes);
     }
 
     LeoPostDone(cmdBlock, mq);

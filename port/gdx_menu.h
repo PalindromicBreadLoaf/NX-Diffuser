@@ -1,71 +1,94 @@
-// port/gdx_menu.h — G-Diffuser in-game enhancement menu (ImGui menu bar).
-//
-// WHAT THIS IS
-// ------------
-// This is the P0 "menu shell" the whole enhancement overlay rides on (see
-// docs/IMGUI_MENU_SCOPE.md). Until this class is registered, F1 opens NOTHING:
-// libultraship (LUS) already wires the F1 / Esc / Gamepad-Back toggle
-// (libultraship/src/ship/window/gui/Gui.cpp:206-213) and renders ImGui every frame,
-// but the port registers no GuiMenuBar and no windows. Registering one GdxMenuBar via
-// Gui::SetMenuBar (Gui.cpp:355) is what makes F1 actually surface a menu.
-//
-// HOW IT PLUGS INTO LUS
-// ---------------------
-// We subclass Ship::GuiMenuBar (ship/window/gui/GuiMenuBar.h). Its base Draw() early-returns
-// when the bar is hidden and otherwise calls our DrawElement() (verified in
-// GuiMenuBar.cpp:20-28). IMPORTANT: despite the header docstring in GuiMenuBar.h claiming the
-// base "wraps ImGui::BeginMainMenuBar()/EndMainMenuBar()", the .cpp does NOT — it only calls
-// DrawElement(). So DrawElement() itself must open/close the main menu bar with
-// ImGui::BeginMainMenuBar()/EndMainMenuBar(). (The stale docstring is why this is spelled out.)
-//
-// GuiElement (the grandparent) declares InitElement()/UpdateElement()/DrawElement() pure-virtual
-// (GuiElement.h:74-81); GuiMenuBar overrides only Draw()+SetVisibility(), so this subclass MUST
-// implement all three of InitElement/UpdateElement/DrawElement.
-//
-// PHASING NOTE
-// ------------
-// Features that already exist (Audio LLE/HLE + reconstruction filter, the LUS graphics
-// "courtesy" CVars, the surfaced LUS dev/input windows) are wired to real controls. Everything
-// still parity-blocked or unbuilt is shown as an ImGui::TextDisabled("Coming soon") line so the
-// menu documents the roadmap without pretending a feature is live. Every default reproduces
-// today's confirmed-good behavior (the "optionality constitution": every default 1:1).
-
 #pragma once
 
 #include <string>
-#include "ship/window/gui/GuiMenuBar.h"
+
+#include "ship/window/gui/GuiWindow.h"
 
 /**
- * @brief The G-Diffuser enhancement menu bar (top-of-screen ImGui menu, toggled by F1).
+ * Full-screen modern settings menu inspired by Ship of Harkinian's 9.2.3 menu shell.
  *
- * Construct with no arguments and hand to Gui::SetMenuBar():
- *   pgui->SetMenuBar(std::make_shared<GdxMenuBar>());
- * The constructor pins the visibility CVar to "gOpenMenuBar" (the same CVar the LUS F1 toggle
- * flips — Gui.cpp) and starts hidden, and registers the port's gEnhancements.* CVars at their
- * 1:1 defaults so a fresh gdiffuser.cfg.json behaves exactly like today.
+ * The menu remains port-owned: all existing G-Diffuser CVars and callbacks are preserved, while
+ * the presentation changes from a row of ImGui dropdowns to header navigation, a sidebar, search,
+ * responsive scrolling, embedded tool windows, and confirmation modals.
  */
-class GdxMenuBar : public Ship::GuiMenuBar {
+class GdxMenu final : public Ship::GuiWindow {
   public:
-    GdxMenuBar();
+    GdxMenu();
 
-    // GuiElement lifecycle (all pure-virtual on the base — must be provided here).
-    void InitElement() override;
-    void UpdateElement() override;
+    void Draw() override;
     void DrawElement() override;
 
+  protected:
+    void InitElement() override;
+    void UpdateElement() override;
+
   private:
-    // One top-level menu per tab in docs/menu/*.md.
-    void DrawGraphicsMenu();
+    enum class Header : int {
+        Settings,
+        Enhancements,
+        Workshop,
+        Online,
+        DevTools,
+    };
+
+    enum class Page : int {
+        General,
+        Audio,
+        Graphics,
+        Controls,
+        InputViewer,
+        EnhancementGraphics,
+        Gameplay,
+        Practice,
+        Ghosts,
+        Content,
+        OnlineOverview,
+        DeveloperGeneral,
+        Stats,
+        Console,
+        GfxDebugger,
+    };
+
+    void DrawHeader();
+    void DrawSidebar();
+    void DrawCurrentPage();
+    void DrawSearchResults();
+    void DrawQuitModal();
+
+    void DrawGeneralPage();
+    void DrawGraphicsMenu(bool enhancementsOnly);
     void DrawAudioMenu();
     void DrawGameplayMenu();
     void DrawPracticeMenu();
     void DrawControlsMenu();
+    void DrawInputViewerMenu();
+    void DrawGhostsMenu();
     void DrawWorkshopMenu();
     void DrawOnlineMenu();
     void DrawDeveloperMenu();
+    void DrawToolWindowPage(const char* name, const char* description);
     void DrawAboutMenu();
 
-    // Remembers the last non-zero reconstruction-filter cutoff so the "off" checkbox can restore
-    // it when re-enabled (0 in the CVar means "filter disabled"). Seeded to the 1:1 default.
+    void SelectHeader(Header header);
+    void SelectPage(Page page);
+    Header HeaderForPage(Page page) const;
+    Page FirstPageForHeader(Header header) const;
+    const char* PageTitle(Page page) const;
+
+    // Restore io.KeyRepeatDelay/Rate to their pre-menu values if the menu tightened them for
+    // gamepad nav. Safe to call when nothing was applied (no-op).
+    void RestoreNavRepeatTuning();
+
+    Header mActiveHeader = Header::Settings;
+    Page mActivePage = Page::General;
+    char mSearch[128] = {};
+    bool mOpenQuitModal = false;
     int mLastLowPassHz = 15000;
+
+    // Gamepad-navigation state (only meaningful while gControlNav is on).
+    bool mFocusSidebar = false;    // one-shot: land nav focus on the active sidebar page next draw
+    bool mMenuWasVisible = false;  // tracks open transitions so focus is seeded on each open
+    bool mNavTuningApplied = false;     // io.KeyRepeat* currently overridden by the menu
+    float mSavedKeyRepeatDelay = 0.0f;  // pre-override io.KeyRepeatDelay
+    float mSavedKeyRepeatRate = 0.0f;   // pre-override io.KeyRepeatRate
 };
