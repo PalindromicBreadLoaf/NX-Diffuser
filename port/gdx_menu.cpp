@@ -67,13 +67,6 @@ extern "C" const char* SDL_GetCurrentAudioDriver(void);
 extern "C" int gdx_input_in_gameplay(void);
 extern "C" void gdx_game_request_reset(void);
 
-// In-session save-state API (port/gdx_savestate.c). save/load are armed requests fulfilled at the
-// frame-loop yield boundary under the audio lock; exists() reports whether a RAM slot is held.
-// Gated by gEnhancements.Gameplay.SaveStates (default 0 = strict no-op). Same-race/same-course only.
-extern "C" void gdx_savestate_save(void);
-extern "C" void gdx_savestate_load(void);
-extern "C" int gdx_savestate_exists(void);
-
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // Small helpers (main-thread only — the whole menu draws inside Gui::StartDraw/EndDraw).
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -286,10 +279,6 @@ GdxMenu::GdxMenu() : Ship::GuiWindow("gOpenMenuBar", false, "G-Diffuser Menu") {
     CVarRegisterInteger("gEnhancements.Audio.MasterVolume", 100);
     CVarRegisterInteger("gEnhancements.Audio.Reverb", 1);
     CVarRegisterInteger("gEnhancements.Audio.BufferFrames", 4096);
-    // Adaptive final-lap audio uses the Audio.* namespace but is surfaced in the Gameplay tab.
-    //   gEnhancements.Audio.FinalLapAdaptive = 0 -> off = stock. When on, a subtle +15% BGM lift on
-    //                                               the final lap (audio/disk/external.c NA_SE_18 hook).
-    CVarRegisterInteger("gEnhancements.Audio.FinalLapAdaptive", 0);
 
     // GRAPHICS tab enhancement CVars (port-owned; distinct from the LUS-owned g* CVars used in
     // DrawGraphicsMenu). Every default reproduces today's rendering (the optionality constitution):
@@ -328,13 +317,6 @@ GdxMenu::GdxMenu() : Ship::GuiWindow("gOpenMenuBar", false, "G-Diffuser Menu") {
     //                                                      stock behavior. Consumed in menus.c
     //                                                      (Gdx_AutosaveGhostOnRecord).
     CVarRegisterInteger("gEnhancements.Gameplay.AutosaveOnRecord", 0);
-    //   gEnhancements.Gameplay.SaveStates = 0 -> off = stock (strict no-op: no allocation, no
-    //                                            capture). When on, Quick Save/Load snapshot the race
-    //                                            (RDRAM + curated racer/camera/RNG/game globals) to a
-    //                                            single RAM slot at the frame-loop yield boundary
-    //                                            under the audio lock. SAME-RACE/SAME-COURSE only;
-    //                                            audio does not rewind. Consumed in gdx_savestate.c.
-    CVarRegisterInteger("gEnhancements.Gameplay.SaveStates", 0);
     //   gEnhancements.Gameplay.SkippableTransitions = 0 -> off = stock (transitions play fully). When
     //                                                      on, the transition overlay fast-completes
     //                                                      (transition.c Transition_Update). [PB].
@@ -711,9 +693,7 @@ void GdxMenu::DrawCurrentPage() {
         case Page::Content: DrawWorkshopMenu(); break;
         case Page::OnlineOverview: DrawOnlineMenu(); break;
         case Page::DeveloperGeneral: DrawDeveloperMenu(); break;
-        case Page::Stats:
-            DrawToolWindowPage("Stats", "Live frame timing and renderer statistics.");
-            break;
+        case Page::Stats: DrawStatsMenu(); break;
         case Page::Console:
             DrawToolWindowPage("Console", "Developer console and command history.");
             break;
@@ -735,7 +715,7 @@ void GdxMenu::DrawSearchResults() {
         { Page::Controls, "controls controller configuration keyboard gamepad mouse bindings remap" },
         { Page::InputViewer, "input viewer overlay analog stick buttons speedrun" },
         { Page::EnhancementGraphics, "graphics enhancements widescreen hud ui draw distance lod frame pacing" },
-        { Page::Gameplay, "gameplay save states transitions autosave ghost adaptive final lap" },
+        { Page::Gameplay, "gameplay transitions autosave ghost" },
         { Page::Practice, "practice lap delta ghost import export photo mode free camera replay" },
         { Page::Ghosts, "ghost browser replay library opponents import export staff player" },
         { Page::Content, "workshop content texture packs track cup machine mods dump reload hi-res font" },
@@ -995,11 +975,15 @@ void GdxMenu::DrawGraphicsMenu(bool enhancementsOnly) {
         }
     }
 
-    // Z-fighting mode — CVar gZFightingMode (enum), default 0. Read live per-draw. The exact
-    // non-zero semantics are backend-specific and unverified here, so labels stay neutral; the
-    // default 0 is the 1:1 value.
+    // Z-fighting mode — CVar gZFightingMode (enum), default 0 (= 1:1). Consumed live by the active
+    // Fast3D backend when it builds the rasterizer state for DECAL z-mode polygons: it sets the
+    // SlopeScaledDepthBias applied to coplanar decal surfaces (track markings, shadows, surface
+    // text) so they don't z-fight against the geometry they sit on (gfx_direct3d11.cpp:724, and the
+    // matching gfx_opengl/gfx_metal switches). Mode 1 scales the bias by render height to mimic the
+    // N64's own decal offset; Mode 2 uses a stronger bias that stops far decals from vanishing.
+    // Only visible where decal geometry coexists with its base surface, so the effect is subtle.
     {
-        static const char* const kZLabels[] = { "Disabled", "Mode 1", "Mode 2" };
+        static const char* const kZLabels[] = { "Disabled", "N64-style (scaled)", "No vanishing decals" };
         int idx = CVarGetInteger("gZFightingMode", 0);
         if (idx < 0 || idx > 2) {
             idx = 0;
@@ -1007,6 +991,10 @@ void GdxMenu::DrawGraphicsMenu(bool enhancementsOnly) {
         if (ImGui::Combo("Z-fighting reduction", &idx, kZLabels, 3)) {
             CVarSetInteger("gZFightingMode", idx);
             GdxSaveCvars();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Adjusts the depth bias on decal surfaces (track markings, shadows)\n"
+                              "so they don't shimmer against the road. Disabled = stock.");
         }
     }
 
@@ -1048,29 +1036,39 @@ void GdxMenu::DrawGraphicsMenu(bool enhancementsOnly) {
     }
 
     // Draw distance — CVar gEnhancements.Graphics.DrawDistance (%, default 100 = stock). Scales each
-    // course's own far-render cutoff per-venue (course.c Course_Draw); 100% is bit-exact. Very high
-    // values saturate against the game's fixed far clip plane with no further visible change.
+    // course's own far-render cutoff per-venue (course.c Course_Draw); 100% is bit-exact.
+    //
+    // SLIDER CAPPED AT 200% ON PURPOSE (effective ceiling, honest UI). The CVar multiplies the
+    // per-chunk cull threshold (sCourseFarRenderDistance * scale), but the track itself is streamed
+    // as a fixed set of chunks that Course_SegmentsInit builds only out to a bounded horizon
+    // (gSegmentChunks, capped at SEGMENT_CHUNK_COUNT — course.c). By ~200% the raised cull threshold
+    // already clears the depth of the furthest chunk that was ever built, so pushing the scale
+    // higher un-culls nothing: there is no loaded geometry beyond that point to draw. Anything past
+    // ~200% therefore produced no visible change (owner-observed), so the slider stops at the real
+    // maximum rather than advertising dead range. This is a content/streaming limit, not a code
+    // clamp that could simply be raised.
     {
         int dd = CVarGetInteger("gEnhancements.Graphics.DrawDistance", 100);
         if (dd < 100) {
             dd = 100;
         }
-        if (dd > 300) {
-            dd = 300;
+        if (dd > 200) {
+            dd = 200;
         }
-        if (ImGui::SliderInt("Draw distance (%)", &dd, 100, 300)) {
+        if (ImGui::SliderInt("Draw distance (%)", &dd, 100, 200)) {
             if (dd < 100) {
                 dd = 100;
             }
-            if (dd > 300) {
-                dd = 300;
+            if (dd > 200) {
+                dd = 200;
             }
             CVarSetInteger("gEnhancements.Graphics.DrawDistance", dd);
             GdxSaveCvars();
         }
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Extends how far each track's own geometry renders (100%% = stock,\n"
-                              "scales per-venue). Very high values may hit the fixed far clip.");
+                              "scales per-venue). 200%% is the effective max: beyond it the track's\n"
+                              "streamed geometry runs out, so there is nothing further to draw.");
         }
     }
 
@@ -1322,38 +1320,6 @@ void GdxMenu::DrawAudioMenu() {
 //                             persists the best ghost per course at race finish; this tab owns the toggle.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 void GdxMenu::DrawGameplayMenu() {
-    // Save-states (in-session RAM rewind) — CVar gEnhancements.Gameplay.SaveStates, default 0 (strict
-    // no-op). EXPERIMENTAL. When on, Quick Save/Load snapshot & restore the race (RDRAM + curated
-    // racer/camera/RNG/game-mode globals) to a single RAM slot at the frame-loop yield boundary under
-    // the audio lock. SAME-RACE / SAME-COURSE only (cross-course load is unguarded and may glitch);
-    // audio does not rewind. Buttons call gdx_savestate_save/load (armed, fulfilled at the boundary).
-    {
-        bool on = CVarGetInteger("gEnhancements.Gameplay.SaveStates", 0) != 0;
-        if (ImGui::Checkbox("Save-states (experimental)", &on)) {
-            CVarSetInteger("gEnhancements.Gameplay.SaveStates", on ? 1 : 0);
-            GdxSaveCvars();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Experimental in-race rewind to a single RAM slot.\n"
-                              "Save, then Load during the SAME race on the SAME course.\n"
-                              "Audio does not rewind; loading after a course change may glitch. Off by default.");
-        }
-
-        ImGui::BeginDisabled(!on);
-        if (ImGui::Button("Quick Save (RAM)")) {
-            gdx_savestate_save();
-        }
-        ImGui::SameLine();
-        ImGui::BeginDisabled(gdx_savestate_exists() == 0);
-        if (ImGui::Button("Quick Load (RAM)")) {
-            gdx_savestate_load();
-        }
-        ImGui::EndDisabled();
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        ImGui::TextDisabled(gdx_savestate_exists() != 0 ? "(slot held)" : "(no slot yet)");
-    }
-
     // Skippable transitions — CVar gEnhancements.Gameplay.SkippableTransitions, default 0 (stock:
     // transitions play fully). When on, transition.c Transition_Update re-runs its same per-tick
     // logic in one call until finished (up to 128x), so screen wipes resolve near-instantly. The
@@ -1408,22 +1374,6 @@ void GdxMenu::DrawGameplayMenu() {
             ImGui::SetTooltip("Auto-save your best Time Attack ghost replay when you beat it,\n"
                               "without the manual Save-Ghost prompt.\n"
                               "(Record TIMES already autosave in stock F-Zero X.) Off by default.");
-        }
-    }
-
-    ImGui::Separator();
-
-    // Adaptive final-lap audio — CVar gEnhancements.Audio.FinalLapAdaptive, default 0. When on, a
-    // subtle +15% BGM volume lift triggers on the final lap via the game's own NA_SE_18 final-lap
-    // cue (audio/disk/external.c). Music-only (seqPlayer 1); auto-resets on the next BGM load.
-    {
-        bool on = CVarGetInteger("gEnhancements.Audio.FinalLapAdaptive", 0) != 0;
-        if (ImGui::Checkbox("Adaptive final-lap audio", &on)) {
-            CVarSetInteger("gEnhancements.Audio.FinalLapAdaptive", on ? 1 : 0);
-            GdxSaveCvars();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("A subtle music lift on the final lap (opt-in). Off by default.");
         }
     }
 
@@ -1632,6 +1582,17 @@ void GdxMenu::DrawToolWindowPage(const char* name, const char* description) {
     } else {
         window->DrawElement();
     }
+}
+
+void GdxMenu::DrawStatsMenu() {
+    bool showFps = GdxWindowVisible("FPS Counter");
+    if (ImGui::Checkbox("Show FPS counter overlay", &showFps)) {
+        GdxToggleWindow("FPS Counter");
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("Uses the same frame metrics as Stats");
+    ImGui::Separator();
+    DrawToolWindowPage("Stats", "Live frame timing and renderer statistics.");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────

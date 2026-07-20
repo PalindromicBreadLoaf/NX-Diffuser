@@ -24,6 +24,7 @@
 #include "ship/Context.h"
 #include "fast/Fast3dWindow.h"
 #include "fast/lus_gbi.h"
+#include "gdx_perf.h" // GDX_PERF sub-phase seams (xlate/run/mirror); no-op when disabled
 #include "port_log.h"
 #include "rom_buffer.h"
 #include "n64_rdram.h"
@@ -36,6 +37,7 @@ extern "C" {
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -44,6 +46,57 @@ extern "C" int gGdxRaceActive;
 /* GDX-DEBUG-2026-07-15: forward decl (also declared lower in this file) so the
    mode-gated Create Machine SETTIMG census can read GET_MODE(gGameMode)==0x10. */
 extern "C" int gGameMode;
+
+// ---------------------------------------------------------------------------------------------
+// Segment-reload epoch (Create Machine / mode-transition TOCTOU guard).
+//
+// Mode transitions reload asset segments on the GAME thread: decomp_port.c's
+// gdx_load_mode_segments() DMAs/MIO0-decodes fresh bytes into the segment-4/7/9
+// carves, rewrites them in place (gdx_fixup_asset_segment_image), and swaps the
+// gSegments[] bases (Segment_SetAddress). The GRAPHICS thread concurrently reads
+// gSegments[] and the segment buffer CONTENTS while translating display lists,
+// with no synchronization. Reading a half-rewritten command word can hand the
+// interpreter a torn opcode/pointer -- e.g. a byte that lands as an OTR-filepath
+// opcode (0x25) paired with a bare 32-bit token where a host string pointer is
+// expected, which then faults inside strlen on the LUS side.
+//
+// This is a seqlock generation counter. The game thread brackets every segment
+// mutation with gdx_segment_epoch_begin()/gdx_segment_epoch_end(); the value is
+// ODD while a mutation is in flight. The graphics thread snapshots it before a
+// segment-backed resolution and, via GdxSegmentEpochStable(), rejects the result
+// if the snapshot was odd (mutation in progress) or changed across the resolution
+// (a mutation started/finished mid-read -- possibly torn). The graphics thread
+// NEVER blocks: on an unstable snapshot it takes the same graceful hard-skip as a
+// failed resolution, dropping that one texture for the single reload frame (an
+// invisible cost during a mode transition). Wait-free by construction -- only
+// atomic loads, no locks, no ret/spins on the render thread.
+static std::atomic<uint32_t> gGdxSegmentEpoch{0};
+
+// Game-thread mutation brackets. acq_rel keeps each increment from being
+// reordered past the segment writes it fences: begin()'s odd publish stays
+// BEFORE the buffer/base writes, end()'s even publish stays AFTER them, so a
+// graphics-thread acquire-load that sees an even, unchanged epoch is guaranteed
+// to have observed a fully-settled segment state.
+extern "C" void gdx_segment_epoch_begin(void) {
+    gGdxSegmentEpoch.fetch_add(1u, std::memory_order_acq_rel);
+}
+extern "C" void gdx_segment_epoch_end(void) {
+    gGdxSegmentEpoch.fetch_add(1u, std::memory_order_acq_rel);
+}
+
+// Graphics-thread seqlock read side.
+static inline uint32_t GdxSegmentEpochSnapshot() {
+    return gGdxSegmentEpoch.load(std::memory_order_acquire);
+}
+// True iff `snap` was taken outside any mutation window AND no mutation has begun
+// since: even snapshot and unchanged now. The acquire fence orders the caller's
+// segment reads (which happened after taking `snap`) before this second load, so
+// a mutation that raced the reads is reliably detected as a changed epoch.
+static inline bool GdxSegmentEpochStable(uint32_t snap) {
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const uint32_t now = gGdxSegmentEpoch.load(std::memory_order_acquire);
+    return ((snap & 1u) == 0u) && (snap == now);
+}
 // #16 investigation aid: decomp sets this to 1 (racer.c, right where it already
 // logs "[countdown] draw emitted") the instant the countdown draw code runs, so
 // the bridge's raw vtx/mtx trace only has to cover the interesting few frames
@@ -1419,9 +1472,18 @@ bool ResolvePortBssAlias(uint32_t raw, ResolvedAddress& out) {
    full address being compared. Returns 0 when `full` is not a known stub. */
 bool ResolveVenueBankAlias(uint32_t raw, ResolvedAddress& out); // fwd decl (defined below)
 uintptr_t ResolveWideAssetStubPointer(uintptr_t full, uintptr_t moduleBegin, uintptr_t moduleEnd) {
-    if (full == 0 || moduleBegin == 0 || full < moduleBegin || full >= moduleEnd) {
+    if (full == 0) {
         return 0;
     }
+    /* Exact-symbol matchers run FIRST, before the coarse module-range gate below.
+       They compare `full`'s low32 against the KNOWN addresses of specific stub
+       symbols, so a hit is unambiguous and needs no range pre-filter. This order
+       is load-bearing: on Linux PIE, GetMainModuleRange under-covers the anonymous
+       .bss tail where the venue-bank stubs (D_A000000..D_A008000) live, so gating
+       exact matching behind the range check dropped every venue bank and the track
+       floor/walls/pipes sampled the raw zero stub byte (solid black). Exact
+       resolution is safe regardless of the range: the stub's own address is what
+       matched. */
     const uint32_t low = Low32(full);
     ResolvedAddress out = {};
     if (ResolveVenueBankAlias(low, out)) {
@@ -1429,6 +1491,13 @@ uintptr_t ResolveWideAssetStubPointer(uintptr_t full, uintptr_t moduleBegin, uin
     }
     if (ResolveGeneratedAssetStub(low, out)) {
         return out.full;
+    }
+    /* Coarse module-range gate: preserved to guard any range-scoped resolution
+       that follows the exact matchers. A `full` outside the EXE module is not a
+       generated stub and must not be reinterpreted. Nothing range-scoped exists
+       below yet, so a miss falls through to 0 either way. */
+    if (moduleBegin == 0 || full < moduleBegin || full >= moduleEnd) {
+        return 0;
     }
     return 0;
 }
@@ -1534,7 +1603,77 @@ bool ResolveSetupGfxStub(uint32_t raw, ResolvedAddress& out) {
     return false;
 }
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+bool IsReadablePageProtect(uint32_t protect);
+
+struct WindowsMemoryRegion {
+    uintptr_t begin;
+    uintptr_t end;
+    bool readable;
+};
+
+static std::vector<WindowsMemoryRegion> sWindowsMemoryRegions;
+
+static const WindowsMemoryRegion* FindWindowsMemoryRegion(uintptr_t address) {
+    size_t low = 0;
+    size_t high = sWindowsMemoryRegions.size();
+    while (low < high) {
+        const size_t middle = low + (high - low) / 2;
+        const WindowsMemoryRegion& region = sWindowsMemoryRegions[middle];
+        if (address < region.begin) {
+            high = middle;
+        } else if (address >= region.end) {
+            low = middle + 1;
+        } else {
+            return &region;
+        }
+    }
+    return nullptr;
+}
+
+static bool WindowsMemoryRegionFor(uintptr_t address, WindowsMemoryRegion& out) {
+    const WindowsMemoryRegion* cached = FindWindowsMemoryRegion(address);
+    if (cached != nullptr) {
+        out = *cached;
+        return true;
+    }
+
+    MEMORY_BASIC_INFORMATION info = {};
+    if (VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) == 0) {
+        return false;
+    }
+
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(info.BaseAddress);
+    if (info.RegionSize == 0 || info.RegionSize > UINTPTR_MAX - begin) {
+        return false;
+    }
+
+    WindowsMemoryRegion region = {
+        begin,
+        begin + info.RegionSize,
+        info.State == MEM_COMMIT && IsReadablePageProtect(info.Protect),
+    };
+    if (!region.readable) {
+        out = region;
+        return address >= out.begin && address < out.end;
+    }
+    auto insertAt = std::lower_bound(
+        sWindowsMemoryRegions.begin(), sWindowsMemoryRegions.end(), region.begin,
+        [](const WindowsMemoryRegion& existing, uintptr_t value) {
+            return existing.begin < value;
+        });
+    insertAt = sWindowsMemoryRegions.insert(insertAt, region);
+    out = *insertAt;
+    return address >= out.begin && address < out.end;
+}
+
+static void ResetWindowsMemoryRegionCache() {
+    sWindowsMemoryRegions.clear();
+    if (sWindowsMemoryRegions.capacity() == 0) {
+        sWindowsMemoryRegions.reserve(64);
+    }
+}
+#else
 // ---------------------------------------------------------------------------------------------
 // POSIX memory-probe backend: a snapshot of /proc/self/maps with miss-triggered refresh.
 //
@@ -1630,7 +1769,7 @@ static bool PosixRegionFor(uintptr_t addr, MapsRegion& out) {
     out = *r;
     return true;
 }
-#endif // !_WIN32
+#endif
 
 void GetMainModuleRange(uintptr_t& moduleBegin, uintptr_t& moduleEnd) {
     moduleBegin = 0;
@@ -1736,22 +1875,17 @@ bool IsReadablePageProtect(uint32_t protect) {
 
 size_t ReadableCommandLimit(const void* source, size_t stride = kN64GfxStride) {
 #ifdef _WIN32
-    MEMORY_BASIC_INFORMATION mbi = {};
-    if (VirtualQuery(source, &mbi, sizeof(mbi)) == 0) {
+    const uintptr_t address = reinterpret_cast<uintptr_t>(source);
+    WindowsMemoryRegion region;
+    if (!WindowsMemoryRegionFor(address, region) || !region.readable) {
         return 0;
     }
 
-    if (mbi.State != MEM_COMMIT || !IsReadablePageProtect(mbi.Protect)) {
+    if (address >= region.end) {
         return 0;
     }
 
-    const uintptr_t begin = reinterpret_cast<uintptr_t>(source);
-    const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-    if (begin >= regionEnd) {
-        return 0;
-    }
-
-    return static_cast<size_t>((regionEnd - begin) / stride);
+    return static_cast<size_t>((region.end - address) / stride);
 #else
     const uintptr_t addr = reinterpret_cast<uintptr_t>(source);
     MapsRegion r;
@@ -1767,21 +1901,16 @@ size_t ReadableCommandLimit(const void* source, size_t stride = kN64GfxStride) {
 
 size_t ReadableByteLimit(uintptr_t address) {
 #ifdef _WIN32
-    MEMORY_BASIC_INFORMATION mbi = {};
-    if (VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi)) == 0) {
+    WindowsMemoryRegion region;
+    if (!WindowsMemoryRegionFor(address, region) || !region.readable) {
         return 0;
     }
 
-    if (mbi.State != MEM_COMMIT || !IsReadablePageProtect(mbi.Protect)) {
+    if (address >= region.end) {
         return 0;
     }
 
-    const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-    if (address >= regionEnd) {
-        return 0;
-    }
-
-    return static_cast<size_t>(regionEnd - address);
+    return static_cast<size_t>(region.end - address);
 #else
     MapsRegion r;
     if (!PosixRegionFor(address, r) || !r.readable) {
@@ -1796,12 +1925,11 @@ size_t ReadableByteLimit(uintptr_t address) {
 
 bool IsReadableAddress(uintptr_t address) {
 #ifdef _WIN32
-    MEMORY_BASIC_INFORMATION mbi = {};
-    if (VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi)) == 0) {
+    WindowsMemoryRegion region;
+    if (!WindowsMemoryRegionFor(address, region)) {
         return false;
     }
-
-    return mbi.State == MEM_COMMIT && IsReadablePageProtect(mbi.Protect);
+    return region.readable;
 #else
     MapsRegion r;
     if (!PosixRegionFor(address, r)) {
@@ -2091,7 +2219,8 @@ class N64DisplayListAdapter {
                     break;
                 }
             }
-            if (!dlDup && sDlCensusCount < 48) {
+            // [dl-census] high-frequency per-draw diagnostic: silent unless GDX_DIAG_VERBOSE=1.
+            if (gdx_diag_verbose() && !dlDup && sDlCensusCount < 48) {
                 sDlCensusSeen[sDlCensusCount++] = srcAddr;
                 uint64_t prefVA = 0;
                 if (mModuleBegin != 0 && srcAddr >= mModuleBegin && srcAddr < mModuleEnd) {
@@ -2967,7 +3096,9 @@ class N64DisplayListAdapter {
             static int sMissingDlPrintsMenu = 0;
             static int sMissingDlPrintsRace = 0;
             int& missingBudget = (gGdxRaceActive != 0) ? sMissingDlPrintsRace : sMissingDlPrintsMenu;
-            const int missingCap = (gGdxRaceActive != 0) ? 400 : 60;
+            // Always-on error family, but bounded in every phase so it cannot flood boot
+            // menus: race keeps the large evidence budget, non-race is capped small (40).
+            const int missingCap = (gGdxRaceActive != 0) ? 400 : 40;
             if (missingBudget < missingCap) {
                 ++missingBudget;
                 const uintptr_t parent = reinterpret_cast<uintptr_t>(parentSource);
@@ -3020,7 +3151,9 @@ class N64DisplayListAdapter {
             static int sBadDlPrintsMenu = 0;
             static int sBadDlPrintsRace = 0;
             int& badBudget = (gGdxRaceActive != 0) ? sBadDlPrintsRace : sBadDlPrintsMenu;
-            const int badCap = (gGdxRaceActive != 0) ? 400 : 60;
+            // Always-on error family, bounded in every phase (see [gdl-miss] above):
+            // race keeps the large evidence budget, non-race is capped small (40).
+            const int badCap = (gGdxRaceActive != 0) ? 400 : 40;
             if (badBudget < badCap) {
                 ++badBudget;
                 const uint32_t alignedRaw = raw & ~7u;
@@ -3697,15 +3830,46 @@ class N64DisplayListAdapter {
 
                 case kOpSetTextureImage:
                     {
+                        /* TOCTOU guard (Create Machine entry, thread_id=3 AV in
+                           strlen): snapshot the segment-reload epoch BEFORE touching
+                           any segment-backed state. A mode transition on the game
+                           thread reloads segments 4/7/9 (decomp_port.c
+                           gdx_load_mode_segments) -- rewriting the carve bytes AND
+                           swapping the gSegments[] bases -- while this thread reads
+                           them unsynchronized. */
+                        const uint32_t settimgEpoch = GdxSegmentEpochSnapshot();
                         const uintptr_t translated =
                             w1IsHostPointer ? w1full : TranslateDataPointer(in.w1);
+                        /* If a reload raced a segment-backed resolution (odd or
+                           changed epoch), the translated pointer and the bytes it
+                           addresses may be torn. Host-pointer textures never read
+                           gSegments[], so they are exempt (no behavior change).
+                           Drop the texture for this one frame -- the previous
+                           binding persists and the skip is invisible during a mode
+                           transition -- rather than sampling / stringifying
+                           half-written state. Wait-free: only atomic loads ran. */
+                        const bool segmentReloadRaced =
+                            !w1IsHostPointer && !GdxSegmentEpochStable(settimgEpoch);
+                        if (segmentReloadRaced) {
+                            if (mStats != nullptr) mStats->skippedTextures++;
+                            continue;
+                        }
+                        /* A resolution is USABLE -- for the O2R/pack OTR-filepath
+                           emit and for every diagnostic that dereferences the
+                           resolved bytes as memory or a string -- only if it
+                           produced a non-null pointer. A failed/partial resolution
+                           (the [resolve-fail] path returns 0) hard-skips the entire
+                           census / pack-override / logging branch below; the normal
+                           unresolved-fallback emit (FallbackDataPointer, further
+                           down) is unchanged. */
+                        const bool resolutionUsable = (translated != 0);
                         // Only emit the O2R filepath opcode for BSS-stub textures (asset-segment
                         // symbols with a 1:1 O2R resource). RDRAM-backed textures are contiguous
                         // multi-tile buffers where the game issues many G_LOADBLOCKs with
                         // increasing ULS offsets across the full region — the O2R resource only
                         // covers the first tile and causes out-of-bounds reads for later bands.
                         // Those textures must go through the raw-copy path (1MB slice of RDRAM).
-                        const char* o2rKey = (!w1IsHostPointer && translated != 0 && !IsRdramHostPointer(translated))
+                        const char* o2rKey = (!w1IsHostPointer && resolutionUsable && !IsRdramHostPointer(translated))
                                                  ? gdx_lookup_asset_segment_o2r_key(in.w1)
                                                  : nullptr;
                         const char* texCensusPath = "rawcopy"; /* [tex-census] delivery classification */
@@ -3726,7 +3890,7 @@ class N64DisplayListAdapter {
                            later band (the title-screen text corruption with a font pack
                            active). Atlas replacement needs per-tile keying; until then those
                            buffers keep the raw-copy path. */
-                        if (!o2rKey && translated != 0 && !IsRdramHostPointer(translated) &&
+                        if (!o2rKey && resolutionUsable && !IsRdramHostPointer(translated) &&
                             gdx_workshop_texture_packs_enabled()) {
                             const char* assetKey = GDiffuser_LookupLoadedAssetKey(
                                 reinterpret_cast<const void*>(translated), 0, 0);
@@ -3918,7 +4082,9 @@ class N64DisplayListAdapter {
                             const bool censusHasBudget =
                                 (sTexCensusCount < 512) ||
                                 (cFmt == 2u && sTexCensusCiCount < 64);
-                            if (!censusDup && censusHasBudget) {
+                            // [tex-census]/[ci-dump] high-frequency per-draw census:
+                            // silent unless GDX_DIAG_VERBOSE=1.
+                            if (gdx_diag_verbose() && !censusDup && censusHasBudget) {
                                 if (sTexCensusCount < 512) {
                                     sTexCensusSeen[sTexCensusCount++] = in.w1;
                                 } else if (cFmt == 2u && sTexCensusCiCount < 64) {
@@ -4106,7 +4272,10 @@ class N64DisplayListAdapter {
                                Log the first few repoints of EVERY segment. */
                             if (gSegments[segIdx] != normalized) {
                                 static int sSegRepointLogs[kGfxSegmentCount] = {};
-                                if (sSegRepointLogs[segIdx] < 6) {
+                                // [seg-dl] successful repoint is informational per-draw:
+                                // silent unless GDX_DIAG_VERBOSE=1 (the FAILED variant below
+                                // is an error family and stays always-on).
+                                if (gdx_diag_verbose() && sSegRepointLogs[segIdx] < 6) {
                                     ++sSegRepointLogs[segIdx];
                                     gdx_port_logf("[seg-dl] moveword seg=%X raw=%08X %p -> %p\n", segIdx, in.w1,
                                                   reinterpret_cast<void*>(gSegments[segIdx]),
@@ -4135,7 +4304,8 @@ class N64DisplayListAdapter {
                                    time) on the next soak run. */
                                 if (segIdx == 0x0A && gGdxRaceActive != 0) {
                                     static int sSegARaceRepointLogs = 0;
-                                    if (sSegARaceRepointLogs < 32) {
+                                    // [seg-dl-race] informational probe: silent unless GDX_DIAG_VERBOSE=1.
+                                    if (gdx_diag_verbose() && sSegARaceRepointLogs < 32) {
                                         ++sSegARaceRepointLogs;
                                         gdx_port_logf(
                                             "[seg-dl-race] seg=A raw=%08X %p -> %p (race-scoped, unbudgeted by "
@@ -4594,6 +4764,38 @@ class N64DisplayListAdapter {
                 }
             }
 
+            /* OTR-filepath strlen backstop (Create Machine entry, thread_id=3 AV
+               in strlen). The LUS OTR-filepath handlers (interpreter.cpp
+               gfx_set_timg_otr_filepath_handler_custom et al.) treat w1 as a
+               `const char*` and hand it to LoadResourceProcess -> strlen. LUS
+               already rejects w1 < 0x10000 and > 0x0000FFFFFFFFFFFF, but a BARE
+               32-bit token zero-extended into the mid range (e.g. 0x25820F60 --
+               note the 0x25 top byte is itself the SETTIMG-OTR opcode of a torn
+               command word) sails through that filter straight into strlen.
+               Such a value reaches here two ways: (a) a segment buffer read torn
+               mid-reload whose opcode byte happens to land on an OTR-filepath
+               opcode, routed through `default:` with outW1 = the raw low32 token;
+               (b) any future emit path that sets an OTR opcode without a real host
+               string pointer. A legitimate O2R/pack emit always stores a heap or
+               module string pointer, which on this 64-bit target has non-zero
+               high bits and is readable -- so this guard is byte-identical for
+               every real filepath command and only drops the poisoned ones. */
+            {
+                const uint8_t outOp = static_cast<uint8_t>((outW0 >> 24) & 0xFFu);
+                /* Literal opcode bytes (fast/lus_gbi.h): 0x24 OTR_G_VTX_OTR_FILEPATH,
+                   0x25 OTR_G_SETTIMG_OTR_FILEPATH, 0x27 OTR_G_DL_OTR_FILEPATH,
+                   0x28 OTR_G_PUSHCD, 0x29 OTR_G_MTX_OTR_FILEPATH. Byte values are part
+                   of the LUS OTR command format and stable across header revisions. */
+                const bool outIsOtrFilepath = (outOp == 0x24u) || (outOp == 0x25u) ||
+                                              (outOp == 0x27u) || (outOp == 0x28u) ||
+                                              (outOp == 0x29u);
+                if (outIsOtrFilepath &&
+                    ((static_cast<uint64_t>(outW1) >> 32) == 0 || !IsReadableAddress(outW1))) {
+                    if (mStats != nullptr) mStats->skippedDataCommands++;
+                    continue;
+                }
+            }
+
             item.listPtr->commands.push_back(MakeLusGfx(outW0, outW1));
             if (mStats != nullptr) {
                 mStats->commandsOut++;
@@ -4773,7 +4975,8 @@ static void SeedFramebufferQuad(Fast::Interpreter* interp, const uint16_t* srcPi
     // (count>0: the quad draw itself is broken).
     {
         static int sSeedContentLogs = 0;
-        if (sSeedContentLogs < 10) {
+        // [seed] quad content probe: high-frequency diagnostic, silent unless GDX_DIAG_VERBOSE=1.
+        if (gdx_diag_verbose() && sSeedContentLogs < 10) {
             ++sSeedContentLogs;
             size_t nonZero = 0;
             size_t nonBackground = 0; // pixels != 0x0001 (the RGBA5551 cleared-black
@@ -4800,7 +5003,7 @@ static void SeedFramebufferQuad(Fast::Interpreter* interp, const uint16_t* srcPi
     // Boot-phase frames run before the game ever sets an RDP scissor, leaving
     // it 0x0 ([gpustate] sc=0.0,0.0 0.0x0.0) — the interpreter clips every
     // rectangle against it, so the quad was drawn and fully scissored away
-    // (vifallback-frame.bmp: solid black while the source FB held the logo).
+    // (a prior one-shot capture was solid black while the source FB held the logo).
     // Establish the full-screen scissor this draw needs; coords are 10.2 fixed.
     interp->GfxDpSetScissor(0 /*G_SC_NON_INTERLACE*/, 0, 0, kFbW << 2, kFbH << 2);
 
@@ -5097,15 +5300,26 @@ extern "C" void gdx_vi_present_fallback(void) {
     //     (resolution multiplier / MSAA), publish it for the GUI compositor. ---
     interp->mGfxFrameBuffer = 0;
     if (interp->mRendersToFb) {
+        // Mirror Interpreter::Run()'s MSAA-resolve decision. This taskless path runs only when NO
+        // gfx task executed this frame, so Interpreter::Run() (and its mid-frame fixed-aspect
+        // re-latch) did NOT run; the caches here are exactly the ones interp->StartFrame() latched
+        // and sized mGameFbMsaaResolved from. That makes the resolved target guaranteed-allocated
+        // whenever this branch selects it (no divergence to guard against, unlike Run()'s epilogue).
+        const bool widescreenPillarbox = !interp->mWidescreenEnabledCache || interp->mForceFixedAspectCache;
         rapi->StartDrawToFramebuffer(0, 1);
         rapi->ClearFramebuffer(true, true);
         if (interp->mMsaaLevel > 1) {
-            if (!interp->ViewportMatchesRendererResolution()) {
+            if (interp->ViewportMatchesRendererResolution() && !widescreenPillarbox) {
+                // Normal path: resolve straight to the window; mGfxFrameBuffer stays 0.
+                rapi->ResolveMSAAColorBuffer(0, interp->mGameFb);
+            } else {
+                // Viewport differs OR a whole-frame pillarbox is required: resolve into the offscreen
+                // target and publish it so Fast3dGui::DrawGame composites the centred 4:3 sub-region.
+                // This is what keeps the fallback from leaving mGfxFrameBuffer == 0 when a pillarbox
+                // is required (which would stretch 4:3 content across the whole window).
                 rapi->ResolveMSAAColorBuffer(interp->mGameFbMsaaResolved, interp->mGameFb);
                 interp->mGfxFrameBuffer =
                     reinterpret_cast<uintptr_t>(rapi->GetFramebufferTextureId(interp->mGameFbMsaaResolved));
-            } else {
-                rapi->ResolveMSAAColorBuffer(0, interp->mGameFb);
             }
         } else {
             interp->mGfxFrameBuffer = reinterpret_cast<uintptr_t>(rapi->GetFramebufferTextureId(interp->mGameFb));
@@ -5131,24 +5345,6 @@ extern "C" void gdx_vi_present_fallback(void) {
         GdxUpdateFrameMirror(interp);
     }
 
-    // Boot-logo verdict probe: dump ONE composed fallback frame (read back from
-    // the mirror just updated above) to vifallback-frame.bmp. The FB source is
-    // proven to hold the logo texels ([seed] nonbg=5304) yet the screen shows
-    // black — this dump splits "the composed frame lacks the logo" (quad draw
-    // broken) from "the frame has it" (presentation-side). Dumped on the 30th
-    // fallback frame so the logo blit (a few frames in) has certainly run.
-    {
-        static int sFallbackFrames = 0;
-        static bool sFallbackDumped = false;
-        ++sFallbackFrames;
-        if (!sFallbackDumped && sFallbackFrames == 30 && gFrameMirrorFb >= 0) {
-            sFallbackDumped = true;
-            static uint16_t sDumpPixels[320 * 240];
-            interp->GetCurrentRenderingAPI()->ReadFramebufferToCPU(gFrameMirrorFb, 320, 240, sDumpPixels);
-            DumpRgba16Bmp("vifallback-frame.bmp", sDumpPixels, 320, 240);
-            gdx_port_logf("[vifallback] frame 30 dumped to vifallback-frame.bmp\n");
-        }
-    }
 }
 
 extern "C" void gdx_set_native_rgba16_texture_range(void* ptr, size_t size, int enabled) {
@@ -5171,6 +5367,36 @@ extern "C" void gdx_defer_native_rgba16_texture_range_clear(void* ptr) {
     if (begin != 0) {
         gPendingNativeRgba16RangeClears.push_back(begin);
     }
+}
+
+/* Minimap staleness fix: sCourseMinimapTex (minimap.c) is a CI8 texture that is
+ * Arena_Allocate'd per race under EXPANSION_KIT. Fast3D's texture cache keys CI8
+ * by address with no content hash, and the deterministic arena rewind hands the
+ * same address to the next race, so a cache HIT serves the previous race's decoded
+ * outline. Evicting the exact buffer address after it has been re-rasterized forces
+ * the next upload to re-decode the current course. Scoped to this one producer on
+ * purpose -- a general CI content-hash caused a race regression (see the CI-hash
+ * note in libultraship interpreter.cpp). Mirrors the TextureCacheDelete usage in
+ * SeedFramebufferQuad and is safe before the interpreter is up (early-out on null),
+ * so callers can invoke it unconditionally. */
+extern "C" void gdx_invalidate_texture_address(const void* addr) {
+    if (addr == nullptr) {
+        return;
+    }
+    auto ctx = Ship::Context::GetInstance();
+    if (ctx == nullptr) {
+        return;
+    }
+    auto wnd = ctx->GetWindow();
+    auto* fw = static_cast<Fast::Fast3dWindow*>(wnd.get());
+    if (fw == nullptr) {
+        return;
+    }
+    auto interp = fw->GetInterpreterWeak().lock();
+    if (!interp) {
+        return;
+    }
+    interp->TextureCacheDelete(reinterpret_cast<const uint8_t*>(addr));
 }
 
 /* Track F probe hook (see gDiagTransitionCaptureBegin). Called by
@@ -5474,9 +5700,15 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
 
     bool isBigEndian = IsLikelyBigEndianDisplayList(static_cast<const N64Gfx*>(dl), dl_size / sizeof(N64Gfx));
 
+    // Sub-phase: per-command DL translation (the adapter's ConvertRoot walk). See gdx_perf.h.
+#ifdef _WIN32
+    ResetWindowsMemoryRegionCache();
+#endif
+    gdx_perf_sub_begin(GDX_PERF_SUB_XLATE);
     ConversionStats stats = {};
     N64DisplayListAdapter adapter(dl, dl_size, isBigEndian, &stats);
     Fast::F3DGfx* converted = adapter.ConvertRoot();
+    gdx_perf_sub_end(GDX_PERF_SUB_XLATE);
     if (converted == nullptr) return;
 
     static bool sBridgeInitDiag = false;
@@ -5538,7 +5770,10 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
                       stats.ucodeSwitches, stats.unknownUcodeSwitches,
                       stats.firstUnknownUcodeRaw,
                       stats.l3dexUcodeSkips, stats.firstL3dexUcodeRaw, dl_size);
-        if (stats.noopDisplayLists != 0) {
+        // [gfxfail]/[datafail] per-frame aggregate diagnostics: silent unless
+        // GDX_DIAG_VERBOSE=1. The per-occurrence, bounded [gdl-miss]/[gdl-bad] lines
+        // (and the bounded [gfxfail] ROOT-rejected error above) stay always-on.
+        if (gdx_diag_verbose() && stats.noopDisplayLists != 0) {
             gdx_port_logf("[gfxfail] "
                           "miss=%zu raw=%08X parent=%p pidx=%zu pstride=%zu pbig=%d pf3d=%d "
                           "praw=%08X/%08X pdecoded=%08X/%08X "
@@ -5568,7 +5803,7 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
                           stats.firstBadDlFailureIndex,
                           static_cast<unsigned>(stats.firstBadDlFailureOpcode));
         }
-        if (stats.fallbackDataCommands != 0 || stats.skippedDataCommands != 0) {
+        if (gdx_diag_verbose() && (stats.fallbackDataCommands != 0 || stats.skippedDataCommands != 0)) {
             gdx_port_logf("[datafail] fallback=%zu op=%02X raw=%08X w0=%08X source=%p idx=%zu "
                           "skipped=%zu op=%02X raw=%08X w0=%08X\n",
                           stats.fallbackDataCommands,
@@ -5600,7 +5835,10 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
     }
 
     interp->ResetGeometryDiagnostics();
+    // Sub-phase: the interpreter Run (F3D command execution -> GPU submission). See gdx_perf.h.
+    gdx_perf_sub_begin(GDX_PERF_SUB_RUN);
     interp->Run(reinterpret_cast<Gfx*>(converted), {});
+    gdx_perf_sub_end(GDX_PERF_SUB_RUN);
     // A real GFX task produced this host frame — the VI-scanout fallback must
     // not also draw over it (see gdx_vi_present_fallback).
     gHostFrameGfxTaskRan = true;
@@ -5649,7 +5887,10 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
     // fb 0 on demand (observed as all-zero transition captures). Keep a
     // persistent GPU-side copy of every completed game frame instead; the
     // transition readback samples this mirror.
+    // Sub-phase: frame-mirror refresh. See gdx_perf.h.
+    gdx_perf_sub_begin(GDX_PERF_SUB_MIRROR);
     GdxUpdateFrameMirror(interp);
+    gdx_perf_sub_end(GDX_PERF_SUB_MIRROR);
 
     const Fast::GeometryDiagnostics& geometry = interp->GetGeometryDiagnostics();
     /* Print-budget split (2026-07-08): a single global sBigTriPrints<60 cap was
@@ -5690,8 +5931,10 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
     }
     static int sLastGeometryTaskUcode = -1;
     const bool geometryUcodeChanged = sLastGeometryTaskUcode != static_cast<int>(taskUcode);
-    if (geometryUcodeChanged || (sDiagFrames % 120) == 0 ||
-        geometry.invalidVertices != 0 || geometry.variantSwitches != 0) {
+    // [geodiag]/[gpustate]/[phasegeom] are per-frame diagnostics: silent unless GDX_DIAG_VERBOSE=1.
+    if (gdx_diag_verbose() &&
+        (geometryUcodeChanged || (sDiagFrames % 120) == 0 ||
+         geometry.invalidVertices != 0 || geometry.variantSwitches != 0)) {
         gdx_port_logf(
             "[geodiag] ucode=%d vtx=%llu invalid=%llu w_nonpos=%llu near=%llu far=%llu "
             "ndc_x=%.3f..%.3f ndc_y=%.3f..%.3f ndc_z=%.3f..%.3f "
@@ -5870,6 +6113,12 @@ static void LogAndDumpTransitionCapture(const uint16_t* pixels, unsigned int wid
     // captures (VI-fallback frames + the title/logo transitions), so the
     // menu-transition captures a soak actually cares about never got logged.
     // Raised so later, more interesting captures still show up.
+    // The one-shot BMP dump is leftover Graphics-wave-W5 instrumentation. Gate it (and the
+    // expensive per-pixel row conversion + file write it needs) behind GDX_DIAG_TRANSITION_DUMP
+    // so a normal play session never writes transition-capture.bmp to disk. The cheap log line
+    // stays (it only reaches a file when the opt-in log sink is enabled — see port_log.h), and
+    // its "dump=" suffix now only advertises the dump when the dump is actually going to happen.
+    static const bool sDumpEnabled = std::getenv("GDX_DIAG_TRANSITION_DUMP") != nullptr;
     static int sCaptureCount = 0;
     static bool sDumped = false;
     if (pixels == nullptr || sCaptureCount >= 24) {
@@ -5885,11 +6134,12 @@ static void LogAndDumpTransitionCapture(const uint16_t* pixels, unsigned int wid
             break;
         }
     }
+    const bool willDump = sDumpEnabled && !sDumped;
     gdx_port_logf("[transition] capture #%d %ux%u source=%s mode=%d firstNonZeroPx=%lld%s\n",
                   sCaptureCount, width, height, sourcePath, (gGameMode & 0x1F), firstNonZero,
-                  sDumped ? "" : " dump=transition-capture.bmp");
+                  willDump ? " dump=transition-capture.bmp" : "");
 
-    if (sDumped) {
+    if (!sDumpEnabled || sDumped) {
         return;
     }
     sDumped = true;

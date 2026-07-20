@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Generate f3d.o2r from our Fast3D shaders and port-owned GUI texture assets.
+"""Generate gdiffuser.o2r (the port's engine archive) from the MIT-licensed Fast3D shaders.
+Named after the port, it contains zero game-derived content.
 
-Fast3D loads shaders from ``shaders/<backend>/...`` during window init. Its GUI texture loader uses
-the same resource manager, so assets under ``port/assets/textures`` are archived as ``textures/...``.
-The shaders always come from this checkout's libultraship rather than another fork.
+Fast3D loads shaders from ``shaders/<backend>/...`` during window init. The shaders always come from
+this checkout's libultraship rather than another fork. Runtime UI is drawn with ImGui primitives or
+uses separately licensed fonts, so this archive does not collect arbitrary image files.
 
 The archive is written deterministically (sorted entry order, fixed timestamps) so identical
 inputs produce byte-identical output on any machine — required for content hashing, build
@@ -15,8 +16,7 @@ import zipfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(REPO, "libultraship", "src", "fast", "shaders")
-GUI_TEXTURES = os.path.join(REPO, "port", "assets", "textures")
-OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(REPO, "build", "x64", "port", "f3d.o2r")
+OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(REPO, "build", "x64", "port", "gdiffuser.o2r")
 
 # Fixed timestamp for all entries: zip format's epoch (1980-01-01).
 FIXED_DATE = (1980, 1, 1, 0, 0, 0)
@@ -44,8 +44,7 @@ def write_deterministic(z, arc, full):
     z.writestr(info, data)
 
 
-entries = collect(SRC, "shaders/") + collect(GUI_TEXTURES, "textures/",
-                                             lambda name: name.lower().endswith(".png"))
+entries = collect(SRC, "shaders/")
 
 with zipfile.ZipFile(OUT, "w", zipfile.ZIP_DEFLATED) as z:
     for arc, full in entries:

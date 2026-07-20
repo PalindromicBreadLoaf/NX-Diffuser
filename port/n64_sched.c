@@ -456,6 +456,26 @@ void gdx_ckp(const char* s, void* p) {
     gdx_port_logf("%s=%p\n", s, p);
 }
 
+int gdx_unlock_diag_enabled(void) {
+    static int sCached = -1;
+    if (sCached < 0) {
+        const char* env = getenv("GDX_DIAG_UNLOCK");
+        sCached = (env != NULL && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }
+    return sCached;
+}
+
+void gdx_unlock_diagf(const char* fmt, ...) {
+    va_list args;
+
+    if (!gdx_unlock_diag_enabled()) {
+        return;
+    }
+    va_start(args, fmt);
+    gdx_port_vlogf(fmt, args);
+    va_end(args);
+}
+
 /* GDX_DIAG_VERBOSE gate for the per-frame diagnostic log families
    ([gfxdiag], [game], [seg], [sched], [phasegeom], [bigtri]). Cached like
    gdx_trace_enabled(); silent (0) by default, enabled by GDX_DIAG_VERBOSE set

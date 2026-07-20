@@ -105,12 +105,14 @@ list(FILTER GAME_SOURCES EXCLUDE REGEX "/audio/rom/lib/aisetnextbuf\\.c$")  # os
 # Deferred to port reimplementation (Slice 4c):
 #   segment.c / cartridge_offsets.c -> N64 ROM-segment system (linker segment symbols
 #     don't exist on host; replaced by libultraship's resource loading).
-#   ending_effects.c -> static GBI display list; needs port-aware gbi pointer packing.
+# ending_effects.c compiles for real as of 2026-07-18: the historical "needs port-aware gbi
+# pointer packing" exclusion became stale once the Phase-G1 wide-Gfx ABI landed (static gs*
+# macros pack 16-byte commands; the bridge reads EXE statics at the wide stride). Its
+# fireworks/podium simulation is the sole producer of gActiveFireworks.
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/sys/segment\\.c$")
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/libultra/os/virtualtophysical\\.c$")
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/libultra/os/physicaltovirtual\\.c$")
 list(FILTER GAME_SOURCES EXCLUDE REGEX "/sys/cartridge_offsets\\.c$")
-list(FILTER GAME_SOURCES EXCLUDE REGEX "/overlays/ending/ending_effects\\.c$")
 
 # Save-system slice: ovl_i2/save.c (settings/records/cup-completion/single-slot ghost
 # checksums + Sram_Init/Sram_ReadWrite) now compiles for real. It no longer needs
@@ -271,18 +273,20 @@ add_executable(G-Diffuser
                                 # Fast3D backend already paces EndFrame() to 60fps, so this is
                                 # opt-in. Standalone C (windows.h + a local CVarGetInteger extern,
                                 # same boundary idiom as input_bridge.c).
-    gdx_savestate.c            # In-session RAM quick-save/load infrastructure (default OFF via
-                                # gEnhancements.Gameplay.SaveStates). Snapshots gdx_rdram at the
-                                # frame-loop yield boundary under the audio lock. NOTE: RDRAM-only —
-                                # a full rewind also needs the decomp .data/.bss (native BSS holds
-                                # the race state); dormant until that design lands. See its header.
     shims.c
     AssetLoader.cpp
     resource/ResourceFactories.cpp
-    gdx_firstboot.cpp          # First-boot setup wizard + per-user data directory resolution. Runs
-                                # before libultraship init to acquire/validate the ROM, EK disk, and
-                                # 64DD IPL, copy them into %APPDATA%/G-Diffuser (or a portable dir),
-                                # and boot straight to the game thereafter. See docs/FIRST_BOOT_DESIGN.md.
+    gdx_firstboot.cpp          # First-boot setup routing + portable data-directory resolution. Runs
+                                # before libultraship init and defers acquisition to the in-window UI;
+                                # all user data remains beside the executable.
+    gdx_extract_launch.cpp     # Runtime O2R extraction: validates the user's ROM, runs the gdx-extract
+                                # companion, and atomically installs fzerox.o2r into the data dir.
+                                # Contract: docs/investigation/2026-07-18/o2r-migration/P0_CONTRACTS.md.
+    gdx_firstboot_gui.cpp      # In-window ImGui first-time setup flow (replaces the old pre-window
+                                # Win32 wizard). Runs after the window/Gui/FileDropMgr exist and before
+                                # the game boots: acquires/validates/copies the ROM+EK disk+IPL (Browse
+                                # picker + drag-and-drop), drives the async O2R extraction with live
+                                # progress, and hot-mounts fzerox.o2r. See gdx_firstboot_gui.{h,cpp}.
     rom_buffer.cpp
     sram_buffer.cpp
     disk_savefile.cpp          # Durable 64DD disk-save sidecar: copy-on-write dirty-LBA journal
@@ -293,8 +297,11 @@ add_executable(G-Diffuser
                                 # library. Uses the game's checksum/conversion routines and keeps
                                 # the vanilla SRAM slot as a compatibility mirror.
     gdx_ghost_window.cpp       # Ghost Browser GuiWindow: table/export UI for every validated player
-                                # ghost in the host library. Registered via AddGuiWindow in main.cpp.
+                                 # ghost in the host library. Registered via AddGuiWindow in main.cpp.
     gdx_input_viewer.cpp       # Draggable N64 input overlay using the state seen by the game.
+    gdx_fps_overlay.cpp        # Optional top-right FPS/frame-time overlay using ImGui's live metrics.
+    gdx_perf.cpp               # GDX_PERF=1 frame-time telemetry: per-phase spike attribution +
+                                # periodic p50/p95/p99 summaries through the port log.
     gdx_imgui_nav.cpp          # Feeds ImGui menu navigation from the SDL controller directly, so a
                                 # raw DualSense (invisible to ImGui's Win32/XInput backend) can open
                                 # and drive the menu on every platform. Gated on gControlNav.
@@ -321,23 +328,28 @@ if(WIN32)
     endif()
 endif()
 
+# Remove the former game-derived icon from incremental build directories. Release builds use the
+# platform default until original project artwork is supplied.
+add_custom_command(TARGET G-Diffuser POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E rm -f "$<TARGET_FILE_DIR:G-Diffuser>/gdiffuser.png"
+    VERBATIM)
+
 file(GLOB_RECURSE GDIFFUSER_F3D_SHADER_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/libultraship/src/fast/shaders/*")
-file(GLOB_RECURSE GDIFFUSER_GUI_TEXTURE_SOURCES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/assets/textures/*.png")
-set(GDIFFUSER_F3D_O2R "${CMAKE_CURRENT_BINARY_DIR}/f3d.o2r")
+# The engine archive is named after the port (gdiffuser.o2r): it contains only the MIT-licensed
+# Fast3D shaders. The input viewer is drawn with ImGui primitives and contributes no image assets.
+set(GDIFFUSER_ENGINE_O2R "${CMAKE_CURRENT_BINARY_DIR}/gdiffuser.o2r")
 add_custom_command(
-    OUTPUT "${GDIFFUSER_F3D_O2R}"
-    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/gen_f3d_o2r.py" "${GDIFFUSER_F3D_O2R}"
+    OUTPUT "${GDIFFUSER_ENGINE_O2R}"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/gen_f3d_o2r.py" "${GDIFFUSER_ENGINE_O2R}"
     DEPENDS "${CMAKE_SOURCE_DIR}/tools/gen_f3d_o2r.py"
             ${GDIFFUSER_F3D_SHADER_SOURCES}
-            ${GDIFFUSER_GUI_TEXTURE_SOURCES}
-    COMMENT "Generating Fast3D shader and GUI texture archive f3d.o2r"
+    COMMENT "Generating engine archive gdiffuser.o2r (Fast3D shaders)"
     VERBATIM)
-add_custom_target(gdiffuser_f3d_o2r DEPENDS "${GDIFFUSER_F3D_O2R}")
-add_dependencies(G-Diffuser gdiffuser_f3d_o2r)
+add_custom_target(gdiffuser_engine_o2r DEPENDS "${GDIFFUSER_ENGINE_O2R}")
+add_dependencies(G-Diffuser gdiffuser_engine_o2r)
 add_custom_command(TARGET G-Diffuser POST_BUILD
-    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${GDIFFUSER_F3D_O2R}" "$<TARGET_FILE_DIR:G-Diffuser>/f3d.o2r"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${GDIFFUSER_ENGINE_O2R}" "$<TARGET_FILE_DIR:G-Diffuser>/gdiffuser.o2r"
     VERBATIM)
 
 # The modern menu uses the same readable UI/monospace pairing as SoH. Keep the assets loose beside
@@ -353,6 +365,94 @@ add_custom_command(TARGET G-Diffuser POST_BUILD
             "$<TARGET_FILE_DIR:G-Diffuser>/fonts"
     VERBATIM)
 
+# Keep the project license and every bundled/static dependency notice with binary releases.
+set(GDIFFUSER_LICENSE_DIR "${CMAKE_SOURCE_DIR}/LICENSES")
+add_custom_command(TARGET G-Diffuser POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/LICENSE"
+            "${CMAKE_SOURCE_DIR}/THIRD_PARTY_NOTICES.md"
+            "$<TARGET_FILE_DIR:G-Diffuser>"
+    COMMAND "${CMAKE_COMMAND}" -E copy_directory
+            "${GDIFFUSER_LICENSE_DIR}"
+            "$<TARGET_FILE_DIR:G-Diffuser>/LICENSES"
+    VERBATIM)
+
+# --- gdx-extract: standalone deterministic O2R extractor ----------------------
+# First-boot spawns this as a child process to build generic.o2r from the user's ROM
+# (contract C2). It is built as an isolated ExternalProject, NOT add_subdirectory'd
+# into the game link: Torch pulls its own spdlog/fmt/yaml-cpp/tinyxml2/libgfxd via
+# FetchContent, and keeping it out-of-tree prevents any ODR/version clash with
+# libultraship's own spdlog/fmt. See docs/investigation/.../W0_TORCH_DEPENDENCIES.md.
+#
+# Determinism (GDX_DETERMINISTIC=ON): MINIZ_NO_TIME + sorted entry walk + pinned
+# deflate level => byte-identical archives for an identical ROM + recipes.
+# Trim: BUILD_STORMLIB=OFF (O2R/miniz path only, no StormLib, no libbz2).
+# CMP0091=NEW lets Torch's CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded (/MT) take effect
+# so the exe is self-contained (matches G-Diffuser, no VC++ redist).
+include(ExternalProject)
+
+set(GDX_EXTRACT_SRC_DIR "${CMAKE_SOURCE_DIR}/torch")
+set(GDX_EXTRACT_PREFIX  "${CMAKE_BINARY_DIR}/gdx-extract")
+set(GDX_EXTRACT_INSTALL "${GDX_EXTRACT_PREFIX}/install")
+set(GDX_EXTRACT_EXE     "${GDX_EXTRACT_INSTALL}/bin/gdx-extract${CMAKE_EXECUTABLE_SUFFIX}")
+
+ExternalProject_Add(gdx_extract_ext
+    SOURCE_DIR  "${GDX_EXTRACT_SRC_DIR}"
+    PREFIX      "${GDX_EXTRACT_PREFIX}"
+    INSTALL_DIR "${GDX_EXTRACT_INSTALL}"
+    CMAKE_CACHE_ARGS
+        -DUSE_STANDALONE:BOOL=ON
+        -DBUILD_STORMLIB:BOOL=OFF
+        -DGDX_DETERMINISTIC:BOOL=ON
+        -DGDX_OUTPUT_NAME:STRING=gdx-extract
+        -DCMAKE_INSTALL_PREFIX:PATH=<INSTALL_DIR>
+        -DCMAKE_BUILD_TYPE:STRING=${CMAKE_BUILD_TYPE}
+        -DCMAKE_POLICY_DEFAULT_CMP0091:STRING=NEW
+    BUILD_COMMAND   "${CMAKE_COMMAND}" --build   <BINARY_DIR> --config $<CONFIG>
+    INSTALL_COMMAND "${CMAKE_COMMAND}" --install <BINARY_DIR> --config $<CONFIG>
+    # BUILD_ALWAYS ON: ExternalProject stamps do not track torch/ source changes, so with OFF a
+    # torch edit kept serving a STALE extractor from the install prefix (bit us twice — the game's
+    # POST_BUILD deploy silently overwrote a freshly built exe with the day-one binary). The
+    # incremental no-change rebuild is a few seconds; correctness wins.
+    BUILD_ALWAYS ON
+    BUILD_BYPRODUCTS "${GDX_EXTRACT_EXE}")
+
+# Convenience target so `cmake --build ... --target gdx-extract` works directly.
+add_custom_target(gdx-extract DEPENDS gdx_extract_ext)
+
+# Ensure the extractor is built (and deployed) whenever the game is built.
+add_dependencies(G-Diffuser gdx_extract_ext)
+
+# Deploy the extractor next to the game executable.
+add_custom_command(TARGET G-Diffuser POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${GDX_EXTRACT_EXE}"
+            "$<TARGET_FILE_DIR:G-Diffuser>/gdx-extract${CMAKE_EXECUTABLE_SUFFIX}"
+    VERBATIM)
+
+# Deploy the recipe tree (US rev0 launch combo) as decomp-recipes/ next to the exe.
+# Torch resolves `-s <srcdir>/config.yml`, then gAssetPath = <srcdir>/<config path:>
+# where the US rev0 key declares `path: assets/yaml/us/rev0`. So the packaged layout
+# mirrors the decomp source tree verbatim and config.yml needs NO edits.
+# Only us/rev0 is shipped (28 YAML files, ~455 KB); the other revisions' config keys
+# are never dereferenced because recipe selection is by the matched ROM SHA1.
+#   decomp-recipes/config.yml
+#   decomp-recipes/assets/yaml/us/rev0/**
+set(GDX_RECIPES_SRC "${CMAKE_SOURCE_DIR}/decomp")
+set(GDX_RECIPES_DST "$<TARGET_FILE_DIR:G-Diffuser>/decomp-recipes")
+add_custom_command(TARGET G-Diffuser POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${GDX_RECIPES_DST}/assets/yaml/us"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${GDX_RECIPES_SRC}/config.yml"
+            "${GDX_RECIPES_DST}/config.yml"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${GDX_RECIPES_SRC}/LICENSE"
+            "${GDX_RECIPES_DST}/LICENSE"
+    COMMAND "${CMAKE_COMMAND}" -E copy_directory
+            "${GDX_RECIPES_SRC}/assets/yaml/us/rev0"
+            "${GDX_RECIPES_DST}/assets/yaml/us/rev0"
+    VERBATIM)
+
 target_include_directories(G-Diffuser PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"   # for "resource/ResourceFactories.h"
     "${DECOMP}/include"
@@ -366,8 +466,9 @@ target_link_libraries(G-Diffuser PRIVATE cxd4_rsp)
 # Link libultraship when built from the top-level project (it provides the libultra HLE:
 # os* threading/messaging, VI, controller, Fast3D).
 if(WIN32)
-    # Win32-only host deps: user32 (MessageBox) + Comdlg32 (GetOpenFileName ROM picker).
-    target_link_libraries(G-Diffuser PRIVATE user32 Comdlg32)
+    # Win32-only host deps: user32 (MessageBox) + Comdlg32 (GetOpenFileName ROM picker)
+    # + Comctl32 (extraction progress dialog marquee, gdx_extract_launch.cpp).
+    target_link_libraries(G-Diffuser PRIVATE user32 Comdlg32 Comctl32)
 else()
     # POSIX host deps: pthread (ucontext fiber backend uses pthread_self; audio thread is
     # std::thread) and dl (dladdr in n64_gfx_bridge.cpp's GetMainModuleRange; -ldl is needed on

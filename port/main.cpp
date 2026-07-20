@@ -6,6 +6,8 @@
 
 #include "ship/Context.h"
 #include "ship/resource/ResourceManager.h"
+#include "ship/resource/archive/ArchiveManager.h"  // enumerate mounted archives for the version check
+#include "ship/resource/archive/Archive.h"          // Archive::HasGameVersion / GetGameVersion / GetPath
 #include "ship/audio/AudioPlayer.h"
 #include "ship/audio/Audio.h"  // Ship::Audio + AudioBackend (startup audio-backend selection)
 #include "resource/ResourceFactories.h"
@@ -33,9 +35,12 @@
 #include "port_log.h"
 #include "rom_buffer.h"
 #include "gdx_firstboot.h"  // first-boot setup + per-user data directory (runs before LUS init)
+#include "gdx_firstboot_gui.h"  // in-window ImGui first-time setup flow (NeedsSetup path)
+#include "gdx_fps_overlay.h" // optional Stats-backed FPS/frame-time counter
+#include "gdx_perf.h"        // GDX_PERF=1 frame-time telemetry (spike attribution + summaries)
+#include "gdx_extract_launch.h"  // runtime O2R extraction (produces generic.o2r before the mount)
 #include "gdx_audio_thread.h"
 #include "gdx_frame_pacer.h"  // optional wall-clock 60Hz pacer (gEnhancements.Graphics.FramePacing)
-#include "gdx_savestate.h"    // in-session RAM quick-save/load infrastructure (default OFF; see file)
 #include <SDL2/SDL.h>  // SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER): enable gamepad auto-detection
 
 #include <algorithm>
@@ -65,6 +70,7 @@ extern "C" void gdx_register_host_range(void* ptr, size_t size); // n64_gfx_brid
 extern "C" void gdx_register_main_module_range(void); // n64_gfx_bridge: resolve low32 EXE/BSS segment tokens
 extern "C" void gdx_game_request_reset(void); // game.c: schedule a title reset at the game-flow boundary
 extern "C" void gdx_disk_save_tick(void);      // disk_savefile: debounced flush of the 64DD save sidecar
+extern "C" void gdx_disk_save_flush(void);     // disk_savefile: force-persist the pending sidecar journal
 
 static void logStep(const char* s) {
     gdx_port_logf("[G-Diffuser] %s\n", s);
@@ -204,20 +210,32 @@ static std::vector<std::string> findArchivePaths(const char* argv0) {
     }
 
     std::vector<std::string> archives;
-    for (const char* name : { "f3d.o2r", "generic.o2r" }) {
-        for (const auto& root : roots) {
-            const auto candidate = root / name;
-            if (std::filesystem::exists(candidate, ec) && std::filesystem::is_regular_file(candidate, ec)) {
-                archives.push_back(std::filesystem::absolute(candidate, ec).string());
+    // The game archive is fzerox.o2r (runtime-extracted); generic.o2r is accepted as a fallback
+    // only when no fzerox.o2r exists — that is Torch's default output name, still used by the
+    // in-tree dev archive (assets/extracted/generic.o2r). Never mount both: they carry the same
+    // resource keys and double-mounting would just shadow one with the other.
+    for (const auto& nameGroup : { std::vector<const char*>{ "gdiffuser.o2r", "f3d.o2r" },
+                                   std::vector<const char*>{ "fzerox.o2r", "generic.o2r" } }) {
+        bool found = false;
+        for (const char* name : nameGroup) {
+            for (const auto& root : roots) {
+                const auto candidate = root / name;
+                if (std::filesystem::exists(candidate, ec) && std::filesystem::is_regular_file(candidate, ec)) {
+                    archives.push_back(std::filesystem::absolute(candidate, ec).string());
+                    found = true;
+                    break;
+                }
+                ec.clear();
+            }
+            if (found) {
                 break;
             }
-            ec.clear();
         }
     }
 
     if (archives.empty()) {
-        archives.push_back("f3d.o2r");
-        archives.push_back("generic.o2r");
+        archives.push_back("gdiffuser.o2r");
+        archives.push_back("fzerox.o2r");
     }
 
     // Workshop W0: append mods/*.o2r after the base archives. ArchiveManager registers files
@@ -279,12 +297,49 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // ── Runtime O2R asset extraction (contracts C1/C5/C6/C7/C8) ──────────────────────────────────
+    // Produce (or refresh) <dataDir>/generic.o2r from the cartridge ROM using the packaged gdx-extract
+    // child + decomp-recipes, BEFORE findArchivePaths (below) builds the mount list — the data dir is
+    // a candidate root, so a freshly installed archive is picked up this same boot. This runs after
+    // the ROM/disk/IPL are validated + consolidated into the data dir (first-boot) and while no window
+    // exists yet, so progress UX is a modeless Win32 dialog on Windows and log-only on Linux.
+    //
+    // The ROM-next-to-exe layout is ALSO the normal end-user layout (SoH/BattleShip convention:
+    // unzip, drop the ROM beside the exe, launch — the archive is generated beside the exe, which
+    // is DevLayout's dataDir). Extraction is skipped only on a true development tree, detected by
+    // the in-tree assets/extracted probe already providing generic.o2r — there, re-extraction would
+    // be wasteful and could clobber a developer's working archive. Extraction NEVER blocks boot: on
+    // any failure it logs an actionable line and the proven raw-ROM fallback carries the session (C6).
+    //
+    // SKIPPED for the NeedsSetup path: there is no ROM yet (the user has not provided one), so
+    // extraction cannot run here. It is instead driven from the in-window setup flow below, after the
+    // window exists, once the ROM/disk/IPL have been acquired. (firstBoot.romPath is empty here.)
+    if (firstBoot.status != gdx::FirstBootStatus::NeedsSetup) {
+        std::error_code cwdEc;
+        const bool devTreeArchive = gdx::DevelopmentTreeProvidesArchive(
+            firstBoot.exeDir, std::filesystem::current_path(cwdEc).string());
+        if (devTreeArchive) {
+            gdx_port_logf("[G-Diffuser] asset extraction: skipped (dev tree provides "
+                          "assets/extracted/generic.o2r)\n");
+        } else {
+            gdx::ExtractOutcome extractOutcome = gdx::GdxExtractEnsureArchive(
+                firstBoot.dataDir.c_str(), firstBoot.romPath.c_str(), firstBoot.exeDir.c_str());
+            gdx_port_logf("[G-Diffuser] asset extraction: %s\n",
+                          gdx::GdxExtractOutcomeString(extractOutcome));
+        }
+    }
+
     logStep("CreateUninitializedInstance");
     auto ctx = Ship::Context::CreateUninitializedInstance("G-Diffuser", "gdiffuser",
                                                           "gdiffuser.cfg.json");
     if (ctx == nullptr) { logStep("FATAL: CreateUninitializedInstance"); return 1; }
 
-    logStep("InitLogging");          ctx->InitLogging();
+    logStep("InitLogging");
+    if (gdx_log_file_enabled()) {
+        ctx->InitLogging();
+    } else {
+        ctx->InitLogging(spdlog::level::off, spdlog::level::off, false);
+    }
     logStep("InitConfiguration");    ctx->InitConfiguration();
     logStep("InitConsoleVariables"); ctx->InitConsoleVariables();
 
@@ -320,7 +375,105 @@ int main(int argc, char** argv) {
     for (const auto& archivePath : archivePaths) {
         gdx_port_logf("[G-Diffuser] archive: %s\n", archivePath.c_str());
     }
+    // Archive version gate.
+    //
+    // libultraship's built-in gate (the validHashes set passed to InitResourceManager) is
+    // REJECT-ONLY and, critically, does NOT special-case archives that declare no version:
+    // ArchiveManager::AddArchiveUnlocked compares every archive's GetGameVersion() (which
+    // defaults to the sentinel 0xFFFFFFFF when the archive carries no "version" file) against
+    // the set, and a non-empty set that lacks that value rejects — i.e. never mounts — the
+    // archive outright (libultraship/src/ship/resource/archive/ArchiveManager.cpp:295-299).
+    //
+    // The port's CURRENTLY SHIPPED archives (f3d.o2r via tools/gen_f3d_o2r.py, texture packs
+    // via tools/gen_texture_pack.py) do NOT stamp a "version" file or a numeric
+    // manifest.json.game_version. Passing any non-empty validHashes today would therefore
+    // reject all of them and break boot. So we keep the built-in gate DISABLED (empty set)
+    // and instead run a post-mount check below. Two policies (contract C4):
+    //   * generic.o2r is ENFORCING. Torch stamps its version = the US-rev0 ROM CRC (0x78D90EB3);
+    //     the bridge's SETTIMG OTR rewrite path is not partial-resilient, so a mismatched
+    //     generic.o2r (wrong region/rev, stale recipe) would render blank textures with no raw
+    //     recovery. On mismatch we UNMOUNT it (RemoveArchive) so the proven-complete raw-ROM
+    //     fallback carries the session — never a silently-wrong archive (C6, complete-or-absent).
+    //   * every OTHER archive stays WARN-ONLY against kGdxExpectedArchiveVersion: unversioned
+    //     archives (f3d.o2r, texture packs) pass through untouched, so the owner's boot is never
+    //     broken, and a versioned foreign pack that mismatches is merely reported.
+    static constexpr uint32_t kGdxExpectedArchiveVersion = 1u;        // schema v1 = first versioned O2R
+    static constexpr uint32_t kGdxExpectedGenericRomCrc = 0x78D90EB3u; // C4: US-rev0 ROM CRC stamp
     logStep("InitResourceManager");   ctx->InitResourceManager(archivePaths, {}, 1);
+
+    {
+        auto rm = ctx->GetResourceManager();
+        auto am = (rm != nullptr) ? rm->GetArchiveManager() : nullptr;
+        auto archives = (am != nullptr) ? am->GetArchives() : nullptr;
+        // Collect generic.o2r paths to unmount AFTER the scan: RemoveArchive rebuilds the VFS and
+        // mutates the internal archive list, so we must not remove while iterating the snapshot.
+        std::vector<std::string> toUnmount;
+        if (archives != nullptr) {
+            for (const auto& archive : *archives) {
+                if (archive == nullptr || !archive->HasGameVersion()) {
+                    continue; // unversioned archive (f3d.o2r, texture packs) — nothing to validate
+                }
+                const std::string path = archive->GetPath();
+                std::string basename = std::filesystem::path(path).filename().string();
+                for (char& c : basename) {
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                }
+                const uint32_t got = archive->GetGameVersion();
+
+                if (basename == "fzerox.o2r" || basename == "generic.o2r") {
+                    // ENFORCING: the version's ROM-CRC must match the expected US-rev0 CRC.
+                    // Covers both the installed name (fzerox.o2r) and Torch's default output name
+                    // (generic.o2r, still used by the in-tree dev archive).
+                    if (got != kGdxExpectedGenericRomCrc) {
+                        gdx_port_logf(
+                            "[G-Diffuser] ERROR: game archive \"%s\" version ROM-CRC is 0x%08X but this "
+                            "build expects 0x%08X (US rev0). Unmounting it and booting from the raw ROM; "
+                            "delete it (or the gdx_extract_state.cfg sidecar) to force a fresh "
+                            "extraction.\n",
+                            path.c_str(), got, kGdxExpectedGenericRomCrc);
+#ifdef _WIN32
+                        char msg[512];
+                        snprintf(msg, sizeof(msg),
+                                 "The extracted asset archive does not match your ROM:\n\n%s\n\nversion "
+                                 "ROM-CRC 0x%08X, expected 0x%08X (US rev0).\n\nG-Diffuser will boot "
+                                 "from the raw ROM. Delete this file to force a fresh extraction.",
+                                 path.c_str(), got, kGdxExpectedGenericRomCrc);
+                        MessageBoxA(nullptr, msg, "G-Diffuser — incompatible generic.o2r",
+                                    MB_OK | MB_ICONWARNING);
+#endif
+                        toUnmount.push_back(path);
+                    }
+                } else if (got != kGdxExpectedArchiveVersion) {
+                    // WARN-ONLY for every other versioned archive.
+                    gdx_port_logf(
+                        "[G-Diffuser] ERROR: archive \"%s\" reports version %u but this build "
+                        "expects %u. The archive is stale or incompatible. Regenerate it with "
+                        "tools/gen_f3d_o2r.py (f3d.o2r) / tools/gen_texture_pack.py, then relaunch.\n",
+                        path.c_str(), got, kGdxExpectedArchiveVersion);
+#ifdef _WIN32
+                    char msg[512];
+                    snprintf(msg, sizeof(msg),
+                             "Asset archive is stale or incompatible:\n\n%s\n\nreports version %u "
+                             "but this build expects %u.\n\nRegenerate it with tools/gen_f3d_o2r.py "
+                             "(f3d.o2r) / tools/gen_texture_pack.py, then relaunch.",
+                             path.c_str(), got, kGdxExpectedArchiveVersion);
+                    MessageBoxA(nullptr, msg, "G-Diffuser — incompatible asset archive",
+                                MB_OK | MB_ICONWARNING);
+#endif
+                    // Warn-and-continue: libultraship already mounted the archive (empty gate),
+                    // so we let it run rather than hard-aborting a possibly-still-usable build.
+                }
+            }
+        }
+        // Enforce C4 for generic.o2r: remove the mismatched archive from the VFS before any resource
+        // is read (GDiffuser_LoadAllAssets runs later), leaving a clean archive-absent state.
+        if (am != nullptr) {
+            for (const auto& path : toUnmount) {
+                am->RemoveArchive(path);
+                gdx_port_logf("[G-Diffuser] unmounted incompatible archive: %s\n", path.c_str());
+            }
+        }
+    }
 
     // Console must exist BEFORE the Gui is built: the Gui adds a ConsoleWindow whose Init()
     // (called by AddGuiWindow) registers commands via Context::GetConsole().
@@ -379,28 +532,37 @@ int main(int argc, char** argv) {
         // Input Viewer: a native N64 overlay fed from the exact mapped state seen by the game.
         pgui->AddGuiWindow(std::make_shared<GdxInputViewer>());
 
-#ifndef _WIN32
-        // Frame-pacing default is platform-specific. On Windows the DXGI backend's own sleep+spin
-        // limiter reliably holds EndFrame() to 60fps, so the port pacer stays OFF (stock behavior).
-        // On Linux the Fast3D SDL2 limiter (SyncFramerateWithTime) sleeps with a *relative*
-        // nanosleep() and no EINTR retry, so a signal can cut the sleep short every frame and the
-        // loop free-runs at the panel refresh (e.g. 144Hz on the ROG Ally -> ~2.4x game speed).
-        // Default the robust wall-clock pacer (clock_nanosleep TIMER_ABSTIME, EINTR-safe) ON here.
+        // Minimal performance overlay: uses ImGui's live Framerate/DeltaTime, exactly like Stats.
+        pgui->AddGuiWindow(std::make_shared<GdxFpsOverlay>());
+
+        // Frame-pacing default is now OFF on ALL platforms. Owner device evidence (ROG Ally X,
+        // Linux): with the pacer OFF the game holds a clean 60 FPS because the backend's vsync caps
+        // correctly; the port pacer misbehaves when ON. Windows already ran with the pacer OFF (the
+        // DXGI backend's own sleep+spin limiter holds EndFrame() to 60fps), so this only changes the
+        // Linux default. The setting stays fully functional — a user who hits the high-refresh
+        // free-run symptom (panel refresh with broken vsync) can re-enable the Frame Pacer from the
+        // Settings menu, and that choice persists.
         //
         // This runs BEFORE the GdxMenu ctor registers the CVar: RegisterInteger only sets a value
         // when the CVar does not yet exist, so a value already loaded from the user's config (their
-        // explicit toggle) still wins, while a fresh config gets the pacer enabled by default.
-        CVarRegisterInteger("gEnhancements.Graphics.FramePacing", 1);
-        // One-time migration: configs written before this default flipped have FramePacing:0
-        // persisted (the old cross-platform default), which the register above cannot override —
-        // so those Linux users would still free-run at the panel refresh (144Hz). Flip it ON once;
-        // the marker preserves any later deliberate OFF. Same pattern as gControlNav.
-        if (CVarGetInteger("gdx.Migrations.LinuxFramePacingOn", 0) == 0) {
-            CVarSetInteger("gdx.Migrations.LinuxFramePacingOn", 1);
-            CVarSetInteger("gEnhancements.Graphics.FramePacing", 1);
+        // explicit toggle) still wins, while a fresh config gets the pacer disabled by default.
+        CVarRegisterInteger("gEnhancements.Graphics.FramePacing", 0);
+        // One-time migration to the new OFF default. A previous build defaulted the pacer ON for
+        // Linux and force-enabled it via gdx.Migrations.LinuxFramePacingOn, persisting FramePacing:1
+        // into existing configs — which the RegisterInteger above cannot override. Flip it back OFF
+        // exactly once for every config that has not yet seen THIS migration (a second, distinct
+        // marker key so it fires once more even for configs the old migration already touched).
+        // We cannot distinguish a value the user deliberately set ON since then from the old
+        // auto-migrated ON, so this is a deliberate one-time reset to the new default (preferred
+        // over added complexity); the marker prevents a second reset, so a later manual re-enable in
+        // the menu persists normally.
+        if (CVarGetInteger("gdx.Migrations.FramePacingDefaultOff", 0) == 0) {
+            CVarSetInteger("gdx.Migrations.FramePacingDefaultOff", 1);
+            CVarSetInteger("gEnhancements.Graphics.FramePacing", 0);
             CVarSave();
+            gdx_port_logf("[G-Diffuser] Frame pacer reset to OFF (new default). "
+                          "Re-enable it in Settings if the game runs too fast.\n");
         }
-#endif
 
         // Install the full-screen menu (Gui::SetMenu calls Init()). The GdxMenu ctor pins
         // visibility to "gOpenMenuBar" for configuration compatibility and registers the port's
@@ -465,6 +627,26 @@ int main(int argc, char** argv) {
     }
     logStep("InitEventSystem");       ctx->InitEventSystem();
     logStep("InitFileDropMgr");       ctx->InitFileDropMgr();
+
+    // ── In-window first-time setup (NeedsSetup path) ─────────────────────────────────────────────
+    // FirstBootRun deferred acquisition to here when the ROM/EK disk/IPL were missing. The window,
+    // Gui, and FileDropMgr now exist, but the game has NOT booted (no RegisterResourceFactories /
+    // LoadAllAssets / bootproc yet — all of which require the ROM). This runs the ImGui setup screen,
+    // which acquires + validates + copies the three inputs, runs the O2R extraction with live progress,
+    // hot-mounts the produced fzerox.o2r, and returns the installed ROM path. On completion, boot falls
+    // through to RegisterResourceFactories → LoadAllAssets → … with firstBoot.romPath now set. If the
+    // user closes the window during setup, exit cleanly (partial files persist; next launch resumes).
+    if (firstBoot.status == gdx::FirstBootStatus::NeedsSetup) {
+        std::string setupRomPath;
+        if (!gdx::GdxFirstBootSetupRun(firstBoot.dataDir, firstBoot.exeDir, setupRomPath)) {
+            // The dedicated audio thread has not started yet (gdx_audio_thread_start is below), so a
+            // plain return is a clean exit here.
+            gdx_port_logf("[G-Diffuser] first-time setup was closed before completion; exiting.\n");
+            return 0;
+        }
+        firstBoot.romPath = setupRomPath;
+        firstBoot.status = gdx::FirstBootStatus::SetupComplete;
+    }
 
     // Phase 3: resolve the GDX_AUDIO_THREAD kill switch and, if enabled (default), start the
     // dedicated audio thread now. Safe this early -- it internally waits for
@@ -538,13 +720,29 @@ int main(int argc, char** argv) {
     logStep("entering frame loop");
     auto w = ctx->GetWindow();
     while (w != nullptr && w->IsRunning()) {
+        gdx::PerfFrameBegin();
+        gdx::PerfPhaseBegin(gdx::PerfEvents);
         w->HandleEvents();
+        gdx::PerfPhaseEnd(gdx::PerfEvents);
+        gdx::PerfPhaseBegin(gdx::PerfInput);
         gdx_controller_poll();
-        // Publish the editor fixed-aspect state before this frame's gfx task runs (gdx_dispatch
+        // Publish the editor fixed-aspect state before this frame's gfx task runs (the gametick
         // below): Course Edit / Create Machine render through the stock 4:3 pillarbox path. No-op
         // CVar-wise except on game-mode transitions. See gdx_fixed_aspect_tick in input_bridge.c.
         gdx_fixed_aspect_tick();
-        gdx_vi_tick();   // advance VI framebuffer + post retrace -> wakes the Main scheduler thread
+        gdx::PerfPhaseEnd(gdx::PerfInput);
+        // "gametick" is where the game frame ACTUALLY runs: gdx_vi_tick posts the VI retrace
+        // message, which wakes the Main scheduler thread and the cooperative scheduler dispatches
+        // the game fiber right here (osSendMesg -> osStartThread -> __osDispatchThread, because
+        // __osRunningThread is NULL in host context). The whole game frame -- game logic AND the
+        // synchronous gfx-task submission (gdx_gfx_run: DL translation, interpreter Run, frame
+        // mirror) -- executes inside this call, not inside gdx_dispatch() below (which then finds
+        // the run queue empty). Sub-phase timers in gdx_gfx_run attribute the breakdown; see
+        // gdx_perf.h. This is why the old telemetry booked all game work under "input"/dispatch=0.
+        gdx::PerfPhaseBegin(gdx::PerfGameTick);
+        gdx_vi_tick();   // advance VI framebuffer + post retrace -> runs the Main game fiber here
+        gdx::PerfPhaseEnd(gdx::PerfGameTick);
+        gdx::PerfPhaseBegin(gdx::PerfInput);
         // Phase 3: wake the dedicated audio thread once per rendered frame (it also self-pumps
         // every 5ms independently, so a lost/late notify here is not a correctness issue --
         // see gdx_audio_thread.cpp). No-op when the kill switch reverts to the fiber path.
@@ -554,39 +752,50 @@ int main(int argc, char** argv) {
         // NewFrame, so a raw DualSense (which ImGui's Win32/XInput backend cannot see) can open and
         // drive the menu on every platform. No-op unless gControlNav is enabled. See gdx_imgui_nav.
         gdx_imgui_nav_tick();
+        gdx::PerfPhaseEnd(gdx::PerfInput);
+        gdx::PerfPhaseBegin(gdx::PerfGuiStart);
         w->GetGui()->StartDraw();
         w->StartFrame(); // must precede gdx_dispatch: Run() needs an initialized frame
         // Cross-thread message wakes recorded by the dedicated audio thread (sendmesg.c PORT
         // path) become runnable here, on the host thread, right before the threads dispatch.
         // See the guard block in n64_sched.c.
         gdx_sched_drain_deferred_wakes();
+        gdx::PerfPhaseEnd(gdx::PerfGuiStart);
+        gdx::PerfPhaseBegin(gdx::PerfDispatch);
         gdx_dispatch();  // run the decomp's game threads cooperatively until they block again
-        // In-session save-state boundary hook. gdx_dispatch() has just drained the run queue,
-        // so every decomp game fiber is parked at its retrace/message wait -- the one point where
-        // an RDRAM snapshot/restore is atomic w.r.t. the game threads (the audio thread is
-        // serialized inside via gdx_audio_ctx_lock). Strict no-op unless
-        // gEnhancements.Gameplay.SaveStates is enabled. See port/gdx_savestate.{h,c}.
-        gdx_savestate_tick();
+        gdx::PerfPhaseEnd(gdx::PerfDispatch);
+        gdx::PerfPhaseBegin(gdx::PerfTicks);
         // Durable 64DD disk-save flush. A game disk write (Course Edit save, MFS
         // format) marked the sidecar dirty via gdx_disk_save_mark_dirty; this
         // debounced tick persists it atomically once the write burst has drained.
         // No-op when nothing is pending. See port/disk_savefile.{h,cpp}.
         gdx_disk_save_tick();
+        gdx::PerfPhaseEnd(gdx::PerfTicks);
+        gdx::PerfPhaseBegin(gdx::PerfPresent);
         // VI-scanout fallback: if no GFX task rendered this frame (boot logo phase
         // or any CPU-drawn screen), present the current VI framebuffer's pixels.
         // Cheap no-op when a real frame was produced.
         gdx_vi_present_fallback();
         w->GetGui()->EndDraw();
         w->EndFrame();
+        gdx::PerfPhaseEnd(gdx::PerfPresent);
         // Port-level wall-clock pacer, gated on gEnhancements.Graphics.FramePacing. Default is
         // platform-specific: OFF on Windows (the DXGI backend already limits EndFrame() to ~60fps)
         // and ON on Linux (the SDL2 limiter is signal-fragile and lets the loop free-run at the
         // panel refresh -- see gdx_frame_pacer.{h,c}). When on, holds the loop to the N64 NTSC
         // field rate (~59.94Hz).
+        gdx::PerfPhaseBegin(gdx::PerfPacer);
         gdx_frame_pacer_tick();
+        gdx::PerfPhaseEnd(gdx::PerfPacer);
+        gdx::PerfFrameEnd();
     }
     logStep("window closed; exiting");
+    // Force-persist any pending 64DD save journal before exit. The per-frame
+    // gdx_disk_save_tick() only flushes after the write burst has been idle for
+    // kDebounceFrames (~0.5s); a save landing inside that final window when the
+    // window closes would otherwise be dropped. gdx_disk_save_flush() writes the
+    // current journal unconditionally (no-op when nothing is active/pending).
+    gdx_disk_save_flush();
     gdx_audio_thread_stop();
-    gdx_savestate_shutdown(); // free the in-RAM slot if one was ever allocated (no-op otherwise)
     return 0;
 }

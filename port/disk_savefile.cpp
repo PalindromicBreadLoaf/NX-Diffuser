@@ -348,6 +348,14 @@ void gdx_disk_save_init(const char* diskName, const unsigned char* pristine, uns
     g_sourceHash = 0;
     g_diskSize = size;
     g_sidecarPresent = false;
+    /* Reset the flush-status latch per boot/disk so a stale FAILED from a prior
+     * disk cannot leak into this one. It stays the honest "not failed" state (true)
+     * until a flush is actually attempted. NOTE: the Workshop getter
+     * (gdx_disk_last_flush_ok) is binary and its read-only consumer renders it as
+     * "ok"/"FAILED" (gdx_menu.cpp), so "no flush attempted this boot" cannot be
+     * distinguished from "last flush succeeded" -- both read as "ok". Introducing a
+     * tri-state would require editing that consumer, which this change does not own. */
+    g_lastFlushOk = true;
 
     if (pristine == nullptr || size == 0) {
         gdx_port_logf("[disk-save] no disk image; durable disk save disabled\n");
@@ -400,6 +408,17 @@ void gdx_disk_save_init(const char* diskName, const unsigned char* pristine, uns
     g_ranges.clear();
     if (primary == LoadStatus::Missing && backup == LoadStatus::Missing) {
         gdx_port_logf("[disk-save] no disk save found, pristine (sidecar: %s)\n", g_gddPath.c_str());
+        /* Fresh install: no sidecar exists at all, so there is nothing to protect.
+         * Auto-arm the one-shot DD-format gate for THIS boot so the MFS RAM area is
+         * initialized without a manual Workshop opt-in and without needing a restart.
+         * Transient runtime state only -- do NOT CVarSave() (persisting runtime flags
+         * to config is the exact defect the input_bridge.c postmortem warns against);
+         * gdx_disk_allow_format() consumes and clears the flag when the format runs.
+         * Deliberately NOT armed in the corrupted/rejected-sidecar branch below: an
+         * existing-but-unreadable save must never be auto-formatted -- the manual
+         * Workshop opt-in remains the only path for the sidecar-present-but-
+         * uninitialized case. */
+        CVarSetInteger("gEnhancements.Workshop.AllowDDFormatOnce", 1);
     } else {
         gdx_port_logf("[disk-save] backup %s unusable (%s); pristine-only\n", g_bakPath.c_str(),
                       statusText(backup == LoadStatus::Missing ? primary : backup));
@@ -527,7 +546,15 @@ int gdx_disk_allow_format(void) {
      * The guard consumes it exactly once here -- clearing it in the runtime store
      * and re-saving the config so a single format runs and the flag never fires
      * again unprompted. The format lands in the in-memory disk image and, via the
-     * dirty-range journal, in the sidecar only -- never in the user's .ndd. */
+     * dirty-range journal, in the sidecar only -- never in the user's .ndd.
+     *
+     * TERMINAL-ONLY CONSUMPTION: this predicate is now called exclusively from
+     * genuinely terminal not-initialized sites -- func_i1_80404830's second-pass
+     * failure (mfs_ram.c, after Mfs_ReadRamArea) and func_80706518's media-init
+     * recovery (sys_leo_dd.c). It is no longer reachable from the transient
+     * wiped-cache first-pass inside Mfs_ValidateRamVolume, which used to consume
+     * the armed one-shot spuriously and format from a stale/empty cache. So the
+     * one-shot can only be consumed when the on-disk volume is truly invalid. */
     if (CVarGetInteger("gEnhancements.Workshop.AllowDDFormatOnce", 0) != 0) {
         CVarSetInteger("gEnhancements.Workshop.AllowDDFormatOnce", 0);
         CVarSave();
@@ -538,9 +565,14 @@ int gdx_disk_allow_format(void) {
 }
 
 void gdx_disk_log_format_refused(void) {
-    /* Composite condition for the Workshop menu: this is only ever called after
-     * the EK format site observes N64DD_MEDIA_NOT_INIT (MFS area uninitialized)
-     * and gdx_disk_allow_format() returned 0. Latch it for the menu's button. */
+    /* Composite condition for the Workshop menu: this is only ever called from a
+     * genuinely terminal not-initialized site -- func_i1_80404830's second-pass
+     * failure (mfs_ram.c) or func_80706518's media-init recovery (sys_leo_dd.c) --
+     * after that site observes N64DD_MEDIA_NOT_INIT (MFS area truly uninitialized)
+     * and gdx_disk_allow_format() returned 0. It is NOT called from the transient
+     * wiped-cache first-pass validate, so the latch is truthful: it reflects a
+     * genuinely uninitialized disk with the format opt-in disarmed, never a
+     * normal mount's transient first-pass miss. Latch it for the menu's button. */
     g_formatRefusedThisBoot = true;
     static int logged = 0;
     if (logged) {

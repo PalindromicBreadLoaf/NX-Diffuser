@@ -3,6 +3,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -12,6 +13,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include <unistd.h>
 #endif
 
 // gdx_ck()/gdx_cki()/gdx_ckp()/gdx_seg_log()/gdx_addr_log() (see n64_sched.c) are per-frame,
@@ -35,10 +38,35 @@
    Error-class logging (crash handler, [transition] timings, boot/ROM/disk
    one-shots) calls gdx_port_logf directly and is always on in both configs. */
 /* GDX_DIAG_VERBOSE gate: the high-frequency per-frame diagnostic log families
-   ([gfxdiag], [game], [seg], [sched], [phasegeom], [bigtri]) are silenced by
-   default and re-enabled with GDX_DIAG_VERBOSE=1 (any non-"0" value). Defined
-   in n64_sched.c and cached there; declared here (and in global.h for decomp
-   sources) so the gate is callable from both the C++ bridge and decomp C. */
+   are silenced by default in BOTH Debug and Release and re-enabled with
+   GDX_DIAG_VERBOSE=1 (any non-"0" value). Defined in n64_sched.c and cached
+   there; declared here (and in global.h for decomp sources) so the gate is
+   callable from both the C++ bridge and decomp C.
+
+   Family -> gate mapping (a tester sets GDX_DIAG_VERBOSE=1 to reveal the
+   "verbose" families for a bug report; error/one-shot families are always on):
+
+   Gated behind GDX_DIAG_VERBOSE=1 (silent by default):
+     n64_sched.c    : [gfxdiag] [game] [seg] [sched] [phasegeom] [bigtri]
+     n64_gfx_bridge : [geodiag] [gpustate] [gfxfail] (per-frame aggregate)
+                      [datafail] [tex-census] [ci-dump] [dl-census]
+                      [seg-dl] (successful repoint) [seg-dl-race] [seed] (quad probe)
+
+   Always on (bounded and/or error/one-shot, high signal for bug reports):
+     [bridge-init]  one-shot boot state
+     [segment]      mode-transition cadence (venue segment loads)
+     [stub-miss]    bounded to 24 unique SETTIMG module pointers
+     [gdl-miss]     error family, per-phase budget: race 400 / non-race 40
+     [gdl-bad]      error family, per-phase budget: race 400 / non-race 40
+     [gfxfail] ROOT rejected  bounded to 16 (frame-skip crash failsafe)
+     [seg-dl] moveword FAILED bounded to 24 (untranslatable repoint = garbage)
+     [seed] boot-logo config  one-shot launch/env state
+     [transition]/[gdxcap]/[dump]/[vifallback] boot/capture one-shots
+
+   Not modified here (already env-gated or tightly bounded, did not flood):
+     [setupdl] (GDX_DIAG_SETUPDL + cap 40), [trect] (cap 8),
+     [vtx-*]/[mtx-*]/[texdiag]/[resolve-fail]/[signext] (small per-cause caps),
+     [transition-cap] (cap 8), GDX_DIAG_SETTIMG race trace (env-gated). */
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -64,6 +92,81 @@ static inline int gdx_trace_enabled(void) {
     return sCached;
 }
 
+// Opt-in gate for the persistent gdiffuser-run.log file sink. File logging is
+// OFF by default (a normal play session must not silently create/append a log
+// at the process CWD, which for shortcuts/packaged installs may be write-
+// protected). It is enabled when any diagnostic mode is requested via env:
+//   GDX_LOG          (=1 / any non-"0" value)  -- dedicated file-log opt-in
+//   GDX_TRACE        (set to any non-"0" value) -- high-frequency trace mode
+//   GDX_DIAG_VERBOSE (set to any non-"0" value) -- verbose diagnostic families
+//   GDX_DIAG_UNLOCK  (set to any non-"0" value) -- unlock-code/audio path only
+// Checked once and static-cached (benign race: every thread computes the same
+// value), matching gdx_trace_enabled() above. The always-on stderr /
+// OutputDebugStringA sinks are unaffected by this gate.
+static inline int gdx_log_file_enabled(void) {
+    static int sCached = -1;
+    if (sCached < 0) {
+        int enabled = 0;
+        const char* log = getenv("GDX_LOG");
+        const char* trace = getenv("GDX_TRACE");
+        const char* diag = getenv("GDX_DIAG_VERBOSE");
+        const char* unlock = getenv("GDX_DIAG_UNLOCK");
+        if (log != NULL && log[0] != '\0' && log[0] != '0') {
+            enabled = 1;
+        } else if (trace != NULL && trace[0] != '\0' && trace[0] != '0') {
+            enabled = 1;
+        } else if (diag != NULL && diag[0] != '\0' && diag[0] != '0') {
+            enabled = 1;
+        } else if (unlock != NULL && unlock[0] != '\0' && unlock[0] != '0') {
+            enabled = 1;
+        }
+        sCached = enabled;
+    }
+    return sCached;
+}
+
+// Resolve "<exe dir>/gdiffuser-run.log" into outPath (the exe-relative saves
+// convention sram_buffer.cpp already uses). Falls back to the bare CWD-relative
+// filename if the exe path is unavailable or does not fit -- acceptable now that
+// file logging is opt-in. Returns outPath.
+static inline const char* gdx_log_file_path(char* outPath, size_t outCap) {
+    const char* fileName = "gdiffuser-run.log";
+#ifdef _WIN32
+    {
+        DWORD n = GetModuleFileNameA(NULL, outPath, (DWORD)outCap);
+        if (n > 0 && n < outCap) {
+            char* slash = strrchr(outPath, '\\');
+            if (slash != NULL) {
+                slash[1] = '\0';
+                if (strlen(outPath) + strlen(fileName) < outCap) {
+                    strcat(outPath, fileName);
+                    return outPath;
+                }
+            }
+        }
+    }
+#else
+    {
+        ssize_t rl = readlink("/proc/self/exe", outPath, outCap - 1);
+        if (rl > 0 && (size_t)rl < outCap) {
+            outPath[rl] = '\0';
+            char* slash = strrchr(outPath, '/');
+            if (slash != NULL &&
+                (size_t)(slash - outPath) + 1 + strlen(fileName) < outCap) {
+                strcpy(slash + 1, fileName);
+                return outPath;
+            }
+        }
+    }
+#endif
+    if (strlen(fileName) < outCap) {
+        strcpy(outPath, fileName);
+    } else if (outCap > 0) {
+        outPath[0] = '\0';
+    }
+    return outPath;
+}
+
 // Safe logging that works from any thread/fiber context.
 // Avoids fopen/fclose per-call which causes heap corruption in Debug CRT
 // when called from the GFX fiber (the CRT's internal dynamic buffer
@@ -76,11 +179,16 @@ static inline void gdx_port_write_log(const char* message) {
 #ifdef _WIN32
     OutputDebugStringA(message);
     // GUI-subsystem builds have no console. Keep a lightweight file sink so boot
-    // diagnostics remain available without reopening the file on every log call.
-    {
+    // diagnostics remain available without reopening the file on every log call
+    // -- but only when opt-in diagnostics are requested (see gdx_log_file_enabled).
+    if (gdx_log_file_enabled()) {
         static HANDLE sLogFile = INVALID_HANDLE_VALUE;
-        if (sLogFile == INVALID_HANDLE_VALUE) {
-            sLogFile = CreateFileA("gdiffuser-run.log", FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+        static int sTriedOpen = 0;
+        if (!sTriedOpen) {
+            sTriedOpen = 1;
+            char logPath[MAX_PATH];
+            gdx_log_file_path(logPath, sizeof(logPath));
+            sLogFile = CreateFileA(logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
                                    OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         }
         if (sLogFile != INVALID_HANDLE_VALUE) {
@@ -92,6 +200,23 @@ static inline void gdx_port_write_log(const char* message) {
     fputs(message, stderr);
     fflush(stderr);
 #else
+    // Opt-in persistent file sink (mirrors the Windows path; stderr is always on).
+    if (gdx_log_file_enabled()) {
+        static FILE* sLogFile = NULL;
+        static int sTriedOpen = 0;
+        if (!sTriedOpen) {
+            sTriedOpen = 1;
+            char logPath[4096];
+            gdx_log_file_path(logPath, sizeof(logPath));
+            if (logPath[0] != '\0') {
+                sLogFile = fopen(logPath, "ab");
+            }
+        }
+        if (sLogFile != NULL) {
+            fputs(message, sLogFile);
+            fflush(sLogFile);
+        }
+    }
     fputs(message, stderr);
     fflush(stderr);
 #endif

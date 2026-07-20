@@ -3,13 +3,8 @@
 #include <imgui.h>
 
 #include <algorithm>
-#include <array>
 #include <cmath>
-#include <cstdio>
-#include <memory>
-#include <string>
 
-#include "fast/Fast3dGui.h"
 #include "libultraship/bridge/consolevariablebridge.h"
 #include "ship/Context.h"
 #include "ship/window/Window.h"
@@ -38,52 +33,22 @@ constexpr int kOutlineAlways = 0;
 constexpr int kOutlineWhileReleased = 1;
 constexpr int kOutlineWhilePressed = 2;
 constexpr int kOutlineNever = 3;
-constexpr float kTextureWidth = 327.0f;
-constexpr float kTextureHeight = 175.0f;
+constexpr float kCanvasWidth = 360.0f;
+constexpr float kCanvasHeight = 196.0f;
 constexpr float kMaximumAxis = 80.0f;
-
-struct TextureLayer {
-    const char* name;
-    const char* path;
-};
-
-constexpr std::array<TextureLayer, 31> kTextureLayers = {{
-    { "Gdx-IV-Background", "textures/buttons/InputViewerBackground.png" },
-    { "Gdx-IV-A", "textures/buttons/ABtn.png" },
-    { "Gdx-IV-A-Outline", "textures/buttons/ABtnOutline.png" },
-    { "Gdx-IV-B", "textures/buttons/BBtn.png" },
-    { "Gdx-IV-B-Outline", "textures/buttons/BBtnOutline.png" },
-    { "Gdx-IV-L", "textures/buttons/LBtn.png" },
-    { "Gdx-IV-L-Outline", "textures/buttons/LBtnOutline.png" },
-    { "Gdx-IV-R", "textures/buttons/RBtn.png" },
-    { "Gdx-IV-R-Outline", "textures/buttons/RBtnOutline.png" },
-    { "Gdx-IV-Z", "textures/buttons/ZBtn.png" },
-    { "Gdx-IV-Z-Outline", "textures/buttons/ZBtnOutline.png" },
-    { "Gdx-IV-Start", "textures/buttons/StartBtn.png" },
-    { "Gdx-IV-Start-Outline", "textures/buttons/StartBtnOutline.png" },
-    { "Gdx-IV-CLeft", "textures/buttons/CLeft.png" },
-    { "Gdx-IV-CLeft-Outline", "textures/buttons/CLeftOutline.png" },
-    { "Gdx-IV-CRight", "textures/buttons/CRight.png" },
-    { "Gdx-IV-CRight-Outline", "textures/buttons/CRightOutline.png" },
-    { "Gdx-IV-CUp", "textures/buttons/CUp.png" },
-    { "Gdx-IV-CUp-Outline", "textures/buttons/CUpOutline.png" },
-    { "Gdx-IV-CDown", "textures/buttons/CDown.png" },
-    { "Gdx-IV-CDown-Outline", "textures/buttons/CDownOutline.png" },
-    { "Gdx-IV-Analog", "textures/buttons/AnalogStick.png" },
-    { "Gdx-IV-Analog-Outline", "textures/buttons/AnalogStickOutline.png" },
-    { "Gdx-IV-DLeft", "textures/buttons/DPadLeft.png" },
-    { "Gdx-IV-DLeft-Outline", "textures/buttons/DPadLeftOutline.png" },
-    { "Gdx-IV-DRight", "textures/buttons/DPadRight.png" },
-    { "Gdx-IV-DRight-Outline", "textures/buttons/DPadRightOutline.png" },
-    { "Gdx-IV-DUp", "textures/buttons/DPadUp.png" },
-    { "Gdx-IV-DUp-Outline", "textures/buttons/DPadUpOutline.png" },
-    { "Gdx-IV-DDown", "textures/buttons/DPadDown.png" },
-    { "Gdx-IV-DDown-Outline", "textures/buttons/DPadDownOutline.png" },
-}};
 
 bool ShouldDrawOutline(int mode, bool pressed) {
     return mode == kOutlineAlways || (mode == kOutlineWhileReleased && !pressed) ||
            (mode == kOutlineWhilePressed && pressed);
+}
+
+ImU32 Color(int r, int g, int b, float alpha, float opacity) {
+    const int a = std::clamp(static_cast<int>(std::round(alpha * opacity * 255.0f)), 0, 255);
+    return IM_COL32(r, g, b, a);
+}
+
+ImVec2 Add(const ImVec2& a, const ImVec2& b) {
+    return ImVec2(a.x + b.x, a.y + b.y);
 }
 
 } // namespace
@@ -94,19 +59,17 @@ GdxInputViewer::GdxInputViewer() : Ship::GuiWindow("gOpenWindows.InputViewer", f
     CVarRegisterInteger("gInputViewer.EnableDragging", 1);
     CVarRegisterInteger("gInputViewer.ShowBackground", 1);
     CVarRegisterInteger("gInputViewer.ShowAnalogValues", 0);
-    CVarRegisterInteger("gInputViewer.ShowDpad", 0);
+    CVarRegisterInteger("gInputViewer.ShowDpad", 1);
     CVarRegisterInteger("gInputViewer.ButtonOutlineMode", kOutlineWhileReleased);
     CVarRegisterInteger("gInputViewer.StyleVersion", 0);
 
-    // The previous vector prototype had a boxed top-left layout and different defaults. Migrate it
-    // once so existing users immediately receive SoH's lower-right transparent presentation.
-    if (CVarGetInteger("gInputViewer.StyleVersion", 0) < 1) {
+    if (CVarGetInteger("gInputViewer.StyleVersion", 0) < 3) {
         CVarSetFloat("gInputViewer.Opacity", 1.0f);
         CVarSetInteger("gInputViewer.ShowBackground", 1);
         CVarSetInteger("gInputViewer.ShowAnalogValues", 0);
-        CVarSetInteger("gInputViewer.ShowDpad", 0);
+        CVarSetInteger("gInputViewer.ShowDpad", 1);
         CVarSetInteger("gInputViewer.ButtonOutlineMode", kOutlineWhileReleased);
-        CVarSetInteger("gInputViewer.StyleVersion", 1);
+        CVarSetInteger("gInputViewer.StyleVersion", 3);
 
         auto context = Ship::Context::GetInstance();
         if (context != nullptr && context->GetWindow() != nullptr && context->GetWindow()->GetGui() != nullptr) {
@@ -131,33 +94,17 @@ void GdxInputViewer::Draw() {
 }
 
 void GdxInputViewer::DrawElement() {
-    auto context = Ship::Context::GetInstance();
-    if (context == nullptr || context->GetWindow() == nullptr) {
-        return;
-    }
-    auto gui = std::dynamic_pointer_cast<Fast::Fast3dGui>(context->GetWindow()->GetGui());
-    if (gui == nullptr) {
-        return;
-    }
-
-    if (!mTexturesLoaded) {
-        for (const TextureLayer& layer : kTextureLayers) {
-            gui->LoadTextureFromRawImage(layer.name, layer.path);
-        }
-        mTexturesLoaded = true;
-    }
-
     const float scale = std::clamp(CVarGetFloat("gInputViewer.Scale", 1.0f), 0.5f, 2.5f);
     const float opacity = std::clamp(CVarGetFloat("gInputViewer.Opacity", 1.0f), 0.2f, 1.0f);
     const bool showAnalogValues = CVarGetInteger("gInputViewer.ShowAnalogValues", 0) != 0;
-    const ImVec2 textureSize(kTextureWidth * scale, kTextureHeight * scale);
+    const ImVec2 canvasSize(kCanvasWidth * scale, kCanvasHeight * scale);
     const float valuesHeight = showAnalogValues ? ImGui::GetTextLineHeightWithSpacing() : 0.0f;
-    const ImVec2 windowSize(textureSize.x + 20.0f, textureSize.y + valuesHeight + 20.0f);
+    const ImVec2 windowSize(canvasSize.x + 20.0f, canvasSize.y + valuesHeight + 20.0f);
     ImGuiViewport* viewport = ImGui::GetMainViewport();
 
     ImGui::SetNextWindowSize(windowSize, ImGuiCond_Always);
-    ImGui::SetNextWindowContentSize(ImVec2(textureSize.x, textureSize.y + valuesHeight));
-    ImGui::SetNextWindowPos(viewport->WorkPos + viewport->WorkSize - textureSize - ImVec2(30.0f, 30.0f),
+    ImGui::SetNextWindowContentSize(ImVec2(canvasSize.x, canvasSize.y + valuesHeight));
+    ImGui::SetNextWindowPos(viewport->WorkPos + viewport->WorkSize - canvasSize - ImVec2(30.0f, 30.0f),
                             ImGuiCond_FirstUseEver);
 
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar |
@@ -169,22 +116,31 @@ void GdxInputViewer::DrawElement() {
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    if (ImGui::Begin("Input Viewer##GdxSohOverlayV2", nullptr, flags)) {
+    if (ImGui::Begin("Input Viewer##GdxPrimitiveOverlay", nullptr, flags)) {
         ImGui::SetCursorPos(ImVec2(10.0f, 10.0f));
         const ImVec2 origin = ImGui::GetCursorScreenPos();
-        ImDrawList* drawList = ImGui::GetWindowDrawList();
-        const ImU32 tint = IM_COL32(255, 255, 255, static_cast<int>(std::round(opacity * 255.0f)));
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        auto point = [&](float x, float y) { return Add(origin, ImVec2(x * scale, y * scale)); };
 
-        auto drawLayer = [&](const char* name, ImVec2 offset = ImVec2(0.0f, 0.0f)) {
-            ImTextureID texture = gui->GetTextureByName(name);
-            if (texture != nullptr) {
-                drawList->AddImage(texture, origin + offset, origin + offset + textureSize, ImVec2(0.0f, 0.0f),
-                                   ImVec2(1.0f, 1.0f), tint);
-            }
-        };
+        const ImU32 outline = Color(218, 223, 230, 0.86f, opacity);
+        const ImU32 muted = Color(143, 151, 163, 0.72f, opacity);
+        const ImU32 label = Color(245, 247, 250, 0.96f, opacity);
+        const ImU32 darkLabel = Color(24, 28, 34, 0.95f, opacity);
+        const ImU32 active = Color(80, 171, 218, 0.95f, opacity);   // A button + analog stick (N64 blue)
+        const ImU32 bActive = Color(96, 188, 122, 0.95f, opacity);  // B button (N64 green)
+        const ImU32 cActive = Color(225, 190, 76, 0.95f, opacity);  // C buttons (N64 yellow)
+        const ImU32 startActive = Color(207, 103, 92, 0.95f, opacity); // Start (N64 red)
+        const ImU32 neutral = Color(150, 159, 173, 0.95f, opacity); // L / R / Z / D-pad (N64 grey)
+        const float thickness = 1.5f * scale < 1.0f ? 1.0f : 1.5f * scale;
 
         if (CVarGetInteger("gInputViewer.ShowBackground", 1) != 0) {
-            drawLayer("Gdx-IV-Background");
+            draw->AddRectFilled(point(0.0f, 0.0f), point(kCanvasWidth, kCanvasHeight),
+                                Color(20, 24, 30, 0.78f, opacity), 10.0f * scale);
+            draw->AddRect(point(0.0f, 0.0f), point(kCanvasWidth, kCanvasHeight),
+                          Color(255, 255, 255, 0.12f, opacity), 10.0f * scale, 0, thickness);
+            draw->AddText(point(14.0f, 10.0f), muted, "INPUT");
+            draw->AddLine(point(14.0f, 31.0f), point(346.0f, 31.0f),
+                          Color(255, 255, 255, 0.10f, opacity), thickness);
         }
 
         unsigned short buttons = 0;
@@ -194,44 +150,100 @@ void GdxInputViewer::DrawElement() {
         const int outlineMode = std::clamp(CVarGetInteger("gInputViewer.ButtonOutlineMode", kOutlineWhileReleased),
                                            kOutlineAlways, kOutlineNever);
 
-        auto drawButton = [&](const char* active, const char* outline, unsigned short mask) {
+        auto centeredText = [&](ImVec2 center, const char* text, ImU32 color) {
+            const ImVec2 size = ImGui::CalcTextSize(text);
+            draw->AddText(ImVec2(center.x - size.x * 0.5f, center.y - size.y * 0.5f), color, text);
+        };
+
+        auto circleButton = [&](float x, float y, float radius, const char* text, unsigned short mask,
+                                ImU32 fill, ImU32 textColor) {
             const bool pressed = (buttons & mask) != 0;
-            if (ShouldDrawOutline(outlineMode, pressed)) {
-                drawLayer(outline);
-            }
+            const ImVec2 center = point(x, y);
             if (pressed) {
-                drawLayer(active);
+                draw->AddCircleFilled(center, radius * scale, fill, 24);
+            }
+            if (ShouldDrawOutline(outlineMode, pressed)) {
+                draw->AddCircle(center, radius * scale, outline, 24, thickness);
+            }
+            if (pressed || ShouldDrawOutline(outlineMode, pressed)) {
+                centeredText(center, text, pressed ? textColor : outline);
             }
         };
 
-        drawButton("Gdx-IV-B", "Gdx-IV-B-Outline", kButtonB);
-        drawButton("Gdx-IV-A", "Gdx-IV-A-Outline", kButtonA);
-        drawButton("Gdx-IV-CUp", "Gdx-IV-CUp-Outline", kCUp);
-        drawButton("Gdx-IV-CLeft", "Gdx-IV-CLeft-Outline", kCLeft);
-        drawButton("Gdx-IV-CRight", "Gdx-IV-CRight-Outline", kCRight);
-        drawButton("Gdx-IV-CDown", "Gdx-IV-CDown-Outline", kCDown);
-        drawButton("Gdx-IV-L", "Gdx-IV-L-Outline", kButtonL);
-        drawButton("Gdx-IV-R", "Gdx-IV-R-Outline", kButtonR);
-        drawButton("Gdx-IV-Z", "Gdx-IV-Z-Outline", kButtonZ);
-        drawButton("Gdx-IV-Start", "Gdx-IV-Start-Outline", kButtonStart);
+        auto rectButton = [&](float x1, float y1, float x2, float y2, const char* text,
+                              unsigned short mask, ImU32 fill) {
+            const bool pressed = (buttons & mask) != 0;
+            const ImVec2 min = point(x1, y1);
+            const ImVec2 max = point(x2, y2);
+            if (pressed) {
+                draw->AddRectFilled(min, max, fill, 5.0f * scale);
+            }
+            if (ShouldDrawOutline(outlineMode, pressed)) {
+                draw->AddRect(min, max, outline, 5.0f * scale, 0, thickness);
+            }
+            if (pressed || ShouldDrawOutline(outlineMode, pressed)) {
+                centeredText(ImVec2((min.x + max.x) * 0.5f, (min.y + max.y) * 0.5f), text,
+                             pressed ? label : outline);
+            }
+        };
 
-        if (CVarGetInteger("gInputViewer.ShowDpad", 0) != 0) {
-            drawButton("Gdx-IV-DLeft", "Gdx-IV-DLeft-Outline", kDpadLeft);
-            drawButton("Gdx-IV-DRight", "Gdx-IV-DRight-Outline", kDpadRight);
-            drawButton("Gdx-IV-DUp", "Gdx-IV-DUp-Outline", kDpadUp);
-            drawButton("Gdx-IV-DDown", "Gdx-IV-DDown-Outline", kDpadDown);
-        }
+        // Shoulder triggers (top corners) + Start (centre) + Z (bottom centre). All are
+        // grey on the real controller except Start, which is red.
+        rectButton(18.0f, 42.0f, 92.0f, 63.0f, "L", kButtonL, neutral);
+        rectButton(268.0f, 42.0f, 342.0f, 63.0f, "R", kButtonR, neutral);
+        rectButton(162.0f, 74.0f, 200.0f, 95.0f, "START", kButtonStart, startActive);
+        rectButton(166.0f, 166.0f, 196.0f, 186.0f, "Z", kButtonZ, neutral);
 
-        drawLayer("Gdx-IV-Analog-Outline");
-        constexpr float kAnalogMovement = 12.0f;
+        // Right-hand face buttons: A (blue, larger, lower) with B (green) to its upper-left,
+        // and the C-button diamond (yellow) above.
+        circleButton(298.0f, 146.0f, 20.0f, "A", kButtonA, active, label);
+        circleButton(254.0f, 120.0f, 15.0f, "B", kButtonB, bActive, label);
+        circleButton(302.0f, 76.0f, 10.0f, "C", kCUp, cActive, darkLabel);
+        circleButton(282.0f, 94.0f, 10.0f, "C", kCLeft, cActive, darkLabel);
+        circleButton(322.0f, 94.0f, 10.0f, "C", kCRight, cActive, darkLabel);
+        circleButton(302.0f, 112.0f, 10.0f, "C", kCDown, cActive, darkLabel);
+
+        // Analog stick: left-centre, on the central prong.
+        const ImVec2 analogCenter = point(82.0f, 104.0f);
+        draw->AddCircle(analogCenter, 27.0f * scale, outline, 32, thickness);
+        draw->AddLine(point(57.0f, 104.0f), point(107.0f, 104.0f), Color(255, 255, 255, 0.12f, opacity),
+                      thickness);
+        draw->AddLine(point(82.0f, 80.0f), point(82.0f, 128.0f), Color(255, 255, 255, 0.12f, opacity),
+                      thickness);
+        constexpr float kAnalogMovement = 15.0f;
         const ImVec2 analogOffset(kAnalogMovement * (static_cast<float>(stickX) / kMaximumAxis) * scale,
                                   -kAnalogMovement * (static_cast<float>(stickY) / kMaximumAxis) * scale);
-        drawLayer("Gdx-IV-Analog", analogOffset);
+        draw->AddCircleFilled(Add(analogCenter, analogOffset), 10.0f * scale,
+                              (stickX != 0 || stickY != 0) ? active : muted, 24);
+
+        // D-pad cluster: classic plus-shape tucked into the left grip, below-left of the
+        // stick. Center hub is always drawn; each arm outlines when released and fills
+        // (grey) when its bit is pressed, matching the pressed=filled convention above.
+        if (CVarGetInteger("gInputViewer.ShowDpad", 1) != 0) {
+            const float dpadRound = 2.0f * scale;
+            auto dpadArm = [&](float x1, float y1, float x2, float y2, unsigned short mask) {
+                const bool pressed = (buttons & mask) != 0;
+                if (pressed) {
+                    draw->AddRectFilled(point(x1, y1), point(x2, y2), neutral, dpadRound);
+                }
+                if (ShouldDrawOutline(outlineMode, pressed)) {
+                    draw->AddRect(point(x1, y1), point(x2, y2), outline, dpadRound, 0, thickness);
+                }
+            };
+            // Center hub (35.5,151.5)-(48.5,164.5); arms extend 15px on each axis.
+            dpadArm(35.5f, 136.5f, 48.5f, 151.5f, kDpadUp);
+            dpadArm(35.5f, 164.5f, 48.5f, 179.5f, kDpadDown);
+            dpadArm(20.5f, 151.5f, 35.5f, 164.5f, kDpadLeft);
+            dpadArm(48.5f, 151.5f, 63.5f, 164.5f, kDpadRight);
+            draw->AddRectFilled(point(35.5f, 151.5f), point(48.5f, 164.5f),
+                                Color(255, 255, 255, 0.06f, opacity), dpadRound);
+            draw->AddRect(point(35.5f, 151.5f), point(48.5f, 164.5f), outline, dpadRound, 0, thickness);
+        }
 
         ImGui::SetCursorPos(ImVec2(10.0f, 10.0f));
-        ImGui::InvisibleButton("##GdxInputViewerCanvas", textureSize);
+        ImGui::InvisibleButton("##GdxInputViewerCanvas", canvasSize);
         if (showAnalogValues) {
-            ImGui::SetCursorPos(ImVec2(20.0f, textureSize.y + 10.0f));
+            ImGui::SetCursorPos(ImVec2(20.0f, canvasSize.y + 10.0f));
             ImGui::Text("Stick  X %+d   Y %+d", static_cast<int>(stickX), static_cast<int>(stickY));
         }
     }

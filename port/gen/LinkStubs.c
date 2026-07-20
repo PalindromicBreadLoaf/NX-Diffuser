@@ -103,7 +103,7 @@ unsigned char framebuffer_unused_VRAM_END[1];
    written by segment.c's PORT block -- the UI texture streamer's base).
    Sizes: gActiveFireworks s16; gArenaStartPtrs uintptr_t[ARENA_COUNT=4] at the
    64-bit PORT pointer width; gMfsError s32; sFireworksType s32 (below). */
-unsigned char gActiveFireworks[2];
+/* gActiveFireworks: real definition now compiles in ending_effects.c (stub removed 2026-07-18). */
 unsigned char gArenaStartPtrs[0x20];
 unsigned char gMfsError[4];
 /* gSettingSoundMode (s16) and gSramPiHandlePtr (OSPiHandle*) are real now:
@@ -186,7 +186,7 @@ unsigned char records_VRAM[1];
 unsigned char records_VRAM_END[1];
 unsigned char rspbootTextEnd[1];
 unsigned char rspbootTextStart[1];
-unsigned char sFireworksType[4]; /* s32; see data-stub real-sizing note above */
+/* sFireworksType: real definition now compiles in ending_effects.c (stub removed 2026-07-18). */
 unsigned char setup_gfx_ROM_END[1];
 unsigned char setup_gfx_ROM_START[1];
 unsigned char setup_gfx_VRAM[1];
@@ -206,10 +206,8 @@ long D_i1_80428618() { return 0; }
    callers ASSIGN the return to their gfx cursor (ending.c / background.c:1079)
    — returning 0 made the caller write through NULL (cup-finish crash).
    Pass the cursor through unchanged: effects are skipped, list stays valid. */
-void* EndingCutsceneEffects_DrawFireworks(void* gfx) { return gfx; }
-void* EndingCutsceneEffects_DrawPodiumRacerCharacters(void* gfx) { return gfx; }
-long EndingCutsceneEffects_Init() { return 0; }
-long EndingCutsceneEffects_Update() { return 0; }
+/* EndingCutsceneEffects_*: real implementations now compile in ending_effects.c
+   (stubs removed 2026-07-18 — the TU's build exclusion was lifted; see port/CMakeLists.txt). */
 /* With the Expansion Kit enabled these come from the real implementations:
    Leo* from port/n64_leo.c + decomp leo/lib pure files, Mfs_* from the
    decomp's leo/mfs filesystem. Keep the no-op stubs only for the US-only

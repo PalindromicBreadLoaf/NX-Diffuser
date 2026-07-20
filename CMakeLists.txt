@@ -26,6 +26,10 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_subdirectory(libultraship)     # runtime + Fast3D renderer
 add_subdirectory(port)             # game glue + decomp sources + G-Diffuser executable
 #
-# Asset extraction (Torch) is driven as a build step against the user-supplied ROM.
+# Asset extraction: port/CMakeLists.txt builds the standalone `gdx-extract` (a trimmed,
+# deterministic Torch, BUILD_STORMLIB=OFF) as an isolated ExternalProject and deploys it
+# plus the decomp-recipes/ tree beside the executable. First-boot spawns it against the
+# user-supplied ROM to produce generic.o2r. Build directly with:
+#   cmake --build <build> --target gdx-extract
 
 message(STATUS "G-Diffuser: libultraship wired via add_subdirectory.")

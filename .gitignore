@@ -24,6 +24,7 @@ torch.hash.yml
 /port/gen/
 baserom*
 *.z64
+*.n64
 *.ndd
 *.z64dd
 

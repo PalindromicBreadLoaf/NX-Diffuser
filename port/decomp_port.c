@@ -100,6 +100,40 @@ void gdx_rdram_init(void) {
         extern unsigned char gAudioHeap[];
         gdx_register_host_range(gAudioHeap, (size_t)0x2ECA00 * 4);
     }
+    // Venue material texture banks (road/wall/pipe/cylinder). course.c's
+    // TRACK_SHAPE_* material tables (D_800CF528 / D_800CF608 / D_800CF668 / ...)
+    // store native pointers to these 1-byte .bss placeholder symbols
+    // (port/gen/LinkStubs.c). At draw time the gfx bridge re-routes each to its
+    // decoded per-venue segment image via ResolveVenueBankAlias, but only after
+    // the pointer is recognized as a known host range. On Windows the module-range
+    // reconstruction happened to cover this .bss tail; on Linux PIE it does not
+    // reach it (the same defect proven for gAudioHeap above), so the banks read as
+    // the raw zero stub byte and the track floor/walls/pipes rendered solid black.
+    // Register each bank explicitly so resolution is platform-independent. The
+    // symbols are consecutive in .bss only by linker accident and LinkStubs.c
+    // exposes no begin/end markers, so register each at its true 1-byte size rather
+    // than assuming a contiguous span. This is exactly the set course.c references
+    // and that ResolveVenueBankAlias enumerates (D_A000000..D_A008000).
+    {
+        extern unsigned char D_A000000[];
+        extern unsigned char D_A001000[];
+        extern unsigned char D_A002000[];
+        extern unsigned char D_A003000[];
+        extern unsigned char D_A004000[];
+        extern unsigned char D_A005000[];
+        extern unsigned char D_A006000[];
+        extern unsigned char D_A007000[];
+        extern unsigned char D_A008000[];
+        gdx_register_host_range(D_A000000, 1);
+        gdx_register_host_range(D_A001000, 1);
+        gdx_register_host_range(D_A002000, 1);
+        gdx_register_host_range(D_A003000, 1);
+        gdx_register_host_range(D_A004000, 1);
+        gdx_register_host_range(D_A005000, 1);
+        gdx_register_host_range(D_A006000, 1);
+        gdx_register_host_range(D_A007000, 1);
+        gdx_register_host_range(D_A008000, 1);
+    }
 
     {
         extern void gdx_cki(const char*, int);
@@ -218,6 +252,10 @@ static int gdx_rdram_baseline_set = 0;
    value = decoded buffer pointer; count D_800E3A20). func_80077D44() invalidates
    it by zeroing the count only — cheap and safe to call on every rewind. */
 extern void func_80077D44(void);
+/* libultraship export (interpreter.cpp): drops every entry in the Fast3D texture
+   cache so the next upload re-decodes from CPU memory. Same extern approach as
+   port/gdx_workshop.cpp's hot-reload caller. */
+extern void gfx_texture_cache_clear(void);
 #endif
 
 void gdx_rdram_mode_reset(void) {
@@ -247,6 +285,20 @@ void gdx_rdram_mode_reset(void) {
        regardless of which decomp path triggered the transition — no cache entry can
        ever outlive the memory it points into. */
     func_80077D44();
+
+    /* Belt-and-suspenders for the whole "stale GPU texture at a reused arena
+       address" class (minimap outline, decoded glyphs, decoded UI): the Fast3D
+       texture cache keys some formats by address alone, so a rewind that re-hands
+       an address to different content would keep serving the previous upload.
+       A full clear here forces every subsequent upload to re-decode. Mode
+       transitions are infrequent, so the cost is negligible. This complements the
+       format-specific content-hash work done in the interpreter.
+       Guarded by timing rather than a per-call interpreter null-check (a C TU
+       cannot inspect the C++ interpreter instance): this rewind branch runs only
+       after the baseline call above, i.e. on a real game-mode transition, by which
+       point the renderer is live — the same call-site-timing guarantee that
+       gdx_workshop.cpp's hot-reload caller relies on. */
+    gfx_texture_cache_clear();
 #endif
 }
 
@@ -512,6 +564,11 @@ extern uintptr_t gGdxMachineModelsVramStart;
 extern uintptr_t gGdxMachineModelsVramEnd;
 extern uintptr_t gGdxCourseEditTexturesVramStart;
 extern uintptr_t gGdxCourseEditTexturesVramEnd;
+/* Segment 5 (podium_gfx) carve markers. Declared in sys_gfx.c but NEVER assigned
+ * a real backing buffer in that file's PORT block (unlike seg 4/7/9), so gSegments[5]
+ * stayed null on the port -- the GP-ending seg-5 DL drop (see gdx_activate_podium_segment5). */
+extern uintptr_t gSegment2738A0VramStart;
+extern uintptr_t gSegment2738A0VramEnd;
 
 /* Deep-audit / Phase 4 hitch fix: gSegment1B8550 (seg4) and gSegment1E23F0 (seg7) are two FIXED
    host buffers reused across every mode transition -- only their CONTENT rotates among a small,
@@ -554,6 +611,15 @@ extern void gdx_fixup_asset_segment_image(unsigned char segment, unsigned int ro
                                            unsigned char* data, unsigned int size);
 extern void gdx_register_asset_segment_command_ranges(unsigned char segment, unsigned int rom_base,
                                                        unsigned char* data, unsigned int size);
+/* Segment-reload TOCTOU epoch (defined in n64_gfx_bridge.cpp). The graphics
+   thread reads gSegments[] and the seg-4/7/9 carve bytes with no lock while a
+   mode transition rewrites them here. Bracketing the reload with begin()/end()
+   makes the shared seqlock counter ODD for the duration, so a racing
+   graphics-thread resolution detects the window and skips the affected texture
+   for that one frame instead of consuming torn state (the Create Machine entry
+   strlen crash). See the epoch comment block in n64_gfx_bridge.cpp. */
+extern void gdx_segment_epoch_begin(void);
+extern void gdx_segment_epoch_end(void);
 #ifdef EXPANSION_KIT
 extern unsigned char* gdx_disk_buffer;
 extern unsigned int gdx_disk_size;
@@ -650,6 +716,16 @@ static int gdx_activate_machine_models_segment9(void) {
     Segment_SetAddress(9, gSegment22B0A0VramStart);
     sGdxSeg9Active = GDX_SEG9_CONTENT_MACHINE_MODELS;
     sGdxSeg9ActiveSize = capacity;
+    /* Segment-9 ceremony diagnostic: GP-ending cutscenes (GAMEMODE_GP_END_CS)
+       could silently drop vehicle models when this activation failed. Every
+       failure branch above already logs via gdx_ck; add the success line here so a
+       GP-ending run shows that machine_models was actually bound and for which
+       game mode. */
+    {
+        extern void gdx_cki(const char*, int);
+        gdx_cki("[segment] seg9 active=machine_models size", (int)sGdxSeg9ActiveSize);
+        gdx_cki("[segment] seg9 gameMode", (int)GET_MODE(gGameMode));
+    }
     return 1;
 }
 
@@ -737,6 +813,108 @@ int gdx_resolve_mode_segment9(unsigned int raw, size_t requiredBytes, uintptr_t*
     return 1;
 }
 
+/* Segment 5 is GP-ending-only ROM data: the podium body meshes (sPodiumDLs,
+ * ending.c) and the ending-venue building detail display lists, all reached via
+ * 0x05xxxxxx G_DL/segment tokens. The console loaders that owned it
+ * (Segment_SetupSegment5 + Segment_LoadSegment5, decomp/src/sys/segment.c) are
+ * excluded from the port build, and sys_gfx.c's PORT block carves buffers for
+ * segments 4/7/9 but not 5 -- so gSegments[5] was left null and every G_DL into
+ * segment 5 resolved to nothing (the ending "[gdl-bad] raw=05xxxxxx first=00000000
+ * w0=DE000000" burst): untextured white venue buildings and no podium.
+ *
+ * podium_gfx is MIO0-compressed in the cartridge ROM (matches the console
+ * `if (*(s32*)vram == 'MIO0') mio0Decode(...)` path). Mirror the seg-9
+ * machine_models activation: validate the MIO0 header, decode into a persistent
+ * RDRAM carve, apply the generated segment fixups + command-range registration
+ * (podium_gfx display lists carry 0x05xxxxxx internal pointers), and point
+ * gSegments[5] at the decoded image.
+ *
+ * Lifetime note: unlike the seg 4/7/9 carves (allocated at boot in sys_gfx.c,
+ * below the mode-reset baseline, hence rewind-protected), this buffer is carved
+ * lazily on the first ending -- AFTER the baseline is captured. gdx_rdram_alloc_raw
+ * memory would be rewound by gdx_rdram_mode_reset on the next mode change, so use
+ * gdx_rdram_persist_alloc_raw (bumps DOWN from the top of RDRAM, never rewound):
+ * the decoded podium image and its in-place fixups survive every mode transition
+ * for the whole session, and revisiting the ending only re-points gSegments[5]. */
+extern void* gdx_rdram_persist_alloc_raw(size_t size, size_t align);
+
+static unsigned char* sGdxSeg5PodiumBuf = NULL; /* host pointer into gdx_rdram (persist region) */
+static size_t sGdxSeg5PodiumSize = 0;
+static int sGdxSeg5Resident = 0;
+
+static int gdx_activate_podium_segment5(void) {
+    const size_t romStart = (size_t)PORT_podium_gfx_ROM_START;
+    unsigned int decodedSize;
+
+    if (gdx_rom_buffer == NULL || romStart + 8u > gdx_rom_size || gdx_rom_buffer[romStart + 0] != 'M' ||
+        gdx_rom_buffer[romStart + 1] != 'I' || gdx_rom_buffer[romStart + 2] != 'O' ||
+        gdx_rom_buffer[romStart + 3] != '0') {
+        gdx_ck("[segment] segment 5 podium_gfx source invalid (not MIO0)");
+        return 0;
+    }
+
+    /* Authoritative decoded size from the MIO0 header (big-endian u32 at +4), same
+     * check the seg-9 machine_models path uses -- a corrupt ROM could otherwise
+     * decompress past the carve. */
+    decodedSize = ((unsigned int)gdx_rom_buffer[romStart + 4] << 24) |
+                  ((unsigned int)gdx_rom_buffer[romStart + 5] << 16) |
+                  ((unsigned int)gdx_rom_buffer[romStart + 6] << 8) | (unsigned int)gdx_rom_buffer[romStart + 7];
+    if (decodedSize == 0u || decodedSize > 0x100000u) {
+        gdx_ck("[segment] segment 5 podium_gfx decoded size implausible");
+        return 0;
+    }
+
+    /* Carve once from the persist region; ROM data is immutable for the process
+     * lifetime, so the buffer and its fixups are reused on every later ending. */
+    if (sGdxSeg5PodiumBuf == NULL || sGdxSeg5PodiumSize < decodedSize) {
+        void* buf = gdx_rdram_persist_alloc_raw((size_t)decodedSize, 16u);
+        if (buf == NULL) {
+            gdx_ck("[segment] segment 5 podium_gfx carve alloc failed");
+            return 0;
+        }
+        sGdxSeg5PodiumBuf = (unsigned char*)buf;
+        sGdxSeg5PodiumSize = (size_t)decodedSize;
+        sGdxSeg5Resident = 0;
+    }
+
+    gSegment2738A0VramStart = (uintptr_t)(sGdxSeg5PodiumBuf - gdx_rdram);
+    gSegment2738A0VramEnd = gSegment2738A0VramStart + sGdxSeg5PodiumSize;
+
+    if (!sGdxSeg5Resident) {
+        mio0Decode(gdx_rom_buffer + romStart, sGdxSeg5PodiumBuf);
+        /* Rewrite the podium display lists' embedded 0x05xxxxxx pointers in place
+         * (idempotency matters: fixups are applied EXACTLY once, guarded by the
+         * resident flag -- double-fixup would corrupt the command words). */
+        gdx_fixup_asset_segment_image(0x05u, (unsigned int)PORT_podium_gfx_ROM_START, sGdxSeg5PodiumBuf,
+                                      (unsigned int)sGdxSeg5PodiumSize);
+        gdx_register_asset_segment_command_ranges(0x05u, (unsigned int)PORT_podium_gfx_ROM_START, sGdxSeg5PodiumBuf,
+                                                   (unsigned int)sGdxSeg5PodiumSize);
+        sGdxSeg5Resident = 1;
+        gdx_ck("[transition] seg5 reload: podium_gfx");
+    } else {
+        gdx_ck("[transition] seg5 reload skipped (podium_gfx resident)");
+    }
+
+    Segment_SetAddress(5, gSegment2738A0VramStart);
+    {
+        extern void gdx_cki(const char*, int);
+        gdx_cki("[segment] seg5 active=podium_gfx size", (int)sGdxSeg5PodiumSize);
+    }
+    return 1;
+}
+
+static void gdx_load_segment5_for_mode(void) {
+    switch (GET_MODE(gGameMode)) {
+        case GAMEMODE_GP_END_CS:
+            gdx_activate_podium_segment5();
+            break;
+        default:
+            /* Non-ending modes never own segment 5; leave gSegments[5]/the carve
+             * untouched (matches the console Segment_SetupSegment5 default path). */
+            break;
+    }
+}
+
 static void gdx_load_mode_segments(void) {
     extern void gdx_cki(const char*, int);
     size_t hudSize = (size_t)(PORT_hud_gfx_ROM_END - PORT_hud_gfx_ROM_START);
@@ -748,6 +926,15 @@ static void gdx_load_mode_segments(void) {
         (size_t)(PORT_expansion_kit_textures_beta_ROM_END - PORT_expansion_kit_textures_beta_ROM_START);
     size_t seg7EkSize = (ekTexturesSize <= machineGlobalSize) ? ekTexturesSize : machineGlobalSize;
     static int sModeSegLogs = 0;
+
+    /* Open the segment-reload epoch window BEFORE any base swap or carve rewrite.
+       Everything below -- Dma_LoadAssets/mio0Decode into the carves,
+       gdx_fixup_asset_segment_image in-place rewrites, and the Segment_SetAddress
+       gSegments[] base swaps for segments 4/7/9 -- mutates state the graphics
+       thread reads unsynchronized. Non-nested: this is the single top-level
+       mode-transition reload path (gdx_load_segment9_for_mode is called inside
+       and never re-enters here). */
+    gdx_segment_epoch_begin();
 
     switch (GET_MODE(gGameMode)) {
         case GAMEMODE_GP_RACE:
@@ -791,6 +978,15 @@ static void gdx_load_mode_segments(void) {
     }
 
     gdx_load_segment9_for_mode();
+    /* Segment 5 (podium_gfx) is GP-ending-only; mutated inside the same epoch
+       window as the seg 4/7/9 rewrites so a racing graphics-thread snapshot skips
+       the frame instead of consuming a torn gSegments[5] base. */
+    gdx_load_segment5_for_mode();
+
+    /* Close the epoch window: publishes the settled segment state (even counter)
+       so the next graphics-thread snapshot resolves normally. Paired 1:1 with the
+       begin() above on every control-flow path (no early returns in between). */
+    gdx_segment_epoch_end();
 
     if (sModeSegLogs < 12) {
         sModeSegLogs++;

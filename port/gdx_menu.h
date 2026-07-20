@@ -66,6 +66,7 @@ class GdxMenu final : public Ship::GuiWindow {
     void DrawWorkshopMenu();
     void DrawOnlineMenu();
     void DrawDeveloperMenu();
+    void DrawStatsMenu();
     void DrawToolWindowPage(const char* name, const char* description);
     void DrawAboutMenu();
 

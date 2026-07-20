@@ -221,8 +221,10 @@ int gdx_widescreen_ui_active(void) {
 // flag the renderer folds into its existing Widescreen==0 pillarbox path (AdjXForAspectRatio,
 // StartFrame's forced offscreen target, and Fast3dGui::DrawGame's centered 4:3 composite), so
 // editor frames render exactly like the stock 4:3 mode regardless of the widescreen settings.
-// The Create Machine ENTRY sub-mode (the EK "SELECT MACHINE" screen) is excepted: its
-// full-width background gradient is an approved widescreen scope (machine_create.c).
+// The WHOLE Create Machine experience is pillarboxed: every gWorksMachineMode sub-state --
+// including the ENTRY "SELECT MACHINE" screen and its file/clear sub-menus -- is forced 4:3
+// exactly like Course Edit, so the classification no longer depends on gWorksMachineMode and the
+// machine_create.c background gradient's STRETCH scope is gated off while the mode forces 4:3.
 // CVar writes are cheap but not free -- publish only on change.
 //
 // STALENESS CONTRACT (2026-07-16 squeeze audit): the per-frame tick below reads gGameMode as of
@@ -237,14 +239,14 @@ int gdx_widescreen_ui_active(void) {
 // 2026-07-16 audit found the old CVar form persisted as 1 into the owner's Debug
 // gdiffuser.cfg.json (saved while inside an editor), pillarboxing pre-tick boot frames.
 // Runtime state never belongs in the config file.
-// True iff a given raw game mode must render stock 4:3 (the EK editors). The Create Machine
-// ENTRY sub-mode (SELECT MACHINE) is excepted -- its full-width background is an approved
-// widescreen scope -- so it also depends on gWorksMachineMode.
+// True iff a given raw game mode must render stock 4:3 (the EK editors). The entire Create Machine
+// experience is pillarboxed 4:3 regardless of gWorksMachineMode: GET_MODE masks off the F3D-variant
+// bits (0xC000), so GAMEMODE_CREATE_MACHINE (0x10) matches every sub-state of the editor. The
+// in-race GAMEMODE_LX_MACHINE_SETTINGS is a different mode value (0x9) and is intentionally NOT
+// covered here.
 static int gdx_mode_forces_fixed_aspect(s32 gamemode) {
-    extern s32 gWorksMachineMode; // decomp/src/overlays/machine_create/machine_create.h
     s32 mode = GET_MODE(gamemode);
-    return (mode == GAMEMODE_COURSE_EDIT) ||
-           ((mode == GAMEMODE_CREATE_MACHINE) && (gWorksMachineMode != 28 /* MACHINE_MODE_ENTRY */));
+    return (mode == GAMEMODE_COURSE_EDIT) || (mode == GAMEMODE_CREATE_MACHINE);
 }
 
 void gdx_fixed_aspect_publish(void) {

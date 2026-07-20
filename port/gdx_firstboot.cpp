@@ -43,6 +43,7 @@ constexpr std::uintmax_t kIplMinBytes = 4u * 1024u * 1024u;    // 64DD IPL dumps
 constexpr const char* kRomName = "baserom.us.rev0.z64";
 constexpr const char* kDiskName = "baserom.translated.ek.ndd";
 constexpr const char* kIplName = "N64DDIPLROM.n64";
+constexpr const char* kGameArchiveName = "fzerox.o2r";
 
 // ROM candidate names probed for DEV-layout detection (mirrors rom_buffer.cpp's next-to-exe list).
 const char* const kRomDevCandidates[] = { "baserom.us.rev0.z64", "fzerox.z64", "f-zero-x.z64" };
@@ -76,33 +77,27 @@ fs::path executableDir(const char* argv0) {
     return fs::current_path(ec);
 }
 
-// Per-user data directory (installed mode). Empty on failure (caller falls back to exe dir).
-fs::path perUserDataDir() {
-#ifdef _WIN32
-    // %APPDATA% = …\AppData\Roaming. Read the wide env var (unicode-safe usernames) — same env-var
-    // approach rom_buffer.cpp uses for FZEROX_ROM, so no extra shell32 link dependency is introduced.
-    wchar_t appdata[MAX_PATH] = {};
-    size_t len = 0;
-    if (_wgetenv_s(&len, appdata, MAX_PATH, L"APPDATA") == 0 && len > 1) {
-        return fs::path(appdata) / L"G-Diffuser";
-    }
-    return {};
-#else
-    const char* xdg = std::getenv("XDG_DATA_HOME");
-    if (xdg != nullptr && xdg[0] != '\0') {
-        return fs::path(xdg) / "G-Diffuser";
-    }
-    const char* home = std::getenv("HOME");
-    if (home != nullptr && home[0] != '\0') {
-        return fs::path(home) / ".local" / "share" / "G-Diffuser";
-    }
-    return {};
-#endif
-}
+// NOTE: G-Diffuser is always portable — no per-user data directory exists. The game folder is the
+// data directory on every platform (product decision, 2026-07-18); AppData/XDG are never touched.
 
 bool fileExists(const fs::path& p) {
     std::error_code ec;
     return !p.empty() && fs::is_regular_file(p, ec);
+}
+
+bool developmentTreeProvidesArchive(const fs::path& exeDir, const fs::path& cwd) {
+    for (const fs::path& base : { exeDir, cwd }) {
+        fs::path probe = base;
+        for (int up = 0; up < 6 && !probe.empty(); ++up, probe = probe.parent_path()) {
+            if (fileExists(probe / "assets" / "extracted" / "generic.o2r")) {
+                return true;
+            }
+            if (probe == probe.root_path()) {
+                break;
+            }
+        }
+    }
+    return false;
 }
 
 std::uintmax_t fileSize(const fs::path& p) {
@@ -269,78 +264,7 @@ fs::path pickFile(const wchar_t* title, const wchar_t* filter) {
     }
     return {};
 }
-
-// Yes/No prompt. Returns true for Yes.
-bool askYesNo(const wchar_t* title, const wchar_t* text) {
-    return MessageBoxW(nullptr, text, title, MB_YESNO | MB_ICONQUESTION) == IDYES;
-}
-
-void showError(const wchar_t* title, const wchar_t* text) {
-    MessageBoxW(nullptr, text, title, MB_OK | MB_ICONERROR);
-}
 #endif
-
-// Acquire one required/optional input via picker + validate + copy. Returns true if the file now
-// exists (valid) in the data dir. `required` controls messaging only; the caller decides on abort.
-using Validator = bool (*)(const fs::path&, std::string&);
-
-bool acquireInput(const fs::path& dataDir, const char* dstName, Validator validate, bool required,
-                  const char* humanName,
-#ifdef _WIN32
-                  const wchar_t* pickerTitle, const wchar_t* pickerFilter
-#else
-                  const wchar_t* /*pickerTitle*/, const wchar_t* /*pickerFilter*/
-#endif
-) {
-    fs::path dst = dataDir / dstName;
-
-    // Already present + valid? Keep it.
-    if (fileExists(dst)) {
-        std::string why;
-        if (validate(dst, why)) {
-            gdx_port_logf("[firstboot] %s already present: %s\n", humanName, dst.string().c_str());
-            return true;
-        }
-        gdx_port_logf("[firstboot] existing %s rejected (%s); re-acquiring\n", humanName, why.c_str());
-    }
-
-#ifdef _WIN32
-    for (;;) {
-        gdx_port_logf("[firstboot] prompting for %s\n", humanName);
-        fs::path picked = pickFile(pickerTitle, pickerFilter);
-        if (picked.empty()) {
-            gdx_port_logf("[firstboot] %s selection cancelled\n", humanName);
-            return false; // caller decides whether this is fatal
-        }
-        std::string why;
-        if (!validate(picked, why)) {
-            std::wstring msg = L"That file is not a valid ";
-            msg += std::wstring(humanName, humanName + std::string(humanName).size());
-            msg += L".\n\nReason: ";
-            msg += std::wstring(why.begin(), why.end());
-            msg += L"\n\nTry again?";
-            if (!askYesNo(L"G-Diffuser — invalid file", msg.c_str())) {
-                return false;
-            }
-            continue;
-        }
-        if (!copyInto(picked, dataDir, dstName)) {
-            showError(L"G-Diffuser — copy failed",
-                      L"Could not copy the selected file into the data directory.");
-            return false;
-        }
-        gdx_port_logf("[firstboot] %s installed: %s\n", humanName, dst.string().c_str());
-        return true;
-    }
-#else
-    // No native picker on this platform in this slice. Degrade gracefully: instruct the user to drop
-    // the file into the data directory and re-launch. (A cross-platform picker — e.g. tinyfiledialogs —
-    // is a documented future upgrade; see docs/FIRST_BOOT_DESIGN.md.)
-    gdx_port_logf("[firstboot] %s not found. Place '%s' in %s and relaunch%s.\n", humanName, dstName,
-                  dataDir.string().c_str(), required ? " (required)" : " (optional)");
-    return false;
-#endif
-}
 
 } // namespace
 
@@ -353,40 +277,41 @@ FirstBootResult FirstBootRun(const char* argv0) {
     if (ec) {
         ec.clear();
     }
+    // Record the executable directory on every return path (dev, warm, wizard, abort). The runtime
+    // O2R extractor reads its packaged gdx-extract child + decomp-recipes from here.
+    result.exeDir = exeDir.string();
 
-    // ── Portable / dev detection ─────────────────────────────────────────────────────────────────
-    // A `portable.txt` beside the exe forces portable mode (data dir = exe dir). Independently, if a
-    // ROM already sits next to the exe (or in the CWD), this is the dev layout: boot exactly as before
-    // with no wizard and no working-directory change. We still resolve the ROM path so main() can
-    // inject it as an argv entry — that suppresses rom_buffer.cpp's own picker, which would otherwise
-    // block a headless launch.
-    const bool portableMarker = fileExists(exeDir / "portable.txt");
-
-    for (const char* cand : kRomDevCandidates) {
-        for (const fs::path& dir : { exeDir, cwd }) {
-            fs::path p = dir / cand;
-            if (fileExists(p)) {
-                result.status = FirstBootStatus::DevLayout;
-                result.romPath = fs::absolute(p, ec).string();
-                result.dataDir = exeDir.string();
-                gdx_port_logf("[firstboot] dev/portable layout: ROM found next to exe (%s); no wizard\n",
-                              result.romPath.c_str());
-                return result;
+    // A ROM beside the executable is normal for a portable release and must not bypass first-time
+    // setup. Preserve the headless shortcut only for a real source tree that already provides the
+    // development generic.o2r archive.
+    if (developmentTreeProvidesArchive(exeDir, cwd)) {
+        for (const char* cand : kRomDevCandidates) {
+            for (const fs::path& dir : { exeDir, cwd }) {
+                fs::path p = dir / cand;
+                if (fileExists(p)) {
+                    result.status = FirstBootStatus::DevLayout;
+                    result.romPath = fs::absolute(p, ec).string();
+                    result.dataDir = exeDir.string();
+                    gdx_port_logf("[firstboot] development tree: ROM=%s; setup not required\n",
+                                  result.romPath.c_str());
+                    return result;
+                }
             }
         }
     }
 
-    // ── Installed mode ───────────────────────────────────────────────────────────────────────────
-    fs::path dataDir = portableMarker ? exeDir : perUserDataDir();
-    if (dataDir.empty()) {
-        dataDir = exeDir; // last-resort fallback
-    }
+    // ── Wizard mode: always portable ─────────────────────────────────────────────────────────────
+    // G-Diffuser never writes to a per-user directory (AppData / XDG data): the game folder is the
+    // data directory, period. Everything the port creates — the extracted fzerox.o2r, saves/,
+    // ghosts/, config, and explicitly requested diagnostics — lives beside the executable, so the
+    // whole installation is one folder that can be moved, backed up, or deleted as a unit.
+    fs::path dataDir = exeDir;
     fs::create_directories(dataDir, ec);
     ec.clear();
     result.dataDir = dataDir.string();
 
-    // Move the working directory into the data dir so config, logs, the disk image, and the IPL ROM
-    // (all of which resolve relative to the CWD in libultraship / disk_buffer.cpp) consolidate there.
+    // Move the working directory into the data dir so config, the disk image, and the IPL ROM
+    // (which resolve relative to the CWD in libultraship / disk_buffer.cpp) consolidate there.
     if (fs::current_path(dataDir, ec); !ec) {
         result.chdirApplied = true;
         gdx_port_logf("[firstboot] data directory: %s (working directory set)\n",
@@ -399,63 +324,121 @@ FirstBootResult FirstBootRun(const char* argv0) {
 
     SetupState st = loadState(dataDir);
 
-    // Fast path: previously completed AND the required inputs are still present + valid.
+    // Fast path: previously completed AND the required inputs and game archive are still present.
+    // Requiring fzerox.o2r keeps an interrupted or failed extraction inside the setup flow on the
+    // next launch instead of silently converting the completion marker into permanent raw fallback.
     fs::path romInData = dataDir / kRomName;
     fs::path diskInData = dataDir / kDiskName;
+    fs::path archiveInData = dataDir / kGameArchiveName;
     if (st.complete) {
         std::string why;
-        if (fileExists(romInData) && validateRom(romInData, why)) {
+        fs::path iplCheck = dataDir / kIplName;
+        if (fileExists(romInData) && validateRom(romInData, why) && fileExists(diskInData) &&
+            fileExists(iplCheck) && fileExists(archiveInData)) {
             result.status = FirstBootStatus::SetupComplete;
             result.romPath = fs::absolute(romInData, ec).string();
             gdx_port_logf("[firstboot] setup complete; booting with configured ROM %s\n",
                           result.romPath.c_str());
             return result;
         }
-        gdx_port_logf("[firstboot] setup was marked complete but the ROM is missing/invalid; re-running setup\n");
+        gdx_port_logf(
+            "[firstboot] setup was marked complete but a required input or fzerox.o2r is missing; re-running setup\n");
         st.complete = false;
     }
 
-    // ── Wizard ───────────────────────────────────────────────────────────────────────────────────
-    gdx_port_logf("[firstboot] running first-time setup wizard in %s\n", dataDir.string().c_str());
-
-    const bool romOk = acquireInput(dataDir, kRomName, &validateRom, /*required=*/true,
-                                    "F-Zero X ROM (US rev0, .z64)",
-                                    L"Select your F-Zero X ROM (US rev0)",
-                                    L"Nintendo 64 ROMs (*.z64;*.n64;*.v64)\0*.z64;*.n64;*.v64\0All files\0*.*\0");
-    if (!romOk) {
-#ifdef _WIN32
-        showError(L"G-Diffuser — ROM required",
-                  L"G-Diffuser needs an F-Zero X ROM to run.\n\n"
-                  L"Setup was cancelled, so the program will now exit. Relaunch to try again.");
-#endif
-        gdx_port_logf("[firstboot] ROM not acquired; aborting setup\n");
-        result.status = FirstBootStatus::Aborted;
-        return result;
-    }
-
-    // Expansion Kit disk + IPL ROM are strongly encouraged but not strictly required to boot base
-    // F-Zero X. Offer them; skipping just leaves EK modes dark until the files are provided later.
-    acquireInput(dataDir, kDiskName, &validateDisk, /*required=*/false,
-                 "Expansion Kit disk (.ndd)",
-                 L"Select your F-Zero X Expansion Kit disk (.ndd)",
-                 L"64DD disk images (*.ndd)\0*.ndd\0All files\0*.*\0");
-    acquireInput(dataDir, kIplName, &validateIpl, /*required=*/false,
-                 "64DD IPL ROM (N64DDIPLROM.n64)",
-                 L"Select your 64DD IPL ROM (N64DDIPLROM.n64)",
-                 L"64DD IPL ROM (*.n64;*.z64)\0*.n64;*.z64\0All files\0*.*\0");
-
-    // Persist.
-    st.complete = true;
-    st.romPath = fs::absolute(romInData, ec).string();
-    st.diskPath = fileExists(diskInData) ? fs::absolute(diskInData, ec).string() : std::string();
-    fs::path iplInData = dataDir / kIplName;
-    st.iplPath = fileExists(iplInData) ? fs::absolute(iplInData, ec).string() : std::string();
-    saveState(dataDir, st);
-
-    result.status = FirstBootStatus::SetupComplete;
-    result.romPath = st.romPath;
-    gdx_port_logf("[firstboot] setup complete; booting with ROM %s\n", result.romPath.c_str());
+    // ── Needs setup ────────────────────────────────────────────────────────────────────────────────
+    // The dev fast-path and the completed fast-path both missed: the required inputs are absent or
+    // invalid. The old blocking Win32-dialog wizard is gone — acquisition now happens IN-WINDOW after
+    // libultraship + the Gui + the FileDropMgr exist. Resolve nothing further here; return NeedsSetup
+    // so main() proceeds through Context/window init without a ROM, then runs the ImGui setup flow
+    // (port/gdx_firstboot_gui.{h,cpp}), which reuses the exported validators/copy/state helpers below.
+    // result.romPath stays empty (the GUI fills the caller's ROM path once the user installs one).
+    result.status = FirstBootStatus::NeedsSetup;
+    gdx_port_logf("[firstboot] required inputs missing; deferring to the in-window setup flow (%s)\n",
+                  dataDir.string().c_str());
     return result;
 }
+
+bool DevelopmentTreeProvidesArchive(const std::string& exeDir, const std::string& cwd) {
+    return developmentTreeProvidesArchive(fs::path(exeDir), fs::path(cwd));
+}
+
+// ── Exported setup helpers (shared with the in-window GUI setup flow) ─────────────────────────────
+
+const char* SetupRomFileName() {
+    return kRomName;
+}
+
+const char* SetupDiskFileName() {
+    return kDiskName;
+}
+
+const char* SetupIplFileName() {
+    return kIplName;
+}
+
+bool ValidateRomFile(const std::string& path, std::string& why) {
+    return validateRom(fs::path(path), why);
+}
+
+bool ValidateDiskFile(const std::string& path, std::string& why) {
+    return validateDisk(fs::path(path), why);
+}
+
+bool ValidateIplFile(const std::string& path, std::string& why) {
+    return validateIpl(fs::path(path), why);
+}
+
+bool CopyInputInto(const std::string& srcPath, const std::string& dataDir, const char* dstName) {
+    return copyInto(fs::path(srcPath), fs::path(dataDir), dstName);
+}
+
+bool WriteSetupComplete(const std::string& dataDir, const std::string& romPath,
+                        const std::string& diskPath, const std::string& iplPath) {
+    SetupState st;
+    st.complete = true;
+    st.romPath = romPath;
+    st.diskPath = diskPath;
+    st.iplPath = iplPath;
+    return saveState(fs::path(dataDir), st);
+}
+
+bool NativeFilePickerAvailable() {
+#ifdef _WIN32
+    return true;
+#else
+    return false;
+#endif
+}
+
+#ifdef _WIN32
+std::string PickRomFile() {
+    fs::path p = pickFile(L"Select your F-Zero X ROM (US rev0, .z64)",
+                          L"Nintendo 64 ROMs (*.z64;*.n64;*.v64)\0*.z64;*.n64;*.v64\0All files\0*.*\0");
+    return p.string();
+}
+
+std::string PickDiskFile() {
+    fs::path p = pickFile(L"Select your F-Zero X Expansion Kit disk (.ndd)",
+                          L"64DD disk images (*.ndd)\0*.ndd\0All files\0*.*\0");
+    return p.string();
+}
+
+std::string PickIplFile() {
+    fs::path p = pickFile(L"Select your 64DD IPL ROM (N64DDIPLROM.n64)",
+                          L"64DD IPL ROM (*.n64;*.z64)\0*.n64;*.z64\0All files\0*.*\0");
+    return p.string();
+}
+#else
+std::string PickRomFile() {
+    return {};
+}
+std::string PickDiskFile() {
+    return {};
+}
+std::string PickIplFile() {
+    return {};
+}
+#endif
 
 } // namespace gdx

@@ -115,6 +115,7 @@
 // ===============================================================================================
 
 #include "gdx_audio_thread.h"
+#include "gdx_perf.h"  // GDX_PERF audio-tick duration telemetry (no-op when disabled)
 #include "port_log.h"
 #include "libultraship/bridge/audiobridge.h"
 
@@ -341,9 +342,15 @@ void AudioThreadMain() {
         const int32_t desired = AudioPlayerGetDesiredBuffered();
         int iterations = 0;
         while (AudioPlayerBuffered() < desired && iterations < kMaxTicksPerWake) {
+            const auto tickStart = std::chrono::steady_clock::now();
             {
                 std::lock_guard<std::recursive_mutex> ctxLock(sAudioCtxMutex);
                 gdx_audio_produce_one_tick();
+            }
+            if (gdx::PerfEnabled()) {
+                gdx::PerfAudioTick(std::chrono::duration<double, std::milli>(
+                                       std::chrono::steady_clock::now() - tickStart)
+                                       .count());
             }
             iterations++;
         }

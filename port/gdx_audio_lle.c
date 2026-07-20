@@ -96,6 +96,8 @@
 #include "n64_rdram.h"
 
 extern void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes);
+extern int gdx_unlock_diag_enabled(void);
+extern void gdx_unlock_diagf(const char* fmt, ...);
 
 /* Low-32 -> full host pointer resolvers (defined in port/n64_gfx_bridge.cpp; the same
  * ones the HLE uses). Deliberately `unsigned int` (unambiguous 32 bits in every TU). */
@@ -119,6 +121,33 @@ static int gdx_audio_lle_enabled(void) {
      * old value). Default 1 = LLE on -- the owner-confirmed audio path -- so behavior is
      * unchanged if the menu is never touched. */
     return CVarGetInteger("gEnhancements.Audio.LLE", 1) != 0;
+}
+
+static int sGdxUnlockDspTraceTasks = 0;
+static unsigned int sGdxUnlockDspTraceGeneration = 0;
+
+void gdx_unlock_audio_trace_dsp_begin(void) {
+    if (gdx_unlock_diag_enabled()) {
+        sGdxUnlockDspTraceTasks = 120;
+        sGdxUnlockDspTraceGeneration++;
+        if (sGdxUnlockDspTraceGeneration == 0) {
+            sGdxUnlockDspTraceGeneration = 1;
+        }
+    }
+}
+
+int gdx_unlock_audio_trace_dsp_active(void) {
+    return sGdxUnlockDspTraceTasks > 0;
+}
+
+unsigned int gdx_unlock_audio_trace_generation(void) {
+    return sGdxUnlockDspTraceGeneration;
+}
+
+static void gdx_unlock_audio_trace_dsp_consume(void) {
+    if (sGdxUnlockDspTraceTasks > 0) {
+        sGdxUnlockDspTraceTasks--;
+    }
 }
 
 /* ==========================================================================
@@ -471,12 +500,19 @@ static void gdx_audio_lle_bridge_run(const void* dataPtr, unsigned int dataSizeB
     uint32_t* scratchCmds;      /* the scratch copy we rewrite w1 fields in */
     uint32_t ostask[16];        /* 64-byte OSTask, host-native little-endian */
     uint32_t i;
+    uint32_t compressedLoads = 0;
+    uint32_t pcmLoads = 0;
     static int sBailLogs = 0;
 
     /* --- BAIL macro: never mutate host state before a successful run, so a mid-marshal
      * abort simply hands the untouched tick to the HLE. --- */
     #define GDX_LLE_BAIL(reasonfmt, ...)                                              \
         do {                                                                          \
+            if (gdx_unlock_audio_trace_dsp_active()) {                                \
+                gdx_unlock_diagf("[unlock-audio] dsp task selected=LLE outcome=fallback reason=" reasonfmt "\n", \
+                                 __VA_ARGS__);                                         \
+                gdx_unlock_audio_trace_dsp_consume();                                 \
+            }                                                                         \
             if (sBailLogs < 32) {                                                     \
                 sBailLogs++;                                                          \
                 gdx_lle_logf("[audio-lle] bail -> HLE: " reasonfmt "\n", __VA_ARGS__);\
@@ -486,6 +522,10 @@ static void gdx_audio_lle_bridge_run(const void* dataPtr, unsigned int dataSizeB
         } while (0)
 
     if (!gdx_lle_init_once()) {
+        if (gdx_unlock_audio_trace_dsp_active()) {
+            gdx_unlock_diagf("[unlock-audio] dsp task selected=LLE outcome=fallback reason=bridge-init-failed\n");
+            gdx_unlock_audio_trace_dsp_consume();
+        }
         gdx_audio_hle_run(dataPtr, dataSizeBytes);
         return;
     }
@@ -493,6 +533,10 @@ static void gdx_audio_lle_bridge_run(const void* dataPtr, unsigned int dataSizeB
     cmds  = (const uint32_t*)dataPtr;
     count = dataSizeBytes / 8u;                 /* Acmd is 8 bytes: {u32 w0; u32 w1;} */
     if (cmds == NULL || count == 0u) {
+        if (gdx_unlock_audio_trace_dsp_active()) {
+            gdx_unlock_diagf("[unlock-audio] dsp task selected=LLE outcome=fallback reason=empty-command-list\n");
+            gdx_unlock_audio_trace_dsp_consume();
+        }
         gdx_audio_hle_run(dataPtr, dataSizeBytes);
         return;
     }
@@ -552,6 +596,11 @@ static void gdx_audio_lle_bridge_run(const void* dataPtr, unsigned int dataSizeB
                 uint32_t dmemDest = w0 & 0xFFFFu;
                 GdxXform xf = (((dmemDest + size) & 0xFFFFu) == GDX_DMEM_COMPRESSED_ADPCM_DATA)
                               ? GDX_XFORM_BYTESTREAM : GDX_XFORM_S16;
+                if (xf == GDX_XFORM_BYTESTREAM) {
+                    compressedLoads++;
+                } else {
+                    pcmLoads++;
+                }
                 void* host = gdx_lle_resolve(w1);
                 uint32_t phys;
                 if (host == NULL) {
@@ -755,6 +804,11 @@ static void gdx_audio_lle_bridge_run(const void* dataPtr, unsigned int dataSizeB
      * to the HLE for this tick so a marshalling bug degrades gracefully instead of
      * spinning the audio thread. */
     if (!gdx_rsp_lle_completed()) {
+        if (gdx_unlock_audio_trace_dsp_active()) {
+            gdx_unlock_diagf("[unlock-audio] dsp task selected=LLE outcome=fallback reason=watchdog cmds=%u bytes=%u\n",
+                             (unsigned)count, (unsigned)dataSizeBytes);
+            gdx_unlock_audio_trace_dsp_consume();
+        }
         if (gdx_diag_verbose()) {
             gdx_lle_logf("[audio-lle] tick WATCHDOG-TIMEOUT: cmds=%u bytes=%u -> HLE fallback\n",
                          (unsigned)count, (unsigned)dataSizeBytes);
@@ -779,6 +833,13 @@ static void gdx_audio_lle_bridge_run(const void* dataPtr, unsigned int dataSizeB
                      (unsigned)gdx_rsp_lle_status());
     }
 
+    if (gdx_unlock_audio_trace_dsp_active()) {
+        gdx_unlock_diagf("[unlock-audio] dsp task selected=LLE outcome=completed cmds=%u bytes=%u maps=%d compressedLoads=%u pcmLoads=%u\n",
+                         (unsigned)count, (unsigned)dataSizeBytes, sMapCount,
+                         (unsigned)compressedLoads, (unsigned)pcmLoads);
+        gdx_unlock_audio_trace_dsp_consume();
+    }
+
     #undef GDX_LLE_BAIL
 }
 
@@ -788,6 +849,11 @@ static void gdx_audio_lle_bridge_run(const void* dataPtr, unsigned int dataSizeB
  * ========================================================================== */
 void gdx_audio_lle_run(const void* dataPtr, unsigned int dataSizeBytes) {
     if (!gdx_audio_lle_enabled()) {
+        if (gdx_unlock_audio_trace_dsp_active()) {
+            gdx_unlock_diagf("[unlock-audio] dsp task selected=HLE outcome=completed bytes=%u\n",
+                             dataSizeBytes);
+            gdx_unlock_audio_trace_dsp_consume();
+        }
         gdx_audio_hle_run(dataPtr, dataSizeBytes);
         return;
     }

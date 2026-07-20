@@ -12,8 +12,11 @@ extern "C" {
 // battery-backed SRAM).
 #define GDX_SRAM_SIZE 0x8000u
 
-// Loads fzerox.sav (next to the executable) into the in-memory SRAM image, or
-// zero-fills it if no save file exists yet / it's the wrong size (first boot).
+// Loads saves/fzerox.sav (on Windows relative to the executable; on POSIX relative
+// to the current working directory, matching the disk-save sidecar and ghost files --
+// a legacy save from the older location is migrated in automatically) into the
+// in-memory SRAM image, or zero-fills it if no save file exists yet / it's the wrong
+// size (first boot).
 // Idempotent: safe to call more than once, later calls are no-ops. Called from
 // the decomp's Sram_Init() (see decomp/src/overlays/ovl_i2/save.c) and
 // defensively from gdx_sram_read/gdx_sram_write so load order never matters.
