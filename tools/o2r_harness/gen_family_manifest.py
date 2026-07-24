@@ -8,10 +8,12 @@ rewrite) is not resilient to a *partial* archive, a family that is present but
 short is a silent texture-corruption bug -- the manifest lets validation catch
 it without booting the game.
 
-The manifest is generated ONCE from the legacy archive
+The manifest is generated from the deterministic archive
 (assets/extracted/generic.o2r) and committed. It encodes the C3 full-recipe
-output (4,240 entries including the inert families), so it also serves as the
-frozen per-family breakdown of the golden.
+output (currently 3,601 records including the inert families, the R1
+segment_blob family, and the R2 audio_blob family), so it also serves as the
+frozen per-family breakdown of the golden. Entry counts are central-directory
+RECORDS (dup-inclusive), matching the runtime gate.
 
 Usage:
   gen_family_manifest.py --archive PATH --out family_manifest.json

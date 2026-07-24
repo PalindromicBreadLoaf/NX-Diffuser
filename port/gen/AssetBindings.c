@@ -9213,3 +9213,63 @@ void gdx_register_asset_segment_command_ranges(unsigned char segment, unsigned i
     }
 }
 #endif /* PORT */
+#ifdef PORT
+/* PORT (R1/R2): maps an absolute ROM read range to its verbatim segment_blob or
+ * audio_blob o2r entry. Consumers (port/gdx_segment_source.c) resolve a read at
+ * [rom_base, rom_base+size) to the blob whose span fully CONTAINS it (containment
+ * lookup, contract C-R1.3), one shared table for both namespaces (C-R2.1).
+ * Sorted by rom_base for a deterministic table; the lookup below is a linear scan
+ * (not a binary search) -- sorting is for determinism/readability only. */
+typedef struct { unsigned int rom_base; unsigned int size; const char* o2r_key; } GdxSegmentBlobEntry;
+static const GdxSegmentBlobEntry sSegmentBlobMap[] = {
+    { 0x00000000U, 0x00001000U, "segment_blob/rom_boot_tuning" },
+    { 0x00080960U, 0x00002EECU, "segment_blob/kanji_tables" },
+    { 0x00145B70U, 0x0000DA40U, "segment_blob/expansion_kit_textures_beta" },
+    { 0x001535B0U, 0x000130B0U, "segment_blob/course_edit_textures_beta" },
+    { 0x00166660U, 0x00006240U, "segment_blob/create_machine_textures" },
+    { 0x0016C8A0U, 0x0000E940U, "segment_blob/course_track_gfx" },
+    { 0x0017B1E0U, 0x0003D370U, "segment_blob/setup_gfx" },
+    { 0x001B8550U, 0x00029EA0U, "segment_blob/hud_gfx" },
+    { 0x001E23F0U, 0x00048CB0U, "segment_blob/machine_global_gfx" },
+    { 0x0022B0A0U, 0x0000A090U, "segment_blob/machine_models" },
+    { 0x00235130U, 0x00004950U, "segment_blob/mute_city_textures" },
+    { 0x00239A80U, 0x000051D0U, "segment_blob/port_town_textures" },
+    { 0x0023EC50U, 0x00005140U, "segment_blob/big_blue_textures" },
+    { 0x00243D90U, 0x000064E0U, "segment_blob/sand_ocean_textures" },
+    { 0x0024A270U, 0x00006580U, "segment_blob/devils_forest_textures" },
+    { 0x002507F0U, 0x00004910U, "segment_blob/white_land_textures" },
+    { 0x00255100U, 0x00004500U, "segment_blob/sector_textures" },
+    { 0x00259600U, 0x00005D60U, "segment_blob/red_canyon_textures" },
+    { 0x0025F360U, 0x000078C0U, "segment_blob/fire_field_textures" },
+    { 0x00266C20U, 0x00006B60U, "segment_blob/silence_textures" },
+    { 0x0026D780U, 0x00006120U, "segment_blob/ending_venue_textures" },
+    { 0x002738A0U, 0x00000F50U, "segment_blob/podium_gfx" },
+    { 0x002747F0U, 0x00004000U, "segment_blob/super_textures" },
+    { 0x002AD1E0U, 0x0000CCC0U, "segment_blob/course_data" },
+    { 0x002B9EA0U, 0x0026AA80U, "segment_blob/common_assets_compressed" },
+    { 0x00524D60U, 0x00002D90U, "audio_blob/audio_bank" },
+    { 0x00527AF0U, 0x00000C40U, "audio_blob/audio_seq" },
+    { 0x00528730U, 0x00A3F1D0U, "audio_blob/audio_table" },
+    { 0U, 0U, NULL }
+};
+
+/* Returns the blob whose [rom_base, rom_base+size) fully contains
+ * [query_rom_base, query_rom_base+size_needed), or NULL. A read anywhere inside
+ * a blob span resolves to that blob (C-R1.3). size_needed==0 always returns NULL
+ * (a zero-length read at a shared span boundary is otherwise ambiguous). */
+const GdxSegmentBlobEntry* gdx_lookup_segment_blob(unsigned int rom_base, unsigned int size_needed) {
+    int i;
+    if (size_needed == 0u) {
+        return NULL; /* closes the shared-boundary tie-break ambiguity */
+    }
+    for (i = 0; sSegmentBlobMap[i].o2r_key != NULL; i++) {
+        unsigned int base = sSegmentBlobMap[i].rom_base;
+        unsigned int end = base + sSegmentBlobMap[i].size;
+        if (rom_base >= base && rom_base <= end &&
+            size_needed <= end - rom_base) {
+            return &sSegmentBlobMap[i];
+        }
+    }
+    return NULL;
+}
+#endif /* PORT */

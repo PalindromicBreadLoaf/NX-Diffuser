@@ -14,6 +14,7 @@
 #endif
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -125,12 +126,12 @@ static inline int gdx_log_file_enabled(void) {
     return sCached;
 }
 
-// Resolve "<exe dir>/gdiffuser-run.log" into outPath (the exe-relative saves
-// convention sram_buffer.cpp already uses). Falls back to the bare CWD-relative
-// filename if the exe path is unavailable or does not fit -- acceptable now that
-// file logging is opt-in. Returns outPath.
-static inline const char* gdx_log_file_path(char* outPath, size_t outCap) {
-    const char* fileName = "gdiffuser-run.log";
+// Resolve "<exe dir>/<fileName>" into outPath (the exe-relative saves convention
+// sram_buffer.cpp already uses). Falls back to the bare CWD-relative filename if
+// the exe path is unavailable or does not fit. Shared by gdx_log_file_path (opt-in
+// run log) and gdx_crash_report_path (always-on crash report) so both sinks agree
+// on where "next to the executable" means. Returns outPath.
+static inline const char* gdx_exe_relative_path(char* outPath, size_t outCap, const char* fileName) {
 #ifdef _WIN32
     {
         DWORD n = GetModuleFileNameA(NULL, outPath, (DWORD)outCap);
@@ -165,6 +166,16 @@ static inline const char* gdx_log_file_path(char* outPath, size_t outCap) {
         outPath[0] = '\0';
     }
     return outPath;
+}
+
+// Resolve "<exe dir>/gdiffuser-run.log" into outPath. See gdx_exe_relative_path.
+static inline const char* gdx_log_file_path(char* outPath, size_t outCap) {
+    return gdx_exe_relative_path(outPath, outCap, "gdiffuser-run.log");
+}
+
+// Resolve "<exe dir>/gdiffuser-crash.txt" into outPath. See gdx_exe_relative_path.
+static inline const char* gdx_crash_report_path(char* outPath, size_t outCap) {
+    return gdx_exe_relative_path(outPath, outCap, "gdiffuser-crash.txt");
 }
 
 // Safe logging that works from any thread/fiber context.
@@ -219,6 +230,53 @@ static inline void gdx_port_write_log(const char* message) {
     }
     fputs(message, stderr);
     fflush(stderr);
+#endif
+}
+
+// Always-on crash-report sink: writes straight to "<exe dir>/gdiffuser-crash.txt",
+// bypassing gdx_log_file_enabled() entirely. Field testers running a plain double-
+// clicked build set none of GDX_LOG/GDX_TRACE/GDX_DIAG_VERBOSE/GDX_DIAG_UNLOCK, so
+// the opt-in run-log sink above never opens -- a crash would otherwise leave zero
+// artifacts on disk. This is called ONLY from the crash handler (n64_sched.c), a
+// rare/exceptional path, so opening+closing the handle per call (rather than
+// caching a handle for the process lifetime like gdx_port_write_log does) is fine
+// and keeps the file free to inspect immediately after a crash without waiting on
+// process exit to flush/close it.
+//
+// Same CRT-FILE* avoidance as gdx_port_write_log above: the crash handler can run
+// on the GFX/audio fiber, whose stack may be mid-switch from the scheduler's point
+// of view, so no fopen/FILE* buffering here -- raw CreateFileA/WriteFile (Windows)
+// or open/write (POSIX) only.
+static inline void gdx_crash_report_write(const char* message) {
+    if (message == NULL || message[0] == '\0') {
+        return;
+    }
+#ifdef _WIN32
+    {
+        char path[MAX_PATH];
+        HANDLE file;
+        gdx_crash_report_path(path, sizeof(path));
+        file = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (file != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            WriteFile(file, message, (DWORD) lstrlenA(message), &written, NULL);
+            CloseHandle(file);
+        }
+    }
+#else
+    {
+        char path[4096];
+        int fd;
+        gdx_crash_report_path(path, sizeof(path));
+        if (path[0] != '\0') {
+            fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd >= 0) {
+                write(fd, message, strlen(message));
+                close(fd);
+            }
+        }
+    }
 #endif
 }
 

@@ -263,3 +263,5 @@ long osPiRawReadIo() { return 0; }
    0 = cold reset. */
 int osResetType = 0;
 long osSetIntMask() { return 0; }
+unsigned char D_A009000[1];
+unsigned char D_A00A000[1];

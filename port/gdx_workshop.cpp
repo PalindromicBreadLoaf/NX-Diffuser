@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -58,6 +59,18 @@ std::unordered_map<std::string, std::string> gOverrideCache;
 // ── dump de-dup (first-seen-wins per session) ─────────────────────────────────────────────────────
 std::mutex gDumpMutex;
 std::unordered_set<std::string> gDumpSeen;
+
+// ── contact-sheet regen debounce ──────────────────────────────────────────────────────────────────
+// Regenerating dump/index.html on every dumped texture turns a level-load burst of ~1000 first-seen
+// textures into ~1000 synchronous full-HTML rewrites. Instead the dump path marks the sheet dirty and
+// regenerates at most once per throttle window; the menu status path (gdx_workshop_dump_count, polled
+// each frame the dump section is open) force-flushes any pending dirty state so a modder alt-tabbing to
+// index.html always sees the complete first-seen set. Guarded by its own mutex so file IO never runs
+// under gDumpMutex.
+std::mutex gSheetMutex;
+bool gSheetDirty = false;
+std::chrono::steady_clock::time_point gSheetLastWrite;  // default-constructed = epoch => first dump writes immediately
+constexpr std::chrono::milliseconds kContactSheetThrottle{2000};
 
 std::string toLower(std::string s) {
     for (char& c : s) {
@@ -286,6 +299,28 @@ void writeContactSheet(const std::filesystem::path& dumpDir) {
     }
 }
 
+// Regenerate the contact sheet only when dirty and either forced or the throttle window has elapsed
+// since the last write. Called with force=false from the dump hot path (coalesces bursts) and
+// force=true from the menu status path (guarantees a fresh sheet whenever a modder is looking).
+void regenContactSheetIfDue(const std::filesystem::path& dumpDir, bool force) {
+    std::lock_guard<std::mutex> lock(gSheetMutex);
+    if (!gSheetDirty) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && (now - gSheetLastWrite) < kContactSheetThrottle) {
+        return;  // within the throttle window: leave dirty, a later dump or menu poll will flush it
+    }
+    writeContactSheet(dumpDir);
+    gSheetDirty = false;
+    gSheetLastWrite = now;
+}
+
+void markContactSheetDirty() {
+    std::lock_guard<std::mutex> lock(gSheetMutex);
+    gSheetDirty = true;
+}
+
 // Minimal flat-JSON string-field extractor: finds "key" : "value". Good enough for pack manifests
 // (name/version/author/game_version/key_scheme_version). Returns empty when absent.
 std::string jsonField(const std::string& json, const char* key) {
@@ -346,6 +381,10 @@ extern "C" int gdx_workshop_texture_dump_enabled(void) {
 }
 
 extern "C" int gdx_workshop_dump_count(void) {
+    // The menu polls this each frame the dump section is open. Piggyback a force-flush of any pending
+    // contact-sheet dirty state here so a modder viewing dump/ always sees the complete first-seen set
+    // even if the last dumps landed inside the debounce throttle window. Cheap no-op when not dirty.
+    regenContactSheetIfDue(resolveDir("dump", false), /*force=*/true);
     std::lock_guard<std::mutex> lock(gDumpMutex);
     return static_cast<int>(gDumpSeen.size());
 }
@@ -459,8 +498,12 @@ extern "C" void gdx_workshop_dump_texture(const void* origSrcAddr, size_t origSr
         }
         std::fprintf(f, "%s\t%d\t%d\t%s\n", key.c_str(), width, height, n64FormatName(n64Fmt, n64Siz));
         std::fclose(f);
-        // Refresh the human-facing contact sheet so it always reflects the full dumped set.
-        writeContactSheet(dumpDir);
+        // Refresh the human-facing contact sheet so it always reflects the full dumped set. Debounced:
+        // mark dirty and regenerate at most once per throttle window so a level-load burst of hundreds
+        // of first-seen textures no longer triggers hundreds of synchronous HTML rewrites. The menu
+        // status path force-flushes any pending dirty state (see gdx_workshop_dump_count).
+        markContactSheetDirty();
+        regenContactSheetIfDue(dumpDir, /*force=*/false);
     }
 }
 

@@ -41,6 +41,7 @@
 #include "gdx_extract_launch.h"  // runtime O2R extraction (produces generic.o2r before the mount)
 #include "gdx_audio_thread.h"
 #include "gdx_frame_pacer.h"  // optional wall-clock 60Hz pacer (gEnhancements.Graphics.FramePacing)
+#include "n64_gfx_bridge.h"   // R6-P2 frame-interpolation host API (gdx_gfx_interp_*)
 #include <SDL2/SDL.h>  // SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER): enable gamepad auto-detection
 
 #include <algorithm>
@@ -48,6 +49,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -59,22 +61,197 @@ extern "C" void GDiffuser_LoadAllAssets(void); // generated asset binding loader
 extern "C" void bootproc(void);                // decomp boot entry (src/sys/sys_main.c)
 extern "C" void gdx_sched_init(void);          // R6: init cooperative fiber scheduler (host fiber)
 extern "C" void gdx_sched_drain_deferred_wakes(void); // cross-thread mesg wakes -> run queue (host)
-extern "C" void gdx_init_rom(int argc, char** argv); // S5: load ROM into host buffer
+extern "C" void gdx_init_rom(int argc, char** argv, int archivesValidated); // S5: load ROM into host buffer (R4: archivesValidated gates no-ROM boot)
 extern "C" void gdx_vi_tick(void);             // R6: advance VI + post retrace (wakes Main thread)
 extern "C" void gdx_dispatch(void);            // R6: run game threads until quiescent
 extern "C" void gdx_vi_present_fallback(void); // VI-scanout fallback: present CPU-drawn framebuffers
 extern "C" void gdx_controller_poll(void);     // PORT: host keyboard -> decomp controller globals
 extern "C" void gdx_fixed_aspect_tick(void);   // input_bridge: force 4:3 rendering for the EK editors
+extern "C" int gdx_get_force_fixed_aspect(void); // libultraship interpreter.cpp: 1 while an EK editor forces 4:3
 extern "C" void gdx_rdram_init(void);          // n64-rdram-buffer: allocate 8MB RDRAM before bootproc
 extern "C" void gdx_register_host_range(void* ptr, size_t size); // n64_gfx_bridge: expose range for TryResolveAddress
 extern "C" void gdx_register_main_module_range(void); // n64_gfx_bridge: resolve low32 EXE/BSS segment tokens
 extern "C" void gdx_game_request_reset(void); // game.c: schedule a title reset at the game-flow boundary
 extern "C" void gdx_disk_save_tick(void);      // disk_savefile: debounced flush of the 64DD save sidecar
 extern "C" void gdx_disk_save_flush(void);     // disk_savefile: force-persist the pending sidecar journal
+extern "C" void gdx_pcm_capture_init(void);    // gdx_audio_capture: arm PCM capture if GDX_PCM_CAPTURE set
+extern "C" int  gdx_pcm_capture_finished(void);// gdx_audio_capture: 1 once the capture window finalized
+extern "C" void gdx_pcm_capture_shutdown(void);// gdx_audio_capture: finalize an in-progress capture
+extern "C" int  GdxSegmentSourcePreload(uint32_t romBase);                                  // gdx_segment_source: force-load a blob family
+extern "C" int  GdxSegmentSourcePayload(uint32_t romBase, void** outPayload, uint32_t* outSize); // gdx_segment_source: resident payload getter
 
 static void logStep(const char* s) {
     gdx_port_logf("[G-Diffuser] %s\n", s);
 }
+
+// ── R6-P2 frame-interpolation host support ───────────────────────────────────────────────────
+// One 60 Hz logic-tick budget (N64 NTSC field = 1.001/60 s). The sim advances exactly one tick
+// per iteration; when interpolation is on, presents are decoupled but this deadline still paces
+// the sim at 60 Hz (the frame pacer is mutually excluded — see gdx_frame_pacer.c).
+static constexpr double kGdxInterpTickSeconds = 1.001 / 60.0;
+// VSync-off safety cap: with VSync off, presents don't block, so bound sub-frames per tick.
+// With VSync on, the panel refresh naturally bounds this to ~refresh/60. This is the HARD CEILING
+// for the per-tick M derivation below (SoH-style target-fps control): 8 covers the UI's 480fps
+// Target FPS ceiling (480/60 = 8) and a typical 480Hz+ "Match Refresh Rate" panel alike.
+static constexpr int kGdxInterpMaxSubframes = 8;
+
+// Real-FPS visibility getters added to the gfx bridge (2026-07-23). Declared at file scope so no
+// n64_gfx_bridge.h change is needed — same minimal-include idiom gdx_menu.cpp uses for the existing
+// gdx_gfx_interp_last_* accessors. Used by the [interp-p2] telemetry line in the frame loop.
+extern "C" double gdx_gfx_interp_presents_per_sec(void);
+extern "C" int gdx_gfx_interp_last_lerped(void);
+extern "C" int gdx_gfx_interp_last_snapped(void);
+
+// Monotonic seconds clock the gfx bridge samples to derive each sub-frame's t. Shared epoch so
+// the logic-deadline wait below converts a deadline back to the same time base.
+static const std::chrono::steady_clock::time_point gGdxHostClockEpoch = std::chrono::steady_clock::now();
+static double gdx_host_now_seconds(void) {
+    using namespace std::chrono;
+    return duration<double>(steady_clock::now() - gGdxHostClockEpoch).count();
+}
+// Hold the host thread until `deadlineSeconds` (same base as gdx_host_now_seconds). No-op if the
+// presents already spent the tick budget (VSync-on case). Keeps the SIM locked to 60 Hz when the
+// sub-frame loop finished early (VSync-off case) — this is interpolation's logic pacer.
+static void gdx_host_pace_logic_until(double deadlineSeconds) {
+    using namespace std::chrono;
+    const auto target = gGdxHostClockEpoch +
+                        duration_cast<steady_clock::duration>(duration<double>(deadlineSeconds));
+    if (steady_clock::now() < target) {
+        std::this_thread::sleep_until(target);
+    }
+}
+
+// Match-Refresh robustness (R6-P2 FIELD-DEFECT FIX, 2026-07-23): some libultraship monitor-detection
+// paths report 60 Hz on a high-refresh panel (observed on this hardware: Fast3dWindow::
+// GetCurrentRefreshRate() -> GetMonitorHzPeriod returned 60 on a 143 Hz display), which pins Frame
+// Interpolation's default "Match Refresh Rate" mode to M=1 (no interpolation at all). Cross-check the
+// OS's current display frequency and use the higher of the two, so Match Refresh follows the real
+// panel even when the backend under-reports. Returns 0 (unknown) on failure or a "hardware default"
+// (0/1) frequency, so a genuine 60 Hz panel is unaffected (both sources agree on 60).
+//
+// MULTI-MONITOR FIX (2026-07-23): the original implementation took the MAX Hz over every active
+// display path system-wide, not the Hz of the monitor the game window is actually on. On a mixed-
+// refresh rig (e.g. a 60 Hz primary + a 144 Hz secondary) with the window on the lower-Hz panel,
+// that max-over-paths value fed interpEffectiveTarget too high; with VSync on, the resulting M
+// blocking presents per tick overran the 1/60s logic budget and the simulation ran in slow motion.
+// We now resolve the monitor under the window rect first (posX/posY/width/height are already
+// exposed by Ship::Window -- Fast3dWindow does not expose a raw HWND, so MonitorFromRect is used
+// instead of MonitorFromWindow; both resolve to the same monitor for a non-minimized window) and
+// match it by GDI device name, first against QueryDisplayConfig's per-path source name, then via a
+// direct EnumDisplaySettingsW on that device. The old "max over all active paths" logic is kept
+// ONLY as the last-resort fallback when the window's monitor cannot be resolved at all.
+#ifdef _WIN32
+static int gdx_display_hz_for_device(const wchar_t* deviceName) {
+    DEVMODEW dm;
+    ZeroMemory(&dm, sizeof(dm));
+    dm.dmSize = sizeof(dm);
+    if (EnumDisplaySettingsW(deviceName, ENUM_CURRENT_SETTINGS, &dm) &&
+        (dm.dmFields & DM_DISPLAYFREQUENCY) != 0 && dm.dmDisplayFrequency > 1) {
+        return static_cast<int>(dm.dmDisplayFrequency);
+    }
+    return 0;
+}
+
+// windowPosX/Y/Width/Height: the game window's current screen rect (Ship::Window::GetPosX/GetPosY/
+// GetWidth/GetHeight). outPath receives a short string naming which resolution path produced the
+// returned Hz, for the [interp-diag] log.
+static int gdx_os_display_refresh_hz(int32_t windowPosX, int32_t windowPosY, uint32_t windowWidth,
+                                     uint32_t windowHeight, const char** outPath) {
+    *outPath = "unresolved";
+
+    // Resolve the monitor the window rect actually sits on, then its GDI device name.
+    wchar_t deviceName[CCHDEVICENAME] = {};
+    RECT windowRect = { windowPosX, windowPosY, windowPosX + static_cast<LONG>(windowWidth),
+                        windowPosY + static_cast<LONG>(windowHeight) };
+    HMONITOR hMonitor = MonitorFromRect(&windowRect, MONITOR_DEFAULTTONEAREST);
+    if (hMonitor != nullptr) {
+        MONITORINFOEXW info;
+        ZeroMemory(&info, sizeof(info));
+        info.cbSize = sizeof(info);
+        if (GetMonitorInfoW(hMonitor, &info)) {
+            wcsncpy(deviceName, info.szDevice, CCHDEVICENAME - 1);
+        }
+    }
+
+    // Primary source: QueryDisplayConfig, matched to the window's monitor by source device name so
+    // we get the EXACT vertical-sync rate as a rational (numerator/denominator) for THAT panel —
+    // EnumDisplaySettings (dmDisplayFrequency) and the DXGI backend's GetMonitorHzPeriod can round
+    // down to 60 on some high-refresh panels (observed on a 143 Hz monitor).
+    UINT32 pathCount = 0, modeCount = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) == ERROR_SUCCESS &&
+        pathCount > 0) {
+        std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+        std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+        if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(), &modeCount, modes.data(),
+                               nullptr) == ERROR_SUCCESS) {
+            if (deviceName[0] != L'\0') {
+                for (UINT32 i = 0; i < pathCount; ++i) {
+                    DISPLAYCONFIG_SOURCE_DEVICE_NAME sourceName = {};
+                    sourceName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+                    sourceName.header.size = sizeof(sourceName);
+                    sourceName.header.adapterId = paths[i].sourceInfo.adapterId;
+                    sourceName.header.id = paths[i].sourceInfo.id;
+                    if (DisplayConfigGetDeviceInfo(&sourceName.header) == ERROR_SUCCESS &&
+                        _wcsicmp(sourceName.viewGdiDeviceName, deviceName) == 0) {
+                        const DISPLAYCONFIG_RATIONAL& r = paths[i].targetInfo.refreshRate;
+                        if (r.Denominator != 0) {
+                            const double hz =
+                                static_cast<double>(r.Numerator) / static_cast<double>(r.Denominator);
+                            const int rounded = static_cast<int>(hz + 0.5);
+                            if (rounded > 1) {
+                                *outPath = "querydisplayconfig:window-monitor";
+                                return rounded;
+                            }
+                        }
+                    }
+                }
+            }
+            // Window's monitor didn't resolve or didn't match a QueryDisplayConfig source: last-
+            // resort fallback identical to the pre-fix behavior (max over all active paths).
+            double best = 0.0;
+            for (UINT32 i = 0; i < pathCount; ++i) {
+                const DISPLAYCONFIG_RATIONAL& r = paths[i].targetInfo.refreshRate;
+                if (r.Denominator != 0) {
+                    const double hz = static_cast<double>(r.Numerator) / static_cast<double>(r.Denominator);
+                    if (hz > best) {
+                        best = hz;
+                    }
+                }
+            }
+            const int rounded = static_cast<int>(best + 0.5);
+            if (rounded > 1) {
+                *outPath = "querydisplayconfig:max-over-paths-fallback";
+                return rounded;
+            }
+        }
+    }
+
+    // Secondary path: EnumDisplaySettingsW directly on the window's monitor device name.
+    if (deviceName[0] != L'\0') {
+        const int hz = gdx_display_hz_for_device(deviceName);
+        if (hz > 0) {
+            *outPath = "enumdisplaysettings:window-monitor";
+            return hz;
+        }
+    }
+
+    // Last-resort fallback: the primary display's current mode (window monitor unresolved).
+    DEVMODEW dm;
+    ZeroMemory(&dm, sizeof(dm));
+    dm.dmSize = sizeof(dm);
+    if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) &&
+        (dm.dmFields & DM_DISPLAYFREQUENCY) != 0 && dm.dmDisplayFrequency > 1) {
+        *outPath = "enumdisplaysettings:primary-fallback";
+        return static_cast<int>(dm.dmDisplayFrequency);
+    }
+    return 0;
+}
+#else
+static int gdx_os_display_refresh_hz(int32_t, int32_t, uint32_t, uint32_t, const char** outPath) {
+    *outPath = "unavailable";
+    return 0;
+}
+#endif
 
 // LUS ControlDeck's connected-port bitmask. ControlDeck::Init() stores this pointer and sets bit
 // 0; the Input Editor reads it for its per-port connection display. It must outlive the deck, so
@@ -214,8 +391,17 @@ static std::vector<std::string> findArchivePaths(const char* argv0) {
     // only when no fzerox.o2r exists — that is Torch's default output name, still used by the
     // in-tree dev archive (assets/extracted/generic.o2r). Never mount both: they carry the same
     // resource keys and double-mounting would just shadow one with the other.
+    // R3 (C-R3.3): n64ddipl.o2r carries the 64DD IPL font block as its own dedicated archive so the
+    // IPL ROM file becomes deletable after setup. Its absence is tolerated — gdx_ddipl_load falls back
+    // to the raw N64DDIPLROM.n64 (retained until R4) — and it is unversioned, which the HasGameVersion
+    // mount gate already skips, so it mounts cleanly alongside the game archives.
+    // R8 Step 1 (analogous): fzerox-disk.o2r carries the whole 64DD EK disk image so the raw .ndd and
+    // the R7 managed copy become deletable once a boot reconstructs from it. Also unversioned and
+    // tolerated-absent — gdx_disk_load falls back to the managed copy / raw .ndd.
     for (const auto& nameGroup : { std::vector<const char*>{ "gdiffuser.o2r", "f3d.o2r" },
-                                   std::vector<const char*>{ "fzerox.o2r", "generic.o2r" } }) {
+                                   std::vector<const char*>{ "fzerox.o2r", "generic.o2r" },
+                                   std::vector<const char*>{ "n64ddipl.o2r" },
+                                   std::vector<const char*>{ "fzerox-disk.o2r" } }) {
         bool found = false;
         for (const char* name : nameGroup) {
             for (const auto& root : roots) {
@@ -401,6 +587,12 @@ int main(int argc, char** argv) {
     static constexpr uint32_t kGdxExpectedGenericRomCrc = 0x78D90EB3u; // C4: US-rev0 ROM CRC stamp
     logStep("InitResourceManager");   ctx->InitResourceManager(archivePaths, {}, 1);
 
+    // R4 (C-R4.1): "archives validated" predicate for the no-ROM boot gate below. True iff the
+    // fzerox.o2r/generic.o2r game archive is mounted AND survives this CRC gate (i.e. is NOT
+    // unmounted by the version check in the block below). Captured here, at the point the gate's
+    // outcome is fully known, and threaded into gdx_init_rom so a missing ROM can be tolerated
+    // when the archive that actually serves the game's assets is present and correct.
+    bool archivesValidated = false;
     {
         auto rm = ctx->GetResourceManager();
         auto am = (rm != nullptr) ? rm->GetArchiveManager() : nullptr;
@@ -442,6 +634,12 @@ int main(int argc, char** argv) {
                                     MB_OK | MB_ICONWARNING);
 #endif
                         toUnmount.push_back(path);
+                    } else {
+                        // R4 (C-R4.1): this is the "fzerox.o2r/generic.o2r mounted AND survived
+                        // the CRC gate" condition -- the exact predicate the no-ROM boot gate
+                        // needs. Both the installed name and Torch's generic dev-archive name
+                        // are accepted by this same branch, so both satisfy the predicate.
+                        archivesValidated = true;
                     }
                 } else if (got != kGdxExpectedArchiveVersion) {
                     // WARN-ONLY for every other versioned archive.
@@ -547,6 +745,15 @@ int main(int argc, char** argv) {
         // when the CVar does not yet exist, so a value already loaded from the user's config (their
         // explicit toggle) still wins, while a fresh config gets the pacer disabled by default.
         CVarRegisterInteger("gEnhancements.Graphics.FramePacing", 0);
+
+        // R6-P2: frame-interpolation master toggle, DEFAULT OFF. When 1, the host loop below
+        // decouples render from logic — the sim still advances exactly one tick per iteration
+        // (never re-cadenced), but the retained gfx task is replayed + presented as M wall-clock
+        // sub-frames per tick (smooth motion on >60 Hz panels). Registered here at its stock-
+        // reproducing default like FramePacing so a persisted user toggle still wins; the P5 menu
+        // ctor also registers it. Interpolation and FramePacing are mutually-exclusive pacing
+        // owners — the pacer no-ops itself while this is on (see gdx_frame_pacer.c).
+        CVarRegisterInteger("gEnhancements.Graphics.FrameInterpolation", 0);
         // One-time migration to the new OFF default. A previous build defaulted the pacer ON for
         // Linux and force-enabled it via gdx.Migrations.LinuxFramePacingOn, persisting FramePacing:1
         // into existing configs — which the RegisterInteger above cannot override. Flip it back OFF
@@ -675,20 +882,32 @@ int main(int argc, char** argv) {
         if (!firstBoot.romPath.empty()) {
             romArgv.push_back(const_cast<char*>(firstBoot.romPath.c_str()));
         }
-        gdx_init_rom(static_cast<int>(romArgv.size()), romArgv.data());
+        gdx_init_rom(static_cast<int>(romArgv.size()), romArgv.data(), archivesValidated ? 1 : 0);
     }
 
-    // Block the game from starting without a ROM — a null buffer causes silent DMA
-    // zero-fills that corrupt game state and produce non-obvious crashes downstream.
-    {
-        if (gdx_rom_buffer == nullptr) {
-            gdx_port_logf("[G-Diffuser] FATAL: no ROM loaded — cannot start game.\n");
-            gdx_port_logf("[G-Diffuser] Place baserom.us.rev0.z64 next to the exe, or pass it as an argument.\n");
+    // R4 (C-R4.1): with archivesValidated, gdx_init_rom's own resolution failure path already
+    // returns success with gdx_rom_buffer == nullptr / gdx_rom_size == 0 (archive-only boot) --
+    // it does not exit(1). So this second null check is now the ACTUAL no-ROM boot gate:
+    //   - gdx_rom_buffer == nullptr && archivesValidated: expected archive-only state, proceed.
+    //   - gdx_rom_buffer == nullptr && !archivesValidated: gdx_init_rom's own FATAL/exit(1) path
+    //     should already have terminated the process before we get here -- this branch is kept
+    //     purely as defense-in-depth (same actionable error the old unconditional check used).
+    if (gdx_rom_buffer == nullptr) {
+        if (archivesValidated) {
+            gdx_port_logf("[G-Diffuser] no ROM loaded; continuing archive-only boot (fzerox.o2r "
+                          "validated). Raw-ROM fallback reads will be logged/zero-filled -- the R4 "
+                          "soak (C-R4.2, GDX_STRICT_ARCHIVE telemetry) must show none for this to "
+                          "be a supported end-user configuration.\n");
+        } else {
+            gdx_port_logf("[G-Diffuser] FATAL: no ROM loaded and no validated archive — cannot start game.\n");
+            gdx_port_logf("[G-Diffuser] Place baserom.us.rev0.z64 next to the exe, pass it as an argument, "
+                          "or complete first-boot setup so a validated fzerox.o2r archive is installed.\n");
 #ifdef _WIN32
             MessageBoxA(nullptr,
-                "No F-Zero X ROM was loaded.\n\n"
+                "No F-Zero X ROM was loaded, and no validated asset archive was found either.\n\n"
                 "Place 'baserom.us.rev0.z64' next to G-Diffuser.exe,\n"
-                "or pass the ROM path as a command-line argument.",
+                "pass the ROM path as a command-line argument,\n"
+                "or complete first-boot setup so a validated fzerox.o2r archive is installed.",
                 "G-Diffuser — ROM required", MB_OK | MB_ICONERROR);
 #endif
             return 1;
@@ -710,6 +929,48 @@ int main(int argc, char** argv) {
     }
     gdx_register_main_module_range();
 
+    // Audio delivery (C-R2.2): preload the three audio blob families once, here, in the same
+    // boot window gdx_rom_buffer is registered (AFTER gdx_rdram_init, BEFORE bootproc), so the
+    // payloads are resident before the first audio DMA rather than loading lazily on an audio
+    // tick. Each resident payload is then registered as a host range so truncated-low32 tokens
+    // of blob-served audio buffers resolve through the marshaller EXACTLY like gAudioHeap /
+    // gdx_rom_buffer do (shared LLE/HLE two-tier resolver). Absence degrades silently: if the
+    // live archive lacks these entries (owner's fzerox.o2r predates them), preload returns 0 and
+    // the DMA sink falls back to raw ROM -- zero behavior change from today.
+    //
+    // Bases are the PORT_audio_{bank,seq,table}_ROM_START constants from
+    // decomp/include/port_segment_addrs.h, declared here by known value (this file deliberately
+    // avoids the decomp include tree; the shared blob table is keyed on these exact bases).
+    {
+        static const uint32_t kAudioBlobBases[3] = {
+            0x00524D60u, // PORT_audio_bank_ROM_START  (audio_blob/audio_bank)
+            0x00527AF0u, // PORT_audio_seq_ROM_START   (audio_blob/audio_seq)
+            0x00528730u, // PORT_audio_table_ROM_START (audio_blob/audio_table)
+        };
+        for (int i = 0; i < 3; ++i) {
+            const uint32_t base = kAudioBlobBases[i];
+            if (GdxSegmentSourcePreload(base)) {
+                void* payload = nullptr;
+                uint32_t payloadSize = 0;
+                if (GdxSegmentSourcePayload(base, &payload, &payloadSize) && payload != nullptr) {
+                    gdx_register_host_range(payload, payloadSize);
+                    gdx_port_logf("[audio-blob] preloaded+registered base=%08X payload=%p low32=%08X size=0x%X\n",
+                                  base, payload,
+                                  static_cast<unsigned>(reinterpret_cast<uintptr_t>(payload) & 0xFFFFFFFFu),
+                                  payloadSize);
+                }
+            } else {
+                gdx_port_logf("[audio-blob] base=%08X not resident (archive lacks entry) — raw-ROM fallback\n",
+                              base);
+            }
+        }
+    }
+
+    // PCM-parity capture (C-R2.3): arm before the audio thread starts producing ticks, so the
+    // capture window and its deterministic-RNG gate are live on the first audio tick. No-op unless
+    // GDX_PCM_CAPTURE is set — zero behavior change for normal play.
+    gdx_pcm_capture_init();
+
     logStep("bootproc() — starting the decomp game threads");
     bootproc();
     logStep("bootproc() returned; game threads running");
@@ -717,6 +978,10 @@ int main(int argc, char** argv) {
     // Frame loop: pump SDL events + libultraship window each tick.
     // HandleEvents() MUST be called every frame to drain the SDL event queue;
     // without it, click/close events pile up and the window manager crashes.
+    // R6-P2: give the gfx bridge a monotonic clock so its sub-frame loop can derive t. Registered
+    // once, before the loop; inert unless FrameInterpolation is on.
+    gdx_gfx_interp_set_now_fn(&gdx_host_now_seconds);
+
     logStep("entering frame loop");
     auto w = ctx->GetWindow();
     while (w != nullptr && w->IsRunning()) {
@@ -731,6 +996,170 @@ int main(int argc, char** argv) {
         // CVar-wise except on game-mode transitions. See gdx_fixed_aspect_tick in input_bridge.c.
         gdx_fixed_aspect_tick();
         gdx::PerfPhaseEnd(gdx::PerfInput);
+
+        // R6-P2: decide render/logic decoupling for THIS tick and configure the bridge's sub-frame
+        // schedule BEFORE gdx_vi_tick — the game's gfx-task submission (gdx_gfx_run) can execute
+        // inside gdx_vi_tick's synchronous fiber dispatch (see the comment just below), so the
+        // schedule must be live before any gfx work runs. Inert unless FrameInterpolation / GDX_INTERP_P2.
+        // tickStart anchors the wall-clock accumulator (plan Step 2a); tickDuration is the fixed 60 Hz
+        // logic budget — the SIM cadence never changes, only the number of presented sub-frames does.
+        // P3 (plan edge #3): gate interpolation OFF while an EK editor (Course Edit / Create
+        // Machine) forces the stock 4:3 pillarbox path. gdx_fixed_aspect_tick() above just
+        // published that state; gdx_get_force_fixed_aspect() reads the same interpreter global the
+        // pillarbox path uses. Editors are low-motion and their fresh mRendersToFb/aspect recompute
+        // must not run per sub-frame, so we drop to the single-present default path (M=1). The
+        // decomp_port.c mode-load cut shim snaps the first tick after leaving the editor.
+        const bool interpEditorActive = (gdx_get_force_fixed_aspect() != 0);
+        const bool interpOn = (gdx_gfx_interp_host_active() != 0) && !interpEditorActive;
+        const double interpTickStart = gdx_host_now_seconds();
+        // SoH-style Frame Interpolation FPS control (gdx_menu.cpp UI, ~:1290-1380): derive this
+        // tick's M (max sub-frames) from the two live CVars instead of the old fixed constant.
+        //   gEnhancements.Graphics.InterpTargetMode = 0 -> Match Refresh Rate: target = the
+        //                                             display's current refresh rate, queried via
+        //                                             Ship::Window::GetCurrentRefreshRate() (`w`
+        //                                             below is already ctx->GetWindow() from above).
+        //                                             1 -> Capped: target = InterpTargetFps.
+        // M = clamp(ceil(target/60), 1, kGdxInterpMaxSubframes) -- one wall-clock present per full
+        // 60 Hz slice of the target, e.g. 60Hz->1 (present-per-tick, still correct), 144Hz->3,
+        // 480fps target->8 (the hard ceiling). Only computed while interpOn; the default path
+        // ignores maxSubframes entirely, so this is inert with interpolation off. Cheap: a couple of
+        // live CVar reads plus (Match Refresh only) one window query, same "read live every tick"
+        // idiom FrameInterpolation's own master toggle already uses above.
+        // R6-P2 FIELD-DEFECT FIX (2026-07-23): derive this tick's sub-frame COUNT via a deterministic
+        // rational remainder accumulator (SoH interpolate_frame), not the old ceil(target/60). The
+        // target-frames that fall inside one 60 Hz logic tick is target * tickSeconds — a FRACTION
+        // (e.g. 143 Hz -> 143 * 1.001/60 = 2.386). ceil() rounded that up to a fixed 3 every tick,
+        // which on a VSync-on 143 Hz panel cannot fit in the tick budget (3 blocking presents ~= 21 ms
+        // > 16.68 ms) and made the loop overrun/oscillate — the owner's "unstable framerate". The
+        // accumulator instead carries the fractional remainder across ticks so the per-tick count
+        // alternates (2,2,3,...) and averages exactly target/60, keeping the long-run present rate at
+        // the target while logic stays 60 Hz. No clock reads: purely a running remainder. The M cap
+        // (kGdxInterpMaxSubframes) is preserved; the tick_config API shape is unchanged (main derives
+        // the count from the target and hands it over as maxSubframes; the bridge presents that many
+        // evenly-spaced sub-frames).
+        int interpMaxSubframes = kGdxInterpMaxSubframes;
+        static double sInterpFrameAccum = 0.0;
+        // Cache for the OS panel-Hz resolution (MonitorFromRect + GetMonitorInfoW + a
+        // QueryDisplayConfig device-matching loop, see gdx_os_display_refresh_hz above) -- that
+        // path is comparatively expensive to run every logic tick while Match Refresh is enabled.
+        // Re-resolved at most once per >=1000ms (using this tick's own wall-clock time source,
+        // interpTickStart) or immediately whenever Match Refresh (re-)becomes active, so a monitor
+        // change/hotplug is still picked up quickly without paying the resolution cost every tick.
+        static double sInterpOsHzLastResolve = -1000.0;
+        static int sInterpOsHzCached = 0;
+        static const char* sInterpOsHzPathCached = "unresolved";
+        static bool sInterpMatchRefreshActive = false;
+        if (interpOn) {
+            const bool interpMatchRefresh = CVarGetInteger("gEnhancements.Graphics.InterpTargetMode", 0) == 0;
+            int interpEffectiveTarget;
+            if (interpMatchRefresh) {
+                const uint32_t refreshRate = w->GetCurrentRefreshRate();
+                int detected = (refreshRate > 0) ? static_cast<int>(refreshRate) : 0;
+                // Cross-check the OS panel rate for the monitor the window is actually ON (see
+                // gdx_os_display_refresh_hz): libultraship may under-report on some high-refresh
+                // panels. Use the higher of the two so a mis-detected 60 Hz on a real 143 Hz panel
+                // still drives interpolation, while a window sitting on a genuinely lower-Hz
+                // monitor doesn't get pulled up to a higher-Hz secondary display's rate.
+                if (!sInterpMatchRefreshActive || (interpTickStart - sInterpOsHzLastResolve) >= 1.0) {
+                    sInterpOsHzCached = gdx_os_display_refresh_hz(w->GetPosX(), w->GetPosY(), w->GetWidth(),
+                                                                   w->GetHeight(), &sInterpOsHzPathCached);
+                    sInterpOsHzLastResolve = interpTickStart;
+                }
+                sInterpMatchRefreshActive = true;
+                const int osHz = sInterpOsHzCached;
+                const char* osHzPath = sInterpOsHzPathCached;
+                if (osHz > detected) {
+                    detected = osHz;
+                }
+                // Fallback to 120 if neither source can report a refresh rate. Floor a genuine
+                // sub-60 report (50 Hz PAL sets, VM/RDP virtual displays, eco panel modes) at 60:
+                // the sim ticks at 60 Hz and always presents at least once per tick, so a sub-60
+                // target cannot be honored anyway — flooring keeps framesPerTick >= 1 by
+                // construction instead of leaning on the count<1 guard below.
+                interpEffectiveTarget = (detected > 0) ? detected : 120;
+                if (interpEffectiveTarget < 60) {
+                    interpEffectiveTarget = 60;
+                }
+                static bool sLoggedRefreshDiag = false;
+                if (!sLoggedRefreshDiag) {
+                    sLoggedRefreshDiag = true;
+                    gdx_port_logf(
+                        "[interp-diag] MatchRefresh: lus_refresh=%u os_refresh=%d (path=%s) -> target=%d\n",
+                        static_cast<unsigned>(refreshRate), osHz, osHzPath, interpEffectiveTarget);
+                }
+            } else {
+                sInterpMatchRefreshActive = false; // re-resolve immediately if Match Refresh re-enables later
+                // Root-fix (judgment-day round 2): clamp the CVar read itself to the UI's enforced
+                // range [60, 480] (gdx_menu.cpp Target FPS slider, ~:1437-1442). A manually edited
+                // config value below 60 used to reach the `count < 1` debit guard below, whose
+                // debit-then-floor arithmetic cannot actually reduce presentation below one present
+                // per tick for a value that low (truncation toward zero on the negative
+                // accumulator). Clamping at the source removes that broken-in-practice path.
+                interpEffectiveTarget = CVarGetInteger("gEnhancements.Graphics.InterpTargetFps", 120);
+                if (interpEffectiveTarget < 60) {
+                    interpEffectiveTarget = 60;
+                }
+                if (interpEffectiveTarget > 480) {
+                    interpEffectiveTarget = 480;
+                }
+            }
+            // target-frames per logic tick (fractional); accumulate the remainder deterministically.
+            const double framesPerTick = static_cast<double>(interpEffectiveTarget) * kGdxInterpTickSeconds;
+            sInterpFrameAccum += framesPerTick;
+            int count = static_cast<int>(sInterpFrameAccum); // floor
+            sInterpFrameAccum -= static_cast<double>(count);  // carry the fractional remainder
+            if (count < 1) {
+                count = 1; // always present at least once (also covers sub-60 targets)
+                // This forced present wasn't "earned" by the accumulator (remainder was already <1
+                // before forcing), so debit it the same way an earned present would have been
+                // subtracted, to avoid a sub-60 target's long-run present rate creeping above
+                // target/60. Floored at -1.0 (at most one tick's worth of debt) so the debt can't
+                // grow unbounded if this guard is ever hit on consecutive ticks. Both
+                // interpEffectiveTarget sources are now floor-bounded at >=60 (Capped mode's CVar
+                // read is clamped to the UI's [60, 480] range above; Match Refresh floors its
+                // detected rate at 60 and falls back to 120 when nothing is detected), so
+                // framesPerTick >= 1 and this branch should not fire; kept as defense-in-depth
+                // for any future target source that skips those clamps.
+                sInterpFrameAccum -= 1.0;
+                if (sInterpFrameAccum < -1.0) {
+                    sInterpFrameAccum = -1.0;
+                }
+            }
+            if (count > kGdxInterpMaxSubframes) {
+                count = kGdxInterpMaxSubframes; // hard M cap
+                sInterpFrameAccum = 0.0;        // don't let a clamped burst bank unbounded remainder
+            }
+            interpMaxSubframes = count;
+
+            // R6-P2 FIELD-DEFECT FIX (2026-07-23, THE throughput fix): raise the window's frame-limiter
+            // target to the interpolation target while interp is on. The DXGI/SDL backend software
+            // limiter (gfx_dxgi.cpp / gfx_sdl2.cpp, mTargetFps, default 60) throttles EVERY present —
+            // including each decoupled sub-frame present — to 60 fps. Measured: with the sub-frame loop
+            // presenting 2-3 frames/tick the limiter pinned total presents at 60/s and dragged the SIM
+            // to ~25 Hz during races (60 / avg_M), so interpolation delivered ZERO extra presented
+            // frames AND ran the game in slow-motion. Setting the limiter target to interpEffectiveTarget
+            // lets it pace sub-frames at the target rate instead (VSync-on: the panel refresh binds;
+            // VSync-off: the limiter paces to target and the logic-deadline wait below still holds the
+            // SIM at 60 Hz). Applied only on a CHANGE (SetTargetFps recomputes the limiter phase),
+            // using the LIVE backend value as the source of truth so on/off and target-change
+            // transitions all settle correctly. This is exactly how SoH drives its interpolation.
+            Fast::Fast3dWindow* interpWin = static_cast<Fast::Fast3dWindow*>(w.get());
+            if (interpWin->GetTargetFps() != interpEffectiveTarget) {
+                interpWin->SetTargetFps(interpEffectiveTarget);
+            }
+        } else {
+            sInterpFrameAccum = 0.0; // reset so a later re-enable starts from a clean remainder
+            sInterpMatchRefreshActive = false; // force an immediate OS-Hz re-resolve on next enable
+            // Restore the stock 60 fps limiter target when interpolation is off (mirror of the raise
+            // above); live-value guarded so we only touch the backend on a real change.
+            Fast::Fast3dWindow* interpWin = static_cast<Fast::Fast3dWindow*>(w.get());
+            if (interpWin->GetTargetFps() != 60) {
+                interpWin->SetTargetFps(60);
+            }
+        }
+        gdx_gfx_interp_tick_config(interpOn ? 1 : 0, interpTickStart, kGdxInterpTickSeconds,
+                                   interpMaxSubframes);
+
         // "gametick" is where the game frame ACTUALLY runs: gdx_vi_tick posts the VI retrace
         // message, which wakes the Main scheduler thread and the cooperative scheduler dispatches
         // the game fiber right here (osSendMesg -> osStartThread -> __osDispatchThread, because
@@ -753,41 +1182,147 @@ int main(int argc, char** argv) {
         // drive the menu on every platform. No-op unless gControlNav is enabled. See gdx_imgui_nav.
         gdx_imgui_nav_tick();
         gdx::PerfPhaseEnd(gdx::PerfInput);
-        gdx::PerfPhaseBegin(gdx::PerfGuiStart);
-        w->GetGui()->StartDraw();
-        w->StartFrame(); // must precede gdx_dispatch: Run() needs an initialized frame
-        // Cross-thread message wakes recorded by the dedicated audio thread (sendmesg.c PORT
-        // path) become runnable here, on the host thread, right before the threads dispatch.
-        // See the guard block in n64_sched.c.
-        gdx_sched_drain_deferred_wakes();
-        gdx::PerfPhaseEnd(gdx::PerfGuiStart);
-        gdx::PerfPhaseBegin(gdx::PerfDispatch);
-        gdx_dispatch();  // run the decomp's game threads cooperatively until they block again
-        gdx::PerfPhaseEnd(gdx::PerfDispatch);
-        gdx::PerfPhaseBegin(gdx::PerfTicks);
-        // Durable 64DD disk-save flush. A game disk write (Course Edit save, MFS
-        // format) marked the sidecar dirty via gdx_disk_save_mark_dirty; this
-        // debounced tick persists it atomically once the write burst has drained.
-        // No-op when nothing is pending. See port/disk_savefile.{h,cpp}.
-        gdx_disk_save_tick();
-        gdx::PerfPhaseEnd(gdx::PerfTicks);
-        gdx::PerfPhaseBegin(gdx::PerfPresent);
-        // VI-scanout fallback: if no GFX task rendered this frame (boot logo phase
-        // or any CPU-drawn screen), present the current VI framebuffer's pixels.
-        // Cheap no-op when a real frame was produced.
-        gdx_vi_present_fallback();
-        w->GetGui()->EndDraw();
-        w->EndFrame();
-        gdx::PerfPhaseEnd(gdx::PerfPresent);
-        // Port-level wall-clock pacer, gated on gEnhancements.Graphics.FramePacing. Default is
-        // platform-specific: OFF on Windows (the DXGI backend already limits EndFrame() to ~60fps)
-        // and ON on Linux (the SDL2 limiter is signal-fragile and lets the loop free-run at the
-        // panel refresh -- see gdx_frame_pacer.{h,c}). When on, holds the loop to the N64 NTSC
-        // field rate (~59.94Hz).
-        gdx::PerfPhaseBegin(gdx::PerfPacer);
-        gdx_frame_pacer_tick();
-        gdx::PerfPhaseEnd(gdx::PerfPacer);
+        if (!interpOn) {
+            // ===== DEFAULT PATH — one tick, one Run, one present. Byte-identical to pre-P2. =====
+            // When FrameInterpolation is OFF, gdx_gfx_interp_host_active() returned 0, the bridge's
+            // adapter leaves mInterpEnabled false (no scratch reroute), gdx_gfx_run takes its single
+            // interp->Run path, and this exact statement sequence presents once and paces via the
+            // frame pacer. Nothing on this branch touches the interpolation machinery.
+            gdx::PerfPhaseBegin(gdx::PerfGuiStart);
+            w->GetGui()->StartDraw();
+            w->StartFrame(); // must precede gdx_dispatch: Run() needs an initialized frame
+            // Cross-thread message wakes recorded by the dedicated audio thread (sendmesg.c PORT
+            // path) become runnable here, on the host thread, right before the threads dispatch.
+            // See the guard block in n64_sched.c.
+            gdx_sched_drain_deferred_wakes();
+            gdx::PerfPhaseEnd(gdx::PerfGuiStart);
+            gdx::PerfPhaseBegin(gdx::PerfDispatch);
+            gdx_dispatch();  // run the decomp's game threads cooperatively until they block again
+            gdx::PerfPhaseEnd(gdx::PerfDispatch);
+            gdx::PerfPhaseBegin(gdx::PerfTicks);
+            // Durable 64DD disk-save flush. A game disk write (Course Edit save, MFS
+            // format) marked the sidecar dirty via gdx_disk_save_mark_dirty; this
+            // debounced tick persists it atomically once the write burst has drained.
+            // No-op when nothing is pending. See port/disk_savefile.{h,cpp}.
+            gdx_disk_save_tick();
+            gdx::PerfPhaseEnd(gdx::PerfTicks);
+            gdx::PerfPhaseBegin(gdx::PerfPresent);
+            // VI-scanout fallback: if no GFX task rendered this frame (boot logo phase
+            // or any CPU-drawn screen), present the current VI framebuffer's pixels.
+            // Cheap no-op when a real frame was produced.
+            gdx_vi_present_fallback();
+            w->GetGui()->EndDraw();
+            w->EndFrame();
+            gdx::PerfPhaseEnd(gdx::PerfPresent);
+            // Port-level wall-clock pacer, gated on gEnhancements.Graphics.FramePacing. Default is
+            // platform-specific: OFF on Windows (the DXGI backend already limits EndFrame() to ~60fps)
+            // and ON on Linux (the SDL2 limiter is signal-fragile and lets the loop free-run at the
+            // panel refresh -- see gdx_frame_pacer.{h,c}). When on, holds the loop to the N64 NTSC
+            // field rate (~59.94Hz).
+            gdx::PerfPhaseBegin(gdx::PerfPacer);
+            gdx_frame_pacer_tick();
+            gdx::PerfPhaseEnd(gdx::PerfPacer);
+        } else {
+            // ===== FRAME-INTERPOLATION PATH (R6-P2, default-OFF) =====
+            // The bridge owns the present this tick: gdx_gfx_run replays + presents M wall-clock
+            // sub-frames of the retained gfx task via fw->DrawAndRunGraphicsCommands (each a full
+            // StartDraw..EndFrame bracket). We must NOT open our own ImGui StartDraw here — it would
+            // nest the per-sub-frame ImGui frames. So this branch runs the scheduler + dispatch, then
+            // only presents itself as a FALLBACK for a taskless tick (edge #6, e.g. boot logo).
+            gdx::PerfPhaseBegin(gdx::PerfGuiStart);
+            gdx_sched_drain_deferred_wakes();
+            gdx::PerfPhaseEnd(gdx::PerfGuiStart);
+            gdx::PerfPhaseBegin(gdx::PerfDispatch);
+            gdx_dispatch();  // game runs once; gdx_gfx_run presents the interpolated sub-frames
+            gdx::PerfPhaseEnd(gdx::PerfDispatch);
+            gdx::PerfPhaseBegin(gdx::PerfTicks);
+            gdx_disk_save_tick();
+            gdx::PerfPhaseEnd(gdx::PerfTicks);
+            gdx::PerfPhaseBegin(gdx::PerfPresent);
+            if (gdx_gfx_interp_presented_last_tick() == 0) {
+                // No gfx task this tick -> interpolation no-ops cleanly (edge #6). Present once via
+                // the normal single-frame bracket (the CPU-drawn VI framebuffer / hold pixels).
+                w->GetGui()->StartDraw();
+                w->StartFrame();
+                gdx_vi_present_fallback();
+                w->GetGui()->EndDraw();
+                w->EndFrame();
+            }
+            gdx::PerfPhaseEnd(gdx::PerfPresent);
+            // Pacer mutual exclusion: the frame pacer is NOT called here (it also no-ops itself when
+            // FrameInterpolation is on — see gdx_frame_pacer.c). Presents ran VSync-paced inside the
+            // sub-frame loop; this holds the host to the 60 Hz LOGIC deadline so the SIM cadence stays
+            // locked at 60 Hz even when presents finished early (VSync-off case). Interpolation and
+            // FramePacing are mutually-exclusive pacing owners (plan §4).
+            gdx::PerfPhaseBegin(gdx::PerfPacer);
+            // R6-P2 FIELD-DEFECT FIX (2026-07-23): pace the SIM against a RUNNING absolute schedule
+            // (advance one tick each iteration), not a fresh interpTickStart+tick each tick. With the
+            // rational accumulator, some ticks present 2 sub-frames (~14 ms VSync) and some 3 (~21 ms);
+            // a per-tick deadline re-anchored to "now" would pad the short ticks with idle time,
+            // injecting a stutter every 2-3 ticks and dragging the average below 60 Hz. A running
+            // schedule lets a short tick recover the time a long tick overran (and vice-versa), so
+            // under VSync-on the presents self-pace and this wait is a near-no-op; re-anchor on a big
+            // stall (menu/alt-tab/breakpoint) so we never replay a burst of missed ticks.
+            static double sNextLogicDeadline = 0.0;
+            if (sNextLogicDeadline <= 0.0 ||
+                interpTickStart > sNextLogicDeadline + 4.0 * kGdxInterpTickSeconds) {
+                sNextLogicDeadline = interpTickStart + kGdxInterpTickSeconds;
+            } else {
+                sNextLogicDeadline += kGdxInterpTickSeconds;
+            }
+            gdx_host_pace_logic_until(sNextLogicDeadline);
+            gdx::PerfPhaseEnd(gdx::PerfPacer);
+
+            // Telemetry (spec item 6): rate-limited [interp-p2] line + a one-time activation line.
+            // Cadence mirrors the bridge's diagnostics: first 8 ticks then every 120th (~1/2 s).
+            {
+                static bool sInterpP2Announced = false;
+                if (!sInterpP2Announced) {
+                    sInterpP2Announced = true;
+                    // interpMaxSubframes is THIS tick's target-fps-derived M (see the derivation
+                    // above tick_config); kGdxInterpMaxSubframes is the hard ceiling it was clamped
+                    // against, independent of the live InterpTargetMode/InterpTargetFps CVars.
+                    gdx_port_logf("[interp-p2] decoupled loop ACTIVE: sim locked at 60 Hz, presenting "
+                                  "%d evenly-spaced sub-frames this tick (rational accumulator averages "
+                                  "target/60; hard cap %d). Window fps-limiter raised to target; frame "
+                                  "pacer mutually excluded.\n",
+                                  interpMaxSubframes, kGdxInterpMaxSubframes);
+                }
+                static size_t sInterpP2Tick = 0;
+                static size_t sInterpP2SubAccum = 0;
+                const size_t tick = sInterpP2Tick++;
+                const int sub = gdx_gfx_interp_last_subframes();
+                sInterpP2SubAccum += (sub > 0) ? static_cast<size_t>(sub) : 0;
+                if (tick < 8 || (tick % 120) == 0) {
+                    const double avg = (tick + 1 > 0)
+                                           ? static_cast<double>(sInterpP2SubAccum) / static_cast<double>(tick + 1)
+                                           : 0.0;
+                    // lerped/snapped: the per-slot tween evidence the P2 path previously never logged
+                    // (it only lived on the env-P1 single-present branch) — surfaced here so the
+                    // owner's actual FrameInterpolation path is diagnosable from the log. presents/s
+                    // is the rolling real-FPS meter. In steady state expect lerped >> snapped.
+                    gdx_port_logf("[interp-p2] ticks=%zu subframes=%d avg_m=%.2f t_last=%.3f "
+                                  "lerped=%d snapped=%d presents/s=%.1f\n",
+                                  tick + 1, sub, avg, gdx_gfx_interp_last_t(),
+                                  gdx_gfx_interp_last_lerped(), gdx_gfx_interp_last_snapped(),
+                                  gdx_gfx_interp_presents_per_sec());
+                }
+            }
+        }
         gdx::PerfFrameEnd();
+
+        // Auto-exit after a bounded PCM capture (C-R2.3): once the capture window has finalized
+        // (GDX_PCM_CAPTURE_FRAMES reached), request a clean shutdown through the SAME path the
+        // window-close event uses (Window::Close() -> IsRunning() goes false), so the loop drains
+        // and the normal teardown below runs. Gated on GDX_PCM_CAPTURE so there is zero behavior
+        // change when capture is not configured. Checked once via a static.
+        {
+            static const bool sCaptureMode = (std::getenv("GDX_PCM_CAPTURE") != nullptr);
+            if (sCaptureMode && gdx_pcm_capture_finished()) {
+                logStep("PCM capture finalized; requesting window close (auto-exit)");
+                w->Close();
+            }
+        }
     }
     logStep("window closed; exiting");
     // Force-persist any pending 64DD save journal before exit. The per-frame
@@ -796,6 +1331,11 @@ int main(int argc, char** argv) {
     // window closes would otherwise be dropped. gdx_disk_save_flush() writes the
     // current journal unconditionally (no-op when nothing is active/pending).
     gdx_disk_save_flush();
+    // Stop/join the audio thread BEFORE finalizing PCM capture: gdx_pcm_capture_shutdown() closes
+    // the file and folds the SHA, so it must not race a still-running audio thread calling feed().
     gdx_audio_thread_stop();
+    // Finalize any still-open PCM capture (unbounded run, or window closed mid-window) so its
+    // <prefix>.pcm.sha256 is always emitted. No-op unless a capture was armed and not yet done.
+    gdx_pcm_capture_shutdown();
     return 0;
 }

@@ -12,17 +12,31 @@ from inside `tools/o2r_harness/` (or with this directory on `sys.path`).
 |---|---|---|
 | `verify_determinism.py` | Runs `gdx-extract` **twice** into separate temp dirs, byte-compares the two archives (C2). | The two runs differ, or the extractor exits non-zero. |
 | `validate_archive.py` | C5 checks 2-4 + the C6 complete-or-absent family check, without booting the game. | Entry count wrong, SHA-256 mismatch, bad `version` entry, or any family present-but-partial / misnamed. |
-| `gen_expected_header.py` | Emits `port/gen/gdx_o2r_expected.h` (`GDX_O2R_EXPECTED_SHA256` + `GDX_O2R_EXPECTED_ENTRY_COUNT`) from a validated archive; prints the embedded ROM CRC. | Entry count != 4240 or `version` entry fails C4 (refuses to write unless `--force`). |
+| `gen_expected_header.py` | Emits `port/gen/gdx_o2r_expected.h` (`GDX_O2R_EXPECTED_SHA256` + `GDX_O2R_EXPECTED_ENTRY_COUNT`) from a validated archive; prints the embedded ROM CRC. | Entry count != `o2r_common.EXPECTED_ENTRY_COUNT` (currently 3604) or `version` entry fails C4 (refuses to write unless `--force`). |
 | `compare_archives.py` | Entry-level diff of two `.o2r` files; reports container-level vs payload-level equality separately. | Payloads differ (key set, record counts, or bytes). Container-only differences do **not** fail. |
 | `gen_family_manifest.py` | (Re)generates `family_manifest.json` from a reference archive. Run once; committed. | Archive missing. |
 
 ### Key facts baked into the harness
 
-- **Entry count is 4,240 central-directory RECORDS, not unique names.** The
-  archive legitimately contains **664 duplicate-named records** (same key emitted
-  by multiple recipes, identical payloads); unique names = 3,576. All counting
-  goes through `o2r_common.read_records` / `record_count`, never a name-keyed
-  dict.
+- **Entry count is central-directory RECORDS (dup-inclusive), not unique names.**
+  This is exactly what the zipEntryCount EOCD comparison in
+  `gdx_extract_launch.cpp` compares — it reads EOCD offset 10 ("total
+  central-directory records"). All
+  counting goes through `o2r_common.read_records` / `record_count`
+  (`len(z.infolist())`), never a name-keyed dict, so it always matches the gate.
+  The current deterministic archive has **no duplicate records** (records ==
+  unique names == `o2r_common.EXPECTED_ENTRY_COUNT`, currently **3604**: 3576
+  pre-R1 base + 22 R1 `segment_blob` families + 3 R2 `audio_blob` families + 3 R4
+  `segment_blob` families (`common_assets_compressed`, `kanji_tables`,
+  `rom_boot_tuning` -- W-R4.S1 census; `segment_blob` family count is now 25)).
+  The historical 4,240-records / 664-duplicates / 3,576-unique figures described
+  the pre-2026-07-18 archive (Windows double-emit bug) and no longer apply after
+  the Torch parity fix.
+- **`-u <version>` is REQUIRED on every `gdx-extract` invocation.** Torch only
+  emits the `portVersion` record when a version string is passed. The runtime
+  passes `-u 2027490995` (decimal of the US-rev0 ROM CRC 0x78D90EB3). Omitting it
+  drops `portVersion`, yielding an archive one record short whose SHA-256 will not
+  match the runtime archive nor the golden header.
 - **`version` entry (C4)** = 5 bytes `01 78 D9 0E B3` = `[endianness=0x01 big]`
   `[u32 big-endian ROM CRC = 0x78D90EB3]`. Validated by
   `o2r_common.parse_version_entry`.
@@ -36,15 +50,18 @@ After agent A's `gdx-extract` target builds, run from `tools/o2r_harness/`:
 
 ```
 # 1. Prove determinism (precondition for a stable golden SHA-256).
+#    The `-u 2027490995` MUST be forwarded (see Key facts): it is the US-rev0 ROM
+#    CRC that makes Torch emit the portVersion record the runtime archive carries.
 python verify_determinism.py \
     --extractor <path/to/gdx-extract> \
     --rom <path/to/rom.z64> \
-    --recipes <path/to/decomp-recipes>
+    --recipes <path/to/decomp-recipes> \
+    --extra-arg=-u --extra-arg=2027490995
 #    PASS => prints the golden SHA-256. FAIL => names the first differing entry
 #    (central-directory) or byte offset (container-level, e.g. a stray timestamp).
 
 # 2. Produce ONE archive to bless (any datadir; then validate that exact file).
-<path/to/gdx-extract> o2r <rom.z64> -s <decomp-recipes> -d <out-dir>
+<path/to/gdx-extract> o2r <rom.z64> -s <decomp-recipes> -d <out-dir> -u 2027490995
 #    => <out-dir>/generic.o2r
 
 # 3. Validate structure + family completeness (no golden hash yet -> --skip-hash).
@@ -54,7 +71,7 @@ python validate_archive.py --archive <out-dir>/generic.o2r --skip-hash
 # 4. Mint the golden header from the blessed archive.
 python gen_expected_header.py --archive <out-dir>/generic.o2r
 #    Writes ../../port/gen/gdx_o2r_expected.h and prints the ROM CRC.
-#    Refuses if entry count != 4240 or version entry is wrong.
+#    Refuses if entry count != o2r_common.EXPECTED_ENTRY_COUNT (3604) or version entry is wrong.
 
 # 5. Re-validate WITH the golden hash to close the loop (all four checks).
 python validate_archive.py \
@@ -97,8 +114,9 @@ explicitly; never rely on inherited CWD.
 ## Regenerating the family manifest
 
 `family_manifest.json` encodes the per-family record counts of the C3 full-recipe
-output (30 families, 4,240 records). Regenerate only when the recipe set
-intentionally changes:
+output (32 families, 3,604 records — includes the R1 `segment_blob` family (25
+entries after R4), the R2 `audio_blob` family, and the 3 R4 `segment_blob`
+additions). Regenerate only when the recipe set intentionally changes:
 
 ```
 python gen_family_manifest.py --archive <reference generic.o2r>

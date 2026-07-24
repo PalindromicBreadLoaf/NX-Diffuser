@@ -249,6 +249,572 @@ static void DmemSetU8(uint32_t byteOffset, uint8_t v) {
     sDmemLastOp[(byteOffset & GDX_DMEM_MASK) >> 4] = sDmemCurOp;
 }
 
+// Pending buffer descriptor set by A_SETBUFF and consumed by decode/resample commands.
+typedef struct GdxBufDesc {
+    uint32_t dmemIn;
+    uint32_t dmemOut;
+    uint32_t count;
+} GdxBufDesc;
+
+// ---- Unlock-jingle HLE stage capture -----------------------------------------
+//
+// GDX_DIAG_UNLOCK already identifies the sequence-channel notes on the CPU side.
+// synthesis.c registers the exact Acmd range and persistent state addresses for
+// each target note before the command list is submitted. Range attribution lets
+// the HLE capture only the unlock voices without changing the command list or
+// guessing from sample contents.
+//
+// Four timeline-aligned WAVs are produced after exactly two seconds:
+//   resample      target voices immediately after A_RESAMPLE
+//   pre-envelope  target voices after optional gain/filter, at A_ENVMIXER input
+//   envelope      target-only dry L/R contributions after envelope/pan
+//   mix           complete dry L/R buses immediately before A_INTERLEAVE
+//
+// Decode and resampler-input samples are summarized in the diagnostic log rather
+// than emitted as WAVs: those buffers run in source-sample space and contain
+// per-call overlap/preamble, so concatenating them would create artificial seams
+// that could be mistaken for the defect under investigation. The capture is
+// dormant until a target note is registered and has no file I/O in normal play.
+#define GDX_UNLOCK_STAGE_FRAMES 64000u
+#define GDX_UNLOCK_STAGE_MAX_CHUNK 256u
+#define GDX_UNLOCK_STAGE_MAX_TARGETS 32u
+#define GDX_UNLOCK_STAGE_MAX_RANGES 128u
+
+#define GDX_UNLOCK_STAGE_RESAMPLE_PATH "gdiffuser-unlock-hle-resample.wav"
+#define GDX_UNLOCK_STAGE_PRE_ENVELOPE_PATH "gdiffuser-unlock-hle-pre-envelope.wav"
+#define GDX_UNLOCK_STAGE_ENVELOPE_PATH "gdiffuser-unlock-hle-envelope.wav"
+#define GDX_UNLOCK_STAGE_MIX_PATH "gdiffuser-unlock-hle-mix.wav"
+
+typedef struct GdxUnlockStageStats {
+    uint64_t samples;
+    uint64_t squareSum;
+    uint64_t hash;
+    int64_t sampleSum;
+    int16_t minSample;
+    int16_t maxSample;
+    int16_t previousSample;
+    uint32_t maxDelta;
+    uint32_t zeroSamples;
+    uint32_t clippedSamples;
+    int hasPreviousSample;
+} GdxUnlockStageStats;
+
+typedef struct GdxUnlockStageTarget {
+    uint32_t adpcmToken;
+    uint32_t resampleToken;
+    uint32_t decodeCalls;
+    uint32_t decodeBoundaryMaxDelta;
+    int noteIndex;
+    int hasDecodeLast;
+    int16_t decodeLast;
+} GdxUnlockStageTarget;
+
+typedef struct GdxUnlockStageRange {
+    uintptr_t start;
+    uintptr_t end;
+    int targetIndex;
+} GdxUnlockStageRange;
+
+typedef struct GdxUnlockStageCapture {
+    unsigned int generation;
+    unsigned int sampleRate;
+    uint32_t frames;
+    uint32_t chunks;
+    uint32_t truncatedChunks;
+    uint32_t resampleClipSamples;
+    uint32_t preEnvelopeClipSamples;
+    uint32_t envelopeClipSamples[2];
+    int active;
+    int complete;
+    int sawHle;
+    int chunkStarted;
+    int currentTarget;
+    uint32_t targetCount;
+    uint32_t rangeCount;
+    uintptr_t commandList;
+    GdxUnlockStageTarget targets[GDX_UNLOCK_STAGE_MAX_TARGETS];
+    GdxUnlockStageRange ranges[GDX_UNLOCK_STAGE_MAX_RANGES];
+    int32_t chunkResample[GDX_UNLOCK_STAGE_MAX_CHUNK];
+    int32_t chunkPreEnvelope[GDX_UNLOCK_STAGE_MAX_CHUNK];
+    int32_t chunkEnvelope[2][GDX_UNLOCK_STAGE_MAX_CHUNK];
+    int16_t resample[GDX_UNLOCK_STAGE_FRAMES];
+    int16_t preEnvelope[GDX_UNLOCK_STAGE_FRAMES];
+    int16_t envelope[GDX_UNLOCK_STAGE_FRAMES * 2u];
+    int16_t mix[GDX_UNLOCK_STAGE_FRAMES * 2u];
+    GdxUnlockStageStats decodeStats;
+    GdxUnlockStageStats resampleInputStats;
+    GdxUnlockStageStats resampleStats;
+    GdxUnlockStageStats preEnvelopeStats;
+    GdxUnlockStageStats envelopeStats[2];
+    GdxUnlockStageStats mixStats[2];
+} GdxUnlockStageCapture;
+
+static GdxUnlockStageCapture sGdxUnlockStage;
+
+static void GdxUnlockStageStatsReset(GdxUnlockStageStats* stats) {
+    memset(stats, 0, sizeof(*stats));
+    stats->hash = UINT64_C(14695981039346656037);
+}
+
+static void GdxUnlockStageStatsBreak(GdxUnlockStageStats* stats) {
+    stats->hasPreviousSample = 0;
+}
+
+static void GdxUnlockStageStatsAdd(GdxUnlockStageStats* stats, int16_t sample) {
+    int32_t value = sample;
+    uint32_t delta;
+
+    if (stats->samples == 0) {
+        stats->minSample = sample;
+        stats->maxSample = sample;
+    } else {
+        if (sample < stats->minSample) {
+            stats->minSample = sample;
+        }
+        if (sample > stats->maxSample) {
+            stats->maxSample = sample;
+        }
+    }
+    stats->samples++;
+    stats->sampleSum += value;
+    stats->squareSum += (uint64_t)(value * value);
+    stats->hash ^= (uint8_t)(uint16_t)sample;
+    stats->hash *= UINT64_C(1099511628211);
+    stats->hash ^= (uint8_t)((uint16_t)sample >> 8);
+    stats->hash *= UINT64_C(1099511628211);
+    if (sample == 0) {
+        stats->zeroSamples++;
+    }
+    if ((sample == INT16_MIN) || (sample == INT16_MAX)) {
+        stats->clippedSamples++;
+    }
+    if (stats->hasPreviousSample) {
+        int32_t signedDelta = value - stats->previousSample;
+        delta = signedDelta < 0 ? (uint32_t)-signedDelta : (uint32_t)signedDelta;
+        if (delta > stats->maxDelta) {
+            stats->maxDelta = delta;
+        }
+    }
+    stats->previousSample = sample;
+    stats->hasPreviousSample = 1;
+}
+
+static int16_t GdxUnlockStageClamp(int32_t value, uint32_t* clippedSamples) {
+    if (value > INT16_MAX) {
+        (*clippedSamples)++;
+        return INT16_MAX;
+    }
+    if (value < INT16_MIN) {
+        (*clippedSamples)++;
+        return INT16_MIN;
+    }
+    return (int16_t)value;
+}
+
+static void GdxUnlockStagePutU16(uint8_t* dst, uint16_t value) {
+    dst[0] = (uint8_t)value;
+    dst[1] = (uint8_t)(value >> 8);
+}
+
+static void GdxUnlockStagePutU32(uint8_t* dst, uint32_t value) {
+    dst[0] = (uint8_t)value;
+    dst[1] = (uint8_t)(value >> 8);
+    dst[2] = (uint8_t)(value >> 16);
+    dst[3] = (uint8_t)(value >> 24);
+}
+
+static int GdxUnlockStageWriteWav(const char* path, const int16_t* pcm, uint32_t frames,
+                                  uint16_t channels, uint32_t sampleRate) {
+    uint8_t header[44];
+    uint8_t sampleBytes[4096];
+    uint32_t dataBytes = frames * channels * (uint32_t)sizeof(int16_t);
+    uint32_t sampleCount = frames * channels;
+    uint32_t sampleIndex = 0;
+    FILE* file;
+    int wroteAll;
+
+    header[0] = 'R';
+    header[1] = 'I';
+    header[2] = 'F';
+    header[3] = 'F';
+    GdxUnlockStagePutU32(&header[4], 36u + dataBytes);
+    header[8] = 'W';
+    header[9] = 'A';
+    header[10] = 'V';
+    header[11] = 'E';
+    header[12] = 'f';
+    header[13] = 'm';
+    header[14] = 't';
+    header[15] = ' ';
+    GdxUnlockStagePutU32(&header[16], 16u);
+    GdxUnlockStagePutU16(&header[20], 1u);
+    GdxUnlockStagePutU16(&header[22], channels);
+    GdxUnlockStagePutU32(&header[24], sampleRate);
+    GdxUnlockStagePutU32(&header[28], sampleRate * channels * (uint32_t)sizeof(int16_t));
+    GdxUnlockStagePutU16(&header[32], (uint16_t)(channels * sizeof(int16_t)));
+    GdxUnlockStagePutU16(&header[34], (uint16_t)(sizeof(int16_t) * 8u));
+    header[36] = 'd';
+    header[37] = 'a';
+    header[38] = 't';
+    header[39] = 'a';
+    GdxUnlockStagePutU32(&header[40], dataBytes);
+
+    file = fopen(path, "wb");
+    if (file == NULL) {
+        return 0;
+    }
+    wroteAll = fwrite(header, 1, sizeof(header), file) == sizeof(header);
+    while (wroteAll && (sampleIndex < sampleCount)) {
+        uint32_t samplesThisWrite = sampleCount - sampleIndex;
+        uint32_t i;
+        if (samplesThisWrite > sizeof(sampleBytes) / 2u) {
+            samplesThisWrite = sizeof(sampleBytes) / 2u;
+        }
+        for (i = 0; i < samplesThisWrite; i++) {
+            uint16_t value = (uint16_t)pcm[sampleIndex + i];
+            sampleBytes[i * 2u + 0u] = (uint8_t)value;
+            sampleBytes[i * 2u + 1u] = (uint8_t)(value >> 8);
+        }
+        wroteAll = fwrite(sampleBytes, 1, samplesThisWrite * 2u, file) == samplesThisWrite * 2u;
+        sampleIndex += samplesThisWrite;
+    }
+    if (fclose(file) != 0) {
+        wroteAll = 0;
+    }
+    return wroteAll;
+}
+
+static void GdxUnlockStageLogStats(const char* stage, const char* channel,
+                                   const GdxUnlockStageStats* stats) {
+    double mean;
+    double rms;
+
+    if (stats->samples == 0) {
+        gdx_port_logf("[unlock-stage] stats stage=%s channel=%s samples=0\n", stage, channel);
+        return;
+    }
+    mean = (double)stats->sampleSum / (double)stats->samples;
+    rms = sqrt((double)stats->squareSum / (double)stats->samples);
+    gdx_port_logf("[unlock-stage] stats stage=%s channel=%s samples=%llu min=%d max=%d "
+                  "mean=%.3f rms=%.3f zeros=%u clipped=%u maxDelta=%u hash=%016llX\n",
+                  stage, channel, (unsigned long long)stats->samples,
+                  stats->minSample, stats->maxSample, mean, rms,
+                  (unsigned)stats->zeroSamples, (unsigned)stats->clippedSamples,
+                  (unsigned)stats->maxDelta, (unsigned long long)stats->hash);
+}
+
+static void GdxUnlockStageChunkReset(void) {
+    memset(sGdxUnlockStage.chunkResample, 0, sizeof(sGdxUnlockStage.chunkResample));
+    memset(sGdxUnlockStage.chunkPreEnvelope, 0, sizeof(sGdxUnlockStage.chunkPreEnvelope));
+    memset(sGdxUnlockStage.chunkEnvelope, 0, sizeof(sGdxUnlockStage.chunkEnvelope));
+    sGdxUnlockStage.chunkStarted = 1;
+    sGdxUnlockStage.currentTarget = -1;
+}
+
+static void GdxUnlockStageReset(unsigned int generation, unsigned int sampleRate) {
+    memset(&sGdxUnlockStage, 0, sizeof(sGdxUnlockStage));
+    sGdxUnlockStage.generation = generation;
+    sGdxUnlockStage.sampleRate = sampleRate;
+    sGdxUnlockStage.active = 1;
+    sGdxUnlockStage.currentTarget = -1;
+    GdxUnlockStageStatsReset(&sGdxUnlockStage.decodeStats);
+    GdxUnlockStageStatsReset(&sGdxUnlockStage.resampleInputStats);
+    GdxUnlockStageStatsReset(&sGdxUnlockStage.resampleStats);
+    GdxUnlockStageStatsReset(&sGdxUnlockStage.preEnvelopeStats);
+    GdxUnlockStageStatsReset(&sGdxUnlockStage.envelopeStats[0]);
+    GdxUnlockStageStatsReset(&sGdxUnlockStage.envelopeStats[1]);
+    GdxUnlockStageStatsReset(&sGdxUnlockStage.mixStats[0]);
+    GdxUnlockStageStatsReset(&sGdxUnlockStage.mixStats[1]);
+    gdx_port_logf("[unlock-stage] armed generation=%u frames=%u sampleRate=%u executor=HLE-required\n",
+                  generation, GDX_UNLOCK_STAGE_FRAMES, sampleRate);
+}
+
+void gdx_unlock_audio_stage_begin_command_list(unsigned int generation, const void* commandList,
+                                               unsigned int sampleRate) {
+    if ((generation == 0u) || (commandList == NULL) || (sampleRate == 0u)) {
+        return;
+    }
+    if (generation != sGdxUnlockStage.generation) {
+        GdxUnlockStageReset(generation, sampleRate);
+    }
+    if (sGdxUnlockStage.complete) {
+        return;
+    }
+    sGdxUnlockStage.commandList = (uintptr_t)commandList;
+    sGdxUnlockStage.rangeCount = 0;
+}
+
+static int GdxUnlockStageFindOrAddTarget(int noteIndex, uint32_t adpcmToken,
+                                         uint32_t resampleToken) {
+    uint32_t i;
+    GdxUnlockStageTarget* target;
+
+    for (i = 0; i < sGdxUnlockStage.targetCount; i++) {
+        target = &sGdxUnlockStage.targets[i];
+        if ((target->resampleToken == resampleToken) || (target->noteIndex == noteIndex)) {
+            target->adpcmToken = adpcmToken;
+            target->resampleToken = resampleToken;
+            target->noteIndex = noteIndex;
+            return (int)i;
+        }
+    }
+    if (sGdxUnlockStage.targetCount >= GDX_UNLOCK_STAGE_MAX_TARGETS) {
+        return -1;
+    }
+
+    target = &sGdxUnlockStage.targets[sGdxUnlockStage.targetCount++];
+    memset(target, 0, sizeof(*target));
+    target->adpcmToken = adpcmToken;
+    target->resampleToken = resampleToken;
+    target->noteIndex = noteIndex;
+    gdx_port_logf("[unlock-stage] target generation=%u note=%d adpcm=%08X resample=%08X count=%u\n",
+                  sGdxUnlockStage.generation, noteIndex, (unsigned)adpcmToken, (unsigned)resampleToken,
+                  (unsigned)sGdxUnlockStage.targetCount);
+    return (int)(sGdxUnlockStage.targetCount - 1u);
+}
+
+void gdx_unlock_audio_stage_register_command_range(
+    unsigned int generation, int noteIndex, const void* commandStart, const void* commandEnd,
+    const void* adpcmState, const void* resampleState, unsigned int sampleRate) {
+    uint32_t adpcmToken;
+    uint32_t resampleToken;
+    int targetIndex;
+    GdxUnlockStageRange* range;
+
+    if ((generation == 0u) || (commandStart == NULL) || (commandEnd == NULL) ||
+        (adpcmState == NULL) || (resampleState == NULL) || (sampleRate == 0u) ||
+        ((uintptr_t)commandEnd <= (uintptr_t)commandStart)) {
+        return;
+    }
+    if (generation != sGdxUnlockStage.generation) {
+        GdxUnlockStageReset(generation, sampleRate);
+    }
+    if (sGdxUnlockStage.complete ||
+        (sGdxUnlockStage.rangeCount >= GDX_UNLOCK_STAGE_MAX_RANGES)) {
+        return;
+    }
+    adpcmToken = (uint32_t)(uintptr_t)adpcmState;
+    resampleToken = (uint32_t)(uintptr_t)resampleState;
+    targetIndex = GdxUnlockStageFindOrAddTarget(noteIndex, adpcmToken, resampleToken);
+    if (targetIndex < 0) {
+        return;
+    }
+    range = &sGdxUnlockStage.ranges[sGdxUnlockStage.rangeCount++];
+    range->start = (uintptr_t)commandStart;
+    range->end = (uintptr_t)commandEnd;
+    range->targetIndex = targetIndex;
+}
+
+static int GdxUnlockStageFindCommandTarget(const GdxAcmd* command) {
+    uintptr_t address;
+    uint32_t i;
+
+    if (!sGdxUnlockStage.active || sGdxUnlockStage.complete) {
+        return -1;
+    }
+    address = (uintptr_t)command;
+    for (i = 0; i < sGdxUnlockStage.rangeCount; i++) {
+        const GdxUnlockStageRange* range = &sGdxUnlockStage.ranges[i];
+        if ((address >= range->start) && (address < range->end)) {
+            return range->targetIndex;
+        }
+    }
+    return -1;
+}
+
+static void GdxUnlockStageCaptureDecode(int targetIndex, const GdxBufDesc* buf, uint32_t flags) {
+    GdxUnlockStageTarget* target;
+    uint32_t sampleCount;
+    uint32_t i;
+    int16_t first;
+    int16_t last;
+
+    if ((targetIndex < 0) || (buf == NULL)) {
+        return;
+    }
+    target = &sGdxUnlockStage.targets[targetIndex];
+    if ((flags & 1u) != 0u) {
+        target->hasDecodeLast = 0;
+    }
+    sampleCount = buf->count / 2u;
+    if (sampleCount == 0u) {
+        return;
+    }
+    first = DmemGetS16(buf->dmemOut + 32u);
+    last = DmemGetS16(buf->dmemOut + 32u + (sampleCount - 1u) * 2u);
+    if (target->hasDecodeLast) {
+        int32_t signedDelta = (int32_t)first - target->decodeLast;
+        uint32_t delta = signedDelta < 0 ? (uint32_t)-signedDelta : (uint32_t)signedDelta;
+        if (delta > target->decodeBoundaryMaxDelta) {
+            target->decodeBoundaryMaxDelta = delta;
+        }
+    }
+    target->decodeLast = last;
+    target->hasDecodeLast = 1;
+    target->decodeCalls++;
+
+    GdxUnlockStageStatsBreak(&sGdxUnlockStage.decodeStats);
+    for (i = 0; i < sampleCount; i++) {
+        GdxUnlockStageStatsAdd(&sGdxUnlockStage.decodeStats,
+                               DmemGetS16(buf->dmemOut + 32u + i * 2u));
+    }
+}
+
+static void GdxUnlockStageCaptureResample(int targetIndex, const GdxBufDesc* buf,
+                                          uint32_t pitch, uint32_t numOut) {
+    uint32_t needIn;
+    uint32_t limit;
+    uint32_t i;
+
+    if ((targetIndex < 0) || (buf == NULL) || !sGdxUnlockStage.chunkStarted) {
+        return;
+    }
+    needIn = ((numOut * pitch) >> 15) + 8u;
+    GdxUnlockStageStatsBreak(&sGdxUnlockStage.resampleInputStats);
+    for (i = 0; i < needIn; i++) {
+        GdxUnlockStageStatsAdd(&sGdxUnlockStage.resampleInputStats,
+                               DmemGetS16(buf->dmemIn + i * 2u));
+    }
+
+    limit = numOut;
+    if (limit > GDX_UNLOCK_STAGE_MAX_CHUNK) {
+        limit = GDX_UNLOCK_STAGE_MAX_CHUNK;
+        sGdxUnlockStage.truncatedChunks++;
+    }
+    for (i = 0; i < limit; i++) {
+        sGdxUnlockStage.chunkResample[i] += DmemGetS16(buf->dmemOut + i * 2u);
+    }
+}
+
+static void GdxUnlockStageCapturePreEnvelope(uint32_t dmemSrc, uint32_t sampleCount) {
+    uint32_t limit = sampleCount;
+    uint32_t i;
+
+    if (!sGdxUnlockStage.chunkStarted || (sGdxUnlockStage.currentTarget < 0)) {
+        return;
+    }
+    if (limit > GDX_UNLOCK_STAGE_MAX_CHUNK) {
+        limit = GDX_UNLOCK_STAGE_MAX_CHUNK;
+        sGdxUnlockStage.truncatedChunks++;
+    }
+    for (i = 0; i < limit; i++) {
+        sGdxUnlockStage.chunkPreEnvelope[i] += DmemGetS16(dmemSrc + i * 2u);
+    }
+}
+
+static void GdxUnlockStageCaptureEnvelopeSample(uint32_t sampleIndex, int32_t left, int32_t right) {
+    if (!sGdxUnlockStage.chunkStarted || (sGdxUnlockStage.currentTarget < 0) ||
+        (sampleIndex >= GDX_UNLOCK_STAGE_MAX_CHUNK)) {
+        return;
+    }
+    sGdxUnlockStage.chunkEnvelope[0][sampleIndex] += left;
+    sGdxUnlockStage.chunkEnvelope[1][sampleIndex] += right;
+}
+
+static void GdxUnlockStageFinish(void) {
+    uint32_t i;
+    int writeResample;
+    int writePreEnvelope;
+    int writeEnvelope;
+    int writeMix;
+
+    sGdxUnlockStage.complete = 1;
+    writeResample = GdxUnlockStageWriteWav(GDX_UNLOCK_STAGE_RESAMPLE_PATH,
+                                           sGdxUnlockStage.resample, sGdxUnlockStage.frames, 1u,
+                                           sGdxUnlockStage.sampleRate);
+    writePreEnvelope = GdxUnlockStageWriteWav(GDX_UNLOCK_STAGE_PRE_ENVELOPE_PATH,
+                                              sGdxUnlockStage.preEnvelope, sGdxUnlockStage.frames, 1u,
+                                              sGdxUnlockStage.sampleRate);
+    writeEnvelope = GdxUnlockStageWriteWav(GDX_UNLOCK_STAGE_ENVELOPE_PATH,
+                                           sGdxUnlockStage.envelope, sGdxUnlockStage.frames, 2u,
+                                           sGdxUnlockStage.sampleRate);
+    writeMix = GdxUnlockStageWriteWav(GDX_UNLOCK_STAGE_MIX_PATH,
+                                      sGdxUnlockStage.mix, sGdxUnlockStage.frames, 2u,
+                                      sGdxUnlockStage.sampleRate);
+
+    GdxUnlockStageLogStats("decode", "M", &sGdxUnlockStage.decodeStats);
+    GdxUnlockStageLogStats("resample-input", "M", &sGdxUnlockStage.resampleInputStats);
+    GdxUnlockStageLogStats("resample", "M", &sGdxUnlockStage.resampleStats);
+    GdxUnlockStageLogStats("pre-envelope", "M", &sGdxUnlockStage.preEnvelopeStats);
+    GdxUnlockStageLogStats("envelope", "L", &sGdxUnlockStage.envelopeStats[0]);
+    GdxUnlockStageLogStats("envelope", "R", &sGdxUnlockStage.envelopeStats[1]);
+    GdxUnlockStageLogStats("mix", "L", &sGdxUnlockStage.mixStats[0]);
+    GdxUnlockStageLogStats("mix", "R", &sGdxUnlockStage.mixStats[1]);
+    for (i = 0; i < sGdxUnlockStage.targetCount; i++) {
+        const GdxUnlockStageTarget* target = &sGdxUnlockStage.targets[i];
+        gdx_port_logf("[unlock-stage] decode-boundary note=%d token=%08X calls=%u maxDelta=%u\n",
+                      target->noteIndex, (unsigned)target->adpcmToken,
+                      (unsigned)target->decodeCalls, (unsigned)target->decodeBoundaryMaxDelta);
+    }
+    gdx_port_logf("[unlock-stage] complete generation=%u executor=%s chunks=%u frames=%u "
+                  "truncated=%u sumClip=resample:%u,preEnvelope:%u,envelopeL:%u,envelopeR:%u "
+                  "artifacts=resample:%s,preEnvelope:%s,envelope:%s,mix:%s\n",
+                  sGdxUnlockStage.generation, sGdxUnlockStage.sawHle ? "HLE" : "none",
+                  (unsigned)sGdxUnlockStage.chunks, (unsigned)sGdxUnlockStage.frames,
+                  (unsigned)sGdxUnlockStage.truncatedChunks,
+                  (unsigned)sGdxUnlockStage.resampleClipSamples,
+                  (unsigned)sGdxUnlockStage.preEnvelopeClipSamples,
+                  (unsigned)sGdxUnlockStage.envelopeClipSamples[0],
+                  (unsigned)sGdxUnlockStage.envelopeClipSamples[1],
+                  writeResample ? "ok" : "write-failed",
+                  writePreEnvelope ? "ok" : "write-failed",
+                  writeEnvelope ? "ok" : "write-failed",
+                  writeMix ? "ok" : "write-failed");
+}
+
+static void GdxUnlockStageAppendChunk(uint32_t dmemLeft, uint32_t dmemRight, uint32_t sampleCount) {
+    uint32_t available;
+    uint32_t limit;
+    uint32_t i;
+
+    if (!sGdxUnlockStage.active || sGdxUnlockStage.complete || !sGdxUnlockStage.sawHle) {
+        return;
+    }
+    if (!sGdxUnlockStage.chunkStarted) {
+        GdxUnlockStageChunkReset();
+    }
+    available = GDX_UNLOCK_STAGE_FRAMES - sGdxUnlockStage.frames;
+    limit = sampleCount < available ? sampleCount : available;
+    if (limit > GDX_UNLOCK_STAGE_MAX_CHUNK) {
+        limit = GDX_UNLOCK_STAGE_MAX_CHUNK;
+        sGdxUnlockStage.truncatedChunks++;
+    }
+
+    for (i = 0; i < limit; i++) {
+        uint32_t frame = sGdxUnlockStage.frames + i;
+        int16_t resample = GdxUnlockStageClamp(sGdxUnlockStage.chunkResample[i],
+                                               &sGdxUnlockStage.resampleClipSamples);
+        int16_t preEnvelope = GdxUnlockStageClamp(sGdxUnlockStage.chunkPreEnvelope[i],
+                                                  &sGdxUnlockStage.preEnvelopeClipSamples);
+        int16_t envelopeLeft = GdxUnlockStageClamp(sGdxUnlockStage.chunkEnvelope[0][i],
+                                                   &sGdxUnlockStage.envelopeClipSamples[0]);
+        int16_t envelopeRight = GdxUnlockStageClamp(sGdxUnlockStage.chunkEnvelope[1][i],
+                                                    &sGdxUnlockStage.envelopeClipSamples[1]);
+        int16_t mixLeft = DmemGetS16(dmemLeft + i * 2u);
+        int16_t mixRight = DmemGetS16(dmemRight + i * 2u);
+
+        sGdxUnlockStage.resample[frame] = resample;
+        sGdxUnlockStage.preEnvelope[frame] = preEnvelope;
+        sGdxUnlockStage.envelope[frame * 2u + 0u] = envelopeLeft;
+        sGdxUnlockStage.envelope[frame * 2u + 1u] = envelopeRight;
+        sGdxUnlockStage.mix[frame * 2u + 0u] = mixLeft;
+        sGdxUnlockStage.mix[frame * 2u + 1u] = mixRight;
+        GdxUnlockStageStatsAdd(&sGdxUnlockStage.resampleStats, resample);
+        GdxUnlockStageStatsAdd(&sGdxUnlockStage.preEnvelopeStats, preEnvelope);
+        GdxUnlockStageStatsAdd(&sGdxUnlockStage.envelopeStats[0], envelopeLeft);
+        GdxUnlockStageStatsAdd(&sGdxUnlockStage.envelopeStats[1], envelopeRight);
+        GdxUnlockStageStatsAdd(&sGdxUnlockStage.mixStats[0], mixLeft);
+        GdxUnlockStageStatsAdd(&sGdxUnlockStage.mixStats[1], mixRight);
+    }
+    sGdxUnlockStage.frames += limit;
+    sGdxUnlockStage.chunks++;
+    sGdxUnlockStage.chunkStarted = 0;
+    sGdxUnlockStage.currentTarget = -1;
+    if (sGdxUnlockStage.frames == GDX_UNLOCK_STAGE_FRAMES) {
+        GdxUnlockStageFinish();
+    }
+}
+
 // ---- ADPCM codebook access: per-predictor block is `8 * order` shorts (verified against
 // decomp/src/audio/disk/lib/audio.h's AdpcmBook comment "size (8 * order * numPredictors)").
 // The real aspMain ucode's ADPCM decode is fixed-function order-2 (well documented N64 SDK
@@ -266,12 +832,6 @@ static int16_t BookCoef(uint32_t predictorIndex, uint32_t tap /* 0 or 1 */, uint
 
 // ---- Pending "buffer descriptor" set by A_SETBUFF, consumed by the following A_ADPCM /
 // A_S8DEC / A_RESAMPLE (mirrors the real RSP's internal input/output/count registers). ----
-typedef struct {
-    uint32_t dmemIn;
-    uint32_t dmemOut;
-    uint32_t count; /* bytes */
-} GdxBufDesc;
-
 // ---- A_SETLOOP persistence (revamp v2 task A1). Real hardware's aspMain keeps the loop-restart
 // pointer in ucode-internal state that is NEVER cleared between command lists -- it is only ever
 // REPLACED by a new A_SETLOOP (mirrors mupen64plus-rsp-hle's alist_nead.c: `hle->alist_nead.loop`
@@ -1089,6 +1649,17 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
         return;
     }
 
+    if (sGdxUnlockStage.active &&
+        (sGdxUnlockStage.commandList != (uintptr_t)dataPtr)) {
+        sGdxUnlockStage.rangeCount = 0;
+    }
+
+    if (sGdxUnlockStage.active && !sGdxUnlockStage.complete && !sGdxUnlockStage.sawHle) {
+        sGdxUnlockStage.sawHle = 1;
+        gdx_port_logf("[unlock-stage] begin generation=%u executor=HLE targets=%u\n",
+                      sGdxUnlockStage.generation, (unsigned)sGdxUnlockStage.targetCount);
+    }
+
     for (i = 0; i < count; i++) {
         uint32_t w0 = cmds[i].w0;
         uint32_t w1 = cmds[i].w1;
@@ -1103,6 +1674,10 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 uint32_t dmem = w0 & 0xFFFFFFu; /* aClearBuffer packs dmem into the low 24 bits */
                 uint32_t size = w1;
                 uint32_t k;
+                if (sGdxUnlockStage.active && !sGdxUnlockStage.complete &&
+                    (dmem == 0x940u) && (size >= 0x340u)) {
+                    GdxUnlockStageChunkReset();
+                }
                 for (k = 0; k < size; k++) {
                     DmemSetU8(dmem + k, 0);
                 }
@@ -1209,6 +1784,7 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
             case GDX_A_ADPCM: {
                 uint32_t flags = (w0 >> 16) & 0xFFu;
                 int16_t* state = (int16_t*)GdxAudioResolveAddr(w1, "ADPCM-state");
+                int stageTarget = GdxUnlockStageFindCommandTarget(&cmds[i]);
                 /* [pcm-cap] carry-in snapshot BEFORE the decode overwrites it:
                    offline verification of A_CONTINUE frames needs the pre-call
                    history. Under the last-frame state layout the newest two
@@ -1222,6 +1798,7 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 sRsCapAdpcmOut = pendingBuf.dmemOut;
                 sRsCapAdpcmCnt = pendingBuf.count;
                 RunAdpcm(&pendingBuf, flags, state, sPendingLoopState);
+                GdxUnlockStageCaptureDecode(stageTarget, &pendingBuf, flags);
                 /* [pcm-cap] (2026-07-11, audio decode ground-truth capture):
                    one block per UNIQUE sample source. Logs the input identity
                    (resolved src + raw), the book head, the first compressed
@@ -1311,6 +1888,8 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 uint32_t flags = (w0 >> 16) & 0xFFu;
                 uint32_t pitch = w0 & 0xFFFFu;
                 int16_t* state = (int16_t*)GdxAudioResolveAddr(w1, "RESAMPLE-state");
+                int stageTarget = GdxUnlockStageFindCommandTarget(&cmds[i]);
+                sGdxUnlockStage.currentTarget = stageTarget;
                 if (state != NULL) {
                     /* [rs-cap] speculative record: dumped only if a trigger fires (see the
                        probe comment at the sRsCapLast definition). Input window is snapshotted
@@ -1384,6 +1963,7 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                        this slot is never read by decomp C code, only by this interpreter). */
                     state[15] = (int16_t)(uint16_t)pitch;
                     RunResample(&pendingBuf, flags, state);
+                    GdxUnlockStageCaptureResample(stageTarget, &pendingBuf, pitch, numOut);
 
                     for (k = 0; k < sRsCapLast.outN; k++) {
                         sRsCapLast.out[k] = DmemGetS16(pendingBuf.dmemOut + k * 2u);
@@ -1518,6 +2098,7 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 uint32_t dmemR = w1 & 0xFFFFu;
                 uint32_t byteCount = ((w0 >> 16) & 0xFFu) << 4; /* per-channel bytes, c>>4 packed */
                 uint32_t numSamples = byteCount / 2u;
+                GdxUnlockStageAppendChunk(dmemL, dmemR, numSamples);
                 /* [spike] stage scan: the interleave inputs are the fully mixed dry L/R
                    buses -- a spike here but not post-resample means the mixing stages
                    (envmixer/mixer/reverb return) injected it. */
@@ -1621,6 +2202,8 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 uint32_t sIdx = 0;
                 uint32_t blk;
 
+                sGdxUnlockStage.currentTarget = GdxUnlockStageFindCommandTarget(&cmds[i]);
+
                 /* flatvol bypass: zero the per-block ramp so the whole tick uses one
                    constant volume -- tests whether the 8-block volume staircase is the
                    grain (grain A/B). */
@@ -1631,6 +2214,8 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 if (swapLR) {
                     uint32_t tmp = dryLeftDmem; dryLeftDmem = dryRightDmem; dryRightDmem = tmp;
                 }
+
+                GdxUnlockStageCapturePreEnvelope(dmemSrc, sampleCount);
 
                 for (blk = 0; blk < numBlocks; blk++) {
                     uint32_t n;
@@ -1660,6 +2245,8 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                            scope, per file header.) */
                         int32_t wetL = (dl * curReverb) >> 16;
                         int32_t wetR = (dr * curReverb) >> 16;
+
+                        GdxUnlockStageCaptureEnvelopeSample(sIdx, dl, dr);
 
                         DmemSetS16(dryLeftDmem + sIdx * 2u,
                                    ClampS16(DmemGetS16(dryLeftDmem + sIdx * 2u) + dl));
@@ -1704,6 +2291,7 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                         }
                     }
                 }
+                sGdxUnlockStage.currentTarget = -1;
                 break;
             }
 
@@ -1795,4 +2383,6 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 break;
         }
     }
+    sGdxUnlockStage.rangeCount = 0;
+    sGdxUnlockStage.commandList = 0;
 }

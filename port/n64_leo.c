@@ -294,6 +294,56 @@ static s16 gdx_rom_s16(u32 off) {
     return (s16)((gdx_rom_buffer[off] << 8) | gdx_rom_buffer[off + 1]);
 }
 
+/* R4 (C-R4.1): the kanji index table and the ANK metrics table are contiguous in
+ * the cart ROM and covered by a single `kanji_tables` blob [0x80960, +0x2EEC) =
+ * [0x80960, 0x8384C) -- the index table (0xA48 B), a small gap, and the ANK table
+ * (0x908 entries x 4 B, last entry ending at 0x83848). LeoGetKAdr/LeoGetAAdr are
+ * per-glyph HOT paths, so we must NOT call the byte-source shim per glyph: preload
+ * the whole blob ONCE into a static buffer via GdxSegmentSourceRead (archive-first,
+ * byte-identical raw fallback) and serve every glyph read from it. If the one-shot
+ * preload fails (archive absent AND raw ROM absent/too small for the full span) we
+ * fall back to reading gdx_rom_buffer per glyph exactly as before. */
+extern int GdxSegmentSourceRead(unsigned int romBase, unsigned int size, void* dst);
+#define GDX_KANJI_BLOB_BASE 0x80960u
+#define GDX_KANJI_BLOB_SPAN 0x2EECu /* [0x80960, 0x8384C): kanji index + ANK metrics */
+
+/* Same publish discipline as gdx_segment_source.c's SEG_*_FENCE (fill buffer, release-fence,
+ * THEN publish the state; readers acquire-load the state before touching the buffer), sized down
+ * for this TU's single first-use blob instead of the shim's per-family slot table. Forward-declared
+ * rather than including <intrin.h>/<windows.h>: this TU is decomp-headers-only (see file header
+ * comment) -- MSVC recognizes _ReadWriteBarrier as an intrinsic once pragma'd, no header needed. */
+#if defined(_MSC_VER)
+extern void _ReadWriteBarrier(void);
+#pragma intrinsic(_ReadWriteBarrier)
+#define GDX_KANJI_ACQUIRE_FENCE() _ReadWriteBarrier()
+#define GDX_KANJI_RELEASE_FENCE() _ReadWriteBarrier()
+#else
+#define GDX_KANJI_ACQUIRE_FENCE() __atomic_thread_fence(__ATOMIC_ACQUIRE)
+#define GDX_KANJI_RELEASE_FENCE() __atomic_thread_fence(__ATOMIC_RELEASE)
+#endif
+
+static u8 sKanjiBlob[GDX_KANJI_BLOB_SPAN];
+static volatile int sKanjiBlobState = 0; /* 0 = unattempted, 1 = loaded, 2 = failed */
+
+/* Returns the resident blob buffer, or NULL if the one-shot preload failed (caller
+ * then reads raw ROM per glyph). Benign first-use race: concurrent callers copy the
+ * same bytes and settle on the same monotonic state; GdxSegmentSourceRead is itself
+ * internally locked. The acquire fence orders the state load before any buffer read
+ * below; the writer mirrors it with a release fence between filling sKanjiBlob and
+ * publishing sKanjiBlobState, so a reader that observes state==1 always observes the
+ * fully written buffer, never a torn one. */
+static const u8* gdx_kanji_blob(void) {
+    int state = sKanjiBlobState;
+    GDX_KANJI_ACQUIRE_FENCE();
+    if (state == 0) {
+        int ok = GdxSegmentSourceRead(GDX_KANJI_BLOB_BASE, GDX_KANJI_BLOB_SPAN, sKanjiBlob);
+        GDX_KANJI_RELEASE_FENCE();
+        state = ok ? 1 : 2;
+        sKanjiBlobState = state;
+    }
+    return (state == 1) ? sKanjiBlob : NULL;
+}
+
 s32 LeoGetKAdr(s32 sjis) {
     s32 row, cell;
 
@@ -315,6 +365,14 @@ s32 LeoGetKAdr(s32 sjis) {
     row = (sjis >> 8) - 0x81;
     {
         u32 tbl = GDX_ROM_KANJI_INDEX_TBL + (u32)(cell + row * 0xBC) * 2u;
+        const u8* blob = gdx_kanji_blob();
+        if (blob != NULL) {
+            u32 rel = tbl - GDX_KANJI_BLOB_BASE; /* GDX_ROM_KANJI_INDEX_TBL == blob base */
+            if (rel + 2u > GDX_KANJI_BLOB_SPAN) {
+                return -1;
+            }
+            return (s32)(s16)((blob[rel] << 8) | blob[rel + 1]) << 7;
+        }
         if (gdx_rom_buffer == NULL || tbl + 2 > gdx_rom_size) {
             return -1;
         }
@@ -332,12 +390,25 @@ s32 LeoGetAAdr(s32 code, s32* dx, s32* dy, s32* cy) {
         return -1;
     }
     entry = GDX_ROM_ANK_METRICS_TBL + (u32)code * 4u;
-    if (gdx_rom_buffer == NULL || entry + 4 > gdx_rom_size) {
-        return -1;
+    {
+        const u8* blob = gdx_kanji_blob();
+        if (blob != NULL) {
+            u32 rel = entry - GDX_KANJI_BLOB_BASE;
+            if (rel + 4u > GDX_KANJI_BLOB_SPAN) {
+                return -1;
+            }
+            off = ((u32)blob[rel] << 8) | blob[rel + 1];
+            b2 = blob[rel + 2];
+            b3 = (s8)blob[rel + 3];
+        } else {
+            if (gdx_rom_buffer == NULL || entry + 4 > gdx_rom_size) {
+                return -1;
+            }
+            off = ((u32)gdx_rom_buffer[entry] << 8) | gdx_rom_buffer[entry + 1];
+            b2 = gdx_rom_buffer[entry + 2];
+            b3 = (s8)gdx_rom_buffer[entry + 3];
+        }
     }
-    off = ((u32)gdx_rom_buffer[entry] << 8) | gdx_rom_buffer[entry + 1];
-    b2 = gdx_rom_buffer[entry + 2];
-    b3 = (s8)gdx_rom_buffer[entry + 3];
     /* MFS warm-up calls pass NULL metric pointers; the MIPS original stored
        blindly (harmless on the N64 null page), so guard here. */
     if (dy != NULL) {

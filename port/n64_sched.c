@@ -341,6 +341,7 @@ static LONG WINAPI gdx_crash_vectored_handler(EXCEPTION_POINTERS* info) {
     int threadId = __osRunningThread != NULL ? (int) __osRunningThread->id : -1;
     void* faultAddr = NULL;
     int isWrite = -1;
+    char reportLine[512];
 
     // First-chance handler sees ALL exceptions, including ones a __try/__except elsewhere would
     // swallow. Only log fault-class codes so this doesn't spam the log on handled exceptions.
@@ -355,53 +356,110 @@ static LONG WINAPI gdx_crash_vectored_handler(EXCEPTION_POINTERS* info) {
             return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2) {
-        isWrite = (int) rec->ExceptionInformation[0];
-        faultAddr = (void*) rec->ExceptionInformation[1];
-    }
-
-    gdx_port_logf(
-        "[crash] UNHANDLED EXCEPTION code=0x%08X pc=%p thread_id=%d fault_addr=%p access=%s\n",
-        (unsigned) rec->ExceptionCode, (void*) rec->ExceptionAddress, threadId, faultAddr,
-        (isWrite < 0) ? "n/a" : (isWrite ? "write" : "read"));
-
-    /* Best-effort symbolization (course-edit 80%-crash investigation): Debug builds
-       ship the PDB next to the exe, so a raw pc can be named right here instead of
-       hand-mapping ASLR'd addresses across runs. Everything below is optional
-       diagnostics -- any failure just leaves the raw-pc line above as before. */
+    // Re-entry guard: everything below (dbghelp symbol lookup, file I/O) can itself fault on a
+    // sufficiently corrupted process. Without this a fault-while-handling-a-fault would re-enter
+    // this same handler and recurse until the stack (or the crash report) is exhausted. A second,
+    // unrelated top-level crash later in the process lifetime is still reported -- the flag is
+    // released once this invocation finishes, it is not a permanent kill switch. The release is
+    // wrapped in __finally so it runs even if the guarded body itself faults (e.g. dbghelp or
+    // gdx_crash_report_write raising inside this handler): otherwise the nested exception would
+    // hit the guard above, never reach the InterlockedExchange release below, and leave the flag
+    // latched for the rest of the process, silently dropping every later crash report.
     {
-        static int sSymInit = 0;
-        HANDLE proc = GetCurrentProcess();
-        DWORD64 pc = (DWORD64) (uintptr_t) rec->ExceptionAddress;
-        char symBuf[sizeof(SYMBOL_INFO) + 256];
-        SYMBOL_INFO* sym = (SYMBOL_INFO*) symBuf;
-        DWORD64 disp = 0;
-        IMAGEHLP_LINE64 line;
-        DWORD lineDisp = 0;
-        HMODULE mod = NULL;
+        static volatile LONG sInHandler = 0;
+        if (InterlockedCompareExchange(&sInHandler, 1, 0) != 0) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
 
-        if (!sSymInit) {
-            sSymInit = 1;
-            SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-            SymInitialize(proc, NULL, TRUE);
+      __try {
+        if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2) {
+            isWrite = (int) rec->ExceptionInformation[0];
+            faultAddr = (void*) rec->ExceptionInformation[1];
         }
-        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               (LPCSTR) rec->ExceptionAddress, &mod)) {
-            gdx_port_logf("[crash]   module_base=%p rva=0x%llX\n", (void*) mod,
-                          (unsigned long long) (pc - (DWORD64) (uintptr_t) mod));
+
+        // Always-on crash artifact (course-edit first-release blocker): field testers run a plain
+        // double-clicked build with none of GDX_LOG/GDX_TRACE/GDX_DIAG_VERBOSE/GDX_DIAG_UNLOCK set,
+        // so gdx_port_logf's file sink below never opens and a crash leaves nothing on disk. Mirror
+        // every line already sent to gdx_port_logf into gdiffuser-crash.txt via gdx_crash_report_write,
+        // which bypasses that opt-in gate entirely. gdx_port_logf's own output is unchanged, so an
+        // opted-in run log still captures the same crash inline.
+        {
+            SYSTEMTIME st;
+            int n;
+            GetSystemTime(&st);
+            n = snprintf(reportLine, sizeof(reportLine),
+                         "\n==== gdiffuser-x64 crash %04u-%02u-%02u %02u:%02u:%02u.%03u UTC ====\n",
+                         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+                         st.wMilliseconds);
+            if (n > 0) {
+                gdx_crash_report_write(reportLine);
+            }
         }
-        memset(symBuf, 0, sizeof(symBuf));
-        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
-        sym->MaxNameLen = 255;
-        if (SymFromAddr(proc, pc, &disp, sym)) {
-            gdx_port_logf("[crash]   at %s+0x%llX\n", sym->Name, (unsigned long long) disp);
+
+        gdx_port_logf(
+            "[crash] UNHANDLED EXCEPTION code=0x%08X pc=%p thread_id=%d fault_addr=%p access=%s\n",
+            (unsigned) rec->ExceptionCode, (void*) rec->ExceptionAddress, threadId, faultAddr,
+            (isWrite < 0) ? "n/a" : (isWrite ? "write" : "read"));
+        if (snprintf(reportLine, sizeof(reportLine),
+                     "[crash] UNHANDLED EXCEPTION code=0x%08X pc=%p thread_id=%d fault_addr=%p access=%s\n",
+                     (unsigned) rec->ExceptionCode, (void*) rec->ExceptionAddress, threadId, faultAddr,
+                     (isWrite < 0) ? "n/a" : (isWrite ? "write" : "read")) > 0) {
+            gdx_crash_report_write(reportLine);
         }
-        memset(&line, 0, sizeof(line));
-        line.SizeOfStruct = sizeof(IMAGEHLP_LINE64);
-        if (SymGetLineFromAddr64(proc, pc, &lineDisp, &line)) {
-            gdx_port_logf("[crash]   %s:%lu\n", line.FileName, (unsigned long) line.LineNumber);
+
+        /* Best-effort symbolization (course-edit 80%-crash investigation): Debug builds
+           ship the PDB next to the exe, so a raw pc can be named right here instead of
+           hand-mapping ASLR'd addresses across runs. Everything below is optional
+           diagnostics -- any failure just leaves the raw-pc line above as before. */
+        {
+            static int sSymInit = 0;
+            HANDLE proc = GetCurrentProcess();
+            DWORD64 pc = (DWORD64) (uintptr_t) rec->ExceptionAddress;
+            char symBuf[sizeof(SYMBOL_INFO) + 256];
+            SYMBOL_INFO* sym = (SYMBOL_INFO*) symBuf;
+            DWORD64 disp = 0;
+            IMAGEHLP_LINE64 line;
+            DWORD lineDisp = 0;
+            HMODULE mod = NULL;
+
+            if (!sSymInit) {
+                sSymInit = 1;
+                SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+                SymInitialize(proc, NULL, TRUE);
+            }
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCSTR) rec->ExceptionAddress, &mod)) {
+                gdx_port_logf("[crash]   module_base=%p rva=0x%llX\n", (void*) mod,
+                              (unsigned long long) (pc - (DWORD64) (uintptr_t) mod));
+                if (snprintf(reportLine, sizeof(reportLine), "[crash]   module_base=%p rva=0x%llX\n",
+                             (void*) mod, (unsigned long long) (pc - (DWORD64) (uintptr_t) mod)) > 0) {
+                    gdx_crash_report_write(reportLine);
+                }
+            }
+            memset(symBuf, 0, sizeof(symBuf));
+            sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+            sym->MaxNameLen = 255;
+            if (SymFromAddr(proc, pc, &disp, sym)) {
+                gdx_port_logf("[crash]   at %s+0x%llX\n", sym->Name, (unsigned long long) disp);
+                if (snprintf(reportLine, sizeof(reportLine), "[crash]   at %s+0x%llX\n", sym->Name,
+                             (unsigned long long) disp) > 0) {
+                    gdx_crash_report_write(reportLine);
+                }
+            }
+            memset(&line, 0, sizeof(line));
+            line.SizeOfStruct = sizeof(IMAGEHLP_LINE64);
+            if (SymGetLineFromAddr64(proc, pc, &lineDisp, &line)) {
+                gdx_port_logf("[crash]   %s:%lu\n", line.FileName, (unsigned long) line.LineNumber);
+                if (snprintf(reportLine, sizeof(reportLine), "[crash]   %s:%lu\n", line.FileName,
+                             (unsigned long) line.LineNumber) > 0) {
+                    gdx_crash_report_write(reportLine);
+                }
+            }
         }
+      } __finally {
+        InterlockedExchange(&sInHandler, 0);
+      }
     }
 
     return EXCEPTION_CONTINUE_SEARCH; // do not swallow the fault, only log it
@@ -484,6 +542,36 @@ int gdx_diag_verbose(void) {
     static int sCached = -1;
     if (sCached < 0) {
         const char* env = getenv("GDX_DIAG_VERBOSE");
+        sCached = (env != NULL && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }
+    return sCached;
+}
+
+/* GDX_RAIL_COLOR_TEST gate (interp strobe investigation, decomp course.c rail
+   primcolor sites): freezes the rail chevron color sawtooth to a constant so a
+   single attract/race run answers whether the owner-reported interp-on rail
+   strobe is the frozen-color-animation stepping unevenly (strobe gone => build
+   primcolor value-interpolation in the bridge). Cached like gdx_diag_verbose;
+   OFF by default (stock color animation). */
+int gdx_rail_color_test_enabled(void) {
+    static int sCached = -1;
+    if (sCached < 0) {
+        const char* env = getenv("GDX_RAIL_COLOR_TEST");
+        sCached = (env != NULL && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }
+    return sCached;
+}
+
+/* GDX_DIAG_RIVAL gate (rival-icon investigation, decomp racer.c draw gate):
+   arms a once-per-second dump of every boolean in the rival-icon draw
+   condition plus, when the gate passes, the emitted texrect screen coords —
+   splitting "gate never passes" from "draw emitted but invisible"
+   (prim-depth/interpreter suspicion) in a single logged race. Cached like
+   gdx_rail_color_test_enabled; OFF by default. */
+int gdx_diag_rival_enabled(void) {
+    static int sCached = -1;
+    if (sCached < 0) {
+        const char* env = getenv("GDX_DIAG_RIVAL");
         sCached = (env != NULL && env[0] != '\0' && env[0] != '0') ? 1 : 0;
     }
     return sCached;

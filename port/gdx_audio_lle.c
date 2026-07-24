@@ -89,6 +89,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <math.h>
 #include <string.h>
 
 #include "rsp/cxd4/gdx_rsp_driver.h"
@@ -147,6 +148,199 @@ unsigned int gdx_unlock_audio_trace_generation(void) {
 static void gdx_unlock_audio_trace_dsp_consume(void) {
     if (sGdxUnlockDspTraceTasks > 0) {
         sGdxUnlockDspTraceTasks--;
+    }
+}
+
+#define GDX_UNLOCK_AI_CAPTURE_FRAMES 64000u
+#define GDX_UNLOCK_AI_CAPTURE_CHANNELS 2u
+#define GDX_UNLOCK_AI_CAPTURE_PATH "gdiffuser-unlock-ai.wav"
+
+typedef struct GdxUnlockAiCapture {
+    unsigned int generation;
+    uint32_t frames;
+    uint32_t buffers;
+    uint32_t maxDelta[GDX_UNLOCK_AI_CAPTURE_CHANNELS];
+    uint32_t zeroSamples[GDX_UNLOCK_AI_CAPTURE_CHANNELS];
+    uint32_t clippedSamples[GDX_UNLOCK_AI_CAPTURE_CHANNELS];
+    uint64_t squareSum[GDX_UNLOCK_AI_CAPTURE_CHANNELS];
+    int64_t sampleSum[GDX_UNLOCK_AI_CAPTURE_CHANNELS];
+    int16_t minSample[GDX_UNLOCK_AI_CAPTURE_CHANNELS];
+    int16_t maxSample[GDX_UNLOCK_AI_CAPTURE_CHANNELS];
+    int16_t previousSample[GDX_UNLOCK_AI_CAPTURE_CHANNELS];
+    int16_t pcm[GDX_UNLOCK_AI_CAPTURE_FRAMES * GDX_UNLOCK_AI_CAPTURE_CHANNELS];
+    int hasPreviousSample;
+    int complete;
+} GdxUnlockAiCapture;
+
+static GdxUnlockAiCapture sGdxUnlockAiCapture;
+
+static void gdx_unlock_ai_capture_put_u16(uint8_t* dst, uint16_t value) {
+    dst[0] = (uint8_t)value;
+    dst[1] = (uint8_t)(value >> 8);
+}
+
+static void gdx_unlock_ai_capture_put_u32(uint8_t* dst, uint32_t value) {
+    dst[0] = (uint8_t)value;
+    dst[1] = (uint8_t)(value >> 8);
+    dst[2] = (uint8_t)(value >> 16);
+    dst[3] = (uint8_t)(value >> 24);
+}
+
+static void gdx_unlock_ai_capture_reset(unsigned int generation, unsigned int sampleRate) {
+    unsigned int channel;
+
+    sGdxUnlockAiCapture.generation = generation;
+    sGdxUnlockAiCapture.frames = 0;
+    sGdxUnlockAiCapture.buffers = 0;
+    sGdxUnlockAiCapture.hasPreviousSample = 0;
+    sGdxUnlockAiCapture.complete = 0;
+    for (channel = 0; channel < GDX_UNLOCK_AI_CAPTURE_CHANNELS; channel++) {
+        sGdxUnlockAiCapture.maxDelta[channel] = 0;
+        sGdxUnlockAiCapture.zeroSamples[channel] = 0;
+        sGdxUnlockAiCapture.clippedSamples[channel] = 0;
+        sGdxUnlockAiCapture.squareSum[channel] = 0;
+        sGdxUnlockAiCapture.sampleSum[channel] = 0;
+        sGdxUnlockAiCapture.minSample[channel] = INT16_MAX;
+        sGdxUnlockAiCapture.maxSample[channel] = INT16_MIN;
+        sGdxUnlockAiCapture.previousSample[channel] = 0;
+    }
+
+    gdx_unlock_diagf("[unlock-audio] ai tap begin generation=%u frames=%u sampleRate=%u channels=2 "
+                     "format=s16le boundary=pre-osAiSetNextBuffer\n",
+                     generation, GDX_UNLOCK_AI_CAPTURE_FRAMES, sampleRate);
+}
+
+static int gdx_unlock_ai_capture_write_wav(unsigned int sampleRate) {
+    uint8_t header[44];
+    uint32_t dataBytes = sGdxUnlockAiCapture.frames * GDX_UNLOCK_AI_CAPTURE_CHANNELS * sizeof(int16_t);
+    FILE* file;
+    int wroteAll;
+
+    header[0] = 'R';
+    header[1] = 'I';
+    header[2] = 'F';
+    header[3] = 'F';
+    gdx_unlock_ai_capture_put_u32(&header[4], 36u + dataBytes);
+    header[8] = 'W';
+    header[9] = 'A';
+    header[10] = 'V';
+    header[11] = 'E';
+    header[12] = 'f';
+    header[13] = 'm';
+    header[14] = 't';
+    header[15] = ' ';
+    gdx_unlock_ai_capture_put_u32(&header[16], 16u);
+    gdx_unlock_ai_capture_put_u16(&header[20], 1u);
+    gdx_unlock_ai_capture_put_u16(&header[22], GDX_UNLOCK_AI_CAPTURE_CHANNELS);
+    gdx_unlock_ai_capture_put_u32(&header[24], sampleRate);
+    gdx_unlock_ai_capture_put_u32(&header[28],
+                                  sampleRate * GDX_UNLOCK_AI_CAPTURE_CHANNELS * sizeof(int16_t));
+    gdx_unlock_ai_capture_put_u16(&header[32], GDX_UNLOCK_AI_CAPTURE_CHANNELS * sizeof(int16_t));
+    gdx_unlock_ai_capture_put_u16(&header[34], sizeof(int16_t) * 8u);
+    header[36] = 'd';
+    header[37] = 'a';
+    header[38] = 't';
+    header[39] = 'a';
+    gdx_unlock_ai_capture_put_u32(&header[40], dataBytes);
+
+    file = fopen(GDX_UNLOCK_AI_CAPTURE_PATH, "wb");
+    if (file == NULL) {
+        return 0;
+    }
+    wroteAll = (fwrite(header, 1, sizeof(header), file) == sizeof(header)) &&
+               (fwrite(sGdxUnlockAiCapture.pcm, 1, dataBytes, file) == dataBytes);
+    if (fclose(file) != 0) {
+        wroteAll = 0;
+    }
+    return wroteAll;
+}
+
+static void gdx_unlock_ai_capture_finish(unsigned int sampleRate) {
+    unsigned int channel;
+    int wroteWav;
+
+    sGdxUnlockAiCapture.complete = 1;
+    for (channel = 0; channel < GDX_UNLOCK_AI_CAPTURE_CHANNELS; channel++) {
+        double mean = (double)sGdxUnlockAiCapture.sampleSum[channel] / sGdxUnlockAiCapture.frames;
+        double meanSquare = (double)sGdxUnlockAiCapture.squareSum[channel] / sGdxUnlockAiCapture.frames;
+
+        gdx_unlock_diagf("[unlock-audio] ai tap stats generation=%u channel=%c min=%d max=%d "
+                         "mean=%.3f rms=%.3f zeros=%u clipped=%u maxDelta=%u\n",
+                         sGdxUnlockAiCapture.generation, channel == 0 ? 'L' : 'R',
+                         sGdxUnlockAiCapture.minSample[channel], sGdxUnlockAiCapture.maxSample[channel],
+                         mean, sqrt(meanSquare), sGdxUnlockAiCapture.zeroSamples[channel],
+                         sGdxUnlockAiCapture.clippedSamples[channel], sGdxUnlockAiCapture.maxDelta[channel]);
+    }
+
+    wroteWav = gdx_unlock_ai_capture_write_wav(sampleRate);
+    gdx_unlock_diagf("[unlock-audio] ai tap complete generation=%u buffers=%u frames=%u artifact=%s "
+                     "bytes=%u status=%s\n",
+                     sGdxUnlockAiCapture.generation, sGdxUnlockAiCapture.buffers,
+                     sGdxUnlockAiCapture.frames, GDX_UNLOCK_AI_CAPTURE_PATH,
+                     44u + sGdxUnlockAiCapture.frames * GDX_UNLOCK_AI_CAPTURE_CHANNELS * sizeof(int16_t),
+                     wroteWav ? "ok" : "write-failed");
+}
+
+void gdx_unlock_audio_capture_ai_buffer(const int16_t* buffer, unsigned int frameCount,
+                                        unsigned int sampleRate) {
+    unsigned int generation = sGdxUnlockDspTraceGeneration;
+    uint32_t framesToCopy;
+    uint32_t frame;
+    unsigned int channel;
+
+    if ((generation == 0) || (buffer == NULL) || (frameCount == 0)) {
+        return;
+    }
+    if (generation != sGdxUnlockAiCapture.generation) {
+        gdx_unlock_ai_capture_reset(generation, sampleRate);
+    }
+    if (sGdxUnlockAiCapture.complete) {
+        return;
+    }
+
+    framesToCopy = frameCount;
+    if (framesToCopy > GDX_UNLOCK_AI_CAPTURE_FRAMES - sGdxUnlockAiCapture.frames) {
+        framesToCopy = GDX_UNLOCK_AI_CAPTURE_FRAMES - sGdxUnlockAiCapture.frames;
+    }
+    sGdxUnlockAiCapture.buffers++;
+
+    for (frame = 0; frame < framesToCopy; frame++) {
+        for (channel = 0; channel < GDX_UNLOCK_AI_CAPTURE_CHANNELS; channel++) {
+            int32_t value = buffer[frame * GDX_UNLOCK_AI_CAPTURE_CHANNELS + channel];
+            uint32_t captureIndex =
+                (sGdxUnlockAiCapture.frames + frame) * GDX_UNLOCK_AI_CAPTURE_CHANNELS + channel;
+
+            sGdxUnlockAiCapture.pcm[captureIndex] = (int16_t)value;
+            sGdxUnlockAiCapture.sampleSum[channel] += value;
+            sGdxUnlockAiCapture.squareSum[channel] += (uint64_t)(value * value);
+            if (value < sGdxUnlockAiCapture.minSample[channel]) {
+                sGdxUnlockAiCapture.minSample[channel] = (int16_t)value;
+            }
+            if (value > sGdxUnlockAiCapture.maxSample[channel]) {
+                sGdxUnlockAiCapture.maxSample[channel] = (int16_t)value;
+            }
+            if (value == 0) {
+                sGdxUnlockAiCapture.zeroSamples[channel]++;
+            }
+            if ((value == INT16_MIN) || (value == INT16_MAX)) {
+                sGdxUnlockAiCapture.clippedSamples[channel]++;
+            }
+            if (sGdxUnlockAiCapture.hasPreviousSample) {
+                int32_t signedDelta = value - sGdxUnlockAiCapture.previousSample[channel];
+                uint32_t delta = signedDelta < 0 ? (uint32_t)-signedDelta : (uint32_t)signedDelta;
+
+                if (delta > sGdxUnlockAiCapture.maxDelta[channel]) {
+                    sGdxUnlockAiCapture.maxDelta[channel] = delta;
+                }
+            }
+            sGdxUnlockAiCapture.previousSample[channel] = (int16_t)value;
+        }
+        sGdxUnlockAiCapture.hasPreviousSample = 1;
+    }
+
+    sGdxUnlockAiCapture.frames += framesToCopy;
+    if (sGdxUnlockAiCapture.frames == GDX_UNLOCK_AI_CAPTURE_FRAMES) {
+        gdx_unlock_ai_capture_finish(sampleRate);
     }
 }
 

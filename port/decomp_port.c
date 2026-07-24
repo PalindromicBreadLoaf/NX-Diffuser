@@ -15,6 +15,13 @@
 extern void gdx_ck(const char* s);
 extern void gdx_seg_log(const char* kind, int seg, uintptr_t raw, void* resolved);
 extern void gdx_addr_log(const char* kind, uintptr_t raw, void* resolved);
+/* Printf-style sibling of gdx_ck, same stdio.h-avoidance reason (defined in
+   n64_sched.c). Unlike gdx_ck/gdx_cki it is NOT gated behind GDX_TRACE -- it
+   always reaches stderr/OutputDebugString and additionally persists to
+   gdiffuser-run.log whenever GDX_LOG (or another diagnostic env var) is set
+   (see port_log.h's gdx_log_file_enabled). Used below for the segment-9
+   activation diagnostic (Course Edit node-info panel scatter investigation). */
+extern void gdx_dbg_logf(const char* fmt, ...);
 extern void* gdx_host_calloc(size_t count, size_t size);
 extern void  gdx_host_exit(int status);
 extern void  gdx_host_abort(void);
@@ -23,9 +30,18 @@ extern void* gdx_resolve_module_host_address(unsigned int addr);
 extern void* gdx_ensure_asset_segment_for_symbol(unsigned int symLow32, unsigned int* outOffset);
 extern int   gdx_load_venue_texture_segment(int venue);
 extern s32   gGameMode;
+/* Declared locally (not via <stdlib.h>, which -- like <stdio.h> above -- clashes
+   with the decomp's libc/stdint.h) so the [seg9diag] gate below can read GDX_LOG
+   without pulling in the standard header. */
+extern char* getenv(const char* name);
 
 extern unsigned char* gdx_rom_buffer;
 extern size_t gdx_rom_size;
+/* R1 (C-R1.3): single archive-first byte-source shim. The seg-9 machine_models
+ * and seg-5 podium loaders below stage their compressed MIO0 span through this
+ * instead of reading gdx_rom_buffer directly; it returns verbatim ROM bytes, so
+ * mio0Decode sees byte-identical input. See port/gdx_segment_source.{h,c}. */
+extern int GdxSegmentSourceRead(unsigned int romBase, unsigned int size, void* dst);
 extern unk_80225800 D_80225800;
 #ifdef EXPANSION_KIT
 extern unk_80128C94* D_80128C90;
@@ -58,6 +74,16 @@ static size_t Gdx_RomOffset(u32 addr) {
 
 extern void gdx_register_host_range(void* ptr, size_t size); // defined in n64_gfx_bridge.cpp
 extern void gdx_register_host_wide_command_range(void* ptr, size_t size);
+// A1/A2: same "known compiled-in host array" registration E3 uses for EK disk
+// assets (see its comment in n64_gfx_bridge.cpp), reused here for base-game
+// arrays. gdx_register_host_pointer_stub only affects RECOGNITION (silences the
+// "[stub-miss] ... taken verbatim" census for a legitimate module-resident
+// array); gdx_set_native_rgba16_texture_range additionally marks a range as
+// host-endian so the SETTIMG wide-pointer path byte-swaps it into a persistent
+// copy before Fast3D reads it (same mechanism transition.c uses for
+// sTransitionPalette/backgroundBuffer).
+extern void gdx_register_host_pointer_stub(void* dest, size_t size);
+extern void gdx_set_native_rgba16_texture_range(void* ptr, size_t size, int enabled);
 extern GfxPool D_1000000; // defined below; forward-declared here so gdx_rdram_init() can reference it
 extern GfxPool D_8024DCE0[2];
 
@@ -134,6 +160,66 @@ void gdx_rdram_init(void) {
         gdx_register_host_range(D_A007000, 1);
         gdx_register_host_range(D_A008000, 1);
     }
+    // E4 (A3 follow-up): banks 9-11 (D_A009000..D_A00B000, decomp's
+    // fzx_segmentA.h:15-17) -- same 1-byte-LinkStubs-on-Linux-PIE registration
+    // as banks 0-8 above, extending the range n64_gfx_bridge.cpp's kBankLow32[]
+    // now also covers. D_A009000/D_A00A000 are unreferenced placeholders (see
+    // tools/gen_link_stubs.py's EXTRA_DATA_SYMS) always linked via LinkStubs.c;
+    // D_A00B000 is live (gRoadTypeMenuItems, decomp/src/overlays/expansion_kit/
+    // A3AE0.c:534-544) but only exists in the EK-only port/gen/EkLinkStubs.c, so
+    // it must stay behind EXPANSION_KIT like its bridge-side extern declaration.
+    {
+        extern unsigned char D_A009000[];
+        extern unsigned char D_A00A000[];
+        gdx_register_host_range(D_A009000, 1);
+        gdx_register_host_range(D_A00A000, 1);
+    }
+#ifdef EXPANSION_KIT
+    {
+        extern unsigned char D_A00B000[];
+        gdx_register_host_range(D_A00B000, 1);
+    }
+#endif
+
+    // A1 (podium/ending fireworks invisible): EndingCutsceneEffects_DrawFireworks
+    // (decomp/src/overlays/ending/ending_effects.c) SETTIMGs these three compiled-in
+    // u16[64] sparkle textures directly -- real, full-size host arrays, not
+    // LinkStubs placeholders, so ResolveWideAssetStubPointer miscounted them as
+    // unbound stubs ("[stub-miss] ... taken verbatim"). "Verbatim" was also
+    // pixel-wrong: their u16 literals (e.g. 0xFFFE/0xFFFF) are compiled at their
+    // native (host, little-endian) byte order, but Fast3D's RGBA16 texture reader
+    // wants a big-endian byte stream -- the same endianness class as the
+    // sTransitionPalette/backgroundBuffer bug transition.c already works around.
+    // gdx_set_native_rgba16_texture_range marks each array so the SETTIMG wide-
+    // pointer path byte-swaps it into a persistent copy before Fast3D samples it
+    // (this is the actual pixel fix); gdx_register_host_pointer_stub additionally
+    // marks it as a recognized identity so the stub-miss census stops naming it.
+    // Sizes are 64 elements * sizeof(u16) = 128 bytes each (counted from the
+    // array initializers in ending_effects.c).
+    {
+        extern u16 D_i7_8014ADA8[];
+        extern u16 D_i7_8014AE30[];
+        extern u16 D_i7_8014AEB8[];
+        gdx_set_native_rgba16_texture_range(D_i7_8014ADA8, 128u, 1);
+        gdx_set_native_rgba16_texture_range(D_i7_8014AE30, 128u, 1);
+        gdx_set_native_rgba16_texture_range(D_i7_8014AEB8, 128u, 1);
+        gdx_register_host_pointer_stub(D_i7_8014ADA8, 128u);
+        gdx_register_host_pointer_stub(D_i7_8014AE30, 128u);
+        gdx_register_host_pointer_stub(D_i7_8014AEB8, 128u);
+    }
+
+    // A2 (sCourseMinimapPalette stub-miss at venue load): this IS the same TLUT
+    // minimap.c already pre-swaps under #ifdef PORT (MINIMAP_TLUT_ENTRY), so its
+    // compiled bytes are already big-endian-correct -- unlike the fireworks
+    // arrays above, it must NOT go through gdx_set_native_rgba16_texture_range
+    // (that would re-swap already-correct bytes back to broken). Register it as a
+    // recognized identity only, purely to silence the stub-miss census entry this
+    // legitimate, sampled-every-frame array otherwise produces. 4 entries *
+    // sizeof(u16) = 8 bytes (CLEAR/BLACK/WHITE/GREY, minimap.c).
+    {
+        extern u16 sCourseMinimapPalette[];
+        gdx_register_host_pointer_stub(sCourseMinimapPalette, 8u);
+    }
 
     {
         extern void gdx_cki(const char*, int);
@@ -146,6 +232,14 @@ void gdx_rdram_init(void) {
     }
 
     gdx_ck("[rdram] 8MB buffer initialized");
+}
+
+// R6-P2 ground truth: the hand-copied kGfxPoolSize constant in port/gdx_interp.cpp cannot be
+// checked at parity 0 (its self-check degenerates to a tautology there — see PrevPoolBase). This
+// TU compiles WITH the real decomp GfxPool type, so it is the one place that can answer "how big
+// IS GfxPool, really" without guessing. gdx_interp verifies this ONCE against its constant.
+size_t gdx_gfxpool_sizeof(void) {
+    return sizeof(GfxPool);
 }
 
 void* gdx_rdram_alloc_raw(size_t size, size_t align) {
@@ -335,15 +429,21 @@ u32 osVirtualToPhysical(void* vaddr) {
 #endif
 
 u32 gdx_rom_read32(u32 addr) {
+    /* R4 (C-R4.1): single chokepoint for ~27 ROM_READ sites (racer.c/machine_draw.c/
+     * E7CF0.c). Read 4 bytes via the byte-source shim (archive-first, byte-identical
+     * raw fallback) and assemble big-endian exactly as before. On a total miss the
+     * shim returns 0 and leaves tmp untouched, so we return 0 -- the same value the
+     * old NULL/OOB guard returned. */
     size_t off = Gdx_RomOffset(addr);
-    if (gdx_rom_buffer == NULL || off + sizeof(u32) > gdx_rom_size) {
+    u8 tmp[4];
+    if (!GdxSegmentSourceRead((unsigned int)off, (unsigned int)sizeof(tmp), tmp)) {
         return 0;
     }
 
-    return ((u32)gdx_rom_buffer[off + 0] << 24) |
-           ((u32)gdx_rom_buffer[off + 1] << 16) |
-           ((u32)gdx_rom_buffer[off + 2] << 8)  |
-           ((u32)gdx_rom_buffer[off + 3] << 0);
+    return ((u32)tmp[0] << 24) |
+           ((u32)tmp[1] << 16) |
+           ((u32)tmp[2] << 8)  |
+           ((u32)tmp[3] << 0);
 }
 
 u32 gdx_io_read(u32 addr) {
@@ -672,14 +772,25 @@ static void gdx_load_seg7_if_needed(GdxSeg7Content want, unsigned char* romStart
  * 0x09xxxxxx tokens as globally interchangeable makes the two layouts collide.
  * Keep the ownership explicit and expose a narrow resolver hook so the graphics
  * bridge can prefer the active image before its global generated-asset ranges. */
+/* Staging buffer for the compressed seg-9 MIO0 span, filled by the byte-source
+ * shim. Sized to the full ROM span [ROM_START, ROM_END) so the entire MIO0
+ * stream is present before decoding. Game-thread only (mode transitions are
+ * sequential), so no additional guard is needed here. */
+static unsigned char sGdxSeg9Stage[PORT_machine_models_ROM_END - PORT_machine_models_ROM_START];
+
 static int gdx_activate_machine_models_segment9(void) {
     unsigned char* dest = (unsigned char*)osPhysicalToVirtual(gGdxMachineModelsVramStart);
     size_t capacity = (size_t)(gGdxMachineModelsVramEnd - gGdxMachineModelsVramStart);
     const size_t romStart = (size_t)PORT_machine_models_ROM_START;
+    const unsigned int span = (unsigned int)(PORT_machine_models_ROM_END - PORT_machine_models_ROM_START);
 
-    if (dest == NULL || capacity == 0 || gdx_rom_buffer == NULL || romStart + 8u > gdx_rom_size ||
-        gdx_rom_buffer[romStart + 0] != 'M' || gdx_rom_buffer[romStart + 1] != 'I' ||
-        gdx_rom_buffer[romStart + 2] != 'O' || gdx_rom_buffer[romStart + 3] != '0') {
+    /* Stage the compressed span through the shim (archive-first, raw fallback),
+     * then probe the staged bytes -- byte-identical to the old direct
+     * gdx_rom_buffer probe/decode. A source miss trips the same invalid path. */
+    if (dest == NULL || capacity == 0 ||
+        !GdxSegmentSourceRead((unsigned int)romStart, span, sGdxSeg9Stage) ||
+        sGdxSeg9Stage[0] != 'M' || sGdxSeg9Stage[1] != 'I' ||
+        sGdxSeg9Stage[2] != 'O' || sGdxSeg9Stage[3] != '0') {
         gdx_ck("[segment] segment 9 machine_models source/capacity invalid");
         return 0;
     }
@@ -690,16 +801,16 @@ static int gdx_activate_machine_models_segment9(void) {
          * RDRAM carve. Check it against the carve capacity before decoding (the EK
          * disk path below already does the equivalent required>capacity check). */
         {
-            unsigned int decodedSize = ((unsigned int)gdx_rom_buffer[romStart + 4] << 24) |
-                                       ((unsigned int)gdx_rom_buffer[romStart + 5] << 16) |
-                                       ((unsigned int)gdx_rom_buffer[romStart + 6] << 8) |
-                                       (unsigned int)gdx_rom_buffer[romStart + 7];
+            unsigned int decodedSize = ((unsigned int)sGdxSeg9Stage[4] << 24) |
+                                       ((unsigned int)sGdxSeg9Stage[5] << 16) |
+                                       ((unsigned int)sGdxSeg9Stage[6] << 8) |
+                                       (unsigned int)sGdxSeg9Stage[7];
             if (decodedSize > capacity) {
                 gdx_ck("[segment] segment 9 machine_models MIO0 decoded size exceeds carve capacity");
                 return 0;
             }
         }
-        mio0Decode(gdx_rom_buffer + romStart, dest);
+        mio0Decode(sGdxSeg9Stage, dest);
         gdx_fixup_asset_segment_image(0x09u, (unsigned int)PORT_machine_models_ROM_START,
                                       dest, (unsigned int)capacity);
         gdx_register_asset_segment_command_ranges(0x09u,
@@ -729,15 +840,60 @@ static int gdx_activate_machine_models_segment9(void) {
     return 1;
 }
 
+/* [seg9diag] instrumentation gate: gdx_dbg_logf (used throughout this block)
+ * always reaches stderr/OutputDebugString regardless of env vars -- unlike
+ * gdx_ck/gdx_cki it has no built-in opt-out -- so without this gate every
+ * [seg9diag] line below would spam stderr/OutputDebugString on a normal run
+ * even with no diagnostics requested. GDX_LOG opt-in, lazily cached (same
+ * sentinel pattern as port_log.h's gdx_log_file_enabled; this TU cannot
+ * include port_log.h, see the top-of-file comment). */
+static int gdx_seg9diag_enabled(void) {
+    static int sCached = -1;
+    if (sCached < 0) {
+        const char* log = getenv("GDX_LOG");
+        sCached = (log != NULL && log[0] != '\0' && log[0] != '0') ? 1 : 0;
+    }
+    return sCached;
+}
+
 #ifdef EXPANSION_KIT
+/* Task 3 diag (Course Edit node-info panel still blank at runtime, [nodeinfo]
+ * scatter investigation): entry/state/result tracing for the seg-9 activation
+ * this game mode depends on. Uses gdx_dbg_logf (always reaches stderr/
+ * OutputDebugString; persists to gdiffuser-run.log when GDX_LOG is set -- see
+ * the extern declaration above), NOT gdx_ck/gdx_cki, so these lines are not
+ * silently dropped when GDX_TRACE is unset. Low-noise: activation only runs
+ * on a mode transition into Course Edit, not per frame. Gated on
+ * gdx_seg9diag_enabled() (GDX_LOG) so a normal run stays silent.
+ *
+ * The fill call is pulled out of the original single OR-chained `if` into an
+ * explicit `fillOk` local so its result can be logged -- the precheck
+ * (dest/capacity/required) still short-circuits BEFORE the fill is attempted,
+ * exactly as the original expression did; no behavioral change. */
 static int gdx_activate_course_edit_segment9(void) {
     unsigned char* dest = (unsigned char*)osPhysicalToVirtual(gGdxCourseEditTexturesVramStart);
     size_t capacity = (size_t)(gGdxCourseEditTexturesVramEnd - gGdxCourseEditTexturesVramStart);
     size_t required = (size_t)gdx_ek_segment_image_size(9u);
+    int precheckFailed = (dest == NULL || capacity == 0 || required == 0 || required > capacity);
+    int fillOk = 0;
+    const int diagEnabled = gdx_seg9diag_enabled();
 
-    if (dest == NULL || capacity == 0 || required == 0 || required > capacity ||
-        !gdx_ek_segment_image_fill(9u, gdx_disk_buffer, (unsigned long long)gdx_disk_size,
-                                   dest, (unsigned int)capacity)) {
+    if (diagEnabled) {
+        gdx_dbg_logf("[seg9diag] activate_course_edit entry gameMode=%d diskBuffer=%p diskSize=%u dest=%p "
+                     "capacity=%u required=%u\n",
+                     (int)gGameMode, (void*)gdx_disk_buffer, (unsigned int)gdx_disk_size, (void*)dest,
+                     (unsigned int)capacity, (unsigned int)required);
+    }
+
+    if (!precheckFailed) {
+        fillOk = gdx_ek_segment_image_fill(9u, gdx_disk_buffer, (unsigned long long)gdx_disk_size, dest,
+                                           (unsigned int)capacity);
+    }
+    if (diagEnabled) {
+        gdx_dbg_logf("[seg9diag] activate_course_edit fill precheckFailed=%d fillOk=%d\n", precheckFailed, fillOk);
+    }
+
+    if (precheckFailed || !fillOk) {
         gdx_ck("[segment] segment 9 course_edit_textures fill failed");
         return 0;
     }
@@ -753,12 +909,29 @@ static int gdx_activate_course_edit_segment9(void) {
     Segment_SetAddress(9, gSegment22B0A0VramStart);
     sGdxSeg9Active = GDX_SEG9_CONTENT_COURSE_EDIT;
     sGdxSeg9ActiveSize = required;
+    if (diagEnabled) {
+        gdx_dbg_logf("[seg9diag] activate_course_edit SUCCESS Segment_SetAddress(9, 0x%08X) size=%u\n",
+                     (unsigned int)gSegment22B0A0VramStart, (unsigned int)sGdxSeg9ActiveSize);
+    }
     return 1;
 }
 #endif
 
 static void gdx_load_segment9_for_mode(void) {
     int loaded = 0;
+    /* Task 3 diag: one shared per-dispatch budget for both the entry and exit
+     * lines below (first 40 dispatches per boot). Every call here is a
+     * mode-transition event, not a per-frame one, so this stays low-noise even
+     * unbounded, but the cap matches the "first-N per boot" instruction. Also
+     * gated on gdx_seg9diag_enabled() (GDX_LOG) so a normal run stays silent. */
+    static int sSeg9DispatchLogs = 0;
+    const int diagThisCall = (sSeg9DispatchLogs < 40) && gdx_seg9diag_enabled();
+    if (sSeg9DispatchLogs < 40) {
+        sSeg9DispatchLogs++;
+    }
+    if (diagThisCall) {
+        gdx_dbg_logf("[seg9diag] load_segment9_for_mode entry gameMode=%d\n", (int)gGameMode);
+    }
 
     switch (gGameMode) {
         case GAMEMODE_CREATE_MACHINE:
@@ -783,6 +956,12 @@ static void gdx_load_segment9_for_mode(void) {
         sGdxSeg9Active = GDX_SEG9_CONTENT_NONE;
         sGdxSeg9ActiveSize = 0;
         Segment_SetAddress(9, gSegment22B0A0VramStart);
+    }
+
+    if (diagThisCall) {
+        gdx_dbg_logf("[seg9diag] load_segment9_for_mode exit gameMode=%d loaded=%d activeContent=%d "
+                     "Segment_SetAddress(9)=0x%08X\n",
+                     (int)gGameMode, loaded, (int)sGdxSeg9Active, (unsigned int)gSegment22B0A0VramStart);
     }
 }
 
@@ -813,6 +992,28 @@ int gdx_resolve_mode_segment9(unsigned int raw, size_t requiredBytes, uintptr_t*
     return 1;
 }
 
+/* E2 (editor resolver diagnosis): while a mode owns segment 4/7/9, that live
+ * carve is authoritative and the ROM-backed AssetBindings.c table rows for the
+ * SAME segment are stale context that must not be treated as a fallback match
+ * by the generated-stub lookup in n64_gfx_bridge.cpp (ResolveGeneratedAssetStub,
+ * reached from TryResolveAddress). TryResolveAddress already gives
+ * gdx_resolve_mode_segment9 first refusal over those rows for segment 9 (see
+ * the comment there); this extends the same intent to segments 4/7 and gives
+ * the bridge an explicit way to skip a ROM-table hit for any segment currently
+ * owned by a mode carve, instead of returning wrong-source bytes. */
+int gdx_mode_owns_segment(unsigned int seg) {
+    switch (seg) {
+        case 4u:
+            return sGdxSeg4Resident != GDX_SEG4_CONTENT_NONE;
+        case 7u:
+            return sGdxSeg7Resident != GDX_SEG7_CONTENT_NONE;
+        case 9u:
+            return sGdxSeg9Active != GDX_SEG9_CONTENT_NONE;
+        default:
+            return 0;
+    }
+}
+
 /* Segment 5 is GP-ending-only ROM data: the podium body meshes (sPodiumDLs,
  * ending.c) and the ending-venue building detail display lists, all reached via
  * 0x05xxxxxx G_DL/segment tokens. The console loaders that owned it
@@ -841,14 +1042,20 @@ extern void* gdx_rdram_persist_alloc_raw(size_t size, size_t align);
 static unsigned char* sGdxSeg5PodiumBuf = NULL; /* host pointer into gdx_rdram (persist region) */
 static size_t sGdxSeg5PodiumSize = 0;
 static int sGdxSeg5Resident = 0;
+/* Staging buffer for the compressed seg-5 MIO0 span, filled by the byte-source
+ * shim (same pattern as seg-9). Sized to the full podium_gfx ROM span. */
+static unsigned char sGdxSeg5Stage[PORT_podium_gfx_ROM_END - PORT_podium_gfx_ROM_START];
 
 static int gdx_activate_podium_segment5(void) {
     const size_t romStart = (size_t)PORT_podium_gfx_ROM_START;
+    const unsigned int span = (unsigned int)(PORT_podium_gfx_ROM_END - PORT_podium_gfx_ROM_START);
     unsigned int decodedSize;
 
-    if (gdx_rom_buffer == NULL || romStart + 8u > gdx_rom_size || gdx_rom_buffer[romStart + 0] != 'M' ||
-        gdx_rom_buffer[romStart + 1] != 'I' || gdx_rom_buffer[romStart + 2] != 'O' ||
-        gdx_rom_buffer[romStart + 3] != '0') {
+    /* Stage the compressed span through the shim, then probe the staged bytes for
+     * the MIO0 magic -- byte-identical to the old direct gdx_rom_buffer probe. */
+    if (!GdxSegmentSourceRead((unsigned int)romStart, span, sGdxSeg5Stage) ||
+        sGdxSeg5Stage[0] != 'M' || sGdxSeg5Stage[1] != 'I' ||
+        sGdxSeg5Stage[2] != 'O' || sGdxSeg5Stage[3] != '0') {
         gdx_ck("[segment] segment 5 podium_gfx source invalid (not MIO0)");
         return 0;
     }
@@ -856,9 +1063,9 @@ static int gdx_activate_podium_segment5(void) {
     /* Authoritative decoded size from the MIO0 header (big-endian u32 at +4), same
      * check the seg-9 machine_models path uses -- a corrupt ROM could otherwise
      * decompress past the carve. */
-    decodedSize = ((unsigned int)gdx_rom_buffer[romStart + 4] << 24) |
-                  ((unsigned int)gdx_rom_buffer[romStart + 5] << 16) |
-                  ((unsigned int)gdx_rom_buffer[romStart + 6] << 8) | (unsigned int)gdx_rom_buffer[romStart + 7];
+    decodedSize = ((unsigned int)sGdxSeg5Stage[4] << 24) |
+                  ((unsigned int)sGdxSeg5Stage[5] << 16) |
+                  ((unsigned int)sGdxSeg5Stage[6] << 8) | (unsigned int)sGdxSeg5Stage[7];
     if (decodedSize == 0u || decodedSize > 0x100000u) {
         gdx_ck("[segment] segment 5 podium_gfx decoded size implausible");
         return 0;
@@ -881,7 +1088,7 @@ static int gdx_activate_podium_segment5(void) {
     gSegment2738A0VramEnd = gSegment2738A0VramStart + sGdxSeg5PodiumSize;
 
     if (!sGdxSeg5Resident) {
-        mio0Decode(gdx_rom_buffer + romStart, sGdxSeg5PodiumBuf);
+        mio0Decode(sGdxSeg5Stage, sGdxSeg5PodiumBuf);
         /* Rewrite the podium display lists' embedded 0x05xxxxxx pointers in place
          * (idempotency matters: fixups are applied EXACTLY once, guarded by the
          * resident flag -- double-fixup would corrupt the command words). */
@@ -917,6 +1124,13 @@ static void gdx_load_segment5_for_mode(void) {
 
 static void gdx_load_mode_segments(void) {
     extern void gdx_cki(const char*, int);
+    /* P3 frame-interpolation cut epoch (MATRIX_INTERPOLATION_PLAN.md Step 7, event #5): this is the
+       single port-side chokepoint every mode/screen transition passes through (Segment_LoadOverlays
+       calls it on each mode change). Bumping the cut epoch here snaps the first rendered tick of the
+       new mode so nothing streaks across SELECT MACHINE<->race, Course Edit<->play, GRAND PRIX
+       standings, race entry, or a Retry reload. Render-only; no-op unless interpolation is on. */
+    extern void gdx_interp_mark_cut_src(const char* tag);
+    gdx_interp_mark_cut_src("mode-change");
     size_t hudSize = (size_t)(PORT_hud_gfx_ROM_END - PORT_hud_gfx_ROM_START);
     size_t createMachineSize =
         (size_t)(PORT_create_machine_textures_ROM_END - PORT_create_machine_textures_ROM_START);

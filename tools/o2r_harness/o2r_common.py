@@ -24,11 +24,60 @@ EXPECTED_ROM_CRC = 0x78D90EB3          # US rev0 cartridge CRC (C4)
 VERSION_ENTRY_LEN = 5                  # 1 endianness byte + 4 CRC bytes
 
 # C3 golden entry count (full recipe output including the inert families).
-EXPECTED_ENTRY_COUNT = 3576  # deduplicated (Torch parity fix 2026-07-18); was 4240 with the Windows double-emit bug
+#
+# This is the number of central-directory RECORDS (dup-inclusive) — EXACTLY what the runtime gate
+# at the zipEntryCount EOCD comparison in gdx_extract_launch.cpp compares (it reads EOCD offset 10,
+# "total central-directory records"). record_count() below computes the same thing
+# (len(z.infolist())). The current
+# deterministic archive has NO duplicate records, so records == unique names; the historical
+# 4240-records / 664-duplicates / 3576-unique split described the pre-2026-07-18 archive (Windows
+# double-emit bug) and no longer applies after the Torch parity fix.
+#
+# 3604 = 3576 pre-R1 base + 22 R1 segment_blob families + 3 R2 audio_blob families + 3 R4
+# segment_blob families (common_assets_compressed, kanji_tables, rom_boot_tuning -- W-R4.S1
+# census). The base 3576 includes the portVersion entry, which Torch only emits when gdx-extract
+# is run with `-u <version>` (the runtime passes `-u 2027490995`, the US-rev0 ROM CRC 0x78D90EB3).
+# The gauntlet MUST pass the same `-u` or it will mint a golden that is one record short and whose
+# SHA-256 will not match the runtime archive.
+EXPECTED_ENTRY_COUNT = 3604
 
 # Macro names are a frozen code-level contract with agent 1-B (C3).
 MACRO_SHA256 = "GDX_O2R_EXPECTED_SHA256"
 MACRO_ENTRY_COUNT = "GDX_O2R_EXPECTED_ENTRY_COUNT"
+
+# --- R5 (C-R5.5) JP profile constants -------------------------------------
+# The JP ROM is NOT on disk in this repo, so a real JP golden (archive SHA-256, entry count, and the
+# JP cartridge CRC that stamps the archive's version entry) is OWNER-RUN-REQUIRED. These stay None so
+# no script can fabricate a JP golden; the JP profile emits an OWNER-RUN-REQUIRED placeholder header
+# until the owner runs a real JP extraction. The JP rev0 ROM SHA-1 below is documented in
+# decomp/config.yml (an identity, NOT a fabricated golden).
+EXPECTED_ROM_CRC_JP = None            # JP cartridge CRC unknown (owner-run)
+EXPECTED_ENTRY_COUNT_JP = None        # JP archive entry count unknown (owner-run)
+EXPECTED_ROM_SHA1_JP = "a418b0151521b76691fa03f8658c8b567c69498b"
+MACRO_SHA256_JP = "GDX_O2R_EXPECTED_SHA256_JP"
+MACRO_ENTRY_COUNT_JP = "GDX_O2R_EXPECTED_ENTRY_COUNT_JP"
+
+# Placeholder SHA-256 written into a JP header until a real JP archive exists. An all-zero hash can
+# never match a real archive, so the runtime JP gate stays "experimental" (install without the golden
+# gate) rather than silently accepting a wrong archive.
+PLACEHOLDER_SHA256 = "0" * 64
+
+
+def profile_macros(profile):
+    """(sha_macro, count_macro) for a profile key ('us' or 'jp')."""
+    if profile == "jp":
+        return MACRO_SHA256_JP, MACRO_ENTRY_COUNT_JP
+    return MACRO_SHA256, MACRO_ENTRY_COUNT
+
+
+def profile_expected_crc(profile):
+    """Expected version-entry ROM CRC for a profile, or None if unknown (JP, owner-run)."""
+    return EXPECTED_ROM_CRC_JP if profile == "jp" else EXPECTED_ROM_CRC
+
+
+def profile_expected_count(profile):
+    """Expected archive entry count for a profile, or None if unknown (JP, owner-run)."""
+    return EXPECTED_ENTRY_COUNT_JP if profile == "jp" else EXPECTED_ENTRY_COUNT
 
 
 def sha256_file(path):
@@ -65,11 +114,12 @@ class Entry:
 def read_records(path):
     """Return the ordered list of Entry records from the central directory.
 
-    Includes DUPLICATE names: the legacy generic.o2r carries 664 duplicate-named
-    zip records (same key emitted by multiple recipes, identical payloads). The
-    "entry count" in C3 (4,240) is the number of central-directory RECORDS, not
-    the number of unique names -- so counting must go through this list, never a
-    name-keyed dict (which would collapse duplicates).
+    Counts by RECORD, not by unique name: the "entry count" (C3) and the runtime
+    gate both compare the number of central-directory RECORDS, so counting must
+    go through this list, never a name-keyed dict (which would collapse any
+    duplicates). The current deterministic archive has no duplicate names, but a
+    future recipe could reintroduce them; this list stays dup-inclusive so the
+    count always matches the runtime gate.
     """
     records = []
     with zipfile.ZipFile(path) as z:
@@ -124,11 +174,14 @@ def family_counts(path):
     return counts
 
 
-def parse_version_entry(data):
+def parse_version_entry(data, expected_crc=EXPECTED_ROM_CRC):
     """Parse a `version` entry per C4.
 
     Returns dict: {ok, reason, endianness, crc, raw_hex}.
-    ok is True only when the entry is exactly [0x01][u32 BE == EXPECTED_ROM_CRC].
+    ok is True when the entry is [0x01][u32 BE == expected_crc]. When expected_crc is None (a
+    profile whose golden CRC is unknown, e.g. JP/owner-run), the CRC equality check is SKIPPED: a
+    well-formed [0x01][u32] entry is reported ok with the observed CRC, so the JP scaffolding can run
+    without a fabricated CRC.
     """
     result = {
         "ok": False,
@@ -153,9 +206,13 @@ def parse_version_entry(data):
         return result
     crc = struct.unpack(">I", data[1:5])[0]
     result["crc"] = crc
-    if crc != EXPECTED_ROM_CRC:
+    if expected_crc is None:
+        result["ok"] = True
+        result["reason"] = "ok (CRC not checked: profile golden CRC unknown / owner-run)"
+        return result
+    if crc != expected_crc:
         result["reason"] = (
-            "ROM CRC 0x%08X, expected 0x%08X (US rev0)" % (crc, EXPECTED_ROM_CRC)
+            "ROM CRC 0x%08X, expected 0x%08X" % (crc, expected_crc)
         )
         return result
     result["ok"] = True
@@ -163,10 +220,11 @@ def parse_version_entry(data):
     return result
 
 
-def check_version_entry(path):
+def check_version_entry(path, expected_crc=EXPECTED_ROM_CRC):
     """Read and validate the `version` entry of an archive (C4). Returns parse dict.
 
-    Adds `present` key; if absent, ok=False with a reason.
+    Adds `present` key; if absent, ok=False with a reason. `expected_crc=None` skips CRC equality
+    (profile golden CRC unknown / owner-run).
     """
     entries = read_entries(path)
     if VERSION_ENTRY_NAME not in entries:
@@ -179,6 +237,6 @@ def check_version_entry(path):
             "raw_hex": "",
         }
     data = read_payload(path, VERSION_ENTRY_NAME)
-    parsed = parse_version_entry(data)
+    parsed = parse_version_entry(data, expected_crc)
     parsed["present"] = True
     return parsed

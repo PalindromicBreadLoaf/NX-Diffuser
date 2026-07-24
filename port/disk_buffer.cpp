@@ -3,9 +3,11 @@
 // target cannot include. Mirrors rom_buffer.cpp's role for the cartridge.
 #include "port_log.h"
 #include "rom_buffer.h"
+#include "gdx_extract_launch.h" // R8: disk deletion-gate helpers (sidecar disk_sha256 + SHA-256 over memory)
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -49,16 +51,139 @@ void gdx_leo_on_disk_loaded(const unsigned char* disk);
 // below without pulling in decomp headers.
 extern unsigned short D_80769DF0[];
 
-// Loads N64DDIPLROM.n64 and normalizes it to native big-endian byte order
-// (dumps circulate as z64/BE, v64/16-bit-swapped, or n64/32-bit-LE; detect by
-// the first byte of the PI header, which is 0x80 in native order).
-static void gdx_ddipl_load(void) {
-    if (gdx_ddipl_buffer != nullptr) {
-        return;
+// Forward declarations of the path helpers defined lower in this TU (used by the raw IPL fallback).
+static void gdx_dir_of(const char* path, char* outDir, size_t outSize);
+static void gdx_exe_dir(char* outDir, size_t outSize);
+
+// Raw archive-file reader (port/AssetLoader.cpp): copies min(fileSize, outSize) bytes of a mounted
+// o2r entry into `out`, returns 1 on success. Used by the archive-first IPL path below to pull the
+// pre-sliced font block out of n64ddipl.o2r without touching the IPL ROM file.
+extern "C" int GDiffuser_LoadArchiveFileBytes(const char* key, void* out, size_t outSize, size_t* copiedSize);
+
+// R3 IPL geometry (frozen contract C-R3.1/C-R3.2). DDROM_FONT_START is where the drive-ROM font
+// block begins; the port allocates a fixed 0x140000-byte buffer, zero-fills [0, 0xA0000), and copies
+// the font block at 0xA0000 so every consumer's guard (fontAddr >= 0xA0000 &&
+// fontAddr + 0x80 <= gdx_ddipl_size) and LeoGetKAdr's arithmetic hold unchanged.
+#define GDX_DDROM_FONT_START 0xA0000u
+#define GDX_DDIPL_LOGICAL_SIZE 0x140000u
+#define GDX_DDIPL_FONT_BLOCK_BYTES (GDX_DDIPL_LOGICAL_SIZE - GDX_DDROM_FONT_START) // 0xA0000
+
+// C-R3.2 archive-first: when n64ddipl.o2r is mounted, allocate the 0x140000 logical image, zero-fill
+// the low region, and copy the archived font block to 0xA0000. Returns true on success. The archived
+// slice is already byte-order-normalized big-endian (the gdx-extract `ipl` step normalized it), so no
+// swap happens here. Absence of the archive returns false and the raw-file fallback below carries.
+static bool gdx_ddipl_load_from_archive(void) {
+    unsigned char* buf = static_cast<unsigned char*>(malloc(GDX_DDIPL_LOGICAL_SIZE));
+    if (buf == nullptr) {
+        return false;
     }
-    FILE* f = fopen("N64DDIPLROM.n64", "rb");
+    memset(buf, 0, GDX_DDIPL_LOGICAL_SIZE);
+    size_t copied = 0;
+    if (!GDiffuser_LoadArchiveFileBytes("ipl/font_block", buf + GDX_DDROM_FONT_START,
+                                        GDX_DDIPL_FONT_BLOCK_BYTES, &copied) ||
+        copied != GDX_DDIPL_FONT_BLOCK_BYTES) {
+        free(buf);
+        return false;
+    }
+    gdx_ddipl_buffer = buf;
+    gdx_ddipl_size = GDX_DDIPL_LOGICAL_SIZE;
+    gdx_port_logf("[leo] 64DD IPL font block served from n64ddipl.o2r (%u bytes at 0x%X)\n",
+                  GDX_DDIPL_FONT_BLOCK_BYTES, GDX_DDROM_FONT_START);
+    return true;
+}
+
+// Best-effort lookup of the firstboot-recorded IPL path (Game.DdIplPath in gdx_firstboot.cfg). In
+// installed mode the process CWD is the data dir; in the dev/portable layout the cfg sits next to the
+// exe. Reads the first cfg found. Returns true and fills `outPath` when the key is present.
+static bool gdx_firstboot_ipl_path(char* outPath, size_t outSize) {
+    if (outSize == 0) {
+        return false;
+    }
+    outPath[0] = '\0';
+    char exeDir[1024] = {};
+    gdx_exe_dir(exeDir, sizeof(exeDir));
+    const char* dirs[] = { "", exeDir }; // "" == current working directory
+    for (const char* dir : dirs) {
+        char cfgPath[1200];
+        snprintf(cfgPath, sizeof(cfgPath), "%sgdx_firstboot.cfg", dir);
+        FILE* cf = fopen(cfgPath, "rb");
+        if (cf == nullptr) {
+            continue;
+        }
+        char line[2048];
+        bool found = false;
+        while (fgets(line, sizeof(line), cf) != nullptr) {
+            // Strip trailing CR/LF.
+            size_t len = strlen(line);
+            while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+                line[--len] = '\0';
+            }
+            const char* kv = "Game.DdIplPath=";
+            const size_t kvLen = strlen(kv);
+            if (strncmp(line, kv, kvLen) == 0 && line[kvLen] != '\0') {
+                strncpy(outPath, line + kvLen, outSize - 1);
+                outPath[outSize - 1] = '\0';
+                found = true;
+                break;
+            }
+        }
+        fclose(cf);
+        if (found) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Opens the IPL dump by trying, in order: the firstboot-recorded path, then the canonical
+// "N64DDIPLROM.n64" next to (a) the exe, (b) the chosen ROM, (c) the current working directory. This
+// replaces the old bare CWD-relative fopen (C-R3.4 / RELEASE_HYGIENE): a launch whose CWD is not the
+// data dir no longer silently loses the drive-ROM font. Returns an open FILE* (caller closes) or null.
+static FILE* gdx_ddipl_open_raw(char* chosenPath, size_t chosenSize) {
+    if (chosenSize > 0) {
+        chosenPath[0] = '\0';
+    }
+    // (0) firstboot-recorded absolute path.
+    char recorded[1024] = {};
+    if (gdx_firstboot_ipl_path(recorded, sizeof(recorded)) && recorded[0] != '\0') {
+        FILE* f = fopen(recorded, "rb");
+        if (f != nullptr) {
+            if (chosenSize > 0) {
+                strncpy(chosenPath, recorded, chosenSize - 1);
+                chosenPath[chosenSize - 1] = '\0';
+            }
+            return f;
+        }
+    }
+    // (1) exe dir, (2) next to the chosen ROM, (3) current working directory.
+    char exeDir[1024] = {};
+    gdx_exe_dir(exeDir, sizeof(exeDir));
+    char romDir[1024] = {};
+    gdx_dir_of(gdx_rom_path, romDir, sizeof(romDir));
+    const char* dirs[] = { exeDir, romDir, "" };
+    for (const char* dir : dirs) {
+        char path[1200];
+        snprintf(path, sizeof(path), "%sN64DDIPLROM.n64", dir);
+        FILE* f = fopen(path, "rb");
+        if (f != nullptr) {
+            if (chosenSize > 0) {
+                strncpy(chosenPath, path, chosenSize - 1);
+                chosenPath[chosenSize - 1] = '\0';
+            }
+            return f;
+        }
+    }
+    return nullptr;
+}
+
+// Raw-file fallback (retained until R4): loads N64DDIPLROM.n64 and normalizes it to native
+// big-endian byte order (dumps circulate as z64/BE, v64/16-bit-swapped, or n64/32-bit-LE; detect by
+// the first byte of the PI header, which is 0x80 in native order).
+static void gdx_ddipl_load_from_raw(void) {
+    char chosen[1200] = {};
+    FILE* f = gdx_ddipl_open_raw(chosen, sizeof(chosen));
     if (f == nullptr) {
-        gdx_port_logf("[leo] no N64DDIPLROM.n64; drive-ROM font stays blank\n");
+        gdx_port_logf("[leo] no N64DDIPLROM.n64 (and no n64ddipl.o2r); drive-ROM font stays blank\n");
         return;
     }
     fseek(f, 0, SEEK_END);
@@ -66,7 +191,7 @@ static void gdx_ddipl_load(void) {
     fseek(f, 0, SEEK_SET);
     if (sz < 0x100000) { // sanity: IPL ROM dumps are 4MB
         fclose(f);
-        gdx_port_logf("[leo] N64DDIPLROM.n64 too small (%ld bytes); ignored\n", sz);
+        gdx_port_logf("[leo] %s too small (%ld bytes); ignored\n", chosen, sz);
         return;
     }
     unsigned char* buf = static_cast<unsigned char*>(malloc(static_cast<size_t>(sz)));
@@ -89,12 +214,24 @@ static void gdx_ddipl_load(void) {
             buf[i + 2] = t1; buf[i + 3] = t0;
         }
     } else {
-        gdx_port_logf("[leo] N64DDIPLROM.n64: unrecognized byte order (first bytes %02X %02X %02X %02X); using as-is\n",
-                      buf[0], buf[1], buf[2], buf[3]);
+        gdx_port_logf("[leo] %s: unrecognized byte order (first bytes %02X %02X %02X %02X); using as-is\n",
+                      chosen, buf[0], buf[1], buf[2], buf[3]);
     }
     gdx_ddipl_buffer = buf;
     gdx_ddipl_size = static_cast<unsigned int>(sz);
-    gdx_port_logf("[leo] 64DD IPL ROM loaded (%ld bytes)\n", sz);
+    gdx_port_logf("[leo] 64DD IPL ROM loaded from %s (%ld bytes)\n", chosen, sz);
+}
+
+// Provisioning order (C-R3.2): the dedicated archive n64ddipl.o2r first (so a completed setup can
+// delete the IPL ROM file), then the raw-IPL-file fallback (retained until R4's soak rule).
+static void gdx_ddipl_load(void) {
+    if (gdx_ddipl_buffer != nullptr) {
+        return;
+    }
+    if (gdx_ddipl_load_from_archive()) {
+        return;
+    }
+    gdx_ddipl_load_from_raw();
 }
 
 // Best-effort check of whether the loaded cartridge ROM is the Japanese
@@ -174,8 +311,118 @@ static void gdx_exe_dir(char* outDir, size_t outSize) {
 #endif
 }
 
+// R8 Step 1: canonical retail/translated EK image size and the .gdd save key for archive-sourced
+// loads. The R7 managed copy is always kept under this leaf name (gdx_firstboot.cpp copies every
+// source to it), so an archive built from that copy replays saves under the exact same key the
+// managed-copy file path would use -- ".gdd keying (canonical leaf name) unchanged" (R8 invariant).
+#define GDX_DISK_EXACT_BYTES 64931840u
+static const char* const kDiskArchiveSaveKey = "baserom.translated.ek.ndd";
+
+// Deletion-gate verdict. 1 ONLY after a boot both (a) reconstructed the disk from fzerox-disk.o2r and
+// (b) verified SHA-256(reconstructed image) == the R7 managed-copy sha. Read by the Data & Files panel
+// via gdx_disk_archive_verified(); the panel offers deletion only on a passed verdict. No code ever
+// deletes user files -- this is a UX gate, not an action.
+static int s_diskArchiveVerified = 0;
+
+// Common post-load tail, shared by the archive-first branch and the raw-file/managed-copy branch.
+// Assumes gdx_disk_buffer/gdx_disk_size are already set to the PRISTINE image bytes. Runs the leo
+// disk-loaded hook, the EK asset fill, the translated-disk label overrides, the boot-logo texel swap,
+// IPL provisioning, then the durable .gdd save init + replay. `diskName` keys the .gdd sidecar
+// (canonical leaf name only, never a path). `sourceLabel` is logged as "[leo] disk source:".
+static void gdx_disk_finalize(const char* diskName, const char* sourceLabel) {
+    // R7 (C-R7.2): explicit provenance line, stable for a "disk source:" log grep (archive|managed|original).
+    gdx_port_logf("[leo] disk source: %s\n", sourceLabel);
+    gdx_leo_on_disk_loaded(gdx_disk_buffer);
+    gdx_ek_assets_fill(gdx_disk_buffer, static_cast<unsigned long long>(gdx_disk_size));
+    gdx_ek_disk_overrides_apply();
+
+    /* Host byte order for the boot-logo texels (2026-07-09): the fill above copies raw BIG-ENDIAN
+       disk bytes, but func_806F33D0 (sys_main.c) CPU-blits these u16s into a VI framebuffer that
+       everything else treats as host-order. Swap once here, at the only fill site; the blit is this
+       texture's only consumer (no GFX-task path reads it as big-endian). This is a decoded-TEXTURE
+       fixup, NOT a disk-image normalization -- it runs identically on the archive and file paths, and
+       the disk buffer itself is never byte-swapped (which is why the archive stores it verbatim). */
+    for (unsigned int i = 0; i < 5304; i++) {
+        const unsigned short v = D_80769DF0[i];
+        D_80769DF0[i] = static_cast<unsigned short>((v >> 8) | (v << 8));
+    }
+
+    gdx_ddipl_load();
+
+    // Durable disk save: gdx_disk_buffer is still the PRISTINE image here (the calls above take it as
+    // const / patch decoded C arrays, not the disk buffer), so its CRC64 fingerprint is the pristine
+    // one. init records that fingerprint + loads any matching sidecar; apply replays saved dirty ranges.
+    gdx_disk_save_init(diskName, gdx_disk_buffer, gdx_disk_size);
+    gdx_disk_save_apply(gdx_disk_buffer);
+}
+
+// R8 Step 1 archive-first: when fzerox-disk.o2r is mounted and its disk/image inflates to exactly
+// GDX_DISK_EXACT_BYTES, use it as the in-memory image source. The archive stores the disk bytes
+// VERBATIM (the loader never byte-swaps the disk buffer -- see gdx_disk_finalize), so archive-sourced
+// and file-sourced images are byte-identical: the existing .gdd replay, gdx_ek_assets_fill, and
+// byte-order handling all run unchanged, and there is no swap step to bypass. Returns 1 on success
+// (buffer installed + finalized), 0 to fall through to the managed-copy/raw-file search.
+static int gdx_disk_load_from_archive(void) {
+    unsigned char* buf = static_cast<unsigned char*>(malloc(GDX_DISK_EXACT_BYTES));
+    if (buf == nullptr) {
+        return 0;
+    }
+    size_t copied = 0;
+    if (!GDiffuser_LoadArchiveFileBytes("disk/image", buf, GDX_DISK_EXACT_BYTES, &copied) ||
+        copied != GDX_DISK_EXACT_BYTES) {
+        // No archive mounted, or disk/image did not inflate to the exact size -- fall through.
+        free(buf);
+        return 0;
+    }
+
+    // ── Deletion gate ────────────────────────────────────────────────────────────────────────────
+    // SHA-256 of the reconstructed image must equal the R7 managed-copy sha (sidecar disk_sha256)
+    // before the Data & Files panel may EVER offer deletion. Compute on the PRISTINE bytes now, before
+    // gdx_disk_save_apply (inside finalize) replays saves over them. The recorded value is preferred;
+    // if the sidecar has none, hash the managed copy file once as a fallback. A missing managed copy or
+    // any mismatch leaves the verdict false -- the gate never suggests deletion on unproven bytes.
+    char exeDir[1024] = {};
+    gdx_exe_dir(exeDir, sizeof(exeDir));
+    std::string archiveSha = gdx::GdxExtractSha256Bytes(buf, static_cast<unsigned long long>(GDX_DISK_EXACT_BYTES));
+    std::string recorded = gdx::GdxExtractRecordedDiskSha256(exeDir);
+    if (recorded.empty() && exeDir[0] != '\0') {
+        char managedPath[1200];
+        snprintf(managedPath, sizeof(managedPath), "%smedia/%s", exeDir, kDiskArchiveSaveKey);
+        recorded = gdx::GdxExtractFileSha256(managedPath);
+    }
+    s_diskArchiveVerified = (!recorded.empty() && archiveSha == recorded) ? 1 : 0;
+    if (s_diskArchiveVerified) {
+        gdx_port_logf("[leo] disk archive verified byte-identical to the managed copy (SHA-256 %s); "
+                      "original .ndd and managed copy are deletable\n",
+                      archiveSha.c_str());
+    } else {
+        gdx_port_logf("[leo] disk archive NOT verified (reconstructed %s vs recorded %s); deletion "
+                      "stays gated\n",
+                      archiveSha.empty() ? "(none)" : archiveSha.c_str(),
+                      recorded.empty() ? "(none)" : recorded.c_str());
+    }
+
+    gdx_disk_buffer = buf;
+    gdx_disk_size = GDX_DISK_EXACT_BYTES;
+    gdx_port_logf("[leo] disk image reconstructed from fzerox-disk.o2r (%u bytes)\n", GDX_DISK_EXACT_BYTES);
+    gdx_disk_finalize(kDiskArchiveSaveKey, "archive");
+    return 1;
+}
+
+// R8 Step 1: deletion-gate verdict for the Data & Files panel. 1 iff this boot reconstructed the disk
+// from the archive AND proved byte-identity against the managed copy. Never triggers any deletion.
+int gdx_disk_archive_verified(void) {
+    return s_diskArchiveVerified;
+}
+
 int gdx_disk_load(void) {
     if (gdx_disk_buffer != nullptr) {
+        return 1;
+    }
+
+    // R8 Step 1: archive-first. A mounted, exact-size fzerox-disk.o2r reconstructs the image (and runs
+    // the deletion gate); the managed-copy/raw-file search below is the unchanged fallback.
+    if (gdx_disk_load_from_archive()) {
         return 1;
     }
 
@@ -201,24 +448,33 @@ int gdx_disk_load(void) {
     const char* const* diskNames = jpRom ? kJpPreferredNames : kUsPreferredNames;
     const size_t diskNameCount = 3;
 
-    // Search location order: (1) next to the chosen ROM -- so multiple
-    // installs/folders with different .ndd files never cross-pollinate --
-    // then (2) the exe directory, then (3) the process's current working
-    // directory (legacy behavior, kept as a last resort for scripted/dev
+    // Search location order (R7 -- disk internalization): (0) the managed copy under
+    // <exeDir>/media -- a byte-identical copy gdx_firstboot.cpp creates from the user's original
+    // disk at setup time, kept under the SAME canonical leaf name, so the .gdd save key (which
+    // derives from the leaf name only, never a path -- see disk_savefile.cpp:381) is unaffected by
+    // preferring it -- then (1) next to the chosen ROM -- so multiple installs/folders with
+    // different .ndd files never cross-pollinate -- then (2) the exe directory, then (3) the
+    // process's current working directory (legacy behavior, kept as a last resort for scripted/dev
     // launches that rely on CWD rather than exe-relative paths).
     char romDir[1024] = {};
     gdx_dir_of(gdx_rom_path, romDir, sizeof(romDir));
     char exeDir[1024] = {};
     gdx_exe_dir(exeDir, sizeof(exeDir));
+    char mediaDir[1040] = {};
+    if (exeDir[0] != '\0') {
+        snprintf(mediaDir, sizeof(mediaDir), "%smedia/", exeDir);
+    }
 
     struct SearchLocation {
         const char* dir;
         const char* why;
+        bool managed;
     };
     const SearchLocation searchLocations[] = {
-        { romDir, "next to chosen ROM" },
-        { exeDir, "exe directory" },
-        { "", "current directory" },
+        { mediaDir, "managed copy (media/)", true },
+        { romDir, "next to chosen ROM", false },
+        { exeDir, "exe directory", false },
+        { "", "current directory", false },
     };
 
     for (const SearchLocation& loc : searchLocations) {
@@ -262,37 +518,9 @@ int gdx_disk_load(void) {
             gdx_disk_size = static_cast<unsigned int>(sz);
             gdx_port_logf("[leo] disk image loaded: %s (%ld bytes) -- picked from %s, region=%s\n", path, sz,
                           loc.why, jpRom ? "JP (matches cartridge ROM)" : "US/unknown (default preference)");
-            gdx_leo_on_disk_loaded(gdx_disk_buffer);
-            gdx_ek_assets_fill(gdx_disk_buffer, static_cast<unsigned long long>(gdx_disk_size));
-            gdx_ek_disk_overrides_apply();
-
-            /* Host byte order for the boot-logo texels (2026-07-09): the fill
-               above copies raw BIG-ENDIAN disk bytes, but func_806F33D0
-               (sys_main.c) CPU-blits these u16s into a VI framebuffer that
-               everything else — the game's own clear (0x0001) and the seed
-               quad's RGBA5551 conversion — treats as host-order. The result
-               on screen was the byte-swap signature exactly: white "64DD"
-               intact (0xFFFF is swap-invariant), the N-cube's colors
-               scrambled, and the cleared-black border around the blit showing
-               as dim green (0x0001 -> 0x0100). Swap once here, at the only
-               fill site, right after the probe; the blit is this texture's
-               only consumer (no GFX-task path reads it as big-endian). */
-            for (unsigned int i = 0; i < 5304; i++) {
-                const unsigned short v = D_80769DF0[i];
-                D_80769DF0[i] = static_cast<unsigned short>((v >> 8) | (v << 8));
-            }
-
-            gdx_ddipl_load();
-
-            // Durable disk save: gdx_disk_buffer is still the PRISTINE file bytes
-            // here -- gdx_ek_assets_fill and gdx_leo_on_disk_loaded take it as
-            // const, and gdx_ek_disk_overrides_apply patches decoded C arrays, not
-            // the disk buffer -- so its CRC64 fingerprint is the pristine one. init
-            // records that fingerprint and loads any matching sidecar; apply then
-            // replays the saved dirty ranges over the image so prior saves come
-            // back. The sidecar mirrors the loaded disk's file name.
-            gdx_disk_save_init(diskNames[i], gdx_disk_buffer, gdx_disk_size);
-            gdx_disk_save_apply(gdx_disk_buffer);
+            // Managed-copy/raw-file load: no archive reconstruction happened this boot, so the deletion
+            // gate stays unproven (s_diskArchiveVerified remains 0) and the disk is NOT marked deletable.
+            gdx_disk_finalize(diskNames[i], loc.managed ? "managed" : "original");
             return 1;
         }
     }

@@ -248,6 +248,9 @@ add_executable(G-Diffuser
                                 # target_link_libraries(libultraship) below).
     input_bridge.c
     n64_gfx_bridge.cpp
+    gdx_interp.cpp             # R6-P1: matrix frame-interpolation math (guMtxL2F/F2L float lerp),
+                                # dual-pool prev/cur resolution, and per-tick snap state. Drives the
+                                # bridge's G_MTX scratch-slot indirection. Default-OFF (GDX_INTERP_P1).
     n64_gfx_convert.cpp        # G2: binary N64 (8-byte) -> wide 16-byte boundary
                                 # converter + cross-frame cache. Standalone C++
                                 # (no bridge/LUS/decomp deps); unit-tested by the
@@ -267,6 +270,10 @@ add_executable(G-Diffuser
                                 # audio production (replaces the cooperative-fiber-driven path
                                 # for silence-hole elimination). See its header comment for the
                                 # full cross-thread touchpoint enumeration and design notes.
+    gdx_audio_capture.c        # R2 bit-identical PCM gate (C-R2.3): streaming s16-stereo capture off
+                                # the audio tap (thread.c:84), armed by GDX_PCM_CAPTURE, writing
+                                # <prefix>.pcm + a SHA-256 sidecar. Standalone C, unit-tested by the
+                                # gdx_pcm_capture_tests target.
     gdx_frame_pacer.c          # Optional wall-clock host-loop pacer (default OFF): holds the
                                 # loop to the N64 NTSC field rate when
                                 # gEnhancements.Graphics.FramePacing is enabled. libultraship's
@@ -282,6 +289,9 @@ add_executable(G-Diffuser
     gdx_extract_launch.cpp     # Runtime O2R extraction: validates the user's ROM, runs the gdx-extract
                                 # companion, and atomically installs fzerox.o2r into the data dir.
                                 # Contract: docs/investigation/2026-07-18/o2r-migration/P0_CONTRACTS.md.
+    gdx_dump_launch.cpp        # R8 Step 4b: per-class offline "Dump All" launcher for the Workshop menu.
+                                # Spawns tools/gen_dump_all.py once per selected class on a worker thread
+                                # (per-class failure isolation); UI reads a shared snapshot. Dev-facing.
     gdx_firstboot_gui.cpp      # In-window ImGui first-time setup flow (replaces the old pre-window
                                 # Win32 wizard). Runs after the window/Gui/FileDropMgr exist and before
                                 # the game boots: acquires/validates/copies the ROM+EK disk+IPL (Browse
@@ -308,6 +318,11 @@ add_executable(G-Diffuser
     gdx_workshop.cpp           # Workshop W0: texture-pack override shim, decoded-texture dump
                                 # (vendored stb_image_write), and hot reload. All CVar-gated OFF.
     mio0_wrap.c
+    gdx_segment_source.c       # R1 (C-R1.3): single archive-first byte-source shim behind every
+                                # ROM read (segment_blob table -> raw gdx_rom_buffer fallback) with
+                                # per-family fallback telemetry. Linked into the exe because it needs
+                                # GDiffuser_LoadArchiveFileBytes (AssetLoader.cpp), gdx_rom_buffer
+                                # (rom_buffer.cpp), and gdx_lookup_segment_blob (gen/AssetBindings.c).
     "${CMAKE_CURRENT_SOURCE_DIR}/../torch/lib/libmio0/mio0.c"
     $<TARGET_OBJECTS:gdiffuser_game>)
 
@@ -440,6 +455,9 @@ add_custom_command(TARGET G-Diffuser POST_BUILD
 #   decomp-recipes/assets/yaml/us/rev0/**
 set(GDX_RECIPES_SRC "${CMAKE_SOURCE_DIR}/decomp")
 set(GDX_RECIPES_DST "$<TARGET_FILE_DIR:G-Diffuser>/decomp-recipes")
+# R8 Step 2: the EK slice manifest (tools/gen_ek_assets.py output) ships beside the recipes so the
+# runtime disk step can pass it to `gdx-extract disk -m` and produce the ek/<symbol> per-asset entries.
+set(GDX_EK_SLICE_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/gen/ek_slice_manifest.txt")
 add_custom_command(TARGET G-Diffuser POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${GDX_RECIPES_DST}/assets/yaml/us"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
@@ -448,9 +466,23 @@ add_custom_command(TARGET G-Diffuser POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "${GDX_RECIPES_SRC}/LICENSE"
             "${GDX_RECIPES_DST}/LICENSE"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${GDX_EK_SLICE_MANIFEST}"
+            "${GDX_RECIPES_DST}/ek_slice_manifest.txt"
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
             "${GDX_RECIPES_SRC}/assets/yaml/us/rev0"
             "${GDX_RECIPES_DST}/assets/yaml/us/rev0"
+    # Native Dump All data files: emit (a) the parsed gSoundFontTable/gSequenceTable + evaluated audio
+    # tables FROM the decomp source (audio_tables.c) via the oracle's own parser/evaluator, so the
+    # `tables`, `audio` and `midi` classes reconstruct the exact same output on machines without decomp
+    # source; and (b) the EK CI4/CI8 TLUT-resolution map (ek_tlut_map.json) FROM the EK recipe tree via
+    # the oracle's own ek_recipe_index(), so the `textures` class resolves EK palettes with no
+    # --ek-yaml-dir. Same "generate FROM the single source of truth at build time" pattern as the EK
+    # slice manifest above.
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/gen_dump_tables_data.py"
+            --audio-tables "${GDX_RECIPES_SRC}/src/audio/disk/audio_tables.c"
+            --out-dir "${GDX_RECIPES_DST}"
+            --ek-yaml-dir "${CMAKE_SOURCE_DIR}/fzerox-expansion-kit/assets/yaml/jp"
     VERBATIM)
 
 target_include_directories(G-Diffuser PRIVATE
@@ -521,6 +553,21 @@ if(MSVC)
 elseif(GDX_PORT_WARN_FLAGS)
     target_compile_options(gdx_dsp_tests PRIVATE ${GDX_PORT_WARN_FLAGS})
     target_link_libraries(gdx_dsp_tests PRIVATE m) # sin/floor: libm is separate on UNIX
+endif()
+
+# PCM capture unit test (C-R2.3): standalone console exe compiling gdx_audio_capture.c UNMODIFIED
+# alongside port/tests/pcm_capture_tests.c, which drives the module's public API (init/arm/feed/
+# active/finished/shutdown) plus its test-only reset seam. Verifies streamed .pcm byte layout, the
+# GDX_PCM_CAPTURE_FRAMES frame-cap stop, the sidecar SHA-256 (cross-checked against a second,
+# independent SHA-256 in the test), the unconfigured no-op path, and run-to-run determinism. No game
+# objects, no libultraship, no decomp headers -- runnable directly after a normal build.
+add_executable(gdx_pcm_capture_tests
+    tests/pcm_capture_tests.c
+    gdx_audio_capture.c)
+if(MSVC)
+    target_compile_options(gdx_pcm_capture_tests PRIVATE /W3)
+elseif(GDX_PORT_WARN_FLAGS)
+    target_compile_options(gdx_pcm_capture_tests PRIVATE ${GDX_PORT_WARN_FLAGS})
 endif()
 
 # VI-scanout fallback unit test: standalone console exe compiling gdx_vi_convert.c
@@ -616,4 +663,199 @@ if(MSVC)
 else()
     # Vendored C89 cxd4 sources dominate this target: keep quiet.
     target_compile_options(gdx_rsp_boot_tests PRIVATE -w)
+endif()
+
+# ============================================================================================
+# R5 (C-R5.1/C-R5.3): EXPERIMENTAL second binary — G-Diffuser-JP (VERSION_JP profile).
+#
+# The port is US-only in three independent compile-time layers (generated binding tables, golden
+# constants, and 69 VERSION_JP decomp behavior branches), so US+JP cannot share one executable
+# without weeks of decomp churn. The frozen decision (QUALITY_PARITY_ROADMAP §R5) is TWO binaries
+# from one tree, sharing one data dir and one launcher/wizard, with per-profile archives
+# (fzerox.o2r / fzerox-jp.o2r).
+#
+# This target is guarded behind GDX_BUILD_JP (default OFF) so the DEFAULT build is byte-unchanged —
+# the owner flips it ON when the JP ROM lands. It mirrors the US gdiffuser_game / G-Diffuser targets
+# but bakes VERSION_JP=1 ASSET_VERSION=jp ASSET_REVISION=rev0 and consumes the JP-profile generated
+# sources (gen/AssetBindings.jp.c, gen/LinkStubs.jp.c from tools/gen_*.py --profile jp/rev0).
+#
+# KNOWN PREREQUISITES (owner-run; these are EXPECTED build findings, not target bugs):
+#   * Torch-generated JP asset headers do NOT exist yet: ASSET_HEADER expands to
+#     assets/jp/rev0/<x> (macros.h), but only include/assets/us exists. 54 decomp TUs include
+#     these — the JP decomp compile fails until Torch codegen for jp/rev0 (+ jp/ek) is run against
+#     the owner's JP ROM. This is the #1 JP compile blocker.
+#   * The 69 VERSION_JP sites in decomp/src have never been compiled in this port; expect JP-only
+#     compile errors (missing JP symbols, ifdef mismatches). Decomp-side VERSION_JP fixes are a
+#     follow-up wave item, tracked in the R5-AB report.
+#   * The EK gen files (gen/EkAssetBindings.c) are US-EK; a real JP-EK (jp/ek) binding set is a
+#     follow-up. The JP target reuses the US-EK files to mirror the EXPANSION_KIT matrix.
+#   * gen/LinkStubs.jp.c is a placeholder seed (JP yaml table symbols only) — its function stubs
+#     must be regenerated from a JP build's own link log (see the file's banner).
+# ============================================================================================
+option(GDX_BUILD_JP "Build the EXPERIMENTAL second binary G-Diffuser-JP (VERSION_JP profile)" OFF)
+
+if(GDX_BUILD_JP)
+    message(STATUS "G-Diffuser: GDX_BUILD_JP=ON — configuring EXPERIMENTAL VERSION_JP target G-Diffuser-JP.")
+
+    # --- JP decomp game library (mirror of gdiffuser_game with the JP profile) -----------------
+    # GAME_SOURCES is the region-agnostic decomp .c list already resolved above (same EK exclusions);
+    # only the defines and the generated binding/stub files differ between profiles.
+    add_library(gdiffuser_game_jp OBJECT ${GAME_SOURCES}
+        "${CMAKE_CURRENT_SOURCE_DIR}/decomp_port.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/n64_sched.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/n64_vi.c"
+        "${DECOMP}/src/libultra/io/devmgr.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/gen/AssetBindings.jp.c"   # R5: JP-profile asset symbol defs
+        "${CMAKE_CURRENT_SOURCE_DIR}/gen/LinkStubs.jp.c")      # R5: JP-profile placeholder defs
+
+    if(GDX_EXPANSION_KIT)
+        target_sources(gdiffuser_game_jp PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/n64_leo.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/gen/EkAssetBindings.c"   # NOTE: US-EK bindings reused (jp/ek TODO)
+            "${CMAKE_CURRENT_SOURCE_DIR}/gen/EkLinkStubs.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/gdx_ek_disk_overrides.c")
+        target_compile_definitions(gdiffuser_game_jp PRIVATE EXPANSION_KIT=1 MFS_VERSION=1 BUILD_VERSION=VERSION_J)
+    endif()
+
+    if(WIN32)
+        target_sources(gdiffuser_game_jp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/gdx_fiber_win32.c")
+    else()
+        target_sources(gdiffuser_game_jp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/gdx_fiber_ucontext.c")
+    endif()
+
+    target_include_directories(gdiffuser_game_jp PRIVATE
+        "${DECOMP}"
+        "${DECOMP}/include"
+        "${DECOMP}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../include")   # Torch asset headers: needs include/assets/jp/rev0 (owner-run)
+
+    # Same UB-hardening + define set as gdiffuser_game, but the JP profile triplet.
+    target_compile_definitions(gdiffuser_game_jp PRIVATE
+        PORT=1
+        GDIFFUSER_PORT=1
+        NON_MATCHING=1
+        NON_EQUIVALENT=1
+        AVOID_UB=1
+        F3DEX_GBI_2=1
+        _LANGUAGE_C=1
+        VERSION_JP=1
+        ASSET_VERSION=jp
+        ASSET_REVISION=rev0
+    )
+    if(MSVC)
+        target_compile_options(gdiffuser_game_jp PRIVATE /W0 /w14715 /w14716)
+    else()
+        target_compile_options(gdiffuser_game_jp PRIVATE -w -Werror=return-type -fcommon
+            -fno-strict-aliasing -fwrapv
+            -Wno-error=int-conversion
+            -Wno-error=incompatible-pointer-types
+            -Wno-error=implicit-function-declaration)
+    endif()
+
+    # --- JP executable (mirror of G-Diffuser, linking the JP game objects) ---------------------
+    add_executable(G-Diffuser-JP
+        main.cpp
+        gdx_gui.cpp
+        gdx_menu.cpp
+        input_bridge.c
+        n64_gfx_bridge.cpp
+        gdx_interp.cpp             # R6-P1: matrix frame-interpolation (see US target note)
+        n64_gfx_convert.cpp
+        gdx_vi_convert.c
+        n64_audio_hle.c
+        gdx_audio_lle.c
+        gdx_audio_thread.cpp
+        gdx_audio_capture.c
+        gdx_frame_pacer.c
+        shims.c
+        AssetLoader.cpp
+        resource/ResourceFactories.cpp
+        gdx_firstboot.cpp
+        gdx_extract_launch.cpp
+        gdx_dump_launch.cpp
+        gdx_firstboot_gui.cpp
+        rom_buffer.cpp
+        sram_buffer.cpp
+        disk_savefile.cpp
+        gdx_ghost_io.c
+        gdx_ghost_window.cpp
+        gdx_input_viewer.cpp
+        gdx_fps_overlay.cpp
+        gdx_perf.cpp
+        gdx_imgui_nav.cpp
+        gdx_workshop.cpp
+        mio0_wrap.c
+        gdx_segment_source.c
+        "${CMAKE_CURRENT_SOURCE_DIR}/../torch/lib/libmio0/mio0.c"
+        $<TARGET_OBJECTS:gdiffuser_game_jp>)
+
+    # The port glue (main.cpp, extraction launcher, gfx bridge, etc.) is region-agnostic C/C++ that
+    # keys profile behavior off the VERSION_JP define, so the exe TUs must see it too (they include
+    # decomp headers whose region branches depend on it).
+    target_compile_definitions(G-Diffuser-JP PRIVATE
+        PORT=1 GDIFFUSER_PORT=1 F3DEX_GBI_2=1 _LANGUAGE_C=1 VERSION_JP=1
+        ASSET_VERSION=jp ASSET_REVISION=rev0)
+
+    if(GDX_EXPANSION_KIT)
+        target_sources(G-Diffuser-JP PRIVATE disk_buffer.cpp)
+        target_compile_definitions(G-Diffuser-JP PRIVATE EXPANSION_KIT=1)
+    endif()
+
+    if(WIN32)
+        set_target_properties(G-Diffuser-JP PROPERTIES WIN32_EXECUTABLE TRUE)
+        if(MSVC)
+            target_link_options(G-Diffuser-JP PRIVATE "/MAP")
+        endif()
+    endif()
+
+    target_include_directories(G-Diffuser-JP PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${DECOMP}/include"
+        "${DECOMP}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../torch/lib/libmio0")
+
+    target_link_libraries(G-Diffuser-JP PRIVATE cxd4_rsp)
+
+    if(WIN32)
+        target_link_libraries(G-Diffuser-JP PRIVATE user32 Comdlg32 Comctl32)
+    else()
+        find_package(Threads REQUIRED)
+        target_link_libraries(G-Diffuser-JP PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+    endif()
+
+    if(GDX_PORT_WARN_FLAGS)
+        target_compile_options(G-Diffuser-JP PRIVATE ${GDX_PORT_WARN_FLAGS})
+    endif()
+    if(NOT MSVC)
+        target_compile_options(G-Diffuser-JP PRIVATE -fno-strict-aliasing -fwrapv)
+        target_link_options(G-Diffuser-JP PRIVATE
+            "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/gdx_hide_libm.map")
+    endif()
+    if(TARGET libultraship)
+        target_link_libraries(G-Diffuser-JP PRIVATE libultraship)
+        target_include_directories(G-Diffuser-JP PRIVATE
+            "${CMAKE_SOURCE_DIR}/libultraship/src"
+            "${CMAKE_SOURCE_DIR}/libultraship/include")
+    endif()
+
+    # Deploy the shared engine archive + the extractor + recipe tree (US rev0 AND JP rev0 so the
+    # shared extraction/launcher can build either profile's archive from one binary).
+    add_dependencies(G-Diffuser-JP gdiffuser_engine_o2r gdx_extract_ext)
+    add_custom_command(TARGET G-Diffuser-JP POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${GDIFFUSER_ENGINE_O2R}" "$<TARGET_FILE_DIR:G-Diffuser-JP>/gdiffuser.o2r"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${GDX_EXTRACT_EXE}" "$<TARGET_FILE_DIR:G-Diffuser-JP>/gdx-extract${CMAKE_EXECUTABLE_SUFFIX}"
+        VERBATIM)
+    add_custom_command(TARGET G-Diffuser-JP POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:G-Diffuser-JP>/decomp-recipes/assets/yaml/us"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:G-Diffuser-JP>/decomp-recipes/assets/yaml/jp"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${GDX_RECIPES_SRC}/config.yml" "$<TARGET_FILE_DIR:G-Diffuser-JP>/decomp-recipes/config.yml"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${GDX_EK_SLICE_MANIFEST}" "$<TARGET_FILE_DIR:G-Diffuser-JP>/decomp-recipes/ek_slice_manifest.txt"
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory
+                "${GDX_RECIPES_SRC}/assets/yaml/us/rev0" "$<TARGET_FILE_DIR:G-Diffuser-JP>/decomp-recipes/assets/yaml/us/rev0"
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory
+                "${GDX_RECIPES_SRC}/assets/yaml/jp/rev0" "$<TARGET_FILE_DIR:G-Diffuser-JP>/decomp-recipes/assets/yaml/jp/rev0"
+        VERBATIM)
 endif()

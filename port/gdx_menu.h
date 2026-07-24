@@ -31,20 +31,28 @@ class GdxMenu final : public Ship::GuiWindow {
         DevTools,
     };
 
+    // Page order is meaningful: HeaderForPage() derives the owning header from contiguous ranges,
+    // and the sidebar draws pages in this order. General must stay first and GfxDebugger last
+    // (InitElement clamps the persisted page index against those bounds).
     enum class Page : int {
+        // Settings — graphics / audio / input basics
         General,
-        Audio,
         Graphics,
+        Audio,
         Controls,
-        InputViewer,
+        // Enhancements — grouped by domain
         EnhancementGraphics,
         Gameplay,
         Practice,
+        // Workshop
         Ghosts,
         Content,
+        // Online
         OnlineOverview,
+        // Dev Tools — diagnostics, overlays, and embedded tool windows last
         DeveloperGeneral,
         Stats,
+        InputViewer,
         Console,
         GfxDebugger,
     };

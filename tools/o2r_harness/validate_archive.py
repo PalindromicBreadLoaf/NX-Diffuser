@@ -8,7 +8,8 @@ cover C5 check 1 (extractor exit code 0) -- that is the caller's concern
 (verify_determinism.py / the orchestrator observe the child exit code).
 
 Checks performed:
-  2. Zip index readable; entry count == expected (C3 = 4240 / GDX_O2R_EXPECTED_ENTRY_COUNT).
+  2. Zip index readable; entry count == expected (o2r_common.EXPECTED_ENTRY_COUNT /
+     GDX_O2R_EXPECTED_ENTRY_COUNT; central-directory RECORDS, dup-inclusive).
   3. Archive SHA-256 == expected (skippable with --skip-hash for pre-determinism archives).
   4. Version entry matches C4 ([0x01 big][u32 BE == 0x78D90EB3]).
   +  Complete-or-absent: every family in family_manifest.json is present with its
@@ -37,15 +38,16 @@ import sys
 import o2r_common as oc
 
 
-def parse_expected_header(path):
-    """Extract GDX_O2R_EXPECTED_SHA256 / _ENTRY_COUNT from a C header."""
+def parse_expected_header(path, profile="us"):
+    """Extract the profile's GDX_O2R_EXPECTED_SHA256[_JP] / _ENTRY_COUNT[_JP] from a C header."""
+    macro_sha, macro_count = oc.profile_macros(profile)
     text = open(path, "r", encoding="utf-8").read()
     sha = None
     count = None
-    m = re.search(r'#define\s+%s\s+"([0-9a-fA-F]+)"' % oc.MACRO_SHA256, text)
+    m = re.search(r'#define\s+%s\s+"([0-9a-fA-F]+)"' % macro_sha, text)
     if m:
         sha = m.group(1).lower()
-    m = re.search(r"#define\s+%s\s+(\d+)" % oc.MACRO_ENTRY_COUNT, text)
+    m = re.search(r"#define\s+%s\s+(\d+)" % macro_count, text)
     if m:
         count = int(m.group(1))
     return sha, count
@@ -103,7 +105,7 @@ def check_family_completeness(archive, manifest):
     return ok, findings
 
 
-def validate(archive, expected_sha, expected_count, manifest, skip_hash):
+def validate(archive, expected_sha, expected_count, manifest, skip_hash, expected_crc=oc.EXPECTED_ROM_CRC):
     report = {"archive": archive, "checks": []}
     overall = True
 
@@ -114,7 +116,8 @@ def validate(archive, expected_sha, expected_count, manifest, skip_hash):
         report["checks"].append({"name": name, "ok": ok, "detail": detail})
 
     # Check 2: zip index readable + entry count.
-    # Count central-directory RECORDS (dup-inclusive), matching C3's 4,240.
+    # Count central-directory RECORDS (dup-inclusive), matching the runtime gate
+    # (port/gdx_extract_launch.cpp:1123, EOCD total-records field).
     try:
         records = oc.read_records(archive)
         readable = True
@@ -125,11 +128,15 @@ def validate(archive, expected_sha, expected_count, manifest, skip_hash):
     count = len(records)
     unique = len({e.name for e in records})
     record("2.zip_index_readable", readable, "%d records (%d unique names)" % (count, unique))
-    record(
-        "2.entry_count",
-        count == expected_count,
-        "count=%d expected=%d" % (count, expected_count),
-    )
+    if expected_count is None:
+        # Owner-run profile (JP): no expected count known — report, do not fail.
+        record("2.entry_count", True, "count=%d (no expected count for this profile — owner-run)" % count)
+    else:
+        record(
+            "2.entry_count",
+            count == expected_count,
+            "count=%d expected=%d" % (count, expected_count),
+        )
 
     # Check 3: SHA-256.
     if skip_hash:
@@ -144,8 +151,8 @@ def validate(archive, expected_sha, expected_count, manifest, skip_hash):
             "actual=%s expected=%s" % (actual_sha, expected_sha),
         )
 
-    # Check 4: version entry (C4).
-    ver = oc.check_version_entry(archive)
+    # Check 4: version entry (C4). expected_crc=None (JP/owner-run) reports the CRC without failing.
+    ver = oc.check_version_entry(archive, expected_crc)
     detail = ver["reason"]
     if ver.get("crc") is not None:
         detail = "%s (crc=0x%08X, raw=%s)" % (ver["reason"], ver["crc"], ver["raw_hex"])
@@ -180,9 +187,15 @@ def main(argv):
     ap = argparse.ArgumentParser(description="Validate a .o2r archive (C5 checks 2-4 + C6).")
     ap.add_argument("--archive", required=True, help="path to the .o2r to validate")
     ap.add_argument(
+        "--profile", choices=["us", "jp"], default="us",
+        help="golden profile (default: us). 'jp' parses the _JP macros and, since the JP cartridge "
+             "CRC is owner-run/unknown, reports the version-entry CRC without failing on it.",
+    )
+    ap.add_argument(
         "--expected-header",
         default=None,
-        help="C header with GDX_O2R_EXPECTED_* macros (e.g. port/gen/gdx_o2r_expected.h)",
+        help="C header with GDX_O2R_EXPECTED_* macros (e.g. port/gen/gdx_o2r_expected.h, "
+             "or gdx_o2r_expected.jp.h with --profile jp)",
     )
     ap.add_argument("--expected-sha", default=None, help="override expected SHA-256 (hex)")
     ap.add_argument("--expected-count", type=int, default=None, help="override expected entry count")
@@ -203,17 +216,19 @@ def main(argv):
     expected_count = args.expected_count
 
     if args.expected_header:
-        hsha, hcount = parse_expected_header(args.expected_header)
+        hsha, hcount = parse_expected_header(args.expected_header, args.profile)
         if expected_sha is None:
             expected_sha = hsha
         if expected_count is None:
             expected_count = hcount
 
     if expected_count is None:
-        expected_count = oc.EXPECTED_ENTRY_COUNT
+        # For JP this is None (owner-run); leave it None so the entry-count check is informational.
+        expected_count = oc.profile_expected_count(args.profile)
 
+    expected_crc = oc.profile_expected_crc(args.profile)
     manifest = load_manifest(args.manifest)
-    report = validate(args.archive, expected_sha, expected_count, manifest, args.skip_hash)
+    report = validate(args.archive, expected_sha, expected_count, manifest, args.skip_hash, expected_crc)
 
     if args.json:
         print(json.dumps(report, indent=2))

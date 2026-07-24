@@ -93,12 +93,30 @@ static void gdx_ensure_controller_connected(void) {
     }
 }
 
-/* Scripted input for headless/automated test runs: if gdx-autoinput.txt sits
-   next to the exe, each line is "<seconds_since_boot> <input>". Button names
-   are START/A/B/UP/DOWN/LEFT/RIGHT; analog menu navigation uses STICK_UP,
-   STICK_DOWN, STICK_LEFT, and STICK_RIGHT. Each input is held for 0.25s.
-   Real (LUS-sourced) input still works and is combined with the script. */
-/* Monotonic milliseconds for the autoinput clock (host-agnostic). */
+/* Scripted input for headless/automated test runs. If gdx-autoinput.txt sits next to the exe it
+   is parsed once and combined with the live (LUS-sourced) input every poll.
+   ---------------------------------------------------------------------------------------------
+   FORMAT (two timebases; auto-detected by a version marker on the FIRST non-blank line):
+   ---------------------------------------------------------------------------------------------
+   TICK MODE (deterministic — required for the R2 bit-identical PCM gate, C-R2.3):
+       The first non-blank line is the literal word `ticks` (case-insensitive). Every later line is
+           <tick> <INPUT> [holdTicks]
+       where <tick> is an integer VI-tick index (the counter below, incremented once per
+       gdx_controller_poll() call — i.e. once per host frame, wall-clock-independent), and the
+       optional [holdTicks] is how many ticks the input stays asserted (default 15). Because the
+       schedule is expressed purely in ticks, a given script produces the exact same input on the
+       exact same frames on every run and every machine — the property golden PCM capture needs.
+
+   LEGACY SECONDS MODE (unchanged; kept working for existing scripts):
+       No `ticks` marker. Every line is
+           <secondsSinceLoad> <INPUT>
+       clocked off the host monotonic wall clock; each input is held for 0.25 s. This is the
+       original behavior and is selected whenever the first token is not `ticks`.
+
+   INPUT names (both modes): START A B UP DOWN LEFT RIGHT (buttons); STICK_UP STICK_DOWN
+   STICK_LEFT STICK_RIGHT (analog, ±80). Blank lines and lines starting with '#' are ignored.
+   Up to 64 events. */
+/* Monotonic milliseconds for the legacy seconds-mode autoinput clock (host-agnostic). */
 static unsigned long long gdx_autoinput_now_ms(void) {
 #ifdef _WIN32
     return (unsigned long long) GetTickCount64();
@@ -109,61 +127,123 @@ static unsigned long long gdx_autoinput_now_ms(void) {
 #endif
 }
 
+/* Default tick-mode hold window (~0.25 s at 60 Hz, matching the legacy seconds-mode hold). */
+#define GDX_AUTOINPUT_DEFAULT_HOLD_TICKS 15
+
+/* Map an INPUT token to a button bit and/or analog stick offset. Returns 1 if recognized. */
+static int gdx_autoinput_parse_input(const char* name, u16* out_btn, s8* out_x, s8* out_y) {
+    u16 b = 0;
+    s8 x = 0;
+    s8 y = 0;
+    if (strcmp(name, "START") == 0) b = BTN_START;
+    else if (strcmp(name, "A") == 0) b = BTN_A;
+    else if (strcmp(name, "B") == 0) b = BTN_B;
+    else if (strcmp(name, "UP") == 0) b = BTN_UP;
+    else if (strcmp(name, "DOWN") == 0) b = BTN_DOWN;
+    else if (strcmp(name, "LEFT") == 0) b = BTN_LEFT;
+    else if (strcmp(name, "RIGHT") == 0) b = BTN_RIGHT;
+    else if (strcmp(name, "STICK_UP") == 0) y = 80;
+    else if (strcmp(name, "STICK_DOWN") == 0) y = -80;
+    else if (strcmp(name, "STICK_LEFT") == 0) x = -80;
+    else if (strcmp(name, "STICK_RIGHT") == 0) x = 80;
+    else return 0;
+    *out_btn = b;
+    *out_x = x;
+    *out_y = y;
+    return (b != 0 || x != 0 || y != 0);
+}
+
 static void gdx_autoinput_apply(u16* io_buttons, s8* io_stick_x, s8* io_stick_y) {
     static int s_state = -1; /* -1 unread, 0 absent, 1 loaded */
-    static struct { double at; u16 btn; s8 stick_x; s8 stick_y; } s_events[64];
+    static int s_tickmode = 0;
+    /* `at` and `hold` are in the active timebase's native unit: VI-ticks (tick mode) or seconds
+       (legacy mode). */
+    static struct { double at; double hold; u16 btn; s8 stick_x; s8 stick_y; } s_events[64];
     static int s_count = 0;
-    static unsigned long long s_start = 0;
+    static unsigned long long s_start_ms = 0;    /* seconds-mode wall-clock baseline */
+    static unsigned long long s_tick = 0;        /* tick-mode VI-tick counter */
 
     if (s_state == -1) {
         FILE* f = fopen("gdx-autoinput.txt", "r");
         s_state = 0;
         if (f != NULL) {
-            char name[16];
-            double at;
-            while (s_count < 64 && fscanf(f, "%lf %15s", &at, name) == 2) {
-                u16 b = 0;
-                s8 x = 0;
-                s8 y = 0;
-                if (strcmp(name, "START") == 0) b = BTN_START;
-                else if (strcmp(name, "A") == 0) b = BTN_A;
-                else if (strcmp(name, "B") == 0) b = BTN_B;
-                else if (strcmp(name, "UP") == 0) b = BTN_UP;
-                else if (strcmp(name, "DOWN") == 0) b = BTN_DOWN;
-                else if (strcmp(name, "LEFT") == 0) b = BTN_LEFT;
-                else if (strcmp(name, "RIGHT") == 0) b = BTN_RIGHT;
-                else if (strcmp(name, "STICK_UP") == 0) y = 80;
-                else if (strcmp(name, "STICK_DOWN") == 0) y = -80;
-                else if (strcmp(name, "STICK_LEFT") == 0) x = -80;
-                else if (strcmp(name, "STICK_RIGHT") == 0) x = 80;
-                if (b != 0 || x != 0 || y != 0) {
-                    s_events[s_count].at = at;
-                    s_events[s_count].btn = b;
-                    s_events[s_count].stick_x = x;
-                    s_events[s_count].stick_y = y;
-                    s_count++;
+            char line[64];
+            int sniffed = 0;
+            while (s_count < 64 && fgets(line, (int) sizeof(line), f) != NULL) {
+                char name[16];
+                double at;
+                int hold_ticks;
+                u16 b;
+                s8 x, y;
+                /* Skip blank / comment lines. */
+                {
+                    const char* p = line;
+                    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+                    if (*p == '\0' || *p == '#') continue;
+                }
+                /* First meaningful line: sniff the timebase marker. */
+                if (!sniffed) {
+                    char first[16];
+                    if (sscanf(line, "%15s", first) == 1 &&
+                        (strcmp(first, "ticks") == 0 || strcmp(first, "TICKS") == 0 ||
+                         strcmp(first, "Ticks") == 0)) {
+                        s_tickmode = 1;
+                        sniffed = 1;
+                        continue; /* the marker line carries no event */
+                    }
+                    s_tickmode = 0;
+                    sniffed = 1;
+                    /* fall through: this line is the first event (legacy seconds mode) */
+                }
+                if (s_tickmode) {
+                    int n = sscanf(line, "%lf %15s %d", &at, name, &hold_ticks);
+                    if (n < 2) continue;
+                    if (n < 3 || hold_ticks <= 0) hold_ticks = GDX_AUTOINPUT_DEFAULT_HOLD_TICKS;
+                    if (gdx_autoinput_parse_input(name, &b, &x, &y)) {
+                        s_events[s_count].at = at;
+                        s_events[s_count].hold = (double) hold_ticks;
+                        s_events[s_count].btn = b;
+                        s_events[s_count].stick_x = x;
+                        s_events[s_count].stick_y = y;
+                        s_count++;
+                    }
+                } else {
+                    if (sscanf(line, "%lf %15s", &at, name) != 2) continue;
+                    if (gdx_autoinput_parse_input(name, &b, &x, &y)) {
+                        s_events[s_count].at = at;
+                        s_events[s_count].hold = 0.25; /* legacy fixed 0.25 s hold */
+                        s_events[s_count].btn = b;
+                        s_events[s_count].stick_x = x;
+                        s_events[s_count].stick_y = y;
+                        s_count++;
+                    }
                 }
             }
             fclose(f);
             s_state = 1;
-            s_start = gdx_autoinput_now_ms();
-            gdx_port_logf("[input] autoinput script loaded: %d events\n", s_count);
+            s_start_ms = gdx_autoinput_now_ms();
+            gdx_port_logf("[input] autoinput script loaded: %d events (%s timebase)\n", s_count,
+                          s_tickmode ? "tick" : "seconds");
         }
     }
     if (s_state != 1) {
         return;
     }
     {
-        double now = (double) (gdx_autoinput_now_ms() - s_start) / 1000.0;
+        double now = s_tickmode ? (double) s_tick
+                                : (double) (gdx_autoinput_now_ms() - s_start_ms) / 1000.0;
         int i;
         for (i = 0; i < s_count; i++) {
-            if (now >= s_events[i].at && now < s_events[i].at + 0.25) {
+            if (now >= s_events[i].at && now < s_events[i].at + s_events[i].hold) {
                 *io_buttons |= s_events[i].btn;
                 if (s_events[i].stick_x != 0) *io_stick_x = s_events[i].stick_x;
                 if (s_events[i].stick_y != 0) *io_stick_y = s_events[i].stick_y;
             }
         }
     }
+    /* Advance the VI-tick counter once per poll (tick mode only; harmless otherwise). This runs
+       exactly once per gdx_controller_poll() call — see the single call site below. */
+    s_tick++;
 }
 
 // Decomp race state. Kept behind small C helpers so every photo-mode consumer uses the same

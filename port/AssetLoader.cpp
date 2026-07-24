@@ -82,6 +82,62 @@ extern "C" int GDiffuser_LoadAssetBytes(const char* key, void* out, size_t outSi
     return 1;
 }
 
+extern "C" int GDiffuser_LoadArchiveFileBytes(const char* key, void* out, size_t outSize, size_t* copiedSize) {
+    if ((key == nullptr) || (out == nullptr) || (outSize == 0)) {
+        return 0;
+    }
+
+    auto ctx = Ship::Context::GetInstance();
+    if (ctx == nullptr) {
+        return 0;
+    }
+
+    auto rm = ctx->GetResourceManager();
+    if (rm == nullptr) {
+        return 0;
+    }
+
+    /* Raw archive-file bytes, bypassing resource-factory deserialization.
+     * Staff-ghost records are stored in the o2r as Torch "GhostRecord" resources,
+     * for which the port registers NO libultraship factory yet (see the R1b TODO in
+     * port/resource/ResourceFactories.cpp). GDiffuser_LoadAssetBytes therefore cannot
+     * serve them -- LoadResource() returns nullptr without a factory. LoadFileProcess
+     * hands back the untouched file buffer (64-byte OTR/Torch header followed by the
+     * Torch-serialized payload) so the caller can parse it directly.
+     *
+     * Copies min(fileSize, outSize) bytes -- a partial read is intentional: a ghost
+     * entry carries ~16 KB of trailing replay data, and a caller that only needs the
+     * leading record header passes a small buffer instead of an oversized one.
+     *
+     * fileSize note: archive backends (O2rArchive/FolderArchive/OtrArchive) over-allocate
+     * File::Buffer by a fixed +4096 guard region, so Buffer->size() is NOT the real entry
+     * size and would silently zero-pad truncated reads instead of surfacing a short read to
+     * exact-size integrity gates downstream. File::TrueSize carries the real entry byte
+     * count and is preferred here; Buffer->size() is kept only as a defensive fallback for
+     * File instances where TrueSize is unset (0), and as a hard clamp so the copy can never
+     * run past the allocated buffer regardless of what TrueSize reports. */
+    auto file = rm->LoadFileProcess(std::string(key));
+    if ((file == nullptr) || (file->Buffer == nullptr)) {
+        return 0;
+    }
+
+    const size_t bufferSize = file->Buffer->size();
+    const size_t fileSize = (file->TrueSize != 0) ? file->TrueSize : bufferSize;
+    if (fileSize == 0) {
+        return 0;
+    }
+
+    size_t copy = (fileSize < outSize) ? fileSize : outSize;
+    if (copy > bufferSize) {
+        copy = bufferSize;
+    }
+    std::memcpy(out, file->Buffer->data(), copy);
+    if (copiedSize != nullptr) {
+        *copiedSize = copy;
+    }
+    return 1;
+}
+
 extern "C" void GDiffuser_RegisterLoadedAssetBuffer(const void* buffer, size_t size, const char* key) {
     if ((buffer == nullptr) || (size == 0) || (key == nullptr) || (key[0] == '\0')) {
         return;

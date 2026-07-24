@@ -183,7 +183,7 @@ static void load_rom_next_to_exe(void) {
 #endif
 }
 
-void gdx_init_rom(int argc, char** argv) {
+void gdx_init_rom(int argc, char** argv, int archivesValidated) {
     // 1. Explicit command-line ROM path wins for scripted/dev launches.
     for (int i = 1; i < argc; i++) {
         size_t len = strlen(argv[i]);
@@ -198,13 +198,20 @@ void gdx_init_rom(int argc, char** argv) {
 
     // 2. For interactive/direct launches, ask first. This intentionally runs before
     // env/exe-dir fallbacks so a stale FZEROX_ROM or nearby baserom cannot silently
-    // force the old ROM during renderer testing.
+    // force the old ROM during renderer testing. With validated archives the picker
+    // is skipped entirely: archive-only is a supported install state (the originals
+    // are deletable), so a missing ROM must not cost the user a dialog every boot.
     bool pickerCancelled = false;
 #ifdef _WIN32
-    gdx_port_logf("[rom] no ROM argument provided; opening picker.\n");
-    pick_rom_with_dialog();
-    if (gdx_rom_buffer) return;
-    pickerCancelled = true;
+    if (!archivesValidated) {
+        gdx_port_logf("[rom] no ROM argument provided; opening picker.\n");
+        pick_rom_with_dialog();
+        if (gdx_rom_buffer) return;
+        pickerCancelled = true;
+    } else {
+        gdx_port_logf("[rom] no ROM argument provided; picker skipped (validated archives "
+                       "present, archive-only boot is available).\n");
+    }
 #endif
 
     // 3. Environment variable fallback for non-interactive/dev runs.
@@ -237,19 +244,45 @@ void gdx_init_rom(int argc, char** argv) {
         return;
     }
 
-    /* Without a ROM the game "runs" but every DMA read is blank — a confusing
-       half-boot. Require the ROM outright rather than continuing silently. */
+    /* R4 (C-R4.1): archives validated (fzerox.o2r mounted AND survived the post-mount CRC gate)
+       means every family that today streams raw+MIO0/big-endian bytes from gdx_rom_buffer has
+       an archive-first path (the segment_blob, audio_blob and ipl namespaces) whose shim already tolerates
+       gdx_rom_buffer==NULL and returns 0 on a total miss (GdxSegmentSourceRead's raw-fallback
+       guard, gdx_segment_source.c:299; gdx_rom_read32 -> 0 on miss, decomp_port.c:342-356;
+       GDX_LoadRawRomAsset's own NULL guard zero-fills, decomp/src/game/object.c:108-116). So a
+       missing ROM is no longer an automatic half-boot -- it degrades to "assets served from
+       fzerox.o2r, raw-ROM fallback disabled by absence" instead of undefined blank reads.
+       Booting archive-only is gated on R4's soak evidence (C-R4.2: gdx_rom_fallback_reads == 0
+       across the full matrix before any family's raw fallback is retired); GDX_STRICT_ARCHIVE
+       (gdx_segment_source.c) is the telemetry collector that must show zero archive-miss reads
+       during that soak -- a NULL ROM turning any archive miss into a silently-blank asset is
+       exactly the regression the soak exists to catch. */
+    if (archivesValidated) {
+        gdx_port_logf("[rom] no ROM image found; booting archive-only (assets served from "
+                       "fzerox.o2r; raw-ROM fallback disabled by absence)\n");
+        gdx_rom_buffer = nullptr;
+        gdx_rom_size = 0;
+        return;
+    }
+
+    /* Without a ROM AND without a validated archive the game "runs" but every DMA read is
+       blank — a confusing half-boot. Require one or the other rather than continuing silently. */
     if (pickerCancelled) {
         gdx_port_logf("[rom] FATAL: picker cancelled and no fallback ROM found "
-                       "(FZEROX_ROM unset/invalid, no baserom next to the exe). Exiting.\n");
+                       "(FZEROX_ROM unset/invalid, no baserom next to the exe), and no completed "
+                       "archive setup was found either. Exiting.\n");
     } else {
-        gdx_port_logf("[rom] FATAL: no ROM file found. Set FZEROX_ROM env var, pass ROM path as argument, or select it in the picker.\n");
+        gdx_port_logf("[rom] FATAL: no ROM file found and no completed archive setup was found. "
+                       "Set FZEROX_ROM env var, pass ROM path as argument, select it in the "
+                       "picker, or complete first-boot setup to install fzerox.o2r.\n");
     }
 #ifdef _WIN32
     MessageBoxW(nullptr,
                 L"G-Diffuser needs an F-Zero X (U) ROM to run.\n\n"
                 L"Select the ROM in the file picker, pass its path on the command line, "
-                L"or set the FZEROX_ROM environment variable.",
+                L"set the FZEROX_ROM environment variable, or complete first-boot setup so a "
+                L"validated fzerox.o2r archive is installed (which also allows booting without "
+                L"the ROM present).",
                 L"G-Diffuser - ROM required", MB_OK | MB_ICONERROR);
 #endif
     exit(1);

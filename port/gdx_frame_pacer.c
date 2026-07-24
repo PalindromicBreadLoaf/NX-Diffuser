@@ -68,6 +68,18 @@
 // this C TU does not pull the C++ bridge header.
 extern int CVarGetInteger(const char* name, int defaultValue);
 
+// R6-P2 finding fix (MEDIUM): port/n64_gfx_bridge.cpp's per-tick truth, NOT the raw
+// gEnhancements.Graphics.FrameInterpolation CVar. main.cpp's per-tick interpOn also forces the
+// classic single-present branch (which calls gdx_frame_pacer_tick()) while an EK editor (Course
+// Edit / Create Machine) is active, even though the FrameInterpolation CVar itself stays 1. Reading
+// the raw CVar here made those editor ticks self-unarm this pacer AND get no interpolation pacing
+// either -- neither pacing mechanism ran (free-run). gdx_gfx_interp_tick_active() returns the
+// active flag main.cpp already committed for THIS tick via gdx_gfx_interp_tick_config, so editor
+// ticks (active=0) correctly fall through to normal FramePacing, and genuine interpolation ticks
+// (active=1) still no-op this pacer. Declared locally -- same minimal-include idiom as
+// CVarGetInteger above -- so this C TU does not pull the C++ bridge header.
+extern int gdx_gfx_interp_tick_active(void);
+
 // Target: N64 NTSC field rate = 60 / 1.001 Hz. Frame interval = 1.001 / 60 s.
 // Expressed as a rational scale of the QPC frequency: ticks = freq * 1001 / 60000.
 #define GDX_PACER_INTERVAL_NUM 1001
@@ -141,6 +153,18 @@ static LONGLONG gdx_ticks_to_100ns(LONGLONG ticks) {
 void gdx_frame_pacer_tick(void) {
     LARGE_INTEGER now;
     LONGLONG remaining;
+
+    // R6-P2 mutual exclusion: frame interpolation and frame pacing are opposed pacing owners. When
+    // interpolation actually drove THIS tick, the host paces the SIM to the logic deadline
+    // (port/main.cpp) and presents run VSync-paced inside the sub-frame loop; this fixed 59.94 Hz
+    // pacer must NOT also throttle the loop (it would fight the accumulator and starve the
+    // sub-frame budget). No-op + unarm so a later disable re-baselines cleanly. Per-tick read (not
+    // the raw CVar -- see gdx_gfx_interp_tick_active's comment above) so an EK editor tick, which
+    // forces the classic branch even while the CVar stays on, is not mistaken for an interp tick.
+    if (gdx_gfx_interp_tick_active() != 0) {
+        sNextDeadline = 0;
+        return;
+    }
 
     // Live read every frame so the menu toggle takes effect immediately. Default is
     // platform-specific (GDX_PACER_CVAR_DEFAULT): OFF on Windows, ON on Linux.
@@ -282,6 +306,13 @@ static void gdx_sleep_until_ns(int64_t deadlineNs) {
 void gdx_frame_pacer_tick(void) {
     int64_t now;
     int64_t remaining;
+
+    // R6-P2 mutual exclusion (POSIX): see the Windows path above. Interpolation owns pacing only on
+    // the ticks it actually drove (per-tick truth, not the raw CVar -- see the comment above).
+    if (gdx_gfx_interp_tick_active() != 0) {
+        sPosixNextDeadlineNs = 0;
+        return;
+    }
 
     if (CVarGetInteger("gEnhancements.Graphics.FramePacing", GDX_PACER_CVAR_DEFAULT) == 0) {
         sPosixNextDeadlineNs = 0; // disabled: strict no-op, re-anchor on a later enable

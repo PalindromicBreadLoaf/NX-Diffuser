@@ -37,6 +37,9 @@
 #include "fast/Fast3dWindow.h"      // Fast::Fast3dWindow::SetTextureFilter + Fast::FilteringMode
                                     // (the texture-filter setter is Fast3d-only, not on the base
                                     // Ship::Window, so it needs a downcast — see DrawGraphicsMenu)
+#include "ship/resource/ResourceManager.h"       // Data & Files: ResourceManager::GetArchiveManager
+#include "ship/resource/archive/ArchiveManager.h" // Data & Files: ArchiveManager::GetArchives
+#include "ship/resource/archive/Archive.h"        // Data & Files: Archive::GetPath (basename match)
 
 #include "libultraship/bridge/consolevariablebridge.h" // CVarGet/Set/Register*
 #include "libultraship/bridge/audiobridge.h"           // AudioPlayerBuffered (Audio tab status line)
@@ -58,14 +61,39 @@ extern "C" const char* SDL_GetCurrentAudioDriver(void);
 #include "gdx_ghost_io.h" // .gdg ghost import/export C API (Practice tab Export / Import buttons)
 #include "gdx_gui.h"
 #include "gdx_workshop.h"    // Workshop tab: texture-pack listing, override count, reload, dump dir
+#include "gdx_dump_launch.h" // Workshop tab "Asset Dump" section: per-class offline gen_dump_all.py launcher
 #include "disk_savefile.h"   // Workshop tab "DD Save" subsection: sidecar status + one-shot format
+#include "rom_buffer.h"      // Data & Files: gdx_rom_buffer/gdx_rom_path (live ROM residency signal)
+#include "gdx_firstboot.h"   // Data & Files: canonical file names + gdx::ManagedDiskPath
+#include "gdx_segment_source.h" // Data & Files: R1 archive-coverage telemetry (fallback counters)
 
 #include <vector>
+#include <filesystem>
 
 // From port/input_bridge.c: nonzero while an on-track race is live. The ghost Import writes to the
 // SRAM ghost slot, which must not race the game fiber, so the Import button is disabled in-race.
 extern "C" int gdx_input_in_gameplay(void);
 extern "C" void gdx_game_request_reset(void);
+// R8 Step 1: deletion-gate verdict (port/disk_buffer.cpp). 1 iff this boot reconstructed the EK disk
+// from fzerox-disk.o2r AND proved it byte-identical to the R7 managed copy. The Data & Files panel
+// offers disk deletion ONLY on a passed verdict; it never deletes anything itself.
+extern "C" int gdx_disk_archive_verified(void);
+
+// From port/n64_gfx_bridge.cpp: R6-P2 frame-interpolation telemetry for the Graphics tab's
+// "subframes last tick" status line. Declared here rather than pulling in n64_gfx_bridge.h (this
+// TU doesn't otherwise need the gfx bridge's internals) — signatures match the header exactly.
+extern "C" int gdx_gfx_interp_last_subframes(void);
+extern "C" double gdx_gfx_interp_last_t(void);
+// Real-FPS visibility (owner requirement, 2026-07-23): true presented frames/sec, the live master
+// toggle state, and last-tick per-slot tween/snap counts — shown on the Stats page.
+extern "C" int gdx_gfx_interp_host_active(void);
+extern "C" double gdx_gfx_interp_presents_per_sec(void);
+extern "C" int gdx_gfx_interp_last_lerped(void);
+extern "C" int gdx_gfx_interp_last_snapped(void);
+// Per-tick truth (n64_gfx_bridge.cpp): main.cpp forces interpolation off THIS tick (Course Edit /
+// Create Machine editors) even while the raw CVar above is still on. The Stats block below must
+// show the paused truth in that case rather than the (stale) live numbers.
+extern "C" int gdx_gfx_interp_tick_active(void);
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // Small helpers (main-thread only — the whole menu draws inside Gui::StartDraw/EndDraw).
@@ -148,6 +176,21 @@ void GdxComingSoon(const char* label) {
     ImGui::TextDisabled("%s  -  Coming soon", label);
 }
 
+// Marks the item just submitted as differing from its stock default: a subtle accent asterisk
+// drawn inline to the right, with an explanatory tooltip (the SoH "modified" cue). No-op when the
+// value is unchanged. Call immediately after a widget (and after its own hover tooltip, if any) so
+// the SameLine anchors to that widget. Purely presentational — reads no state of its own.
+void GdxModifiedMarker(bool changed) {
+    if (!changed) {
+        return;
+    }
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.63f, 0.76f, 1.0f, 1.0f), "*");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Changed from the default (stock) value.");
+    }
+}
+
 // Opens a filesystem directory in the host file browser (Workshop "Open ... folder" buttons). The
 // directory is created first if absent. Windows uses ShellExecute; other hosts fall back to xdg-open.
 void GdxOpenFolder(const std::string& dir) {
@@ -214,6 +257,162 @@ std::string GdxLowercase(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(),
                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
     return value;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// "Data & Files" (General tab): live on-disk state for the three original setup inputs, per
+// R4/R7's C-R4.3/C-R7.3 UX contract. Every line below is backed by a live, cheaply-rechecked
+// signal rather than static copy -- see the per-row comments for exactly what is and is not
+// determinable from this file (gdx_menu.cpp cannot touch disk_buffer.cpp, which owns the IPL/EK
+// disk load state and is out of scope for this wave; we report filesystem + archive-mount facts
+// instead of guessing which source disk_buffer.cpp actually read from).
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+// True if any mounted archive's filename (case-insensitive) matches `basename` exactly. Mirrors
+// main.cpp's own basename-match pattern (main.cpp:427-431) for the version-gate scan.
+bool GdxArchiveMounted(const char* basename) {
+    auto ctx = Ship::Context::GetInstance();
+    auto rm = (ctx != nullptr) ? ctx->GetResourceManager() : nullptr;
+    auto am = (rm != nullptr) ? rm->GetArchiveManager() : nullptr;
+    auto archives = (am != nullptr) ? am->GetArchives() : nullptr;
+    if (archives == nullptr) {
+        return false;
+    }
+    const std::string want = GdxLowercase(basename);
+    for (const auto& archive : *archives) {
+        if (archive == nullptr) {
+            continue;
+        }
+        std::string name = GdxLowercase(std::filesystem::path(archive->GetPath()).filename().string());
+        if (name == want) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void GdxDrawDataAndFilesPanel() {
+    if (!ImGui::CollapsingHeader("Data & Files")) {
+        return; // collapsed by default -- this is diagnostic detail, not a control most players need
+    }
+    ImGui::TextWrapped(
+        "What G-Diffuser currently has on disk for the three original setup inputs, and which of "
+        "them are safe to delete once setup has completed.");
+    ImGui::Spacing();
+
+    // G-Diffuser is always portable and the current working directory is set to the data directory
+    // at boot (gdx_firstboot.cpp's FirstBootRun chdir; see also gdx_workshop.cpp's exeDir() helper,
+    // which relies on the same fact). A failed query degrades to "." -- still correct in practice
+    // since every canonical name below is looked up relative to the CWD either way.
+    std::error_code dirEc;
+    std::filesystem::path dataDir = std::filesystem::current_path(dirEc);
+    if (dirEc) {
+        dataDir = std::filesystem::path(".");
+    }
+
+    const ImVec4 kGdxOk = ImVec4(0.45f, 0.85f, 0.45f, 1.0f);
+    const ImVec4 kGdxWarn = ImVec4(0.90f, 0.70f, 0.30f, 1.0f);
+    const ImVec4 kGdxBad = ImVec4(1.0f, 0.40f, 0.40f, 1.0f);
+
+    // ── F-Zero X ROM ─────────────────────────────────────────────────────────────────────────
+    // Live signal: gdx_rom_buffer (rom_buffer.h). Non-null means the port genuinely has the raw
+    // cartridge image resident in memory THIS session -- the one row here with a true "in use"
+    // fact rather than an inference, because rom_buffer.cpp exports the pointer directly.
+    ImGui::SeparatorText("F-Zero X ROM (.z64)");
+    if (gdx_rom_buffer != nullptr) {
+        ImGui::TextColored(kGdxWarn, "In use from: %s", gdx_rom_path[0] != '\0' ? gdx_rom_path : "(unknown path)");
+    } else {
+        ImGui::TextColored(kGdxOk, "Not loaded -- served from the game archive this session.");
+    }
+    ImGui::TextDisabled(
+        "Deletable once setup has completed and Archive coverage below reads 0 fallbacks across a "
+        "full play session.");
+
+    // ── 64DD IPL ROM ─────────────────────────────────────────────────────────────────────────
+    // No live "which source is loaded" getter is exposed outside disk_buffer.cpp (out of scope this
+    // wave), so this reports the two independently-checkable facts instead of guessing: whether the
+    // original file is present next to the game, and whether the dedicated archive is mounted.
+    ImGui::SeparatorText("64DD IPL ROM (N64DDIPLROM.n64)");
+    {
+        std::error_code ec;
+        bool iplFilePresent =
+            std::filesystem::is_regular_file(dataDir / gdx::SetupIplFileName(), ec);
+        ec.clear();
+        bool iplArchiveMounted = GdxArchiveMounted("n64ddipl.o2r");
+        ImGui::Text("Original file: %s", iplFilePresent ? "present" : "not present");
+        ImGui::Text("Archive (n64ddipl.o2r): %s", iplArchiveMounted ? "mounted" : "not mounted");
+        if (!iplFilePresent && iplArchiveMounted) {
+            ImGui::TextColored(kGdxOk, "Served from the archive.");
+        } else if (!iplFilePresent && !iplArchiveMounted) {
+            ImGui::TextColored(kGdxBad, "Neither the file nor the archive is present -- do not delete anything here.");
+        }
+    }
+    ImGui::TextDisabled("Deletable once setup has completed (the port never reads the IPL file again after that).");
+
+    // ── Expansion Kit disk ───────────────────────────────────────────────────────────────────
+    // Reports presence of the original, of the R7 managed copy (gdx::ManagedDiskPath), and of the R8
+    // disk archive, plus the boot-time deletion-gate verdict. The deletable line is shown ONLY on a
+    // passed verdict (gdx_disk_archive_verified) -- otherwise the panel never suggests deletion.
+    ImGui::SeparatorText("Expansion Kit disk (.ndd)");
+    {
+        std::error_code ec;
+        bool diskFilePresent =
+            std::filesystem::is_regular_file(dataDir / gdx::SetupDiskFileName(), ec);
+        ec.clear();
+        std::string managedPath = gdx::ManagedDiskPath(dataDir.string());
+        bool managedPresent = !managedPath.empty() && std::filesystem::is_regular_file(managedPath, ec);
+        ec.clear();
+        bool diskArchiveMounted = GdxArchiveMounted("fzerox-disk.o2r");
+        bool archiveVerified = gdx_disk_archive_verified() != 0;
+        ImGui::Text("Original file: %s", diskFilePresent ? "present" : "not present");
+        ImGui::Text("Managed copy (media/): %s", managedPresent ? "present" : "not present");
+        ImGui::Text("Archive (fzerox-disk.o2r): %s", diskArchiveMounted ? "mounted" : "not mounted");
+        if (archiveVerified) {
+            // Hard gate passed: this boot reconstructed the disk from the archive AND proved it
+            // byte-identical to the managed copy. Only here may the panel state that the disk is deletable.
+            ImGui::TextColored(kGdxOk,
+                               "Disk archive: verified byte-identical -- original and managed copy deletable.");
+        } else if (diskArchiveMounted && !diskFilePresent && managedPresent) {
+            ImGui::TextColored(kGdxOk, "Served from the archive or managed copy.");
+        } else if (!diskFilePresent && managedPresent) {
+            ImGui::TextColored(kGdxOk, "Served from the managed copy.");
+        } else if (!managedPresent && !diskArchiveMounted) {
+            ImGui::TextColored(kGdxBad, "No managed copy or archive yet -- do NOT delete the original disk.");
+        }
+    }
+    ImGui::TextDisabled(
+        "The original .ndd and the managed copy are deletable ONLY after the row above reads "
+        "\"verified byte-identical\" (a boot reconstructed the disk from the archive and proved it "
+        "matches). Your saves live in saves/*.gdd -- back those up regardless.");
+
+    // ── Archive coverage (R1 telemetry: gdx_segment_source_fallback_total / FamilyStats) ───────
+    ImGui::Spacing();
+    ImGui::SeparatorText("Archive coverage");
+    unsigned int fallbackTotal = gdx_segment_source_fallback_total();
+    if (fallbackTotal == 0) {
+        ImGui::TextColored(kGdxOk, "Raw-ROM fallback reads this session: 0");
+    } else {
+        ImGui::TextColored(kGdxWarn, "Raw-ROM fallback reads this session: %u", fallbackTotal);
+        ImFont* monoFont = GdxGuiFontMono(); // gdx_gui.h -- optional bundled mono font, null-safe
+        if (monoFont != nullptr) {
+            ImGui::PushFont(monoFont);
+        }
+        for (unsigned int i = 0;; ++i) {
+            const char* key = nullptr;
+            unsigned int count = 0;
+            if (!GdxSegmentSourceFamilyStats(i, &key, &count)) {
+                break;
+            }
+            if (count > 0) {
+                ImGui::TextUnformatted((std::string("  ") + (key != nullptr ? key : "?") + ": " +
+                                        std::to_string(count)).c_str());
+            }
+        }
+        if (monoFont != nullptr) {
+            ImGui::PopFont();
+        }
+    }
+    ImGui::TextDisabled("Run with GDX_STRICT_ARCHIVE=1 during a soak to log every raw-ROM fallback.");
 }
 
 } // namespace
@@ -305,6 +504,31 @@ GdxMenu::GdxMenu() : Ship::GuiWindow("gOpenMenuBar", false, "G-Diffuser Menu") {
     //                                             pacer.c pins it to the N64 NTSC rate (~59.94Hz).
     //                                             Recommend VSync OFF when enabled (avoids beating).
     CVarRegisterInteger("gEnhancements.Graphics.FramePacing", 0);
+    //   gEnhancements.Graphics.FrameInterpolation = 0 -> off = stock single-pass render. EXPERIMENTAL:
+    //                                             when on, port/n64_gfx_bridge.cpp + port/gdx_interp.cpp
+    //                                             tween M sub-frame presents per 60 Hz logic tick
+    //                                             (dual-pool matrix lerp) for smoother motion on
+    //                                             high-refresh displays. Read LIVE (gdx_interp::
+    //                                             P2HostActive), same idiom as FramePacing above; the
+    //                                             two are mutually exclusive pacing owners.
+    CVarRegisterInteger("gEnhancements.Graphics.FrameInterpolation", 0);
+    //   gEnhancements.Graphics.InterpDebugOverlay = 0 -> off = no overlay (default). When on AND
+    //                                             FrameInterpolation is on, shows the live
+    //                                             "subframes last tick" stat line below the toggle.
+    //                                             Purely diagnostic; no effect on rendering/pacing.
+    CVarRegisterInteger("gEnhancements.Graphics.InterpDebugOverlay", 0);
+    //   gEnhancements.Graphics.InterpTargetMode = 0 -> Match Refresh Rate (default): the sub-frame
+    //                                             target follows the display's current refresh rate,
+    //                                             read live via Ship::Window::GetCurrentRefreshRate().
+    //                                             1 -> Capped: the target is InterpTargetFps below
+    //                                             instead. Only consulted while FrameInterpolation is
+    //                                             on; read LIVE by main.cpp's per-tick M derivation
+    //                                             (M = clamp(ceil(target/60), 1, kGdxInterpMaxSubframes)).
+    //   gEnhancements.Graphics.InterpTargetFps  = 120 -> Capped-mode target frame rate, UI range
+    //                                             60..480. Values above the display's own refresh
+    //                                             rate waste GPU without improving output.
+    CVarRegisterInteger("gEnhancements.Graphics.InterpTargetMode", 0);
+    CVarRegisterInteger("gEnhancements.Graphics.InterpTargetFps", 120);
 
     // GAMEPLAY tab CVars. Every default reproduces stock behavior (the optionality constitution):
     //   gEnhancements.Gameplay.AutosaveOnRecord  = 0    -> off. Stock F-Zero X already commits the
@@ -376,9 +600,15 @@ GdxMenu::GdxMenu() : Ship::GuiWindow("gOpenMenuBar", false, "G-Diffuser Menu") {
     }
 }
 
+// Bump whenever the Page/Header enum ordering changes so persisted ActivePage/ActiveHeader ints
+// from an older layout aren't reinterpreted against the new ordering (same numeric header/page
+// value can silently point at a different tab after a reorder).
+static constexpr int kMenuLayoutVersion = 2;
+
 void GdxMenu::InitElement() {
     const int header = CVarGetInteger("gSettings.Menu.ActiveHeader", static_cast<int>(Header::Settings));
     const int page = CVarGetInteger("gSettings.Menu.ActivePage", static_cast<int>(Page::General));
+    const int layoutVersion = CVarGetInteger("gSettings.Menu.LayoutVersion", 0);
     if (header >= static_cast<int>(Header::Settings) && header <= static_cast<int>(Header::DevTools)) {
         mActiveHeader = static_cast<Header>(header);
     }
@@ -387,6 +617,17 @@ void GdxMenu::InitElement() {
     }
     if (HeaderForPage(mActivePage) != mActiveHeader) {
         mActivePage = FirstPageForHeader(mActiveHeader);
+    }
+    if (layoutVersion != kMenuLayoutVersion) {
+        // Stored page/header indices were persisted under a different Page/Header ordering;
+        // a matching numeric value could now name a different tab, so reset to defaults rather
+        // than trust the stale mapping.
+        mActiveHeader = Header::Settings;
+        mActivePage = Page::General;
+        CVarSetInteger("gSettings.Menu.ActiveHeader", static_cast<int>(mActiveHeader));
+        CVarSetInteger("gSettings.Menu.ActivePage", static_cast<int>(mActivePage));
+        CVarSetInteger("gSettings.Menu.LayoutVersion", kMenuLayoutVersion);
+        CVarSave();
     }
 }
 
@@ -645,10 +886,9 @@ void GdxMenu::DrawSidebar() {
     switch (mActiveHeader) {
         case Header::Settings:
             pageButton(Page::General);
-            pageButton(Page::Audio);
             pageButton(Page::Graphics);
+            pageButton(Page::Audio);
             pageButton(Page::Controls);
-            pageButton(Page::InputViewer);
             break;
         case Header::Enhancements:
             pageButton(Page::EnhancementGraphics);
@@ -665,6 +905,7 @@ void GdxMenu::DrawSidebar() {
         case Header::DevTools:
             pageButton(Page::DeveloperGeneral);
             pageButton(Page::Stats);
+            pageButton(Page::InputViewer);
             pageButton(Page::Console);
             pageButton(Page::GfxDebugger);
             break;
@@ -801,11 +1042,11 @@ void GdxMenu::SelectPage(Page page) {
 }
 
 GdxMenu::Header GdxMenu::HeaderForPage(Page page) const {
-    if (page <= Page::InputViewer) return Header::Settings;
-    if (page <= Page::Practice) return Header::Enhancements;
-    if (page <= Page::Content) return Header::Workshop;
+    if (page <= Page::Controls) return Header::Settings;      // General .. Controls
+    if (page <= Page::Practice) return Header::Enhancements;  // EnhancementGraphics .. Practice
+    if (page <= Page::Content) return Header::Workshop;       // Ghosts .. Content
     if (page == Page::OnlineOverview) return Header::Online;
-    return Header::DevTools;
+    return Header::DevTools;                                  // DeveloperGeneral .. GfxDebugger
 }
 
 GdxMenu::Page GdxMenu::FirstPageForHeader(Header header) const {
@@ -849,6 +1090,9 @@ void GdxMenu::DrawGeneralPage() {
         CVarSetFloat("gSettings.Menu.BackgroundOpacity", static_cast<float>(opacityPercent) / 100.0f);
         GdxSaveCvars();
     }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("How opaque this menu's backdrop is over the game (35%% = most see-through).");
+    }
     bool controllerNav = CVarGetInteger("gControlNav", 0) != 0;
     if (ImGui::Checkbox("Menu controller navigation", &controllerNav)) {
         CVarSetInteger("gControlNav", controllerNav ? 1 : 0);
@@ -858,6 +1102,8 @@ void GdxMenu::DrawGeneralPage() {
         ImGui::SetTooltip("Lets a connected gamepad navigate the menu. Game input is blocked while the menu is open.");
     }
     ImGui::TextDisabled("Open or close this menu with F1, Escape, or Gamepad Back.");
+    ImGui::Spacing();
+    GdxDrawDataAndFilesPanel();
     ImGui::Spacing();
     DrawAboutMenu();
 }
@@ -896,6 +1142,10 @@ void GdxMenu::DrawGraphicsMenu(bool enhancementsOnly) {
                 window->SetResolutionMultiplier(mult); // apply live (Fast3dWindow.cpp:315)
             }
         }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Render scale relative to the window size. 1.00x = native; higher is\n"
+                              "sharper but costs GPU. Applies immediately.");
+        }
     }
 
     // MSAA — CVar gMSAAValue (int sample count), default 1 (= off). Read once at Init; applied LIVE
@@ -917,6 +1167,10 @@ void GdxMenu::DrawGraphicsMenu(bool enhancementsOnly) {
             if (window != nullptr) {
                 window->SetMsaaLevel((uint32_t)kMsaaValues[idx]); // apply live (Fast3dWindow.cpp:319)
             }
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Multi-sample anti-aliasing. Higher smooths edges at a GPU cost.\n"
+                              "Off (1x) = stock. Applies immediately.");
         }
     }
 
@@ -944,6 +1198,10 @@ void GdxMenu::DrawGraphicsMenu(bool enhancementsOnly) {
                 fast->SetTextureFilter(static_cast<Fast::FilteringMode>(idx)); // apply live
             }
         }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("How textures are sampled. Three-point mimics the N64 (stock);\n"
+                              "Linear is smoother; None is sharp/pixelated. Applies immediately.");
+        }
     }
 
     ImGui::Separator();
@@ -955,6 +1213,10 @@ void GdxMenu::DrawGraphicsMenu(bool enhancementsOnly) {
         if (ImGui::Checkbox("VSync", &on)) {
             CVarSetInteger("gVsyncEnabled", on ? 1 : 0);
             GdxSaveCvars();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Syncs presentation to the display refresh to avoid tearing.\n"
+                              "On = stock. Turn off if you use Frame pacing.");
         }
     }
 
@@ -1017,6 +1279,7 @@ void GdxMenu::DrawGraphicsMenu(bool enhancementsOnly) {
             ImGui::SetTooltip("On: fills the window in 16:9 (hor+).\n"
                               "Off: renders 4:3 with pillarbox bars on the sides.");
         }
+        GdxModifiedMarker(!on); // default is on
     }
 
     {
@@ -1033,6 +1296,7 @@ void GdxMenu::DrawGraphicsMenu(bool enhancementsOnly) {
                               "the SELECT MACHINE blue background and race transitions. Other\n"
                               "menu artwork stays proportional in 4:3. Requires Widescreen.");
         }
+        GdxModifiedMarker(on); // default is off
     }
 
     // Draw distance — CVar gEnhancements.Graphics.DrawDistance (%, default 100 = stock). Scales each
@@ -1084,6 +1348,7 @@ void GdxMenu::DrawGraphicsMenu(bool enhancementsOnly) {
             ImGui::SetTooltip("Always renders every machine at its highest-detail model,\n"
                               "ignoring distance. Off = stock distance-based detail.");
         }
+        GdxModifiedMarker(on); // default is off
     }
 
     ImGui::Separator();
@@ -1093,14 +1358,112 @@ void GdxMenu::DrawGraphicsMenu(bool enhancementsOnly) {
     // holds the host loop to the true N64 NTSC field rate (~59.94Hz) with a wall-clock sleep+spin.
     // Recommend VSync OFF while on (a display-refresh present beats against the fixed schedule).
     {
+        bool interpOn = CVarGetInteger("gEnhancements.Graphics.FrameInterpolation", 0) != 0;
         bool on = CVarGetInteger("gEnhancements.Graphics.FramePacing", 0) != 0;
+        ImGui::BeginDisabled(interpOn);
         if (ImGui::Checkbox("Frame pacing (59.94 Hz)", &on)) {
             CVarSetInteger("gEnhancements.Graphics.FramePacing", on ? 1 : 0);
             GdxSaveCvars();
         }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            if (interpOn) {
+                ImGui::SetTooltip("Interpolation owns pacing; frame pacing is unavailable while on.");
+            } else {
+                ImGui::SetTooltip("Experimental. The renderer already limits the game to ~60 fps; this\n"
+                                  "pins the loop to the true N64 rate (59.94 Hz). Turn VSync OFF when using it.");
+            }
+        }
+        GdxModifiedMarker(on); // default is off
+    }
+
+    // Frame interpolation — CVar gEnhancements.Graphics.FrameInterpolation, default 0. EXPERIMENTAL.
+    // Read LIVE every tick (gdx_interp::P2HostActive / port/gdx_frame_pacer.c), so this toggle takes
+    // effect on the next tick like FramePacing above — no restart needed. Mutually exclusive with
+    // Frame pacing (both are pacing owners); this one takes priority when on (see BeginDisabled above).
+    {
+        bool on = CVarGetInteger("gEnhancements.Graphics.FrameInterpolation", 0) != 0;
+        if (ImGui::Checkbox("Frame Interpolation (EXPERIMENTAL)", &on)) {
+            CVarSetInteger("gEnhancements.Graphics.FrameInterpolation", on ? 1 : 0);
+            GdxSaveCvars();
+        }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Experimental. The renderer already limits the game to ~60 fps; this\n"
-                              "pins the loop to the true N64 rate (59.94 Hz). Turn VSync OFF when using it.");
+            ImGui::SetTooltip("Interpolates rendering between 60Hz logic ticks for smoother motion on\n"
+                              "high-refresh displays. EXPERIMENTAL: visual artifacts are possible during\n"
+                              "camera cuts/transitions until further phases mature. VSync ON is\n"
+                              "recommended. Adds about half a tick of latency. Bypasses Frame pacing\n"
+                              "while on. Default OFF.");
+        }
+        GdxModifiedMarker(on); // default is off
+        if (on) {
+            // P5 completeness: gEnhancements.Graphics.InterpDebugOverlay, default 0. Purely
+            // diagnostic (no rendering/pacing effect) — gates the "subframes last tick" line so it
+            // is opt-in rather than always-on clutter once interpolation is enabled. Indented under
+            // the toggle it belongs to and only shown while Frame Interpolation is on.
+            ImGui::Indent();
+            bool overlayOn = CVarGetInteger("gEnhancements.Graphics.InterpDebugOverlay", 0) != 0;
+            if (ImGui::Checkbox("Debug overlay", &overlayOn)) {
+                CVarSetInteger("gEnhancements.Graphics.InterpDebugOverlay", overlayOn ? 1 : 0);
+                GdxSaveCvars();
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Show live sub-frame statistics.");
+            }
+            if (overlayOn) {
+                const int sub = gdx_gfx_interp_last_subframes();
+                const double t = gdx_gfx_interp_last_t();
+                ImGui::TextDisabled("subframes last tick: %d (t=%.2f)", sub, t);
+            }
+
+            // Target-rate mode — CVar gEnhancements.Graphics.InterpTargetMode, default 0 (Match
+            // Refresh Rate). Read LIVE by main.cpp's per-tick M derivation, same idiom as the master
+            // toggle above. The checkbox itself is never disabled (it IS the mode switch); it gates
+            // the Target FPS slider below via BeginDisabled, mirroring the FramePacing/
+            // FrameInterpolation disabled-dependency idiom further up this function.
+            bool matchRefresh = CVarGetInteger("gEnhancements.Graphics.InterpTargetMode", 0) == 0;
+            if (ImGui::Checkbox("Match Refresh Rate", &matchRefresh)) {
+                CVarSetInteger("gEnhancements.Graphics.InterpTargetMode", matchRefresh ? 0 : 1);
+                GdxSaveCvars();
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Targets your monitor's current refresh rate.");
+            }
+
+            // Target FPS — CVar gEnhancements.Graphics.InterpTargetFps, default 120. Only consulted
+            // in Capped mode (Match Refresh Rate off); disabled here otherwise, like FramePacing is
+            // disabled while FrameInterpolation owns pacing.
+            {
+                int targetFps = CVarGetInteger("gEnhancements.Graphics.InterpTargetFps", 120);
+                if (targetFps < 60) {
+                    targetFps = 60;
+                }
+                if (targetFps > 480) {
+                    targetFps = 480;
+                }
+                ImGui::BeginDisabled(matchRefresh);
+                if (ImGui::SliderInt("Target FPS", &targetFps, 60, 480, "%d FPS")) {
+                    if (targetFps < 60) {
+                        targetFps = 60;
+                    }
+                    if (targetFps > 480) {
+                        targetFps = 480;
+                    }
+                    CVarSetInteger("gEnhancements.Graphics.InterpTargetFps", targetFps);
+                    GdxSaveCvars();
+                }
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    if (matchRefresh) {
+                        ImGui::SetTooltip("Match Refresh Rate is on; the target follows your monitor\n"
+                                          "instead. Disable it to set a fixed target here.");
+                    } else {
+                        ImGui::SetTooltip("Interpolation target frame rate. Values above your refresh rate\n"
+                                          "waste GPU without improving output. Each 60fps of target adds a\n"
+                                          "full render pass per tick.");
+                    }
+                }
+            }
+            ImGui::Unindent();
         }
     }
     GdxComingSoon("Mirror mode");
@@ -1130,7 +1493,7 @@ void GdxMenu::DrawAudioMenu() {
         const int32_t buffered = AudioPlayerBuffered();
         const int32_t desired = AudioPlayerGetDesiredBuffered();
 
-        ImGui::TextDisabled("Output status");
+        ImGui::SeparatorText("Output status");
         if (isSdl) {
             ImGui::Text("Active backend: SDL (%s)", sdlDriver != nullptr ? sdlDriver : "no driver");
         } else {
@@ -1149,14 +1512,13 @@ void GdxMenu::DrawAudioMenu() {
                                "SDL fell back to the dummy driver: this launch environment has no\n"
                                "audio socket. Launch from a terminal or fix the launcher's env.");
         }
-        ImGui::Separator();
     }
 
     // Output backend selection — CVar gEnhancements.Audio.Backend (0=Auto, 1=WASAPI, 2=SDL).
     // Applied at startup in main.cpp's InitAudio; Auto keeps libultraship's per-platform default
     // (WASAPI on Windows, SDL on Linux). Only backends that exist on this platform are offered:
     // WASAPI is Windows-only, and on Linux SDL routes to PipeWire/PulseAudio/ALSA.
-    ImGui::TextDisabled("Backend");
+    ImGui::SeparatorText("Output Device");
     {
         int sel = CVarGetInteger("gEnhancements.Audio.Backend", 0);
 #ifdef _WIN32
@@ -1174,30 +1536,38 @@ void GdxMenu::DrawAudioMenu() {
             GdxSaveCvars();
         }
 #endif
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Which OS audio output path to use. Auto keeps the platform default\n"
+                              "(WASAPI on Windows, SDL elsewhere). Applies on restart.");
+        }
         ImGui::TextDisabled("Applies on restart.");
-        ImGui::Separator();
     }
 
     // Engine — CVar gEnhancements.Audio.LLE, default 1. LLE = accurate (cxd4 RSP), HLE = fast.
-    ImGui::TextDisabled("Engine");
+    ImGui::SeparatorText("Synthesis Engine");
     {
         int lle = CVarGetInteger("gEnhancements.Audio.LLE", 1);
         if (ImGui::RadioButton("LLE (accurate)", lle == 1)) {
             CVarSetInteger("gEnhancements.Audio.LLE", 1);
             GdxSaveCvars();
         }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Low-level RSP emulation (cxd4). Most accurate; the default.");
+        }
         if (ImGui::RadioButton("HLE (fast)", lle == 0)) {
             CVarSetInteger("gEnhancements.Audio.LLE", 0);
             GdxSaveCvars();
         }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("High-level audio emulation. Faster, less accurate.");
+        }
+        GdxModifiedMarker(lle == 0); // default is LLE
     }
-
-    ImGui::Separator();
 
     // Output reconstruction filter — CVar gEnhancements.Audio.LowPassHz, default 15000. A value of
     // 0 disables the filter; any value 500..16000 is the low-pass cutoff. The enable checkbox
     // toggles between 0 (off) and the remembered/last cutoff (on).
-    ImGui::TextDisabled("Output reconstruction filter");
+    ImGui::SeparatorText("Reconstruction Filter");
     {
         int hz = CVarGetInteger("gEnhancements.Audio.LowPassHz", 15000);
         bool filterOn = hz > 0;
@@ -1214,6 +1584,11 @@ void GdxMenu::DrawAudioMenu() {
             }
             GdxSaveCvars();
         }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Low-pass filter on the reconstructed output, softening high-frequency\n"
+                              "aliasing. On = stock. Off disables the filter entirely.");
+        }
+        GdxModifiedMarker(!filterOn); // default is on
 
         // Re-read after the checkbox so the slider reflects the change within the same frame.
         int hzNow = CVarGetInteger("gEnhancements.Audio.LowPassHz", 15000);
@@ -1229,15 +1604,17 @@ void GdxMenu::DrawAudioMenu() {
             GdxSaveCvars();
         }
         ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("Cutoff frequency of the reconstruction low-pass. Lower = softer/darker.\n"
+                              "Enable the filter above to adjust this.");
+        }
     }
-
-    ImGui::Separator();
 
     // Master volume — CVar gEnhancements.Audio.MasterVolume (0..100 %, default 100). Applied as a
     // final-stage gain multiply on the s16 output copy in os.cpp's osAiSetNextBuffer, read live
     // there each buffer (same live-CVar pattern as the low-pass). 100 = no-op (the multiply is
     // skipped entirely), so the default is bit-exact.
-    ImGui::TextDisabled("Output");
+    ImGui::SeparatorText("Levels");
     {
         int vol = CVarGetInteger("gEnhancements.Audio.MasterVolume", 100);
         if (vol < 0) {
@@ -1256,6 +1633,9 @@ void GdxMenu::DrawAudioMenu() {
             CVarSetInteger("gEnhancements.Audio.MasterVolume", vol);
             GdxSaveCvars();
         }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Final output gain. 100%% = stock (bit-exact, no gain applied).");
+        }
     }
 
     // Reverb — CVar gEnhancements.Audio.Reverb (default 1 = on). Wired to the HLE reverb kill switch
@@ -1273,15 +1653,14 @@ void GdxMenu::DrawAudioMenu() {
             ImGui::SetTooltip("Affects the HLE audio engine only.\n"
                               "Under the default LLE engine, reverb is the microcode's own.");
         }
+        GdxModifiedMarker(!reverbOn); // default is on
     }
-
-    ImGui::Separator();
 
     // Latency / buffer size — CVar gEnhancements.Audio.BufferFrames (frames, default 4096, range
     // 1024..8192). Read ONCE at InitAudio (main.cpp), so a change applies only on the next restart
     // (hence the note). A larger reservoir rides out host scheduling jitter better but adds output
     // latency; a smaller one is snappier but more underrun-prone.
-    ImGui::TextDisabled("Latency");
+    ImGui::SeparatorText("Latency");
     {
         int frames = CVarGetInteger("gEnhancements.Audio.BufferFrames", 4096);
         if (frames < 1024) {
@@ -1300,12 +1679,15 @@ void GdxMenu::DrawAudioMenu() {
             CVarSetInteger("gEnhancements.Audio.BufferFrames", frames);
             GdxSaveCvars();
         }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Audio buffer size. Larger rides out host jitter (fewer dropouts) but\n"
+                              "adds latency; smaller is snappier but more underrun-prone. Applies on restart.");
+        }
         ImGui::SameLine();
         ImGui::TextDisabled("(applies on restart)");
     }
 
-    ImGui::Separator();
-    ImGui::TextDisabled("More (planned)");
+    ImGui::SeparatorText("More");
     GdxComingSoon("Sound test / jukebox");
 
 }
@@ -1334,6 +1716,7 @@ void GdxMenu::DrawGameplayMenu() {
             ImGui::SetTooltip("Fast-completes screen-transition wipes instead of playing them in full.\n"
                               "Off by default (parity).");
         }
+        GdxModifiedMarker(on); // default is off
     }
 
     // Reduce Course Edit flashing — CVar gEnhancements.Gameplay.ReduceEditorFlashing, default 0
@@ -1350,6 +1733,7 @@ void GdxMenu::DrawGameplayMenu() {
             ImGui::SetTooltip("Halves the Course Edit blink/checker cadence. The 20Hz strobe is\n"
                               "authentic N64 behavior; this calms it on modern displays.");
         }
+        GdxModifiedMarker(!on); // default is on
     }
 
     ImGui::Separator();
@@ -1375,6 +1759,7 @@ void GdxMenu::DrawGameplayMenu() {
                               "without the manual Save-Ghost prompt.\n"
                               "(Record TIMES already autosave in stock F-Zero X.) Off by default.");
         }
+        GdxModifiedMarker(on); // default is off
     }
 
 }
@@ -1397,6 +1782,7 @@ void GdxMenu::DrawPracticeMenu() {
             ImGui::SetTooltip("In Practice mode, shows your last lap vs your session best\n"
                               "(green = faster, red = slower). Off by default.");
         }
+        GdxModifiedMarker(on); // default is off
     }
 
     ImGui::Separator();
@@ -1472,6 +1858,9 @@ void GdxMenu::DrawPracticeMenu() {
                                                          : "Open Ghost Browser window")) {
         GdxToggleWindow("Ghost Browser");
     }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Browse your per-course player-ghost library and export ghosts to .gdg.");
+    }
 
     // Photo mode (free camera) is available in every race mode. When enabled, pausing suppresses
     // all race HUD/pause overlays and reserves their controls for the free camera. Disabling the
@@ -1487,6 +1876,7 @@ void GdxMenu::DrawPracticeMenu() {
                               "Stick: dolly/truck  -  C-buttons: look  -  L/R: FOV  -  hold Z: raise/lower.\n"
                               "Unpausing or turning this off restores the game camera exactly. Off by default.");
         }
+        GdxModifiedMarker(on); // default is off
     }
 
     ImGui::Separator();
@@ -1520,25 +1910,40 @@ void GdxMenu::DrawInputViewerMenu() {
         CVarSetFloat("gInputViewer.Scale", scale);
         GdxSaveCvars();
     }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Size of the on-screen input overlay.");
+    }
     float opacity = std::clamp(CVarGetFloat("gInputViewer.Opacity", 1.0f), 0.2f, 1.0f);
     if (ImGui::SliderFloat("Overlay opacity", &opacity, 0.2f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
         CVarSetFloat("gInputViewer.Opacity", opacity);
         GdxSaveCvars();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Transparency of the input overlay.");
     }
     bool dragging = CVarGetInteger("gInputViewer.EnableDragging", 1) != 0;
     if (ImGui::Checkbox("Enable dragging", &dragging)) {
         CVarSetInteger("gInputViewer.EnableDragging", dragging ? 1 : 0);
         GdxSaveCvars();
     }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Lets you reposition the overlay by dragging it with the mouse.");
+    }
     bool background = CVarGetInteger("gInputViewer.ShowBackground", 1) != 0;
     if (ImGui::Checkbox("Show background layer", &background)) {
         CVarSetInteger("gInputViewer.ShowBackground", background ? 1 : 0);
         GdxSaveCvars();
     }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Draws the controller-body backdrop behind the buttons.");
+    }
     bool dpad = CVarGetInteger("gInputViewer.ShowDpad", 0) != 0;
     if (ImGui::Checkbox("Show D-pad layers", &dpad)) {
         CVarSetInteger("gInputViewer.ShowDpad", dpad ? 1 : 0);
         GdxSaveCvars();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Includes the D-pad in the overlay (off by default; F-Zero X does not use it).");
     }
     int outlineMode = std::clamp(CVarGetInteger("gInputViewer.ButtonOutlineMode", 1), 0, 3);
     const char* outlineLabels[] = { "Always shown", "Shown while released", "Shown while pressed", "Hidden" };
@@ -1546,10 +1951,16 @@ void GdxMenu::DrawInputViewerMenu() {
         CVarSetInteger("gInputViewer.ButtonOutlineMode", outlineMode);
         GdxSaveCvars();
     }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("When each button's outline is drawn relative to its pressed state.");
+    }
     bool analogValues = CVarGetInteger("gInputViewer.ShowAnalogValues", 0) != 0;
     if (ImGui::Checkbox("Show analog values", &analogValues)) {
         CVarSetInteger("gInputViewer.ShowAnalogValues", analogValues ? 1 : 0);
         GdxSaveCvars();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Prints the raw analog-stick X/Y numbers next to the stick.");
     }
     ImGui::TextWrapped("The viewer reads G-Diffuser's final mapped N64 state, after controller bindings and analog "
                        "curves. Inputs intentionally read neutral while this menu owns game input.");
@@ -1589,9 +2000,47 @@ void GdxMenu::DrawStatsMenu() {
     if (ImGui::Checkbox("Show FPS counter overlay", &showFps)) {
         GdxToggleWindow("FPS Counter");
     }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Toggles a small always-on-top frames-per-second overlay.");
+    }
     ImGui::SameLine();
     ImGui::TextDisabled("Uses the same frame metrics as Stats");
     ImGui::Separator();
+
+    // Real presented-FPS visibility (owner requirement, 2026-07-23). When Frame Interpolation is on
+    // the sim runs at 60 Hz but the renderer presents multiple sub-frames per tick, so ImGui's own
+    // io.Framerate (which counts one frame per present) is the true presented rate. We show it
+    // alongside the fixed 60 Hz logic rate ("144 fps (sim 60 Hz)") plus the live sub-frame count and
+    // the previous tick's tween/snap breakdown, so a "cost without benefit" regression (lerped == 0)
+    // is visible at a glance. These reuse the existing bridge getters — no extra per-frame cost.
+    if (gdx_gfx_interp_host_active() != 0) {
+        ImGui::SeparatorText("Frame Interpolation");
+        if (gdx_gfx_interp_tick_active() == 0) {
+            // The menu's toggle is on, but main.cpp forced interpolation off THIS tick (Course
+            // Edit / Create Machine editors force the stock single-present path). The live
+            // numbers below are from before the editor was entered, so show the paused truth
+            // instead of stale/misleading figures.
+            ImGui::TextDisabled("Interpolation paused (editor active)");
+        } else {
+            const double presentedFps = gdx_gfx_interp_presents_per_sec();
+            const float imguiFps = ImGui::GetIO().Framerate;
+            const int m = gdx_gfx_interp_last_subframes();
+            const int lerped = gdx_gfx_interp_last_lerped();
+            const int snapped = gdx_gfx_interp_last_snapped();
+            // presents/s meter is bridge-measured; fall back to ImGui's rate before the first window fills.
+            const double shownFps = (presentedFps > 0.0) ? presentedFps : static_cast<double>(imguiFps);
+            ImGui::Text("Presented: %.0f fps (sim 60 Hz)", shownFps);
+            ImGui::Text("Sub-frames/tick (M): %d", m);
+            if (lerped == 0) {
+                ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.20f, 1.0f),
+                                   "Interpolated slots: 0 (no tween — snapping every tick)");
+            } else {
+                ImGui::Text("Interpolated slots: %d   Snapped: %d", lerped, snapped);
+            }
+        }
+        ImGui::Separator();
+    }
+
     DrawToolWindowPage("Stats", "Live frame timing and renderer statistics.");
 }
 
@@ -1613,6 +2062,7 @@ void GdxMenu::DrawWorkshopMenu() {
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Overrides game textures from mods/*.o2r packs.\nOff = stock rendering.");
         }
+        GdxModifiedMarker(on); // default is off
     }
 
     std::vector<GdxWorkshopPackInfo> packs = GdxWorkshopListPacks();
@@ -1637,6 +2087,9 @@ void GdxMenu::DrawWorkshopMenu() {
                 // Toggling the checkbox rewrites the persisted disable list; the change takes effect
                 // on the next Reload (or the next boot) since the archive set is mounted once.
                 GdxWorkshopSetPackDisabled(p.basename.c_str(), enabled ? 0 : 1);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Enable or disable this pack. Takes effect on the next Reload or boot.");
             }
 
             ImGui::TableSetColumnIndex(1);
@@ -1673,6 +2126,9 @@ void GdxMenu::DrawWorkshopMenu() {
     if (ImGui::Button("Open mods folder")) {
         GdxOpenFolder(GdxWorkshopModsDir(true));
     }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Open the mods/ folder in your file browser (created if absent).");
+    }
     if (sReloadStatus[0] != '\0') {
         ImGui::TextDisabled("%s", sReloadStatus);
     }
@@ -1689,10 +2145,116 @@ void GdxMenu::DrawWorkshopMenu() {
             ImGui::SetTooltip("Writes every decoded texture to dump/<key>.png (first-seen-wins),\n"
                               "with dump/manifest.tsv recording key, size, and format.");
         }
+        GdxModifiedMarker(on); // default is off
     }
     ImGui::TextDisabled("Dumped %d texture(s) this session -> dump/", gdx_workshop_dump_count());
     if (ImGui::Button("Open dump folder")) {
         GdxOpenFolder(GdxWorkshopDumpDir(true));
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Open the dump/ folder in your file browser (created if absent).");
+    }
+
+    // ── Asset Dump (per-class) ────────────────────────────────────────────────────────────────────
+    // R8 Step 4b / Wave 4: offline per-class dump, native-first via the bundled gdx-extract (falls
+    // back to tools/gen_dump_all.py in dev checkouts without the native binary). Implementation lives
+    // in port/gdx_dump_launch.{h,cpp}; this block only READS the shared snapshot — every subprocess
+    // runs on a detached worker thread, one child PER CLASS so a broken class never aborts the rest.
+    ImGui::SeparatorText("Asset Dump");
+    {
+        // Discover the backend once (pure filesystem/PATH — no subprocess), and kick the async
+        // `--list-classes` probe once. Both cached across frames via function-local statics.
+        static gdx::DumpEnvironment sDumpEnv = gdx::GdxDumpDiscover();
+        static bool sProbeKicked = (gdx::GdxDumpBeginClassListProbe(sDumpEnv), true);
+        (void)sProbeKicked;
+
+        ImGui::TextWrapped("Decode named assets straight from the extracted archive — no gameplay "
+                           "needed. Runs the bundled dump tool once per selected class; results land "
+                           "in dump/ (same place as the runtime texture dump).");
+        if (!sDumpEnv.available) {
+            ImGui::TextDisabled("%s", sDumpEnv.reason.c_str());
+        }
+
+        gdx::DumpBatchSnapshot snap = gdx::GdxDumpSnapshot();
+        const bool running = snap.running;
+        const std::vector<std::string> dumpClasses = gdx::GdxDumpCurrentClasses();
+
+        // ── Per-class checkboxes (persisted as gEnhancements.Workshop.DumpClass.<name>, default on) ──
+        ImGui::BeginDisabled(!sDumpEnv.available || running);
+        if (ImGui::BeginTable("##DumpClasses", 2, ImGuiTableFlags_SizingStretchProp)) {
+            for (const auto& cls : dumpClasses) {
+                ImGui::TableNextColumn();
+                std::string cvarKey = "gEnhancements.Workshop.DumpClass." + cls;
+                bool on = CVarGetInteger(cvarKey.c_str(), 1) != 0; // default: every class checked
+                std::string label = gdx::GdxDumpPrettyName(cls) + "##dumpclass_" + cls;
+                if (ImGui::Checkbox(label.c_str(), &on)) {
+                    CVarSetInteger(cvarKey.c_str(), on ? 1 : 0);
+                    GdxSaveCvars();
+                }
+            }
+            ImGui::EndTable();
+        }
+        if (ImGui::Button("Dump selected")) {
+            std::vector<std::string> selected;
+            for (const auto& cls : dumpClasses) {
+                std::string cvarKey = "gEnhancements.Workshop.DumpClass." + cls;
+                if (CVarGetInteger(cvarKey.c_str(), 1) != 0) {
+                    selected.push_back(cls);
+                }
+            }
+            gdx::GdxDumpStartBatch(sDumpEnv, selected, GdxWorkshopDumpDir(true));
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Dump everything")) {
+            gdx::GdxDumpStartBatch(sDumpEnv, dumpClasses, GdxWorkshopDumpDir(true));
+        }
+        ImGui::EndDisabled();
+
+        // ── Cancel (cooperative: stops AFTER the current class finishes) ──
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!running || snap.cancelRequested);
+        if (ImGui::Button("Cancel")) {
+            gdx::GdxDumpRequestCancel();
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Stops after the current class finishes. The running class is left to "
+                              "complete cleanly — no child process is killed.");
+        }
+
+        // ── Per-class progress lines + batch summary ──
+        for (const auto& p : snap.classes) {
+            std::string pretty = gdx::GdxDumpPrettyName(p.name);
+            switch (p.phase) {
+            case gdx::DumpPhase::Queued:
+                ImGui::TextDisabled("%s: queued", pretty.c_str());
+                break;
+            case gdx::DumpPhase::Running: {
+                const char spin[] = {'|', '/', '-', '\\'};
+                ImGui::Text("%s: running %c", pretty.c_str(),
+                            spin[static_cast<int>(ImGui::GetTime() * 4.0) & 3]);
+                break;
+            }
+            case gdx::DumpPhase::Done:
+                if (p.itemsDumped >= 0) {
+                    ImGui::Text("%s: done — %d item(s) in %.1fs", pretty.c_str(), p.itemsDumped,
+                                p.elapsedSeconds);
+                } else {
+                    ImGui::Text("%s: done — %.1fs", pretty.c_str(), p.elapsedSeconds);
+                }
+                break;
+            case gdx::DumpPhase::Failed:
+                ImGui::TextColored(kRed, "%s: FAILED (exit %d) %s", pretty.c_str(), p.exitCode,
+                                   p.lastLine.c_str());
+                break;
+            default:
+                ImGui::TextDisabled("%s: idle", pretty.c_str());
+                break;
+            }
+        }
+        if (!snap.summary.empty()) {
+            ImGui::TextDisabled("%s", snap.summary.c_str());
+        }
     }
 
     // ── DD Save (64DD durable-save sidecar status) ────────────────────────────────────────────────
@@ -1754,10 +2316,13 @@ void GdxMenu::DrawOnlineMenu() {
 void GdxMenu::DrawDeveloperMenu() {
     ImGui::TextWrapped("Developer tools can be embedded in this menu or popped out into independent windows.");
     if (ImGui::Button("Open Stats")) GdxToggleWindow("Stats");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle the live frame-timing / renderer Stats window.");
     ImGui::SameLine();
     if (ImGui::Button("Open Console")) GdxToggleWindow("Console");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle the developer console and command history.");
     ImGui::SameLine();
     if (ImGui::Button("Open Gfx Debugger")) GdxToggleWindow("Gfx Debugger");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle the Fast3D display-list debugger.");
     ImGui::SeparatorText("Windowing");
 
     // Multi-viewport — CVar gEnableMultiViewports, default 1. The ImGui viewport flag is applied
@@ -1768,6 +2333,10 @@ void GdxMenu::DrawDeveloperMenu() {
         if (ImGui::Checkbox("Multi-viewport docking", &mv)) {
             CVarSetInteger("gEnableMultiViewports", mv ? 1 : 0);
             GdxSaveCvars();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Lets popped-out tool windows leave the main window (multi-monitor docking).\n"
+                              "Applies on restart.");
         }
         ImGui::SameLine();
         ImGui::TextDisabled("(restart)");
