@@ -7,10 +7,15 @@
 //     with the per-phase breakdown of THAT frame (catches intermittent hitches with attribution);
 //   * a "[GDX perf] summary ..." line every ~10 seconds: frame-time p50/p95/p99/max, mean per-phase
 //     milliseconds, and the audio thread's tick p95/max over the same window.
-// When GDX_PERF is unset every entry point is a cached-bool early-return — no measurable cost.
+// When telemetry is off every entry point is a bool early-return — no measurable cost.
 //
-// Note: set GDX_LOG=1 (or GDX_TRACE=1) alongside GDX_PERF so the file log sink is enabled and the
-// lines land in gdiffuser-run.log.
+// Telemetry is a Bucket A developer gate (port/gdx_dev_gates.h): GDX_PERF still works at launch,
+// and F1 > Dev Tools > Developer gates > Scheduling > "Frame-time telemetry" toggles it live. The
+// flag is re-latched from the gate once per frame in PerfFrameBegin, never mid-frame, so a toggle
+// can never leave a phase Begin without its End.
+//
+// Note: enable "Write gdiffuser-run.log" (or set GDX_LOG=1 / GDX_TRACE=1) alongside it so the file
+// log sink is open and the lines land in gdiffuser-run.log.
 #pragma once
 
 // ---------------------------------------------------------------------------------------------

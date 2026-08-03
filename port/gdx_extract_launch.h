@@ -3,16 +3,18 @@
 // Produces (or refreshes) <dataDir>/generic.o2r from the cartridge ROM by spawning the packaged
 // `gdx-extract` child process against the shipped `decomp-recipes` tree. This is the runtime
 // counterpart to the build-time archive: an installed/packaged build has NO generic.o2r until this
-// runs (see docs/investigation/2026-07-18/o2r-migration/W0_FIRSTBOOT_INTEGRATION.md §7).
+// runs.
 //
-// Contract references (docs/.../o2r-migration/P0_CONTRACTS.md):
-//   C1  ROM SHA-1 validation before spawn (expected hash read from decomp-recipes/config.yml).
-//   C5  validation-before-install (exit code, zip entry count, archive SHA-256, version entry) +
-//       atomic temp->rename install with a Windows sharing-violation retry loop.
-//   C6  complete-or-absent: extraction NEVER blocks boot; on any failure the temp is deleted, any
-//       previous archive is preserved, and the proven raw-ROM fallback carries the session.
-//   C7  state model: completion sidecar gdx_extract_state.cfg + warm-boot skip.
-//   C8  integration point (main.cpp ~285) + progress UX (Win32 modeless dialog / Linux log-only).
+// Invariants:
+//   * ROM SHA-1 is validated BEFORE the child is spawned (expected hash read from
+//     decomp-recipes/config.yml).
+//   * Validation before install: exit code, zip entry count, archive SHA-256, version entry —
+//     then an atomic temp->rename install with a Windows sharing-violation retry loop.
+//   * Complete-or-absent: extraction NEVER blocks boot. On any failure the temp is deleted, any
+//     previous archive is preserved, and the proven raw-ROM fallback carries the session.
+//   * State model: completion sidecar gdx_extract_state.cfg + warm-boot skip.
+//   * Integration point is main.cpp, before the archive mount list is built; progress UX is a
+//     Win32 modeless dialog on Windows and log-only on Linux.
 //
 // This TU is part of the G-Diffuser exe target (not the decomp game library), so it may freely use
 // the host CRT, <filesystem>, and (Windows) the Win32 process + common-controls APIs. It runs before
@@ -102,9 +104,9 @@ void GdxExtractResetAsync();
 // build); callers should fall back to an indeterminate bar in that case.
 int GdxExtractExpectedCartEntryCount();
 
-// Expected zip entry count for the IPL font-block archive (frozen at 2 -- ipl/font_block + ipl/identity,
-// C-R3.1). Always > 0. Exposed as a function rather than a header constant so gdx_extract_launch.cpp
-// stays the single source of truth for this contract value.
+// Expected zip entry count for the IPL font-block archive (frozen at 2 -- ipl/font_block +
+// ipl/identity). Always > 0. Exposed as a function rather than a header constant so
+// gdx_extract_launch.cpp stays the single source of truth for this value.
 int GdxExtractExpectedIplEntryCount();
 
 // ── ROM identity helpers for the setup GUI ───────────────────────────────────────────────────────
@@ -115,23 +117,23 @@ int GdxExtractExpectedIplEntryCount();
 std::string GdxExtractFileSha1(const char* path);
 
 // The expected US-rev0 ROM SHA-1 (lowercase hex), read from <exeDir>/decomp-recipes/config.yml with
-// the built-in constant as fallback — same resolution the extraction gate uses (C1).
+// the built-in constant as fallback — same resolution the extraction gate uses.
 std::string GdxExtractExpectedRomSha1(const char* exeDir);
 
 // Lowercase-hex SHA-256 of the file at `path` (empty string on read failure). Reuses the same
-// streamed hasher the archive-install gate (C5 step 3) uses; ~150 ms for the 64.9 MB EK disk image.
+// streamed hasher the archive-install gate uses; ~150 ms for the 64.9 MB EK disk image.
 std::string GdxExtractFileSha256(const char* path);
 
-// ── Managed disk copy bookkeeping (R7: disk internalization) ───────────────────────────────────
+// ── Managed disk copy bookkeeping (disk internalization) ──────────────────────────────────────
 // Records the managed Expansion Kit disk copy's identity (SHA-256 + size) into the same completion
-// sidecar (gdx_extract_state.cfg) the archive extraction gate already owns (C7), so one file
+// sidecar (gdx_extract_state.cfg) the archive extraction gate already owns, so one file
 // documents everything this build verified about the installed inputs. Read-modify-write: any
 // existing sidecar fields (ROM/archive identity from extraction) are preserved untouched; only the
 // disk_* keys are set. A missing/unwritable sidecar is a log-only failure — the managed copy on disk
 // remains the source of truth; this call is diagnostic bookkeeping only, never gating.
 void GdxExtractRecordManagedDisk(const char* dataDir, const char* diskSha256, unsigned long long diskSize);
 
-// ── IPL identity bookkeeping (R3: IPL extraction) ────────────────────────────────────────────────
+// ── IPL identity bookkeeping (IPL extraction) ────────────────────────────────────────────────────
 // Records the acquire-time SHA-256 of the 64DD IPL ROM into the completion sidecar
 // (gdx_extract_state.cfg, key `ipl_sha256`), so one file documents every input this build verified.
 // Read-modify-write: existing cart/disk/archive fields are preserved. The dedicated IPL extraction
@@ -140,12 +142,12 @@ void GdxExtractRecordManagedDisk(const char* dataDir, const char* diskSha256, un
 // nothing gates boot on these fields; the archive carries its own ipl/identity entry.
 void GdxExtractRecordIpl(const char* dataDir, const char* iplSha256);
 
-// ── Disk deletion-gate helpers (R8 Step 1: disk internalization) ─────────────────────────────────
+// ── Disk deletion-gate helpers (disk internalization) ────────────────────────────────────────────
 // The boot-time deletion gate (port/disk_buffer.cpp) proves the disk archive is byte-identical to the
-// R7 managed copy before the Data & Files panel ever marks the disk deletable. These two helpers let
+// managed copy before the Data & Files panel ever marks the disk deletable. These two helpers let
 // that TU reuse the sidecar reader + the vendored SHA-256 without duplicating either.
 
-// Lowercase-hex SHA-256 of the R7 managed disk copy, as recorded in the completion sidecar
+// Lowercase-hex SHA-256 of the managed disk copy, as recorded in the completion sidecar
 // (gdx_extract_state.cfg key `disk_sha256`). Empty if the sidecar is missing or the key is unset.
 std::string GdxExtractRecordedDiskSha256(const char* dataDir);
 
@@ -153,7 +155,7 @@ std::string GdxExtractRecordedDiskSha256(const char* dataDir);
 // sidecar (key `disk_archive_sha256`, authored by ensureDiskArchive). Empty if the sidecar is missing
 // or the key is unset. Used by first-boot's setup-required predicate to validate an installed
 // fzerox-disk.o2r against the identity this build recorded before accepting it as satisfying the disk
-// input (the raw .ndd and R7 managed copy having been deleted).
+// input (the raw .ndd and managed copy having been deleted).
 std::string GdxExtractRecordedDiskArchiveSha256(const char* dataDir);
 
 // Lowercase-hex SHA-256 of the cart archive container (fzerox.o2r) as recorded in the completion

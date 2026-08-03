@@ -14,6 +14,7 @@ class GdxFast3dGui final : public Fast::Fast3dGui {
 
   protected:
     void ImGuiWMInit() override;
+    void ImGuiWMNewFrame() override;
 };
 
 ImFont* GdxGuiFontStandard();

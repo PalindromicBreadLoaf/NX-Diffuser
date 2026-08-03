@@ -1,4 +1,4 @@
-/* G-Diffuser -- streaming PCM capture (C-R2.3). See gdx_audio_capture.h for the contract.
+/* G-Diffuser -- streaming PCM capture. See gdx_audio_capture.h for the contract.
  *
  * Writes <prefix>.pcm as headerless interleaved s16-LE stereo, streamed straight off the
  * audio tap (no full-capture RAM ring -- see the fixed-size write-behind buffer below), then

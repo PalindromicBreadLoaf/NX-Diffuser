@@ -57,6 +57,65 @@ list(FILTER GAME_SOURCES EXCLUDE REGEX "/libultra/os/getmemsize\\.c$")
 # runtime-gated by disk-image presence (port/n64_leo.c).
 option(GDX_EXPANSION_KIT "Compile Expansion Kit (64DD) support into the port" ON)
 
+# ── GDX_DEV_TOOLS — compile-time master switch for the behaviour-altering developer gates ──────
+# The port's ~60 GDX_* switches are classified into four buckets (port/gdx_dev_gates.h,
+# docs/menu/DEVELOPER_TAB.md). Bucket B is the dangerous set: gates that CHANGE RENDERING OR GAME
+# BEHAVIOUR rather than only logging (GDX_NO_REVERB, GDX_HLE_FILTER=0, ...).
+# When GDX_DEV_TOOLS is absent, every Bucket B gate is a hard-wired 0 inside gdx_dev_gates.c with
+# no getenv and no CVar read, and the Dev Tools page omits their whole section. That is safe by
+# construction because the gate table normalizes every gate so 0 == stock behaviour.
+#
+# ON for every configuration except Release. Written as a generator expression so ONE build tree is
+# correct under both single-config (Ninja/Makefiles, CMAKE_BUILD_TYPE) and multi-config (Visual
+# Studio) generators. GDX_FORCE_DEV_TOOLS keeps them in a Release build for a soak/QA binary.
+option(GDX_FORCE_DEV_TOOLS "Keep the behaviour-altering developer gates in Release builds too" OFF)
+if(GDX_FORCE_DEV_TOOLS)
+    set(GDX_DEV_TOOLS_DEFS "GDX_DEV_TOOLS=1")
+else()
+    set(GDX_DEV_TOOLS_DEFS "$<$<NOT:$<CONFIG:Release>>:GDX_DEV_TOOLS=1>")
+endif()
+
+# ── GDX_ALLOW_JP_INPUTS — accept Japanese-region GAME DATA in this binary ──────────────────────
+# NOT the same switch as GDX_BUILD_JP further down: that one builds a SECOND executable compiled
+# with VERSION_JP. This one only decides whether the ORDINARY (US) binary is allowed to ingest
+# Japanese-region inputs at all.
+#
+# WHY IT DEFAULTS OFF. The US binary already accepts the Japanese cartridge dump today, on an
+# "experimental" raw-ROM path with no asset extraction. OBSERVED (owner, hands-on testing): that
+# path produces "a lot of static and blasting sounds". That is an ear-safety hazard, not a cosmetic
+# defect, so a plain (release) configure must refuse Japanese inputs outright rather than half-boot
+# them. LIKELY CAUSE, not verified: a raw JP boot still reads cartridge data through this build's
+# US-profile generated binding tables (ASSET_VERSION=us; see the GDX_BUILD_JP block below on the
+# port being US-only in three compile-time layers), so the audio banks/sequences resolve to offsets
+# that hold something else entirely in the Japanese image. Diagnosis is JP-release work; the gate
+# does not depend on it. JP support is a LATER release; none of the JP code is deleted, only gated.
+#
+# WHAT THE GATE COVERS (see the PORT notes at each site):
+#   * port/gdx_firstboot.cpp  — the setup/validation layer. Refuses the JP cartridge dump (by SHA-1
+#                               AND by the ROM header country code, so an unknown JP dump is also
+#                               named as Japanese rather than "unrecognised") and the retail
+#                               Japanese Expansion Kit disk, with an explanatory message; also
+#                               disables the recorded-JP-hash raw-boot fast path.
+#   * port/rom_buffer.cpp     — the runtime cartridge loader (CLI arg / picker / FZEROX_ROM / beside
+#                               the exe), so no JP ROM can reach the emulator through a back door.
+#   * port/disk_buffer.cpp    — the runtime 64DD disk loader: drops the JP disk FILENAMES from the
+#                               search list and refuses the retail JP image by CRC-64 identity.
+# The 64DD IPL is deliberately NOT gated: the drive firmware is Japanese by existence (the 64DD was
+# Japan-only), the JP retail dump is the canonical one every user has, and it carries no game audio.
+#
+# ON restores today's behaviour exactly. The G-Diffuser-JP target below always sets it — building
+# that target is already an explicit Japanese-profile opt-in.
+option(GDX_ALLOW_JP_INPUTS
+       "Accept Japanese-region game data (JP cartridge ROM, retail JP Expansion Kit disk). DEV ONLY — the JP raw-ROM path has broken audio." OFF)
+if(GDX_ALLOW_JP_INPUTS)
+    message(STATUS "G-Diffuser: GDX_ALLOW_JP_INPUTS=ON — Japanese ROM/disk inputs are ACCEPTED (experimental; JP audio is known-bad).")
+    set(GDX_JP_INPUT_DEFS "GDX_ALLOW_JP_INPUTS=1")
+else()
+    # Empty LIST (not an empty string element): an unquoted ${GDX_JP_INPUT_DEFS} then contributes
+    # no argument at all to target_compile_definitions.
+    set(GDX_JP_INPUT_DEFS)
+endif()
+
 if(NOT GDX_EXPANSION_KIT)
     # US base only: exclude Expansion Kit / 64DD code.
     # Mirrors the decomp Makefile's EXPANSION_KIT=0 EXCLUSION_FILES list.
@@ -160,6 +219,7 @@ target_include_directories(gdiffuser_game PRIVATE
 )
 
 target_compile_definitions(gdiffuser_game PRIVATE
+    ${GDX_DEV_TOOLS_DEFS}
     PORT=1
     GDIFFUSER_PORT=1
     NON_MATCHING=1
@@ -177,8 +237,22 @@ target_compile_definitions(gdiffuser_game PRIVATE
 #   C4715/C4716 — non-void function falls off the end (the MIPS compiler left the
 #   return value in $v0 by accident; MSVC returns garbage — AudioHeap_AllocPermanent
 #   handed 0x18 to the audio loader as a buffer pointer).
+#   C4013 — implicit declaration, assumed to return int. Same family, same cause:
+#   a 64-bit pointer comes back in RAX, the implicit-int rule truncates it to EAX,
+#   and the compiler emits `cltq` to sign-extend it back. On MIPS that was the
+#   native ABI and cost nothing; on x64 the caller writes through a bogus pointer.
+#   Course Edit's "Test Course" button crashed exactly this way for want of a
+#   Camera_DrawCourseEditTestRun prototype (fault addr 0xFFFFFFFF87D06E90 — a host
+#   pointer's low 32 bits, sign-extended).
+#
+# These MUST be spelled /we (error), not /wN (set-level). /W0 means "emit no
+# warnings" and outranks any level assigned by /w1NNNN, so the /w14715 /w14716
+# that stood here were dead flags -- the class they claim to keep fatal was never
+# actually checked. Verified directly against cl.exe 14.44: with /W0, /w14715 is
+# silent on a falls-off-the-end function while /we4715 errors on it. /we is
+# independent of the warning level, so it survives /W0.
 if(MSVC)
-    target_compile_options(gdiffuser_game PRIVATE /W0 /w14715 /w14716)
+    target_compile_options(gdiffuser_game PRIVATE /W0 /we4715 /we4716 /we4013)
 else()
     # GCC/Clang (Linux): the decomp C is IDO-era and noisy, so silence warnings like /W0 --
     # but keep the "non-void function falls off the end" class FATAL. On MSVC that is the
@@ -245,8 +319,36 @@ add_executable(G-Diffuser
     gdx_menu.cpp               # In-game ImGui enhancement menu (F1). Pure port-side wiring against
                                 # LUS's ImGui + CVar API; uses the libultraship include dirs the
                                 # G-Diffuser target already has (see target_include_directories +
-                                # target_link_libraries(libultraship) below).
+                                # target_link_libraries(libultraship) below). This half is the SHELL
+                                # (window, sidebar, search, MenuDrawItem) plus the custom blocks.
+    gdx_menu_registry.cpp      # The menu's CONTENTS, declared as data against port/ui/MenuTypes.h
+                                # (the declarative registry ported from HarbourMasters/Lighthouse,
+                                # CC0 1.0). One AddWidget() per control; the shell walks the same
+                                # tree to draw AND to search, which is what makes the search box
+                                # able to find an individual control instead of only a page.
+                                # Separate TU purely for size: it is a long flat declaration with no
+                                # logic worth reading alongside the shell.
+    gdx_console_log.cpp        # Feeds the port log (and spdlog) into LUS's Console window, which
+                                # ships with no log feed of its own.
+    ui/UIWidgets.cpp           # CVar-bound ImGui widgets (ported from HarbourMasters/Lighthouse,
+                                # CC0 1.0). Folds the read + draw + write + save + tooltip sequence
+                                # gdx_menu.cpp used to hand-write for every option into one call.
+                                # Consumers include it as "ui/UIWidgets.hpp" -- port/ is already an
+                                # include dir, so no target_include_directories change is needed.
+                                # gdx_menu.cpp is migrated onto it: 113 call sites, and the
+                                # ImGui::SetTooltip count in that file went from 61 to 2.
+    enhancements/events/GameEvents.cpp      # Enhancement event bus. Owns the EventIDs (it is the one
+                                # TU that defines INIT_EVENT_IDS) and the C fire helpers the
+                                # PORT-gated decomp shims call. REQUIRED: decomp/src/game/racer.c
+                                # references GameEvents_FireOnBoostStart, so omitting this is an
+                                # unresolved-external link failure, not a missing feature.
+    enhancements/tuning/BoostDuration.cpp   # Demo enhancement proving the event layer end to end:
+                                # rewrites the boost timer from gEnhancements.Tuning.BoostDuration
+                                # (0 = stock). Self-registers via a static initializer.
     input_bridge.c
+    gdx_input_script.c        # GDX_INPUT_SCRIPT: dev-only deterministic tick-level input playback for
+                                # unattended automated testing. No-op (single cached getenv) unless the
+                                # env var is set. See its own file header for the script format.
     n64_gfx_bridge.cpp
     gdx_interp.cpp             # R6-P1: matrix frame-interpolation math (guMtxL2F/F2L float lerp),
                                 # dual-pool prev/cur resolution, and per-tick snap state. Drives the
@@ -312,6 +414,10 @@ add_executable(G-Diffuser
     gdx_fps_overlay.cpp        # Optional top-right FPS/frame-time overlay using ImGui's live metrics.
     gdx_perf.cpp               # GDX_PERF=1 frame-time telemetry: per-phase spike attribution +
                                 # periodic p50/p95/p99 summaries through the port log.
+    gdx_dev_gates.c            # Developer-gate table + live cache behind every GDX_* diagnostic /
+                                # behaviour switch surfaced in F1 > Dev Tools. Dependency-free C:
+                                # the CVar entry points arrive as function pointers from main.cpp,
+                                # so the standalone test targets below compile it unchanged.
     gdx_imgui_nav.cpp          # Feeds ImGui menu navigation from the SDL controller directly, so a
                                 # raw DualSense (invisible to ImGui's Win32/XInput backend) can open
                                 # and drive the menu on every platform. Gated on gControlNav.
@@ -329,10 +435,20 @@ add_executable(G-Diffuser
 if(GDX_EXPANSION_KIT)
     # Host-side disk image loader; references gdx_ek_assets_fill from the
     # EK-only EkAssetBindings.c, so it must not build in US-only configs.
-    target_sources(G-Diffuser PRIVATE disk_buffer.cpp)
+    # gen/EkTranslatedOverrides.c (EK reconciliation Phase 3/4a): sparse translated-disk geometry
+    # override table consumed by disk_buffer.cpp's gdx_disk_finalize; EK-only (references the
+    # EK-only machine_create label symbols), so it is gated here alongside disk_buffer.cpp.
+    # gdx_ek_strings.c + gen/EkTranslatedStrings.c (EK reconciliation Phase 4b): the same idea
+    # applied to TEXT rather than textures -- the translated disk's own English, bound to the
+    # overlay string symbols at disk-load time. EK-only for the same reason as the line above:
+    # the table names EK overlay .data symbols that do not exist in a US-only build.
+    target_sources(G-Diffuser PRIVATE disk_buffer.cpp gen/EkTranslatedOverrides.c
+                                      gdx_ek_strings.c gen/EkTranslatedStrings.c)
     # shims.c guards its US-only Leo stubs on this define.
     target_compile_definitions(G-Diffuser PRIVATE EXPANSION_KIT=1)
 endif()
+
+target_compile_definitions(G-Diffuser PRIVATE ${GDX_DEV_TOOLS_DEFS} ${GDX_JP_INPUT_DEFS})
 
 if(WIN32)
     set_target_properties(G-Diffuser PROPERTIES WIN32_EXECUTABLE TRUE)
@@ -545,9 +661,14 @@ endif()
 # chosen over extracting the DSP kernels or #include-ing the .c with a testing guard). Stand-in
 # definitions of the two gdx_resolve_*_host_address externs (normally in n64_gfx_bridge.cpp) live
 # in dsp_tests.c itself, so n64_gfx_bridge.cpp is not part of this target.
+# gdx_dev_gates.c: n64_audio_hle.c reads the developer-gate cache (and port_log.h's log/trace
+# gates do too), so the harness links the same dependency-free table the game uses. It is never
+# bound to a console here, so every gate keeps its env-seeded value — which is exactly what the
+# existing _putenv-based test setup expects.
 add_executable(gdx_dsp_tests
     tests/dsp_tests.c
-    n64_audio_hle.c)
+    n64_audio_hle.c
+    gdx_dev_gates.c)
 if(MSVC)
     target_compile_options(gdx_dsp_tests PRIVATE /W3)
 elseif(GDX_PORT_WARN_FLAGS)
@@ -563,7 +684,8 @@ endif()
 # objects, no libultraship, no decomp headers -- runnable directly after a normal build.
 add_executable(gdx_pcm_capture_tests
     tests/pcm_capture_tests.c
-    gdx_audio_capture.c)
+    gdx_audio_capture.c
+    gdx_dev_gates.c)   # port_log.h's log/trace gates read the developer-gate cache
 if(MSVC)
     target_compile_options(gdx_pcm_capture_tests PRIVATE /W3)
 elseif(GDX_PORT_WARN_FLAGS)
@@ -731,6 +853,7 @@ if(GDX_BUILD_JP)
 
     # Same UB-hardening + define set as gdiffuser_game, but the JP profile triplet.
     target_compile_definitions(gdiffuser_game_jp PRIVATE
+        ${GDX_DEV_TOOLS_DEFS}
         PORT=1
         GDIFFUSER_PORT=1
         NON_MATCHING=1
@@ -757,7 +880,21 @@ if(GDX_BUILD_JP)
         main.cpp
         gdx_gui.cpp
         gdx_menu.cpp
+        gdx_menu_registry.cpp      # Declarative menu registry contents (see US target note). REQUIRED
+                                   # here as well: this target compiles the same gdx_menu.cpp, which
+                                   # declares GdxMenu::RegisterMenu / RegisterDisableReasons and
+                                   # calls them from InitElement -- omitting it is an unresolved
+                                   # external, not a missing feature.
+        gdx_console_log.cpp        # Console window log feed (see US target note)
+        ui/UIWidgets.cpp           # CVar-bound ImGui widgets (see US target note). Listed here too
+                                   # because this target compiles the same gdx_menu.cpp, so the
+                                   # migration must not break JP.
+        enhancements/events/GameEvents.cpp      # Enhancement event bus (see US target note). REQUIRED
+                                   # here as well: this target compiles the same PORT-gated racer.c
+                                   # and therefore references the same GameEvents_FireOnBoostStart.
+        enhancements/tuning/BoostDuration.cpp   # Demo enhancement (see US target note)
         input_bridge.c
+        gdx_input_script.c        # GDX_INPUT_SCRIPT (see US target note)
         n64_gfx_bridge.cpp
         gdx_interp.cpp             # R6-P1: matrix frame-interpolation (see US target note)
         n64_gfx_convert.cpp
@@ -782,6 +919,7 @@ if(GDX_BUILD_JP)
         gdx_input_viewer.cpp
         gdx_fps_overlay.cpp
         gdx_perf.cpp
+        gdx_dev_gates.c            # Developer-gate table + live cache (see the US target note)
         gdx_imgui_nav.cpp
         gdx_workshop.cpp
         mio0_wrap.c
@@ -792,12 +930,19 @@ if(GDX_BUILD_JP)
     # The port glue (main.cpp, extraction launcher, gfx bridge, etc.) is region-agnostic C/C++ that
     # keys profile behavior off the VERSION_JP define, so the exe TUs must see it too (they include
     # decomp headers whose region branches depend on it).
+    # GDX_ALLOW_JP_INPUTS is unconditional here regardless of the option's value: this target IS the
+    # Japanese profile, so refusing Japanese game data would leave it with nothing to load. The
+    # option only governs the ordinary US binary above.
     target_compile_definitions(G-Diffuser-JP PRIVATE
+        ${GDX_DEV_TOOLS_DEFS}
         PORT=1 GDIFFUSER_PORT=1 F3DEX_GBI_2=1 _LANGUAGE_C=1 VERSION_JP=1
+        GDX_ALLOW_JP_INPUTS=1
         ASSET_VERSION=jp ASSET_REVISION=rev0)
 
     if(GDX_EXPANSION_KIT)
-        target_sources(G-Diffuser-JP PRIVATE disk_buffer.cpp)
+        # gen/EkTranslatedOverrides.c, gdx_ek_strings.c: see the matching US-target comment above.
+        target_sources(G-Diffuser-JP PRIVATE disk_buffer.cpp gen/EkTranslatedOverrides.c
+                                             gdx_ek_strings.c gen/EkTranslatedStrings.c)
         target_compile_definitions(G-Diffuser-JP PRIVATE EXPANSION_KIT=1)
     endif()
 

@@ -3,7 +3,8 @@
 // target cannot include. Mirrors rom_buffer.cpp's role for the cartridge.
 #include "port_log.h"
 #include "rom_buffer.h"
-#include "gdx_extract_launch.h" // R8: disk deletion-gate helpers (sidecar disk_sha256 + SHA-256 over memory)
+#include "gdx_extract_launch.h" // disk deletion-gate helpers (sidecar disk_sha256 + SHA-256 over memory)
+#include "gen/EkTranslatedOverrides.h" // translated-disk geometry override table
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -28,12 +29,19 @@ unsigned char* gdx_ddipl_buffer = nullptr;
 unsigned int gdx_ddipl_size = 0;
 
 void gdx_ek_assets_fill(const unsigned char* disk, unsigned long long diskSize);
+// EK text binding (port/gdx_ek_strings.c): copies the translated disk's own English
+// into the overlay string symbols. Declared here for the same reason as the fill
+// above -- it is a C TU with no header of its own worth introducing for one symbol.
+void gdx_ek_strings_apply(const unsigned char* disk, unsigned long long diskSize);
 // Durable disk-save sidecar (port/disk_savefile.cpp). init computes the pristine
 // fingerprint and loads any existing sidecar; apply replays saved dirty ranges
 // over the freshly loaded image. Declared here (host TU boundary) rather than via
 // the decomp side; see disk_savefile.h.
 void gdx_disk_save_init(const char* diskName, const unsigned char* pristine, unsigned int size);
 void gdx_disk_save_apply(unsigned char* buffer);
+// CRC-64/XZ fingerprint helper exposed by disk_savefile.cpp (see disk_savefile.h) -- reused below for
+// EK translated-disk variant detection instead of duplicating the CRC-64 table implementation.
+unsigned long long gdx_disk_crc64(const unsigned char* data, unsigned long long length);
 // Post-fill fixup for the fan-translated EK disk's re-authored Create-Machine
 // label sub-block (port/gdx_ek_disk_overrides.c). Overwrites three garbled I8
 // heading/caption glyphs with authored English ones. No-op for Course Edit
@@ -60,7 +68,7 @@ static void gdx_exe_dir(char* outDir, size_t outSize);
 // pre-sliced font block out of n64ddipl.o2r without touching the IPL ROM file.
 extern "C" int GDiffuser_LoadArchiveFileBytes(const char* key, void* out, size_t outSize, size_t* copiedSize);
 
-// R3 IPL geometry (frozen contract C-R3.1/C-R3.2). DDROM_FONT_START is where the drive-ROM font
+// 64DD IPL geometry (frozen). DDROM_FONT_START is where the drive-ROM font
 // block begins; the port allocates a fixed 0x140000-byte buffer, zero-fills [0, 0xA0000), and copies
 // the font block at 0xA0000 so every consumer's guard (fontAddr >= 0xA0000 &&
 // fontAddr + 0x80 <= gdx_ddipl_size) and LeoGetKAdr's arithmetic hold unchanged.
@@ -68,7 +76,7 @@ extern "C" int GDiffuser_LoadArchiveFileBytes(const char* key, void* out, size_t
 #define GDX_DDIPL_LOGICAL_SIZE 0x140000u
 #define GDX_DDIPL_FONT_BLOCK_BYTES (GDX_DDIPL_LOGICAL_SIZE - GDX_DDROM_FONT_START) // 0xA0000
 
-// C-R3.2 archive-first: when n64ddipl.o2r is mounted, allocate the 0x140000 logical image, zero-fill
+// Archive-first: when n64ddipl.o2r is mounted, allocate the 0x140000 logical image, zero-fill
 // the low region, and copy the archived font block to 0xA0000. Returns true on success. The archived
 // slice is already byte-order-normalized big-endian (the gdx-extract `ipl` step normalized it), so no
 // swap happens here. Absence of the archive returns false and the raw-file fallback below carries.
@@ -137,7 +145,7 @@ static bool gdx_firstboot_ipl_path(char* outPath, size_t outSize) {
 
 // Opens the IPL dump by trying, in order: the firstboot-recorded path, then the canonical
 // "N64DDIPLROM.n64" next to (a) the exe, (b) the chosen ROM, (c) the current working directory. This
-// replaces the old bare CWD-relative fopen (C-R3.4 / RELEASE_HYGIENE): a launch whose CWD is not the
+// replaces the old bare CWD-relative fopen: a launch whose CWD is not the
 // data dir no longer silently loses the drive-ROM font. Returns an open FILE* (caller closes) or null.
 static FILE* gdx_ddipl_open_raw(char* chosenPath, size_t chosenSize) {
     if (chosenSize > 0) {
@@ -156,27 +164,35 @@ static FILE* gdx_ddipl_open_raw(char* chosenPath, size_t chosenSize) {
         }
     }
     // (1) exe dir, (2) next to the chosen ROM, (3) current working directory.
+    // Both known dump filenames are probed in each directory: the canonical
+    // JP-retail name and the US-prototype name the firstboot wizard also
+    // recognizes (a dev-tree boot has no firstboot-recorded path, so this loop
+    // is the only chance to find the US dump — previously only the JP name was
+    // probed here and the drive-ROM font silently stayed blank).
     char exeDir[1024] = {};
     gdx_exe_dir(exeDir, sizeof(exeDir));
     char romDir[1024] = {};
     gdx_dir_of(gdx_rom_path, romDir, sizeof(romDir));
     const char* dirs[] = { exeDir, romDir, "" };
+    const char* names[] = { "N64DDIPLROM.n64", "64DD_IPL_US_MJR.n64" };
     for (const char* dir : dirs) {
-        char path[1200];
-        snprintf(path, sizeof(path), "%sN64DDIPLROM.n64", dir);
-        FILE* f = fopen(path, "rb");
-        if (f != nullptr) {
-            if (chosenSize > 0) {
-                strncpy(chosenPath, path, chosenSize - 1);
-                chosenPath[chosenSize - 1] = '\0';
+        for (const char* name : names) {
+            char path[1200];
+            snprintf(path, sizeof(path), "%s%s", dir, name);
+            FILE* f = fopen(path, "rb");
+            if (f != nullptr) {
+                if (chosenSize > 0) {
+                    strncpy(chosenPath, path, chosenSize - 1);
+                    chosenPath[chosenSize - 1] = '\0';
+                }
+                return f;
             }
-            return f;
         }
     }
     return nullptr;
 }
 
-// Raw-file fallback (retained until R4): loads N64DDIPLROM.n64 and normalizes it to native
+// Raw-file fallback: loads N64DDIPLROM.n64 and normalizes it to native
 // big-endian byte order (dumps circulate as z64/BE, v64/16-bit-swapped, or n64/32-bit-LE; detect by
 // the first byte of the PI header, which is 0x80 in native order).
 static void gdx_ddipl_load_from_raw(void) {
@@ -222,8 +238,8 @@ static void gdx_ddipl_load_from_raw(void) {
     gdx_port_logf("[leo] 64DD IPL ROM loaded from %s (%ld bytes)\n", chosen, sz);
 }
 
-// Provisioning order (C-R3.2): the dedicated archive n64ddipl.o2r first (so a completed setup can
-// delete the IPL ROM file), then the raw-IPL-file fallback (retained until R4's soak rule).
+// Provisioning order: the dedicated archive n64ddipl.o2r first (so a completed setup can
+// delete the IPL ROM file), then the raw-IPL-file fallback.
 static void gdx_ddipl_load(void) {
     if (gdx_ddipl_buffer != nullptr) {
         return;
@@ -311,32 +327,120 @@ static void gdx_exe_dir(char* outDir, size_t outSize) {
 #endif
 }
 
-// R8 Step 1: canonical retail/translated EK image size and the .gdd save key for archive-sourced
-// loads. The R7 managed copy is always kept under this leaf name (gdx_firstboot.cpp copies every
-// source to it), so an archive built from that copy replays saves under the exact same key the
-// managed-copy file path would use -- ".gdd keying (canonical leaf name) unchanged" (R8 invariant).
+// Canonical retail/translated EK image size and the .gdd save key for archive-sourced loads. The
+// managed copy is always kept under this leaf name (gdx_firstboot.cpp copies every source to it),
+// so an archive built from that copy replays saves under the exact same key the managed-copy file
+// path would use. INVARIANT: .gdd keying is by canonical leaf name, never by path.
 #define GDX_DISK_EXACT_BYTES 64931840u
 static const char* const kDiskArchiveSaveKey = "baserom.translated.ek.ndd";
 
 // Deletion-gate verdict. 1 ONLY after a boot both (a) reconstructed the disk from fzerox-disk.o2r and
-// (b) verified SHA-256(reconstructed image) == the R7 managed-copy sha. Read by the Data & Files panel
+// (b) verified SHA-256(reconstructed image) == the managed-copy sha. Read by the Data & Files panel
 // via gdx_disk_archive_verified(); the panel offers deletion only on a passed verdict. No code ever
 // deletes user files -- this is a UX gate, not an action.
 static int s_diskArchiveVerified = 0;
+
+// Which 64DD disk-layout variant is currently loaded, keyed off the
+// pristine image's CRC64 fingerprint (see gdx_disk_finalize below). 0 = JP retail layout (also the
+// safe default for an unrecognized disk -- gdx_ek_assets_fill's retail-JP-derived offset table
+// already serves it correctly), 1 = the fan-translated disk (LuigiBlood/Zoinkity), whose reshaped
+// Create-Machine label sub-block needs the gEkTranslatedOverrides[] re-copy applied below. Read by
+// decomp-side blit call sites (machine_create_draw.c) via gdx_ek_disk_is_translated() so they draw
+// the label textures at the correct width/height for whichever disk is loaded.
+static int s_ekDiskTranslated = 0;
+
+int gdx_ek_disk_is_translated(void) {
+    return s_ekDiskTranslated;
+}
+
+/* Japanese-region gate (CMake option GDX_ALLOW_JP_INPUTS, default OFF — see port/CMakeLists.txt).
+   True when `pristineCrc64` identifies the retail Japanese Expansion Kit disk and this build does
+   not accept Japanese game data. Callers must run this BEFORE installing the buffer into
+   gdx_disk_buffer, so a refused image never reaches gdx_disk_finalize's consumers.
+
+   Identity, not filename: dropping "baserom.jp.ek.ndd" from the search list below closes the
+   ordinary door, but a Japanese image renamed to the translated disk's filename would walk straight
+   past a name check. The CRC-64 fingerprint is the same one gdx_disk_finalize already needs for its
+   layout-variant decision, so the two share one pass over the image and this check is free. */
+static int gdx_disk_is_refused_japanese(unsigned long long pristineCrc64) {
+#ifdef GDX_ALLOW_JP_INPUTS
+    (void) pristineCrc64;
+    return 0;
+#else
+    return pristineCrc64 == GDX_EK_JP_DISK_CRC64;
+#endif
+}
 
 // Common post-load tail, shared by the archive-first branch and the raw-file/managed-copy branch.
 // Assumes gdx_disk_buffer/gdx_disk_size are already set to the PRISTINE image bytes. Runs the leo
 // disk-loaded hook, the EK asset fill, the translated-disk label overrides, the boot-logo texel swap,
 // IPL provisioning, then the durable .gdd save init + replay. `diskName` keys the .gdd sidecar
 // (canonical leaf name only, never a path). `sourceLabel` is logged as "[leo] disk source:".
-static void gdx_disk_finalize(const char* diskName, const char* sourceLabel) {
-    // R7 (C-R7.2): explicit provenance line, stable for a "disk source:" log grep (archive|managed|original).
+// `pristineCrc64` is the caller's CRC-64 of those same pristine bytes — the callers now need it
+// themselves for the Japanese-region gate (gdx_disk_is_refused_japanese), which must run BEFORE the
+// buffer is installed, so it is passed in rather than recomputed here over an identical image.
+static void gdx_disk_finalize(const char* diskName, const char* sourceLabel,
+                              unsigned long long pristineCrc64) {
+    // Explicit provenance line, stable for a "disk source:" log grep (archive|managed|original).
     gdx_port_logf("[leo] disk source: %s\n", sourceLabel);
     gdx_leo_on_disk_loaded(gdx_disk_buffer);
     gdx_ek_assets_fill(gdx_disk_buffer, static_cast<unsigned long long>(gdx_disk_size));
     gdx_ek_disk_overrides_apply();
 
-    /* Host byte order for the boot-logo texels (2026-07-09): the fill above copies raw BIG-ENDIAN
+    // gdx_ek_assets_fill() above filled every EK texture from the
+    // retail-JP-derived offset table (port/gen/EkAssetBindings.c), which is correct for the JP disk
+    // and for the vast majority of the fan-translated disk too (see tools/gen_translated_ek_table.py's
+    // docstring) -- EXCEPT the three Create-Machine label textures the translator's recompile moved
+    // and/or reshaped. Detect the loaded disk's variant from its pristine-bytes CRC64 fingerprint
+    // (same algorithm as disk_savefile.cpp's own sourceHash -- see gdx_disk_crc64 above) and, only on
+    // the translated disk, re-copy those three textures from their TRANSLATED offsets, overwriting the
+    // JP-offset bytes the fill just wrote. The fingerprint is the caller's `pristineCrc64`, taken over
+    // these exact bytes before the buffer was installed (the caller needs it first for the
+    // Japanese-region gate); nothing above mutates the disk buffer, so it is still valid here.
+    {
+        const unsigned long long diskCrc64 = pristineCrc64;
+        if (diskCrc64 == GDX_EK_TRANSLATED_DISK_CRC64) {
+            s_ekDiskTranslated = 1;
+            unsigned int applied = 0;
+            for (unsigned int i = 0; i < gEkTranslatedOverrideCount; i++) {
+                const GdxEkTranslatedOverride& ov = gEkTranslatedOverrides[i];
+                // Self-validating dest bound: ov.destCapacity is sizeof(ov.dest)'s real array,
+                // computed at generation time (see gen_translated_ek_table.py). Skip rather than
+                // overflow the destination if a row's size ever exceeds it (e.g. a future disk
+                // variant reshapes a symbol larger than the table's known destination budget).
+                if (ov.size > ov.destCapacity) {
+                    gdx_port_logf("[ek-translated] SKIP %s: size %u exceeds dest capacity %u\n",
+                                  ov.name, ov.size, ov.destCapacity);
+                    continue;
+                }
+                if (static_cast<unsigned long long>(ov.translatedDiskOffset) + ov.size <=
+                    static_cast<unsigned long long>(gdx_disk_size)) {
+                    memcpy(ov.dest, gdx_disk_buffer + ov.translatedDiskOffset, ov.size);
+                    applied++;
+                }
+            }
+            gdx_port_logf("[ek-translated] applied %u translated-layout overrides (disk variant: translated)\n",
+                          applied);
+
+            // The text half of the same idea. The overrides above fix WHERE the
+            // translated label textures live; this fixes the strings that are not textures at
+            // all -- the disk-status messages, the Create Machine prompts, the driver names and
+            // the Course Edit tooltips, all of which the decomp compiles in as Japanese C
+            // initializers. The translated disk carries English for them in its own overlay
+            // .data, so the port binds to that instead of shipping a translation of its own.
+            // Gated on the same CRC64 verdict: on the retail-JP disk, or any disk this build
+            // does not recognize, the compiled-in Japanese stands and this never runs.
+            gdx_ek_strings_apply(gdx_disk_buffer, static_cast<unsigned long long>(gdx_disk_size));
+        } else if (diskCrc64 == GDX_EK_JP_DISK_CRC64) {
+            s_ekDiskTranslated = 0;
+            gdx_port_logf("[ek-translated] 0 translated-layout overrides applied (disk variant: JP retail -- none needed)\n");
+        } else {
+            s_ekDiskTranslated = 0;
+            gdx_port_logf("[ek-translated] unknown variant CRC64=0x%016llX, serving JP layout\n", diskCrc64);
+        }
+    }
+
+    /* Host byte order for the boot-logo texels: the fill above copies raw BIG-ENDIAN
        disk bytes, but func_806F33D0 (sys_main.c) CPU-blits these u16s into a VI framebuffer that
        everything else treats as host-order. Swap once here, at the only fill site; the blit is this
        texture's only consumer (no GFX-task path reads it as big-endian). This is a decoded-TEXTURE
@@ -352,11 +456,16 @@ static void gdx_disk_finalize(const char* diskName, const char* sourceLabel) {
     // Durable disk save: gdx_disk_buffer is still the PRISTINE image here (the calls above take it as
     // const / patch decoded C arrays, not the disk buffer), so its CRC64 fingerprint is the pristine
     // one. init records that fingerprint + loads any matching sidecar; apply replays saved dirty ranges.
+    // NOTE: this recomputes the same CRC64 the EK-variant check above already took over the identical
+    // bytes. Left as two passes rather than threading a precomputed hash through gdx_disk_save_init's
+    // signature: a second ~62MB table-based CRC64 pass is a few milliseconds, once per boot, and is not
+    // worth widening that function's API for -- correctness (each caller owns its own fingerprint) over
+    // micro-optimization here.
     gdx_disk_save_init(diskName, gdx_disk_buffer, gdx_disk_size);
     gdx_disk_save_apply(gdx_disk_buffer);
 }
 
-// R8 Step 1 archive-first: when fzerox-disk.o2r is mounted and its disk/image inflates to exactly
+// Archive-first: when fzerox-disk.o2r is mounted and its disk/image inflates to exactly
 // GDX_DISK_EXACT_BYTES, use it as the in-memory image source. The archive stores the disk bytes
 // VERBATIM (the loader never byte-swaps the disk buffer -- see gdx_disk_finalize), so archive-sourced
 // and file-sourced images are byte-identical: the existing .gdd replay, gdx_ek_assets_fill, and
@@ -375,8 +484,22 @@ static int gdx_disk_load_from_archive(void) {
         return 0;
     }
 
+    // Japanese-region gate, before anything else touches these bytes: an archive built by a
+    // JP-enabled (development) build, or carried into a release install with the rest of the game
+    // folder, must not become the loaded disk here. Falling through to the file search below is the
+    // right recovery — a translated .ndd or managed copy beside the game still boots.
+    const unsigned long long pristineCrc64 =
+        gdx_disk_crc64(buf, static_cast<unsigned long long>(GDX_DISK_EXACT_BYTES));
+    if (gdx_disk_is_refused_japanese(pristineCrc64)) {
+        gdx_port_logf("[leo] REJECTED fzerox-disk.o2r: it holds the retail JAPANESE Expansion Kit "
+                      "disk, and Japanese-region support is not enabled in this build (configure "
+                      "with -DGDX_ALLOW_JP_INPUTS=ON to enable it)\n");
+        free(buf);
+        return 0;
+    }
+
     // ── Deletion gate ────────────────────────────────────────────────────────────────────────────
-    // SHA-256 of the reconstructed image must equal the R7 managed-copy sha (sidecar disk_sha256)
+    // SHA-256 of the reconstructed image must equal the managed-copy sha (sidecar disk_sha256)
     // before the Data & Files panel may EVER offer deletion. Compute on the PRISTINE bytes now, before
     // gdx_disk_save_apply (inside finalize) replays saves over them. The recorded value is preferred;
     // if the sidecar has none, hash the managed copy file once as a fallback. A missing managed copy or
@@ -405,11 +528,11 @@ static int gdx_disk_load_from_archive(void) {
     gdx_disk_buffer = buf;
     gdx_disk_size = GDX_DISK_EXACT_BYTES;
     gdx_port_logf("[leo] disk image reconstructed from fzerox-disk.o2r (%u bytes)\n", GDX_DISK_EXACT_BYTES);
-    gdx_disk_finalize(kDiskArchiveSaveKey, "archive");
+    gdx_disk_finalize(kDiskArchiveSaveKey, "archive", pristineCrc64);
     return 1;
 }
 
-// R8 Step 1: deletion-gate verdict for the Data & Files panel. 1 iff this boot reconstructed the disk
+// Deletion-gate verdict for the Data & Files panel. 1 iff this boot reconstructed the disk
 // from the archive AND proved byte-identity against the managed copy. Never triggers any deletion.
 int gdx_disk_archive_verified(void) {
     return s_diskArchiveVerified;
@@ -420,7 +543,7 @@ int gdx_disk_load(void) {
         return 1;
     }
 
-    // R8 Step 1: archive-first. A mounted, exact-size fzerox-disk.o2r reconstructs the image (and runs
+    // Archive-first. A mounted, exact-size fzerox-disk.o2r reconstructs the image (and runs
     // the deletion gate); the managed-copy/raw-file search below is the unchanged fallback.
     if (gdx_disk_load_from_archive()) {
         return 1;
@@ -435,6 +558,7 @@ int gdx_disk_load(void) {
     // cartridge ROM, prefer the untranslated JP disk so on-disk text
     // matches the cartridge's language.
     const bool jpRom = gdx_rom_is_japanese();
+#ifdef GDX_ALLOW_JP_INPUTS
     static const char* const kUsPreferredNames[] = {
         "baserom.translated.ek.ndd",
         "baserom.jp.ek.ndd",
@@ -447,8 +571,20 @@ int gdx_disk_load(void) {
     };
     const char* const* diskNames = jpRom ? kJpPreferredNames : kUsPreferredNames;
     const size_t diskNameCount = 3;
+#else
+    /* Japanese-region gate: the Japanese disk FILENAMES are not searched at all in this build, so a
+       .ndd dropped beside the executable under its usual JP name is simply never opened (no read,
+       no 62 MB CRC pass, no log noise). This is the cheap half of the gate; the authoritative half
+       is the CRC-64 identity check below, which also catches a Japanese image renamed to the
+       translated disk's filename. `jpRom` stays in use for the provenance log line further down. */
+    static const char* const kTranslatedOnlyNames[] = {
+        "baserom.translated.ek.ndd",
+    };
+    const char* const* diskNames = kTranslatedOnlyNames;
+    const size_t diskNameCount = 1;
+#endif
 
-    // Search location order (R7 -- disk internalization): (0) the managed copy under
+    // Search location order (disk internalization): (0) the managed copy under
     // <exeDir>/media -- a byte-identical copy gdx_firstboot.cpp creates from the user's original
     // disk at setup time, kept under the SAME canonical leaf name, so the .gdd save key (which
     // derives from the leaf name only, never a path -- see disk_savefile.cpp:381) is unaffected by
@@ -493,7 +629,7 @@ int gdx_disk_load(void) {
                 fclose(f);
                 continue;
             }
-            /* Codebase-audit P2: gdx_leo_on_disk_loaded and LeoReadDiskID read the
+            /* gdx_leo_on_disk_loaded and LeoReadDiskID read the
                LBA-14 disk ID and system area at fixed offsets with no size guard,
                and gdx_ek_assets_fill walks generated diskOffset tables. A truncated
                .ndd would OOB-read immediately. Retail 64DD images are ~64.9 MB;
@@ -514,13 +650,25 @@ int gdx_disk_load(void) {
                 continue;
             }
             fclose(f);
+            /* Japanese-region gate by IDENTITY, before the buffer is installed: catches a Japanese
+               image renamed to a filename this build does search. Continue the search rather than
+               failing outright, so a translated disk in a later location still wins. */
+            const unsigned long long pristineCrc64 =
+                gdx_disk_crc64(buf, static_cast<unsigned long long>(sz));
+            if (gdx_disk_is_refused_japanese(pristineCrc64)) {
+                gdx_port_logf("[leo] REJECTED %s: this is the retail JAPANESE Expansion Kit disk, "
+                              "and Japanese-region support is not enabled in this build (configure "
+                              "with -DGDX_ALLOW_JP_INPUTS=ON to enable it)\n", path);
+                free(buf);
+                continue;
+            }
             gdx_disk_buffer = buf;
             gdx_disk_size = static_cast<unsigned int>(sz);
             gdx_port_logf("[leo] disk image loaded: %s (%ld bytes) -- picked from %s, region=%s\n", path, sz,
                           loc.why, jpRom ? "JP (matches cartridge ROM)" : "US/unknown (default preference)");
             // Managed-copy/raw-file load: no archive reconstruction happened this boot, so the deletion
             // gate stays unproven (s_diskArchiveVerified remains 0) and the disk is NOT marked deletable.
-            gdx_disk_finalize(diskNames[i], loc.managed ? "managed" : "original");
+            gdx_disk_finalize(diskNames[i], loc.managed ? "managed" : "original", pristineCrc64);
             return 1;
         }
     }

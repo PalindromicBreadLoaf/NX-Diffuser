@@ -5,8 +5,7 @@
 //   * every portable install uses the executable directory for data and runs the in-window setup on
 //     its first launch, even when the user already placed all three canonical inputs beside the game.
 //
-// See docs/FIRST_BOOT_DESIGN.md for the full inventory, layout, flow, and honest scope limits
-// (notably: generic.o2r generation and Windows save-path redirection are NOT solved by this slice).
+// Known limits: generic.o2r generation and Windows save-path redirection are NOT handled here.
 #pragma once
 
 #include <string>
@@ -64,8 +63,31 @@ const char* SetupDiskFileName();  // "baserom.translated.ek.ndd"
 const char* SetupIplFileName();   // "N64DDIPLROM.n64"
 // Accepted alternate names for the Japanese dumps: the wizard probes these when the canonical name
 // is absent, so a JP test folder needs no renaming. A JP ROM boots RAW (experimental; no archives).
+//
+// These keep returning their real names even when the build does NOT accept Japanese inputs (CMake
+// GDX_ALLOW_JP_INPUTS=OFF, the release default). That is deliberate: the probe is what lets the
+// wizard FIND the file and then refuse it by name — "this is the Japanese release, not enabled in
+// this build" — instead of leaving the row on a bare "Missing" that explains nothing. The refusal
+// itself is decided in GdxRecognizeInput, by hash and by ROM-header country code, never by filename.
 const char* SetupRomFileNameJp();  // "baserom.jp.rev0.z64"
 const char* SetupDiskFileNameJp(); // "baserom.jp.ek.ndd"
+// Accepted alternate name for the US prototype 64DD IPL dump: the wizard probes this when
+// N64DDIPLROM.n64 is absent, so a folder holding the dump under its original filename needs no
+// renaming. See kKnownIplDumps in gdx_firstboot.cpp for the recognized SHA-1/label.
+const char* SetupIplFileNameUsProto(); // "64DD_IPL_US_MJR.n64"
+
+// Resolve the 64DD IPL ROM source file inside `dir`: probes the canonical name (N64DDIPLROM.n64)
+// first, then the accepted US-prototype alternate name (64DD_IPL_US_MJR.n64) if the canonical name is
+// absent. Pure existence probe -- does not validate structure/size (callers that need that still call
+// ValidateIplFile/the internal validateIpl themselves). Returns the resolved absolute-or-as-given path
+// (whichever name matched), or an empty string when NEITHER name exists in `dir`.
+//
+// Shared by the in-window setup GUI's Recheck(), FirstBootRun's dev-layout and SetupComplete-fast-path
+// probes (gdx_firstboot.cpp), and the boot-time archive builder (gdx_extract_launch.cpp's
+// ensureIplArchive) so the accepted alternate name can never drift between the three surfaces again.
+// (This exists because the boot-time path once probed only the canonical name and silently booted
+// with no IPL archive and no warning when just the alt-named dump was present in the data dir.)
+std::string GdxFindIplSourceInDir(const std::string& dir);
 
 // Structural validators. Return true if the file at `path` is a plausible input; on false, `why`
 // receives a short human-readable reason (region/size/magic mismatch). A non-existent file is
@@ -84,10 +106,25 @@ bool CopyInputInto(const std::string& srcPath, const std::string& dataDir, const
 //   * ROM  — the US-rev0 dump is VerifiedKnown; the Japan dump is ACCEPTED (AcceptedUnknownWarn with
 //            `jpRom` set) for the experimental raw-ROM boot — setup then SKIPS archive extraction for
 //            it. Any other hash is Rejected with the generic mismatch message.
-//   * IPL  — the one known dump is labelled (VerifiedKnown); every other correctly-sized dump is
-//            AcceptedUnknownWarn (accepted, but the caller must surface the warning text visibly).
+//   * IPL  — each known dump (JP retail, US prototype) is labelled by region (VerifiedKnown); every
+//            other correctly-sized dump is AcceptedUnknownWarn (accepted, but the caller must surface
+//            the warning text visibly).
 //   * disk — each known dump is labelled by region (VerifiedKnown); any other correctly-sized image is
 //            AcceptedUnknownWarn. The size gate stays a hard reject inside ValidateDiskFile.
+//
+// JAPANESE-REGION GATE (CMake option GDX_ALLOW_JP_INPUTS, default OFF — see port/CMakeLists.txt).
+// With the option OFF this function REJECTS Japanese game data at this validation layer, which is
+// the single place the wizard, the drag & drop handler and the Browse… picker all funnel through:
+//   * ROM  — the Japanese dump is Rejected by SHA-1, and ANY other image whose N64 header country
+//            code is 'J' is Rejected too, so an uncatalogued Japanese dump is still named as
+//            Japanese rather than reported as an unrecognised file.
+//   * disk — the retail Japanese Expansion Kit disk is Rejected by SHA-1. Unrecognised images are
+//            unaffected (a 64DD image carries no region marker that separates the fan-translated
+//            disk from the Japanese one it was built from).
+//   * IPL  — NOT gated in either state. The 64DD drive firmware is Japanese by existence (the 64DD
+//            shipped only in Japan), the JP retail dump is the canonical one, and it carries no
+//            game audio — refusing it would break essentially every user for no safety benefit.
+// With the option ON, every verdict above is exactly what it was before the gate existed.
 enum class GdxInputVerdict {
     VerifiedKnown,        // recognized known-good dump — OK/green; `message` is a confirmation label
     AcceptedUnknownWarn,  // structurally valid but unrecognized — OK/green; `message` is a visible warning
@@ -113,12 +150,12 @@ GdxInputRecognition GdxRecognizeInput(const std::string& canonicalName, const st
 
 // Canonical installed archive names (what a validated archive satisfies which input). Exposed so the
 // in-window setup rows can truthfully report a requirement met by its archive when the original file
-// is gone (R7/R8: originals are deletable once the archive covers them).
+// is gone: originals are deletable once the archive covers them.
 const char* SetupGameArchiveFileName();  // "fzerox.o2r"    — satisfies the ROM input
 const char* SetupIplArchiveFileName();   // "n64ddipl.o2r"  — satisfies the 64DD IPL input
 const char* SetupDiskArchiveFileName();  // "fzerox-disk.o2r" — satisfies the EK disk input
 
-// ── Managed disk copy (R7: disk internalization) ───────────────────────────────────────────────
+// ── Managed disk copy (disk internalization) ───────────────────────────────────────────────────
 // A byte-identical copy of the validated Expansion Kit disk, held under <dataDir>/media/<canonical
 // disk name> so the user's original .ndd becomes deletable after setup, exactly like the ROM/IPL
 // (which the port only ever reads back from their installed copies). Kept in a subdirectory SEPARATE
@@ -149,17 +186,16 @@ bool EnsureManagedDiskCopy(const std::string& dataDir, const std::string& valida
 bool WriteSetupComplete(const std::string& dataDir, const std::string& romPath,
                         const std::string& diskPath, const std::string& iplPath);
 
-// ── Missing-input diagnostic (R4 C-R4.1 UX helper) ─────────────────────────────────────────────
+// ── Missing-input diagnostic ───────────────────────────────────────────────────────────────────
 // Conservative, read-only summary of which of the three canonical inputs (ROM / 64DD IPL ROM /
 // Expansion Kit disk) and which game archive are missing or invalid under `dataDir`. Built entirely
-// from the same file-existence + structural-validator helpers this header already exports (plus the
-// R7 managed-copy path), so it never opens a new probe surface and never throws. Returns an empty
-// string when everything needed to boot is present and valid.
+// from the same file-existence + structural-validator helpers this header already exports, so it
+// never opens a new probe surface and never throws. Returns an empty string when everything needed
+// to boot is present and valid.
 //
-// Intended consumer: main.cpp's no-ROM boot error path (C-R4.1 -- "archives validated ⇒ boot
-// proceeds without FZEROX_ROM; missing/invalid archives + missing ROM ⇒ actionable wizard error").
-// This helper is NOT wired into main.cpp by this change -- another agent owns that integration this
-// wave; it only produces the user-presentable text the future error path can display.
+// NO CALLER TODAY. Intended consumer: main.cpp's no-ROM boot error path. It produces only the
+// user-presentable text; the decision to fail the boot and the surface that displays it are not
+// wired up.
 std::string GdxFirstBootDescribeMissing(const std::string& dataDir);
 
 // ── Exported archive-satisfied checks (shared with the in-window wizard's Recheck) ────────────────

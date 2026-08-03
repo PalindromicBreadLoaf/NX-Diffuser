@@ -1,4 +1,4 @@
-// port/n64_sched.c — R6 cooperative fiber scheduler (Option B).
+// port/n64_sched.c — cooperative fiber scheduler.
 //
 // Runs the decomp's REAL N64 threads as cooperative fibers. The decomp's own libultra scheduler
 // (startthread.c / recvmesg.c / sendmesg.c / yieldthread.c / stopthread.c) calls the low-level
@@ -35,6 +35,7 @@
 #include <string.h>
 
 #include "port_log.h"
+#include "gdx_dev_gates.h" // Dev Tools gate layer: the diagnostic/behavior switches below
 
 // ---------------------------------------------------------------------------------------------
 // Per-thread fiber registry. We capture entry+arg here (with full 64-bit pointers) because the
@@ -487,7 +488,7 @@ void gdx_yield_to_host(void) {
 // GDX_CK checkpoints and func_800690FC's entry trace; a burst more during every game-mode
 // transition from game.c's GMI_* checkpoints) -- see the comment on gdx_trace_enabled() in
 // port_log.h for why they're gated off by default (GDX_TRACE=1 re-enables them).
-/* GDX-DEBUG-2026-07-15: real (non-inline) extern printf-style logger so the bounded
+/* Real (non-inline) extern printf-style logger so the bounded
    [GDX-DBG ...] probes in transition.c (decomp) and interpreter.cpp (libultraship) can
    link against a single symbol -- gdx_port_logf is static inline (header-only) and does
    not export. Always on (mirrors gdx_port_logf's own ungated boot/one-shot behaviour).
@@ -514,13 +515,13 @@ void gdx_ckp(const char* s, void* p) {
     gdx_port_logf("%s=%p\n", s, p);
 }
 
+/* The gate accessors below used to each own a `static int sCached = -1;` + getenv. They now read
+   the shared Dev Tools gate cache (port/gdx_dev_gates.{h,c}), which is seeded from the same env
+   vars at startup and refreshed from its CVar once per frame. The signatures are unchanged: the
+   decomp C and the gfx bridge keep calling exactly these names. A gate read is now a single
+   aligned int load, so the per-frame call sites got cheaper, not more expensive. */
 int gdx_unlock_diag_enabled(void) {
-    static int sCached = -1;
-    if (sCached < 0) {
-        const char* env = getenv("GDX_DIAG_UNLOCK");
-        sCached = (env != NULL && env[0] != '\0' && env[0] != '0') ? 1 : 0;
-    }
-    return sCached;
+    return gdx_dev_gate(GDX_GATE_DIAG_UNLOCK);
 }
 
 void gdx_unlock_diagf(const char* fmt, ...) {
@@ -535,47 +536,70 @@ void gdx_unlock_diagf(const char* fmt, ...) {
 }
 
 /* GDX_DIAG_VERBOSE gate for the per-frame diagnostic log families
-   ([gfxdiag], [game], [seg], [sched], [phasegeom], [bigtri]). Cached like
-   gdx_trace_enabled(); silent (0) by default, enabled by GDX_DIAG_VERBOSE set
-   to any non-"0" value. */
+   ([gfxdiag], [game], [seg], [sched], [phasegeom], [bigtri]). Silent (0) by
+   default; enabled by GDX_DIAG_VERBOSE at launch or live from
+   F1 > Dev Tools > Logging (Bucket D: see port/gdx_dev_gates.h). */
 int gdx_diag_verbose(void) {
-    static int sCached = -1;
-    if (sCached < 0) {
-        const char* env = getenv("GDX_DIAG_VERBOSE");
-        sCached = (env != NULL && env[0] != '\0' && env[0] != '0') ? 1 : 0;
-    }
-    return sCached;
+    return gdx_dev_gate(GDX_GATE_DIAG_VERBOSE);
 }
 
-/* GDX_RAIL_COLOR_TEST gate (interp strobe investigation, decomp course.c rail
-   primcolor sites): freezes the rail chevron color sawtooth to a constant so a
-   single attract/race run answers whether the owner-reported interp-on rail
-   strobe is the frozen-color-animation stepping unevenly (strobe gone => build
-   primcolor value-interpolation in the bridge). Cached like gdx_diag_verbose;
-   OFF by default (stock color animation). */
+/* GDX_RAIL_COLOR_TEST gate (decomp course.c rail primcolor sites): freezes the rail
+   chevron color sawtooth to a constant so one run distinguishes an interpolation
+   strobe from the frozen color animation stepping unevenly (strobe gone => build
+   primcolor value-interpolation in the bridge). CHANGES WHAT IS RENDERED, so this
+   is a Bucket B gate: OFF by default (stock color animation) and compiled out
+   entirely of a build without GDX_DEV_TOOLS. */
 int gdx_rail_color_test_enabled(void) {
-    static int sCached = -1;
-    if (sCached < 0) {
-        const char* env = getenv("GDX_RAIL_COLOR_TEST");
-        sCached = (env != NULL && env[0] != '\0' && env[0] != '0') ? 1 : 0;
-    }
-    return sCached;
+    return gdx_dev_gate(GDX_GATE_RAIL_COLOR_TEST);
 }
 
 /* GDX_DIAG_RIVAL gate (rival-icon investigation, decomp racer.c draw gate):
    arms a once-per-second dump of every boolean in the rival-icon draw
    condition plus, when the gate passes, the emitted texrect screen coords —
    splitting "gate never passes" from "draw emitted but invisible"
-   (prim-depth/interpreter suspicion) in a single logged race. Cached like
-   gdx_rail_color_test_enabled; OFF by default. */
+   (prim-depth/interpreter suspicion) in a single logged race. OFF by default. */
 int gdx_diag_rival_enabled(void) {
-    static int sCached = -1;
-    if (sCached < 0) {
-        const char* env = getenv("GDX_DIAG_RIVAL");
-        sCached = (env != NULL && env[0] != '\0' && env[0] != '0') ? 1 : 0;
-    }
-    return sCached;
+    return gdx_dev_gate(GDX_GATE_DIAG_RIVAL);
 }
+
+/* GDX_DIAG_CUSTOMMACHINE gate (Create Machine flat-navy preview): dumps the
+   gCustomMachine record the draw path actually reads. The struct is defined
+   `= { 0 }` (expansion_kit_data.c), and machine_create_draw.c indexes its
+   texture arrays as `logo - 1` / `number - 1` / `decal - 1`, so an
+   uninitialized record means index -1 and a black env color — which would
+   explain both the zero-content logo/number tiles and the untextured hull
+   without any resolver being at fault. One logged entry into the screen
+   separates "record never initialized" from "record fine, asset layer at
+   fault". Rate-limited to one line per distinct record. OFF by default. */
+int gdx_diag_custommachine_enabled(void) {
+    return gdx_dev_gate(GDX_GATE_DIAG_CUSTOMMACHINE);
+}
+
+/* GDX_DIAG_LOOKAT gate (Create Machine flat-navy preview, narrowing pass): the
+   custom-machine part display lists are an environment-mapped reflection
+   overlay — seg-9 state DL D_90186C8, gSPLookAt, the D_9000008 16x16 RGBA16
+   reflection texture, prim alpha 80. The same pass over the same display lists
+   renders correctly on the machine-settings screen (ovl_i4/machine.c:1530), so
+   the asset, the DLs and texgen are all proven good; what differs is the matrix
+   fed to Light_SetLookAtSource. machine.c uses a real camera view matrix,
+   func_xk3_80130698 uses gGfxPool->unk_20108. A degenerate source there yields
+   a dead texgen basis and collapses the overlay to a flat fill showing the
+   stale cockpit env color — which is exactly the reported navy. This logs both
+   sites so the two bases can be compared directly. Rate-limited per site.
+   Diagnostic only: no rendering changes, safe in Release. */
+int gdx_diag_lookat_enabled(void) {
+    return gdx_dev_gate(GDX_GATE_DIAG_LOOKAT);
+}
+
+
+/* Shares GDX_DIAG_NODEINFO with the SETTIMG-side probe in n64_gfx_bridge.cpp so
+   one run captures both ends of the same question: whether the Course Edit info
+   text is drawn at all, and whether its font sheets resolve when it is. */
+int gdx_dev_gate_by_name_nodeinfo(void) {
+    return gdx_dev_gate(GDX_GATE_DIAG_NODEINFO);
+}
+
+
 
 void gdx_seg_log(const char* kind, int seg, uintptr_t raw, void* resolved) {
     if (!gdx_trace_enabled()) return;
@@ -759,8 +783,11 @@ void gdx_dispatch(void) {
 // ---------------------------------------------------------------------------------------------
 // RDRAM size + SP task submission.
 // osMemSize: 4 MB N64 base RAM (US base game; the Expansion Kit / 64DD needs the 8 MB pak).
-// The osSpTask* functions are STUBS for now — R6 piece 4 routes the GFX OSTask's display list to
-// libultraship's Fast3D (Fast3dWindow::DrawAndRunGraphicsCommands) and posts SP/DP completion.
+// Task submission is SPLIT: osSpTaskStartGo below is real — it dispatches on OSTask_t.type,
+// running M_GFXTASK display lists through gdx_gfx_run (the Fast3D bridge) and M_AUDTASK command
+// lists through gdx_audio_lle_run, then posts SP + DP completion. osSpTaskLoad / osSpTaskYield /
+// osSpTaskYielded stay no-ops: there is no RSP to load ucode into and nothing to preempt, since
+// gdx_gfx_run/gdx_audio_lle_run complete synchronously inside StartGo.
 // ---------------------------------------------------------------------------------------------
 u32 osMemSize = 0x1000000; /* 16 MB: base 8MB + Expansion Pak (required by F-Zero X US) */
 
@@ -918,10 +945,10 @@ void osSpTaskStartGo(OSTask* tp) {
         gdx_port_logf("[sched] osSpTaskStartGo: dl=%p size=%u\n",
                       (void*)tp->t.data_ptr, (unsigned)tp->t.data_size);
     }
-    /* DETERMINISTIC ROOT-DL POINTER CARRY (campaign soak fix, 2026-07-08):
+    /* DETERMINISTIC ROOT-DL POINTER CARRY:
        OSTask_t.data_ptr is a u64* -- on the host it already holds the FULL
        64-bit pointer to gGfxPool->gfxBuffer (see Gfx_SetTask). This is the one
-       task pointer the wide-Gfx campaign relies on being carried intact: the
+       task pointer that MUST be carried intact: the
        root DL is fed to the bridge BY POINTER, so it is NEVER subject to the
        low32 truncation + module-window guessing that corrupts sub-DL/vertex
        pointers. Passing tp->t.data_ptr straight through preserves that. The

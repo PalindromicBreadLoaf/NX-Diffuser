@@ -1,5 +1,5 @@
 // G-Diffuser — port entry point.
-// Slice 4c: granular libultraship init. The ControlDeck must be constructed AFTER the Context +
+// Granular libultraship init. The ControlDeck must be constructed AFTER the Context +
 // ConsoleVariables exist (its GlobalSDLDeviceSettings reads CVars via Context::GetInstance()),
 // so we use CreateUninitializedInstance + step-by-step Init rather than the one-shot CreateInstance.
 // After init: register factories, bind assets, then hand off to the decomp boot (bootproc).
@@ -16,9 +16,11 @@
 // WriteToPad -> OSContPad). The port previously used GDiffuser::ControlDeck, a stub that extended
 // the ABSTRACT Ship::ControlDeck: it created no ports and its WriteToPad did nothing, so nobody
 // could read controller state. LUS::ControlDeck is `final`, so we use it directly rather than
-// subclassing. The port's input read (gdx_lus_read_pad below) drives the decomp through it.
+// subclassing. The port's input read (gdx_lus_read_pads below) drives the decomp through it.
 #include "libultraship/controller/controldeck/ControlDeck.h"
-#include "libultraship/libultra/controller.h"  // OSContPad + MAXCONTROLLERS (for gdx_lus_read_pad)
+#include "ship/controller/controldevice/controller/Controller.h"      // Ship::Controller (per-port mapping queries)
+#include "ship/controller/physicaldevice/PhysicalDeviceType.h"        // Keyboard / Mouse / SDLGamepad
+#include "libultraship/libultra/controller.h"  // OSContPad + MAXCONTROLLERS (for gdx_lus_read_pads)
 #include "libultraship/bridge/consolevariablebridge.h"  // CVarGetInteger (audio buffer-frames CVar)
 #include "fast/Fast3dWindow.h"
 #include "ship/debug/Console.h"
@@ -31,17 +33,18 @@
 #include "libultraship/window/gui/InputEditorWindow.h"  // LUS::InputEditorWindow (Controls tab)
 #include "gdx_ghost_window.h"                            // GdxGhostWindow (Practice tab — saved-ghost browser)
 #include "gdx_input_viewer.h"                            // GdxInputViewer (Settings tab + overlay)
-#include "gdx_imgui_nav.h"                               // SDL-controller -> ImGui menu navigation feed
+#include "gdx_console_log.h"                             // port log -> LUS Console window feed
 #include "port_log.h"
 #include "rom_buffer.h"
 #include "gdx_firstboot.h"  // first-boot setup + per-user data directory (runs before LUS init)
 #include "gdx_firstboot_gui.h"  // in-window ImGui first-time setup flow (NeedsSetup path)
 #include "gdx_fps_overlay.h" // optional Stats-backed FPS/frame-time counter
 #include "gdx_perf.h"        // GDX_PERF=1 frame-time telemetry (spike attribution + summaries)
+#include "gdx_dev_gates.h"   // Dev Tools gate layer: env seeding, boot seeding, per-frame refresh
 #include "gdx_extract_launch.h"  // runtime O2R extraction (produces generic.o2r before the mount)
 #include "gdx_audio_thread.h"
 #include "gdx_frame_pacer.h"  // optional wall-clock 60Hz pacer (gEnhancements.Graphics.FramePacing)
-#include "n64_gfx_bridge.h"   // R6-P2 frame-interpolation host API (gdx_gfx_interp_*)
+#include "n64_gfx_bridge.h"   // frame-interpolation host API (gdx_gfx_interp_*)
 #include <SDL2/SDL.h>  // SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER): enable gamepad auto-detection
 
 #include <algorithm>
@@ -55,20 +58,21 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
-extern "C" void GDiffuser_LoadAllAssets(void); // generated asset binding loader (R2)
+extern "C" void GDiffuser_LoadAllAssets(void); // generated asset binding loader
 extern "C" void bootproc(void);                // decomp boot entry (src/sys/sys_main.c)
-extern "C" void gdx_sched_init(void);          // R6: init cooperative fiber scheduler (host fiber)
+extern "C" void gdx_sched_init(void);          // init cooperative fiber scheduler (host fiber)
 extern "C" void gdx_sched_drain_deferred_wakes(void); // cross-thread mesg wakes -> run queue (host)
-extern "C" void gdx_init_rom(int argc, char** argv, int archivesValidated); // S5: load ROM into host buffer (R4: archivesValidated gates no-ROM boot)
-extern "C" void gdx_vi_tick(void);             // R6: advance VI + post retrace (wakes Main thread)
-extern "C" void gdx_dispatch(void);            // R6: run game threads until quiescent
+extern "C" void gdx_init_rom(int argc, char** argv, int archivesValidated); // load ROM into host buffer (archivesValidated gates the no-ROM boot)
+extern "C" void gdx_vi_tick(void);             // advance VI + post retrace (wakes Main thread)
+extern "C" void gdx_dispatch(void);            // run game threads until quiescent
 extern "C" void gdx_vi_present_fallback(void); // VI-scanout fallback: present CPU-drawn framebuffers
 extern "C" void gdx_controller_poll(void);     // PORT: host keyboard -> decomp controller globals
 extern "C" void gdx_fixed_aspect_tick(void);   // input_bridge: force 4:3 rendering for the EK editors
 extern "C" int gdx_get_force_fixed_aspect(void); // libultraship interpreter.cpp: 1 while an EK editor forces 4:3
-extern "C" void gdx_rdram_init(void);          // n64-rdram-buffer: allocate 8MB RDRAM before bootproc
+extern "C" void gdx_rdram_init(void);          // n64-rdram-buffer: allocate 16MB RDRAM before bootproc
 extern "C" void gdx_register_host_range(void* ptr, size_t size); // n64_gfx_bridge: expose range for TryResolveAddress
 extern "C" void gdx_register_main_module_range(void); // n64_gfx_bridge: resolve low32 EXE/BSS segment tokens
 extern "C" void gdx_game_request_reset(void); // game.c: schedule a title reset at the game-flow boundary
@@ -84,7 +88,19 @@ static void logStep(const char* s) {
     gdx_port_logf("[G-Diffuser] %s\n", s);
 }
 
-// ── R6-P2 frame-interpolation host support ───────────────────────────────────────────────────
+// ── Dev Tools gate layer <-> console-variable adapters ────────────────────────────────────────
+// port/gdx_dev_gates.c is deliberately dependency-free C (the standalone unit-test executables
+// compile it unchanged), so it receives the CVar entry points as function pointers. These two
+// thunks exist so the pointer types match exactly rather than relying on int32_t and int being the
+// same type on every toolchain we build with.
+static int GdxGateCVarGet(const char* name, int defaultValue) {
+    return static_cast<int>(CVarGetInteger(name, static_cast<int32_t>(defaultValue)));
+}
+static void GdxGateCVarSet(const char* name, int value) {
+    CVarSetInteger(name, static_cast<int32_t>(value));
+}
+
+// ── Frame-interpolation host support ─────────────────────────────────────────────────────────
 // One 60 Hz logic-tick budget (N64 NTSC field = 1.001/60 s). The sim advances exactly one tick
 // per iteration; when interpolation is on, presents are decoupled but this deadline still paces
 // the sim at 60 Hz (the frame pacer is mutually excluded — see gdx_frame_pacer.c).
@@ -95,7 +111,7 @@ static constexpr double kGdxInterpTickSeconds = 1.001 / 60.0;
 // Target FPS ceiling (480/60 = 8) and a typical 480Hz+ "Match Refresh Rate" panel alike.
 static constexpr int kGdxInterpMaxSubframes = 8;
 
-// Real-FPS visibility getters added to the gfx bridge (2026-07-23). Declared at file scope so no
+// Real-FPS visibility getters on the gfx bridge. Declared at file scope so no
 // n64_gfx_bridge.h change is needed — same minimal-include idiom gdx_menu.cpp uses for the existing
 // gdx_gfx_interp_last_* accessors. Used by the [interp-p2] telemetry line in the frame loop.
 extern "C" double gdx_gfx_interp_presents_per_sec(void);
@@ -121,7 +137,7 @@ static void gdx_host_pace_logic_until(double deadlineSeconds) {
     }
 }
 
-// Match-Refresh robustness (R6-P2 FIELD-DEFECT FIX, 2026-07-23): some libultraship monitor-detection
+// Match-Refresh robustness: some libultraship monitor-detection
 // paths report 60 Hz on a high-refresh panel (observed on this hardware: Fast3dWindow::
 // GetCurrentRefreshRate() -> GetMonitorHzPeriod returned 60 on a 143 Hz display), which pins Frame
 // Interpolation's default "Match Refresh Rate" mode to M=1 (no interpolation at all). Cross-check the
@@ -129,7 +145,7 @@ static void gdx_host_pace_logic_until(double deadlineSeconds) {
 // panel even when the backend under-reports. Returns 0 (unknown) on failure or a "hardware default"
 // (0/1) frequency, so a genuine 60 Hz panel is unaffected (both sources agree on 60).
 //
-// MULTI-MONITOR FIX (2026-07-23): the original implementation took the MAX Hz over every active
+// MULTI-MONITOR: an earlier implementation took the MAX Hz over every active
 // display path system-wide, not the Hz of the monitor the game window is actually on. On a mixed-
 // refresh rig (e.g. a 60 Hz primary + a 144 Hz secondary) with the window on the lower-Hz panel,
 // that max-over-paths value fed interpEffectiveTarget too high; with VSync on, the resulting M
@@ -258,31 +274,193 @@ static int gdx_os_display_refresh_hz(int32_t, int32_t, uint32_t, uint32_t, const
 // it lives at file scope.
 static uint8_t sGdxControllerBits = 0;
 
+// ── Multi-pad routing: SDL gamepads -> LUS ControlDeck ports ─────────────────────────────────────
+// LUS routes physical devices to ports through the ConnectedPhysicalDeviceManager's per-port ignore
+// list, and its out-of-the-box state is single-player only:
+//   * RefreshConnectedSDLGamepads() (ship/controller/physicaldevice/ConnectedPhysicalDeviceManager
+//     .cpp:107-109) inserts EVERY newly seen gamepad into the ignore list of ports 1..3, so a pad is
+//     readable on port 0 and nowhere else — four plugged-in pads all drive player 1.
+//   * ControlDeck::Init() (ship/controller/controldeck/ControlDeck.cpp:36-40) seeds default
+//     mappings for port 0 only, so ports 1..3 have no bindings at all even once a device reaches
+//     them.
+// That is why split-screen VS / Death Race had no second player: the decomp side was hardcoded to
+// one controller (input_bridge.c), and the LUS side had nothing to offer ports 2-4 anyway.
+//
+// This gives each connected gamepad its own port and seeds that port's default gamepad mappings
+// once. Three deliberate restrictions keep it from surprising anyone:
+//   * With fewer than two gamepads connected we do nothing at all, so a lone pad keeps LUS's
+//     permissive "any gamepad drives player 1" behaviour. That matters for hubs / wireless
+//     receivers that expose phantom SDL gamepads: with one real pad an exclusive assignment could
+//     hand port 0 to the phantom and leave player 1 dead.
+//   * Assignments are STICKY. A pad keeps the port it already owns; only pads we have never seen
+//     are placed, and they take the lowest port no other pad holds. Re-deriving the mapping from
+//     scratch on every hotplug would renumber the survivors — unplug pad 2 in a three-player race
+//     and pad 3's owner would inherit car 2 mid-corner.
+//   * Default mappings are only ADDED to a port that has no gamepad mapping yet, so anything the
+//     user bound by hand in the Input Editor is never overwritten.
+//
+// The ignore lists live in memory only and LUS rebuilds them on every hotplug refresh (which is
+// exactly why the sticky map has to be ours), so the routing is re-applied whenever the connected
+// instance-id set changes — but NOT every frame, so the Input Editor's per-port device checkboxes
+// stay usable while the user is toggling them.
+static std::vector<int32_t> sGdxRoutedGamepadIds;              // last seen connected set, sorted
+static std::unordered_map<int32_t, uint8_t> sGdxGamepadPorts;  // SDL instance id -> owned port
+
+static bool gdxPortOwnedByAGamepad(uint8_t port) {
+    for (const auto& [instanceId, ownedPort] : sGdxGamepadPorts) {
+        if (ownedPort == port) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void gdxSyncGamepadPortRouting(const std::shared_ptr<Ship::ControlDeck>& controlDeck) {
+    if (CVarGetInteger("gEnhancements.Input.AutoAssignGamepadPorts", 1) == 0) {
+        return; // opt-out: leave every port exactly as the Input Editor configured it.
+    }
+
+    auto devices = controlDeck->GetConnectedPhysicalDeviceManager();
+    if (devices == nullptr) {
+        return;
+    }
+
+    // GetConnectedSDLGamepadNames() is an unordered_map, so sort to get a stable, reproducible
+    // order. SDL instance ids increase monotonically as devices are opened, which makes ascending
+    // order equal to plug order — so a pad that was already plugged in sorts before a newcomer.
+    std::vector<int32_t> ids;
+    for (const auto& [instanceId, name] : devices->GetConnectedSDLGamepadNames()) {
+        ids.push_back(instanceId);
+    }
+    std::sort(ids.begin(), ids.end());
+
+    if (ids == sGdxRoutedGamepadIds) {
+        return; // connected set unchanged since the last apply — nothing to re-route.
+    }
+    sGdxRoutedGamepadIds = ids;
+
+    if (ids.size() < 2) {
+        sGdxGamepadPorts.clear();
+        return; // single-pad (or no-pad) setup: keep LUS's permissive port-0 default.
+    }
+
+    // Release the ports of pads that are gone, so a newcomer can reuse them.
+    for (auto it = sGdxGamepadPorts.begin(); it != sGdxGamepadPorts.end();) {
+        if (std::find(ids.begin(), ids.end(), it->first) == ids.end()) {
+            it = sGdxGamepadPorts.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Place pads we have not seen before into the lowest unowned port.
+    for (int32_t instanceId : ids) {
+        if (sGdxGamepadPorts.count(instanceId) != 0) {
+            continue;
+        }
+        for (uint8_t port = 0; port < MAXCONTROLLERS; port++) {
+            if (!gdxPortOwnedByAGamepad(port)) {
+                sGdxGamepadPorts[instanceId] = port;
+                break;
+            }
+        }
+        // More pads than ports: the extras stay unassigned and are ignored on every port below.
+    }
+
+    for (uint8_t port = 0; port < MAXCONTROLLERS; port++) {
+        for (int32_t instanceId : ids) {
+            const auto owner = sGdxGamepadPorts.find(instanceId);
+            if (owner != sGdxGamepadPorts.end() && owner->second == port) {
+                devices->UnignoreInstanceIdForPort(port, instanceId);
+            } else {
+                devices->IgnoreInstanceIdForPort(port, instanceId);
+            }
+        }
+
+        // Port 0 always has bindings (ControlDeck::Init seeds them); ports 1..3 only get them here,
+        // and only the first time a device lands on them.
+        if (port == 0 || !gdxPortOwnedByAGamepad(port)) {
+            continue;
+        }
+        auto controller = controlDeck->GetControllerByPort(port);
+        if (controller != nullptr &&
+            !controller->HasMappingsForPhysicalDeviceType(Ship::PhysicalDeviceType::SDLGamepad)) {
+            controller->AddDefaultMappings(Ship::PhysicalDeviceType::SDLGamepad);
+            gdx_port_logf("[input] port %d: seeded default gamepad mappings\n", port + 1);
+        }
+    }
+
+    gdx_port_logf("[input] %zu SDL gamepad(s) connected, %zu routed to their own port\n", ids.size(),
+                  sGdxGamepadPorts.size());
+}
+
+// True when the ControlDeck can actually produce input for `port` this frame. A keyboard or mouse
+// mapping is always live; a gamepad mapping only counts while a non-ignored pad is plugged into
+// that port, which is what makes hot-unplug show up as a disconnect instead of a silently dead
+// player. Note that neither Ship::Controller::IsConnected() (declared at
+// ship/controller/controldevice/controller/Controller.h:55) nor ControlDeck::GetControllerBits()
+// (ControlDeck.h:59) can be used for this — both are declaration-only in libultraship and would
+// not link.
+static bool gdxPortHasLiveInput(const std::shared_ptr<Ship::ControlDeck>& controlDeck, uint8_t port) {
+    auto controller = controlDeck->GetControllerByPort(port);
+    if (controller == nullptr) {
+        return false;
+    }
+    if (controller->HasMappingsForPhysicalDeviceType(Ship::PhysicalDeviceType::Keyboard) ||
+        controller->HasMappingsForPhysicalDeviceType(Ship::PhysicalDeviceType::Mouse)) {
+        return true;
+    }
+    if (!controller->HasMappingsForPhysicalDeviceType(Ship::PhysicalDeviceType::SDLGamepad)) {
+        return false;
+    }
+    auto devices = controlDeck->GetConnectedPhysicalDeviceManager();
+    return devices != nullptr && !devices->GetConnectedSDLGamepadsForPort(port).empty();
+}
+
 // ── PORT input read bridge: LUS ControlDeck -> decomp controller globals ─────────────────────────
 // Called every frame from input_bridge.c (C) via gdx_controller_poll(). input_bridge.c cannot
-// touch the C++ ControlDeck API directly, so this extern "C" shim reads port `port`'s resolved
+// touch the C++ ControlDeck API directly, so this extern "C" shim reads EVERY port's resolved
 // controller state — the Input Editor's mappings applied to the connected keyboard / SDL gamepad /
-// mouse devices — and returns it as a standard N64 button bitmask + analog stick (-80..80).
+// mouse devices — as a standard N64 button bitmask + analog stick (-80..80) per port, plus a
+// per-port connected flag.
 //
-// The heavy lifting is ControlDeck::WriteToPad(), which dispatches (virtually) to
-// LUS::ControlDeck::WriteToOSContPad(): it calls SDL_PumpEvents() to refresh live gamepad state,
-// honors AllGameInputBlocked() (leaving the pad zeroed while the ImGui overlay owns input), and
-// reads every mapped device for every port into our OSContPad buffer. Keyboard / mouse / device
-// add-remove SDL events were already delivered to the ControlDeck earlier this frame by
-// Fast3dWindow::HandleEvents() (main frame loop), so this is the read half of an already-pumped
-// pipeline — no separate per-frame controller pump is needed.
+// ONE WriteToPad PER FRAME, ALL PORTS AT ONCE — this is not just an optimisation. WriteToPad has
+// per-call side effects that make a per-port loop of single-port reads incorrect:
+//   * LUS::ControlDeck::WriteToOSContPad() (libultraship/controller/controldeck/ControlDeck.cpp:57)
+//     calls SDL_PumpEvents() and WheelHandler::Update(); the latter decays the buffered mouse-wheel
+//     axis by one REDUCE_STEP per call (ship/.../mouse/WheelHandler.cpp:23-41), so four calls a
+//     frame would drain wheel input four times as fast.
+//   * LUS::Controller::ReadToOSContPad() pushes one entry into each port's mPadBuffer every call
+//     (libultraship/controller/controldevice/controller/Controller.cpp:41), and that deque is the
+//     CVAR_SIMULATED_INPUT_LAG delay line, capped at 6 entries — four pushes a frame would flush
+//     the whole line every frame and make the lag setting meaningless.
+// So the deck is read exactly once and the caller demultiplexes the result.
 //
-// Returns 1 on success, 0 if the ControlDeck is not available yet (caller degrades to zero input).
-extern "C" int gdx_lus_read_pad(int port, unsigned short* outButtons, signed char* outStickX,
-                                signed char* outStickY) {
-    if (outButtons != nullptr) {
-        *outButtons = 0;
-    }
-    if (outStickX != nullptr) {
-        *outStickX = 0;
-    }
-    if (outStickY != nullptr) {
-        *outStickY = 0;
+// Keyboard / mouse / device add-remove SDL events were already delivered to the ControlDeck earlier
+// this frame by Fast3dWindow::HandleEvents() (main frame loop), so this is the read half of an
+// already-pumped pipeline — no separate per-frame controller pump is needed.
+//
+// `capacity` is the caller's array length (MAXCONTROLLERS on both sides — decomp PR/os_cont.h:88
+// and libultraship libultra/os.h:14 both define it as 4). Returns 1 on success, 0 if the
+// ControlDeck is not available yet, in which case every output slot is left zeroed and the caller
+// degrades to zero input rather than crashing.
+extern "C" int gdx_lus_read_pads(int capacity, unsigned short* outButtons, signed char* outStickX,
+                                 signed char* outStickY, unsigned char* outConnected) {
+    const int ports = (capacity < MAXCONTROLLERS) ? capacity : MAXCONTROLLERS;
+
+    for (int i = 0; i < capacity; i++) {
+        if (outButtons != nullptr) {
+            outButtons[i] = 0;
+        }
+        if (outStickX != nullptr) {
+            outStickX[i] = 0;
+        }
+        if (outStickY != nullptr) {
+            outStickY[i] = 0;
+        }
+        if (outConnected != nullptr) {
+            outConnected[i] = 0;
+        }
     }
 
     auto ctx = Ship::Context::GetInstance();
@@ -290,9 +468,11 @@ extern "C" int gdx_lus_read_pad(int port, unsigned short* outButtons, signed cha
         return 0;
     }
     auto controlDeck = ctx->GetControlDeck();
-    if (controlDeck == nullptr || port < 0 || port >= MAXCONTROLLERS) {
+    if (controlDeck == nullptr || ports <= 0) {
         return 0;
     }
+
+    gdxSyncGamepadPortRouting(controlDeck);
 
     // WriteToOSContPad OR-accumulates into pad->button and only overwrites a stick axis when the
     // incoming value is 0 — it never clears the buffer. So we MUST zero it every frame or buttons
@@ -301,16 +481,43 @@ extern "C" int gdx_lus_read_pad(int port, unsigned short* outButtons, signed cha
     std::memset(pads, 0, sizeof(pads));
     controlDeck->WriteToPad(pads);
 
-    if (outButtons != nullptr) {
-        *outButtons = pads[port].button;
-    }
-    if (outStickX != nullptr) {
-        *outStickX = pads[port].stick_x;
-    }
-    if (outStickY != nullptr) {
-        *outStickY = pads[port].stick_y;
+    for (int i = 0; i < ports; i++) {
+        if (outButtons != nullptr) {
+            outButtons[i] = pads[i].button;
+        }
+        if (outStickX != nullptr) {
+            outStickX[i] = pads[i].stick_x;
+        }
+        if (outStickY != nullptr) {
+            outStickY[i] = pads[i].stick_y;
+        }
+        if (outConnected != nullptr) {
+            outConnected[i] = gdxPortHasLiveInput(controlDeck, (uint8_t) i) ? 1 : 0;
+        }
     }
     return 1;
+}
+
+// NOTE: there is deliberately no single-port variant any more. The previous gdx_lus_read_pad(port)
+// performed a full deck read per call, which was correct only because exactly one port was ever
+// read; keeping it around would be a footgun now that a caller might loop it over four ports and
+// silently break the wheel buffer and the input-lag deque described above.
+
+// ── GDX_INPUT_SCRIPT (dev-only) QUIT hook: request a clean shutdown ──────────────────────────
+// Called from gdx_input_script.c when the script reaches a QUIT command. Reuses the EXACT path
+// a window-close (X button / Alt-F4 / SDL_QUIT) already takes: Window::Close() just flips the
+// backend's "running" flag (see gfx_sdl2.cpp / gfx_dxgi.cpp, both called from the SDL_QUIT case
+// in HandleEvents()), which the frame loop below already polls every iteration via
+// `while (w != nullptr && w->IsRunning())`. No separate flag/break path needed.
+extern "C" void gdx_request_quit(void) {
+    auto ctx = Ship::Context::GetInstance();
+    if (ctx == nullptr) {
+        return; // called before the window exists (unexpected for a script QUIT); nothing to close.
+    }
+    auto w = ctx->GetWindow();
+    if (w != nullptr) {
+        w->Close();
+    }
 }
 
 static void addArchiveCandidateRoots(std::vector<std::filesystem::path>& roots, std::filesystem::path start) {
@@ -338,7 +545,7 @@ static void addArchiveCandidateRoots(std::vector<std::filesystem::path>& roots, 
     }
 }
 
-// Workshop W0: is a mod pack disabled by the user? gEnhancements.Workshop.DisabledPacks is a
+// Workshop: is a mod pack disabled by the user? gEnhancements.Workshop.DisabledPacks is a
 // comma-joined list of pack basenames (e.g. "20-portraits.o2r,legacy.o2r") persisted by the
 // Workshop menu. Matching is case-insensitive on the basename. Mounting a pack is always safe (a
 // pack with no matching keys is inert); this list lets the user keep a pack on disk but out of the
@@ -391,12 +598,12 @@ static std::vector<std::string> findArchivePaths(const char* argv0) {
     // only when no fzerox.o2r exists — that is Torch's default output name, still used by the
     // in-tree dev archive (assets/extracted/generic.o2r). Never mount both: they carry the same
     // resource keys and double-mounting would just shadow one with the other.
-    // R3 (C-R3.3): n64ddipl.o2r carries the 64DD IPL font block as its own dedicated archive so the
+    // n64ddipl.o2r carries the 64DD IPL font block as its own dedicated archive so the
     // IPL ROM file becomes deletable after setup. Its absence is tolerated — gdx_ddipl_load falls back
-    // to the raw N64DDIPLROM.n64 (retained until R4) — and it is unversioned, which the HasGameVersion
+    // to the raw N64DDIPLROM.n64 — and it is unversioned, which the HasGameVersion
     // mount gate already skips, so it mounts cleanly alongside the game archives.
-    // R8 Step 1 (analogous): fzerox-disk.o2r carries the whole 64DD EK disk image so the raw .ndd and
-    // the R7 managed copy become deletable once a boot reconstructs from it. Also unversioned and
+    // Analogously, fzerox-disk.o2r carries the whole 64DD EK disk image so the raw .ndd and
+    // the managed copy become deletable once a boot reconstructs from it. Also unversioned and
     // tolerated-absent — gdx_disk_load falls back to the managed copy / raw .ndd.
     for (const auto& nameGroup : { std::vector<const char*>{ "gdiffuser.o2r", "f3d.o2r" },
                                    std::vector<const char*>{ "fzerox.o2r", "generic.o2r" },
@@ -424,7 +631,7 @@ static std::vector<std::string> findArchivePaths(const char* argv0) {
         archives.push_back("fzerox.o2r");
     }
 
-    // Workshop W0: append mods/*.o2r after the base archives. ArchiveManager registers files
+    // Workshop: append mods/*.o2r after the base archives. ArchiveManager registers files
     // last-wins, so a later archive overrides a same-path resource in an earlier one -- load order
     // is priority order. Scanning in case-insensitive lexicographic order gives users deterministic
     // control via a numeric filename prefix ("10-hifonts.o2r"). The first candidate root that has a
@@ -473,11 +680,17 @@ static std::vector<std::string> findArchivePaths(const char* argv0) {
 }
 
 int main(int argc, char** argv) {
+    // Sample the developer-gate environment FIRST, ahead of every log call this process makes.
+    // Buckets A/B/D all start from their env value here; Bucket D then adopts the persisted CVar
+    // below (unless the env pinned it), and A/B hand over to their CVars once the Gui exists.
+    // See port/gdx_dev_gates.h for the precedence rules and the bucket policy.
+    gdx_dev_gates_init_env();
+
     // First-boot setup + per-user data directory. MUST run before any libultraship path resolution
     // (below) so config, logs, the disk image, and the IPL ROM consolidate into the resolved data
     // directory. In the dev/portable layout (ROM next to the exe) this shows no wizard and leaves the
     // working directory untouched — it only resolves the ROM path so the ROM picker stays suppressed
-    // for a headless launch. See port/gdx_firstboot.{h,cpp} + docs/FIRST_BOOT_DESIGN.md.
+    // for a headless launch. See port/gdx_firstboot.{h,cpp}.
     gdx::FirstBootResult firstBoot = gdx::FirstBootRun((argc > 0) ? argv[0] : nullptr);
     if (firstBoot.status == gdx::FirstBootStatus::Aborted) {
         return 1;
@@ -526,8 +739,24 @@ int main(int argc, char** argv) {
     } else {
         ctx->InitLogging(spdlog::level::off, spdlog::level::off, false);
     }
+    // Start buffering for the in-game console here: the window is built much later, but the queue
+    // keeps the tail of boot so the console is not blank on first open. See gdx_console_log.cpp.
+    GdxConsoleLogInstall();
     logStep("InitConfiguration");    ctx->InitConfiguration();
     logStep("InitConsoleVariables"); ctx->InitConsoleVariables();
+
+    // Bucket D (logging gates) adopt their PERSISTED CVar the moment the config is readable, which
+    // is here — the earliest possible point and still ahead of essentially all boot logging (ROM
+    // load, scheduler init, asset load, bootproc). This is what makes "tick the box in Dev Tools"
+    // survive a restart and capture the NEXT boot. An exported env var pins the gate for this run
+    // and is deliberately NOT written back, so scripted/CI launches keep behaving identically.
+    //
+    // HONEST LIMITATION, stated here and in the Dev Tools UI: libultraship's own spdlog sinks were
+    // already configured a few lines above (InitLogging needs to precede InitConfiguration), so for
+    // THIS run their level still follows GDX_LOG only. The port's gdiffuser-run.log sink — the one
+    // GDX_LOG is really about — opens lazily inside gdx_port_write_log and therefore honours the
+    // CVar from this point forward.
+    gdx_dev_gates_boot_seed(&GdxGateCVarGet);
 
     // Order matches BattleShip's working sequence: ControlDeck -> ResourceManager -> Window.
     // Context + CVars exist now — safe to build the ControlDeck. LUS::ControlDeck's ctor creates
@@ -574,20 +803,20 @@ int main(int argc, char** argv) {
     // via tools/gen_texture_pack.py) do NOT stamp a "version" file or a numeric
     // manifest.json.game_version. Passing any non-empty validHashes today would therefore
     // reject all of them and break boot. So we keep the built-in gate DISABLED (empty set)
-    // and instead run a post-mount check below. Two policies (contract C4):
+    // and instead run a post-mount check below. Two policies:
     //   * generic.o2r is ENFORCING. Torch stamps its version = the US-rev0 ROM CRC (0x78D90EB3);
     //     the bridge's SETTIMG OTR rewrite path is not partial-resilient, so a mismatched
     //     generic.o2r (wrong region/rev, stale recipe) would render blank textures with no raw
     //     recovery. On mismatch we UNMOUNT it (RemoveArchive) so the proven-complete raw-ROM
-    //     fallback carries the session — never a silently-wrong archive (C6, complete-or-absent).
+    //     fallback carries the session — never a silently-wrong archive (complete-or-absent).
     //   * every OTHER archive stays WARN-ONLY against kGdxExpectedArchiveVersion: unversioned
-    //     archives (f3d.o2r, texture packs) pass through untouched, so the owner's boot is never
+    //     archives (f3d.o2r, texture packs) pass through untouched, so boot is never
     //     broken, and a versioned foreign pack that mismatches is merely reported.
     static constexpr uint32_t kGdxExpectedArchiveVersion = 1u;        // schema v1 = first versioned O2R
-    static constexpr uint32_t kGdxExpectedGenericRomCrc = 0x78D90EB3u; // C4: US-rev0 ROM CRC stamp
+    static constexpr uint32_t kGdxExpectedGenericRomCrc = 0x78D90EB3u; // US-rev0 ROM CRC stamp
     logStep("InitResourceManager");   ctx->InitResourceManager(archivePaths, {}, 1);
 
-    // R4 (C-R4.1): "archives validated" predicate for the no-ROM boot gate below. True iff the
+    // "archives validated" predicate for the no-ROM boot gate below. True iff the
     // fzerox.o2r/generic.o2r game archive is mounted AND survives this CRC gate (i.e. is NOT
     // unmounted by the version check in the block below). Captured here, at the point the gate's
     // outcome is fully known, and threaded into gdx_init_rom so a missing ROM can be tolerated
@@ -635,7 +864,7 @@ int main(int argc, char** argv) {
 #endif
                         toUnmount.push_back(path);
                     } else {
-                        // R4 (C-R4.1): this is the "fzerox.o2r/generic.o2r mounted AND survived
+                        // This is the "fzerox.o2r/generic.o2r mounted AND survived
                         // the CRC gate" condition -- the exact predicate the no-ROM boot gate
                         // needs. Both the installed name and Torch's generic dev-archive name
                         // are accepted by this same branch, so both satisfy the predicate.
@@ -701,7 +930,7 @@ int main(int argc, char** argv) {
     // makes F1 actually open a menu: libultraship already wires the F1 / Esc / Gamepad-Back toggle
     // (Gui.cpp:206-213), but the port previously passed an empty window vector (above) and set no
     // menu bar. Purely additive — nothing below runs until the user presses F1.
-    // See docs/IMGUI_MENU_SCOPE.md + port/gdx_menu.{h,cpp}.
+    // See port/gdx_menu.{h,cpp}.
     logStep("register enhancement menu + dev/input windows");
     {
         auto pgui = ctx->GetWindow()->GetGui();
@@ -746,7 +975,7 @@ int main(int argc, char** argv) {
         // explicit toggle) still wins, while a fresh config gets the pacer disabled by default.
         CVarRegisterInteger("gEnhancements.Graphics.FramePacing", 0);
 
-        // R6-P2: frame-interpolation master toggle, DEFAULT OFF. When 1, the host loop below
+        // Frame-interpolation master toggle, DEFAULT OFF. When 1, the host loop below
         // decouples render from logic — the sim still advances exactly one tick per iteration
         // (never re-cadenced), but the retained gfx task is replayed + presented as M wall-clock
         // sub-frames per tick (smooth motion on >60 Hz panels). Registered here at its stock-
@@ -770,6 +999,13 @@ int main(int argc, char** argv) {
             gdx_port_logf("[G-Diffuser] Frame pacer reset to OFF (new default). "
                           "Re-enable it in Settings if the game runs too fast.\n");
         }
+
+        // Hand the developer gates over to the console variables now that the Gui exists. From
+        // here on the CVars are the live source of truth for buckets A and B (an env var that was
+        // exported at launch has just seeded them), and gdx_dev_gates_refresh() below re-reads them
+        // once per frame. Bucket D gates keep whatever boot_seed resolved unless the user toggles
+        // them in the menu.
+        gdx_dev_gates_bind_cvars(&GdxGateCVarGet, &GdxGateCVarSet);
 
         // Install the full-screen menu (Gui::SetMenu calls Init()). The GdxMenu ctor pins
         // visibility to "gOpenMenuBar" for configuration compatibility and registers the port's
@@ -885,7 +1121,7 @@ int main(int argc, char** argv) {
         gdx_init_rom(static_cast<int>(romArgv.size()), romArgv.data(), archivesValidated ? 1 : 0);
     }
 
-    // R4 (C-R4.1): with archivesValidated, gdx_init_rom's own resolution failure path already
+    // With archivesValidated, gdx_init_rom's own resolution failure path already
     // returns success with gdx_rom_buffer == nullptr / gdx_rom_size == 0 (archive-only boot) --
     // it does not exit(1). So this second null check is now the ACTUAL no-ROM boot gate:
     //   - gdx_rom_buffer == nullptr && archivesValidated: expected archive-only state, proceed.
@@ -895,9 +1131,7 @@ int main(int argc, char** argv) {
     if (gdx_rom_buffer == nullptr) {
         if (archivesValidated) {
             gdx_port_logf("[G-Diffuser] no ROM loaded; continuing archive-only boot (fzerox.o2r "
-                          "validated). Raw-ROM fallback reads will be logged/zero-filled -- the R4 "
-                          "soak (C-R4.2, GDX_STRICT_ARCHIVE telemetry) must show none for this to "
-                          "be a supported end-user configuration.\n");
+                          "validated). Any raw-ROM fallback read will be logged/zero-filled.\n");
         } else {
             gdx_port_logf("[G-Diffuser] FATAL: no ROM loaded and no validated archive — cannot start game.\n");
             gdx_port_logf("[G-Diffuser] Place baserom.us.rev0.z64 next to the exe, pass it as an argument, "
@@ -914,7 +1148,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    logStep("gdx_rdram_init() — allocate 8MB RDRAM host buffer");
+    logStep("gdx_rdram_init() — allocate 16MB RDRAM host buffer");
     gdx_rdram_init();
 
     // Register ROM buffer so TryResolveAddress can resolve low32(rom_ptr) addresses
@@ -929,13 +1163,13 @@ int main(int argc, char** argv) {
     }
     gdx_register_main_module_range();
 
-    // Audio delivery (C-R2.2): preload the three audio blob families once, here, in the same
+    // Audio delivery: preload the three audio blob families once, here, in the same
     // boot window gdx_rom_buffer is registered (AFTER gdx_rdram_init, BEFORE bootproc), so the
     // payloads are resident before the first audio DMA rather than loading lazily on an audio
     // tick. Each resident payload is then registered as a host range so truncated-low32 tokens
     // of blob-served audio buffers resolve through the marshaller EXACTLY like gAudioHeap /
     // gdx_rom_buffer do (shared LLE/HLE two-tier resolver). Absence degrades silently: if the
-    // live archive lacks these entries (owner's fzerox.o2r predates them), preload returns 0 and
+    // live archive lacks these entries (an fzerox.o2r built before they existed), preload returns 0 and
     // the DMA sink falls back to raw ROM -- zero behavior change from today.
     //
     // Bases are the PORT_audio_{bank,seq,table}_ROM_START constants from
@@ -966,7 +1200,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // PCM-parity capture (C-R2.3): arm before the audio thread starts producing ticks, so the
+    // PCM-parity capture: arm before the audio thread starts producing ticks, so the
     // capture window and its deterministic-RNG gate are live on the first audio tick. No-op unless
     // GDX_PCM_CAPTURE is set — zero behavior change for normal play.
     gdx_pcm_capture_init();
@@ -978,13 +1212,19 @@ int main(int argc, char** argv) {
     // Frame loop: pump SDL events + libultraship window each tick.
     // HandleEvents() MUST be called every frame to drain the SDL event queue;
     // without it, click/close events pile up and the window manager crashes.
-    // R6-P2: give the gfx bridge a monotonic clock so its sub-frame loop can derive t. Registered
+    // Give the gfx bridge a monotonic clock so its sub-frame loop can derive t. Registered
     // once, before the loop; inert unless FrameInterpolation is on.
     gdx_gfx_interp_set_now_fn(&gdx_host_now_seconds);
 
     logStep("entering frame loop");
     auto w = ctx->GetWindow();
     while (w != nullptr && w->IsRunning()) {
+        // THE per-frame refresh point for every developer gate. One CVar read per gate, once,
+        // here — so no hot path (per draw call, per display-list command, per audio frame) ever
+        // hashes a CVar name. Everything downstream this frame sees a stable, consistent snapshot.
+        // The Dev Tools menu also calls this immediately after a toggle so a click applies on the
+        // same frame rather than the next one.
+        gdx_dev_gates_refresh();
         gdx::PerfFrameBegin();
         gdx::PerfPhaseBegin(gdx::PerfEvents);
         w->HandleEvents();
@@ -997,13 +1237,13 @@ int main(int argc, char** argv) {
         gdx_fixed_aspect_tick();
         gdx::PerfPhaseEnd(gdx::PerfInput);
 
-        // R6-P2: decide render/logic decoupling for THIS tick and configure the bridge's sub-frame
+        // Decide render/logic decoupling for THIS tick and configure the bridge's sub-frame
         // schedule BEFORE gdx_vi_tick — the game's gfx-task submission (gdx_gfx_run) can execute
         // inside gdx_vi_tick's synchronous fiber dispatch (see the comment just below), so the
         // schedule must be live before any gfx work runs. Inert unless FrameInterpolation / GDX_INTERP_P2.
-        // tickStart anchors the wall-clock accumulator (plan Step 2a); tickDuration is the fixed 60 Hz
+        // tickStart anchors the wall-clock accumulator; tickDuration is the fixed 60 Hz
         // logic budget — the SIM cadence never changes, only the number of presented sub-frames does.
-        // P3 (plan edge #3): gate interpolation OFF while an EK editor (Course Edit / Create
+        // P3: gate interpolation OFF while an EK editor (Course Edit / Create
         // Machine) forces the stock 4:3 pillarbox path. gdx_fixed_aspect_tick() above just
         // published that state; gdx_get_force_fixed_aspect() reads the same interpreter global the
         // pillarbox path uses. Editors are low-motion and their fresh mRendersToFb/aspect recompute
@@ -1025,12 +1265,12 @@ int main(int argc, char** argv) {
         // ignores maxSubframes entirely, so this is inert with interpolation off. Cheap: a couple of
         // live CVar reads plus (Match Refresh only) one window query, same "read live every tick"
         // idiom FrameInterpolation's own master toggle already uses above.
-        // R6-P2 FIELD-DEFECT FIX (2026-07-23): derive this tick's sub-frame COUNT via a deterministic
+        // Derive this tick's sub-frame COUNT via a deterministic
         // rational remainder accumulator (SoH interpolate_frame), not the old ceil(target/60). The
         // target-frames that fall inside one 60 Hz logic tick is target * tickSeconds — a FRACTION
         // (e.g. 143 Hz -> 143 * 1.001/60 = 2.386). ceil() rounded that up to a fixed 3 every tick,
         // which on a VSync-on 143 Hz panel cannot fit in the tick budget (3 blocking presents ~= 21 ms
-        // > 16.68 ms) and made the loop overrun/oscillate — the owner's "unstable framerate". The
+        // > 16.68 ms) and made the loop overrun/oscillate into an unstable framerate. The
         // accumulator instead carries the fractional remainder across ticks so the per-tick count
         // alternates (2,2,3,...) and averages exactly target/60, keeping the long-run present rate at
         // the target while logic stays 60 Hz. No clock reads: purely a running remainder. The M cap
@@ -1131,7 +1371,7 @@ int main(int argc, char** argv) {
             }
             interpMaxSubframes = count;
 
-            // R6-P2 FIELD-DEFECT FIX (2026-07-23, THE throughput fix): raise the window's frame-limiter
+            // THE throughput fix: raise the window's frame-limiter
             // target to the interpolation target while interp is on. The DXGI/SDL backend software
             // limiter (gfx_dxgi.cpp / gfx_sdl2.cpp, mTargetFps, default 60) throttles EVERY present —
             // including each decoupled sub-frame present — to 60 fps. Measured: with the sub-frame loop
@@ -1177,13 +1417,9 @@ int main(int argc, char** argv) {
         // see gdx_audio_thread.cpp). No-op when the kill switch reverts to the fiber path.
         gdx_audio_thread_notify_frame();
         w->GetMouseStateManager()->StartFrame();
-        // Feed ImGui menu navigation from the SDL controller BEFORE StartDraw() runs ImGui's
-        // NewFrame, so a raw DualSense (which ImGui's Win32/XInput backend cannot see) can open and
-        // drive the menu on every platform. No-op unless gControlNav is enabled. See gdx_imgui_nav.
-        gdx_imgui_nav_tick();
         gdx::PerfPhaseEnd(gdx::PerfInput);
         if (!interpOn) {
-            // ===== DEFAULT PATH — one tick, one Run, one present. Byte-identical to pre-P2. =====
+            // ===== DEFAULT PATH — one tick, one Run, one present. =====
             // When FrameInterpolation is OFF, gdx_gfx_interp_host_active() returned 0, the bridge's
             // adapter leaves mInterpEnabled false (no scratch reroute), gdx_gfx_run takes its single
             // interp->Run path, and this exact statement sequence presents once and paces via the
@@ -1223,12 +1459,12 @@ int main(int argc, char** argv) {
             gdx_frame_pacer_tick();
             gdx::PerfPhaseEnd(gdx::PerfPacer);
         } else {
-            // ===== FRAME-INTERPOLATION PATH (R6-P2, default-OFF) =====
+            // ===== FRAME-INTERPOLATION PATH (default-OFF) =====
             // The bridge owns the present this tick: gdx_gfx_run replays + presents M wall-clock
             // sub-frames of the retained gfx task via fw->DrawAndRunGraphicsCommands (each a full
             // StartDraw..EndFrame bracket). We must NOT open our own ImGui StartDraw here — it would
             // nest the per-sub-frame ImGui frames. So this branch runs the scheduler + dispatch, then
-            // only presents itself as a FALLBACK for a taskless tick (edge #6, e.g. boot logo).
+            // only presents itself as a FALLBACK for a taskless tick (e.g. boot logo).
             gdx::PerfPhaseBegin(gdx::PerfGuiStart);
             gdx_sched_drain_deferred_wakes();
             gdx::PerfPhaseEnd(gdx::PerfGuiStart);
@@ -1240,7 +1476,7 @@ int main(int argc, char** argv) {
             gdx::PerfPhaseEnd(gdx::PerfTicks);
             gdx::PerfPhaseBegin(gdx::PerfPresent);
             if (gdx_gfx_interp_presented_last_tick() == 0) {
-                // No gfx task this tick -> interpolation no-ops cleanly (edge #6). Present once via
+                // No gfx task this tick -> interpolation no-ops cleanly. Present once via
                 // the normal single-frame bracket (the CPU-drawn VI framebuffer / hold pixels).
                 w->GetGui()->StartDraw();
                 w->StartFrame();
@@ -1253,9 +1489,9 @@ int main(int argc, char** argv) {
             // FrameInterpolation is on — see gdx_frame_pacer.c). Presents ran VSync-paced inside the
             // sub-frame loop; this holds the host to the 60 Hz LOGIC deadline so the SIM cadence stays
             // locked at 60 Hz even when presents finished early (VSync-off case). Interpolation and
-            // FramePacing are mutually-exclusive pacing owners (plan §4).
+            // FramePacing are mutually-exclusive pacing owners.
             gdx::PerfPhaseBegin(gdx::PerfPacer);
-            // R6-P2 FIELD-DEFECT FIX (2026-07-23): pace the SIM against a RUNNING absolute schedule
+            // Pace the SIM against a RUNNING absolute schedule
             // (advance one tick each iteration), not a fresh interpTickStart+tick each tick. With the
             // rational accumulator, some ticks present 2 sub-frames (~14 ms VSync) and some 3 (~21 ms);
             // a per-tick deadline re-anchored to "now" would pad the short ticks with idle time,
@@ -1273,7 +1509,7 @@ int main(int argc, char** argv) {
             gdx_host_pace_logic_until(sNextLogicDeadline);
             gdx::PerfPhaseEnd(gdx::PerfPacer);
 
-            // Telemetry (spec item 6): rate-limited [interp-p2] line + a one-time activation line.
+            // Telemetry: rate-limited [interp-p2] line + a one-time activation line.
             // Cadence mirrors the bridge's diagnostics: first 8 ticks then every 120th (~1/2 s).
             {
                 static bool sInterpP2Announced = false;
@@ -1299,19 +1535,30 @@ int main(int argc, char** argv) {
                                            : 0.0;
                     // lerped/snapped: the per-slot tween evidence the P2 path previously never logged
                     // (it only lived on the env-P1 single-present branch) — surfaced here so the
-                    // owner's actual FrameInterpolation path is diagnosable from the log. presents/s
+                    // the shipping FrameInterpolation path is diagnosable from the log. presents/s
                     // is the rolling real-FPS meter. In steady state expect lerped >> snapped.
-                    gdx_port_logf("[interp-p2] ticks=%zu subframes=%d avg_m=%.2f t_last=%.3f "
-                                  "lerped=%d snapped=%d presents/s=%.1f\n",
-                                  tick + 1, sub, avg, gdx_gfx_interp_last_t(),
-                                  gdx_gfx_interp_last_lerped(), gdx_gfx_interp_last_snapped(),
-                                  gdx_gfx_interp_presents_per_sec());
+                    // pair_max / pair_susp measure whether the slots that lerped were paired with
+                    // the RIGHT previous matrix. Identity is a GfxPool byte offset, so a shift in
+                    // the pool layout silently pairs two different objects; see the block comment on
+                    // gdx_gfx_interp_pair_max_delta in n64_gfx_bridge.h. Sweep the camera and watch
+                    // these: a tail that appears only while the view rotates is the defect.
+                    gdx_port_logf("[interp-p2] ticks=%zu subframes=%d dropped=%d avg_m=%.2f "
+                                  "t_last=%.3f tasks=%d lerped=%d snapped=%d presents/s=%.1f "
+                                  "pair_max=%.0f pair_susp=%d/%d idem_div=%d/%d\n",
+                                  tick + 1, sub, gdx_gfx_interp_last_dropped(), avg,
+                                  gdx_gfx_interp_last_t(), gdx_gfx_interp_last_tasks(),
+                                  gdx_gfx_interp_last_lerped(),
+                                  gdx_gfx_interp_last_snapped(),
+                                  gdx_gfx_interp_presents_per_sec(),
+                                  gdx_gfx_interp_pair_max_delta(), gdx_gfx_interp_pair_suspect(),
+                                  gdx_gfx_interp_pair_lerped_total(),
+                                  gdx_gfx_interp_idem_divergent(), gdx_gfx_interp_idem_multipass());
                 }
             }
         }
         gdx::PerfFrameEnd();
 
-        // Auto-exit after a bounded PCM capture (C-R2.3): once the capture window has finalized
+        // Auto-exit after a bounded PCM capture: once the capture window has finalized
         // (GDX_PCM_CAPTURE_FRAMES reached), request a clean shutdown through the SAME path the
         // window-close event uses (Window::Close() -> IsRunning() goes false), so the loop drains
         // and the normal teardown below runs. Gated on GDX_PCM_CAPTURE so there is zero behavior

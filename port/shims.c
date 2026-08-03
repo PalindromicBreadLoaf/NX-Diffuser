@@ -1,7 +1,16 @@
-// G-Diffuser — port shims (Slice 4c).
+// G-Diffuser — port shims.
 // Minimal definitions for the libultra/N64 symbols that libultraship does NOT provide and
-// that the decomp references. These are PLACEHOLDERS to achieve a clean link; each gets a
-// real implementation (resource-backed ROM access, save system, audio microcode) later.
+// that the decomp references. Three kinds live here, and the difference matters when reading
+// any one of them:
+//   * REAL implementations — _Printf, Arena_Allocate/StartInit, the bcmp/bcopy and CRT
+//     wrappers, LeoTestUnitReady's deliberate "no medium" answer. Load-bearing behavior; see
+//     each one's own comment before changing it.
+//   * FAILURE ANSWERS — osPfs*/osEPi*/osDriveRomInit/osAiSetFrequency. No real work is routed
+//     through them: cart asset DMA goes through Dma_LoadAssets + gdx_segment_source, and saves
+//     go through port/sram_buffer.cpp. Some ARE still called (sys_main.c assigns
+//     gDriveRomHandle = osDriveRomInit()), so their return values are a contract, not dead
+//     code: -1 means "no such device", which is what the port wants the game to conclude.
+//   * ZERO-SIZED DATA MARKERS — the audio ROM-segment / microcode symbols at the bottom.
 //
 // C linkage: the linker resolves these by name (C has no signature mangling), so simplified
 // prototypes are sufficient to satisfy the decomp's references.
@@ -9,26 +18,79 @@
 #include <string.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include "port_log.h"
 
 #define GDX_LEO_TEST_UNIT_MR 0x01
 #define GDX_LEO_ERROR_MEDIUM_NOT_PRESENT 42
 
+// ---- _Printf ----------------------------------------------------------------
+// The libultra formatter behind every _Printf-based text path in the game. It was
+// previously stubbed to `return 0` in port/gen/LinkStubs.c, which is silent rather
+// than fatal: callers test the returned character count before drawing anything, so
+// a zero simply skipped the draw. That blanked the Course Edit info panels (the box
+// rendered, the text did not), the machine names on the Create Machine screen, the
+// disk file-list entries, and the whole N64 crash screen.
+//
+// Contract, from decomp/include/PR/xstdio.h:
+//     typedef char *outfun(char*, const char*, size_t);
+//     int _Printf(outfun prout, char *arg, const char *fmt, va_list args);
+// `outfun` names a function TYPE, so the parameter is a function pointer. The
+// formatter hands its bytes to `prout` and returns the character count; see the
+// concrete consumer func_xk1_800290D0 (expansion_kit/A6340.c:24), which is a memcpy
+// that returns the advanced write pointer.
+//
+// Two behaviours here are load-bearing:
+//   * The count is the ONLY length signal. Callers do not rely on NUL termination —
+//     func_xk1_8002924C walks exactly the returned number of bytes out of an
+//     uninitialised char[0x100]. So the value returned must be what was actually
+//     handed to prout, never vsnprintf's would-have-been length.
+//   * The original streamed unbounded output into a caller buffer whose size it was
+//     never told. Truncating at our own buffer is therefore strictly safer than the
+//     hardware behaviour, and 255 bytes clears the longest format any caller uses.
+typedef char* gdx_prout_fn(char*, const char*, size_t);
+
+int _Printf(gdx_prout_fn* prout, char* arg, const char* fmt, va_list args) {
+    char buf[256];
+    int wanted;
+    size_t emitted;
+
+    if (prout == NULL || fmt == NULL) {
+        return -1;
+    }
+
+    wanted = vsnprintf(buf, sizeof(buf), fmt, args);
+    if (wanted < 0) {
+        return -1;
+    }
+
+    // vsnprintf reports the untruncated length but writes at most sizeof(buf)-1
+    // characters, so clamp before reporting it as bytes the caller may read.
+    emitted = ((size_t) wanted < sizeof(buf)) ? (size_t) wanted : (sizeof(buf) - 1);
+
+    prout(arg, buf, emitted);
+    return (int) emitted;
+}
+
 // ---- libultra function stubs ------------------------------------------------
-// Controller Pak (save) — to be backed by libultraship's save/storage system.
+// Controller Pak: report "no Pak" unconditionally. F-Zero X saves to cart SRAM, which the port
+// backs with port/sram_buffer.cpp, so no game feature depends on a Controller Pak being present.
 int osPfsInitPak(void)       { return -1; }
 int osPfsAllocateFile(void)  { return -1; }
 int osPfsReadWriteFile(void) { return -1; }
 int osPfsFindFile(void)      { return -1; }
 
-// PI / EPI (ROM DMA) — to be replaced by resource-archive reads.
+// PI / EPI (cart + 64DD register I/O): report "no device". Cart reads never reach here — they go
+// through Dma_LoadAssets / gdx_segment_source — and the 64DD drive is emulated in port/n64_leo.c
+// against the disk image, not through these registers.
 int osEPiReadIo(void)        { return -1; }
 int osEPiWriteIo(void)       { return -1; }
 int osEPiLinkHandle(void)    { return  0; }
 int osDriveRomInit(void)     { return -1; }
 
 // Threading / low-level: osStopThread + __osSetHWIntrRoutine are now provided by the decomp's
-// real libultra/os scheduler (stopthread.c, sethwinterrupt.c) — R6 Starship-style.
+// real libultra/os scheduler (stopthread.c, sethwinterrupt.c).
 
 // libultra debug error hook. Some libultra paths reference this as a function; keep a real
 // no-op function shim instead of satisfying the linker with a data symbol.
@@ -71,14 +133,14 @@ void  gdx_host_exit(int status) { exit(status); }
 void  gdx_host_abort(void) { abort(); }
 
 // ---- Memory arena (port reimplementation) ----------------------------------
-// Arena_Allocate now carves from the 8MB RDRAM bump allocator (gdx_rdram_alloc_raw).
-// The whole RDRAM buffer is registered once at startup in gdx_rdram_init() —
-// no per-allocation gdx_register_host_range call needed here.
+// Arena_Allocate carves from the host RDRAM bump allocator (gdx_rdram_alloc_raw; the buffer is
+// GDX_RDRAM_SIZE == 16 MB, see port/n64_rdram.h). The whole RDRAM buffer is registered once at
+// startup in gdx_rdram_init() — no per-allocation gdx_register_host_range call needed here.
 void* gdx_rdram_alloc_raw(size_t size, size_t align); // defined in decomp_port.c
-void* gdx_rdram_peek_raw(size_t size, size_t align);  // deep-audit H1: non-committing peek
-void  gdx_rdram_mode_reset(void);                     // deep-audit H1: per-mode arena rewind
+void* gdx_rdram_peek_raw(size_t size, size_t align);  // non-committing peek
+void  gdx_rdram_mode_reset(void);                     // per-mode arena rewind
 
-/* Deep-audit H1: honor console arena semantics. ALLOC_PEEK is transient
+/* Honor console arena semantics. ALLOC_PEEK is transient
    scratch (cursor not advanced; the next committed allocation may overwrite
    it — exactly how the decomp's texture loader stages mio0 input). FRONT and
    BACK both commit from the single bump region (the console's front/back
@@ -94,7 +156,11 @@ void  Arena_DefaultStartInit(void) { gdx_rdram_mode_reset(); }
 void  Arena_EndInit(void)          {}
 
 // ---- N64 ROM-segment / audio-microcode symbols ------------------------------
-// Placeholders so global audio data links; real values come from the resource system (4c).
+// Address markers only, so the decomp's audio globals link. The real audio payloads are NOT read
+// through these: the bases live as PORT_audio_{bank,seq,table}_ROM_START in
+// decomp/include/port_segment_addrs.h and are served archive-first by gdx_segment_source (see
+// main.cpp's audio-blob preload). aspMain* is the RSP microcode task pointer, which the port never
+// executes -- osSpTaskStartGo routes M_AUDTASK to the software interpreter instead.
 unsigned char audio_bank_ROM_START[1];
 unsigned char audio_table_ROM_START[1];
 unsigned char audio_seq_ROM_START[1];

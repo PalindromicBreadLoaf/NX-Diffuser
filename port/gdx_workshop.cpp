@@ -1,4 +1,4 @@
-// port/gdx_workshop.cpp — Workshop W0 texture-pack + dump implementation. See gdx_workshop.h.
+// port/gdx_workshop.cpp — Workshop texture-pack + dump implementation. See gdx_workshop.h.
 //
 // Everything here is opt-in (CVars default OFF); with the CVars off this file's only runtime cost is
 // a single cached CVar read per registered texture load, and no ResourceManager or disk access.
@@ -626,8 +626,8 @@ std::vector<GdxWorkshopPackInfo> GdxWorkshopListPacks() {
         return out;
     }
 
-    // Best-effort manifest from the mounted VFS (highest-priority pack wins on path collision; W0
-    // limitation, documented). Read once and applied to every row for the mismatch banner.
+    // Best-effort manifest from the mounted VFS (highest-priority pack wins on path collision).
+    // Read once and applied to every row for the mismatch banner.
     // Packs now carry "workshop.json": "manifest.json" is libultraship's RESERVED archive
     // manifest with a numeric game_version schema, and our string game_version made LUS's
     // parser throw on every mount. Old packs are still read via the fallback name.

@@ -1,10 +1,11 @@
 // G-Diffuser — runtime O2R asset extraction launcher. See gdx_extract_launch.h for the contract map.
 
 #include "gdx_extract_launch.h"
+#include "gdx_firstboot.h" // GdxFindIplSourceInDir -- shared IPL-source alt-name probe
 #include "port_log.h"
 
-// C3 golden-archive expectations, emitted by the Wave 1-C harness generator. The single code-level
-// contract between first-boot (1-B, this file) and the harness (1-C) is these two macro names:
+// Golden-archive expectations, emitted by the o2r harness generator. The single code-level
+// contract between this file and the harness is these two macro names:
 //   GDX_O2R_EXPECTED_SHA256       — hex string, the deterministic archive's SHA-256.
 //   GDX_O2R_EXPECTED_ENTRY_COUNT  — integer, the archive's zip entry count (4240).
 // If the generated header is not present yet (generator not wired), fall back to inert placeholders
@@ -27,12 +28,11 @@
 #define GDX_O2R_EXPECTED_ENTRY_COUNT 0
 #endif
 
-// R5 (C-R5.2/C-R5.4/C-R5.5): the JP-profile golden constants. The JP ROM is not on disk in this
-// repo, so a real JP golden is OWNER-RUN-REQUIRED — the placeholder zeros below make the JP
-// extraction path "experimental": it produces fzerox-jp.o2r and installs it, but SKIPS the
-// SHA-256 / entry-count golden gates (which cannot be satisfied without a validated JP archive) and
-// logs the archive loudly as experimental. When the owner generates a real gdx_o2r_expected.jp.h
-// (tools/o2r_harness/gen_expected_header.py --profile jp) the gates engage automatically.
+// JP-profile golden constants. No validated JP archive exists yet, so the placeholder zeros below
+// make the JP extraction path EXPERIMENTAL: it produces fzerox-jp.o2r and installs it, but SKIPS
+// the SHA-256 / entry-count golden gates and logs the archive loudly as experimental. Generating a
+// real gen/gdx_o2r_expected.jp.h (tools/o2r_harness/gen_expected_header.py --profile jp) engages
+// the gates automatically.
 #if defined(__has_include)
 #if __has_include("gen/gdx_o2r_expected.jp.h")
 #include "gen/gdx_o2r_expected.jp.h"
@@ -45,12 +45,12 @@
 #define GDX_O2R_EXPECTED_ENTRY_COUNT_JP 0
 #endif
 
-// R3 (C-R3.5): the IPL archive's own golden constants. Per-user self-consistency — no single
-// canonical retail IPL hash is assumed — so these are diagnostic only: on a dev build they let us WARN
-// on drift from the owner's reference dump, but the runtime IPL step never gates the mount on them
-// (the archive carries its own ipl/identity entry, and absence falls back to the raw IPL — C-R3.2).
-// Placeholder zeros compile cleanly and simply suppress the dev-drift warning until a real header is
-// generated (tools/o2r_harness/gen_ipl_expected.py, OWNER-RUN-REQUIRED without the owner's IPL).
+// The IPL archive's own golden constants. These are PER-USER self-consistency checks — no single
+// canonical retail IPL hash is assumed — so they are diagnostic only: a dev build warns on drift
+// from the reference header, and the runtime IPL step never gates the mount on them (the archive
+// carries its own ipl/identity entry, and absence falls back to the raw IPL). Placeholder zeros
+// compile cleanly and suppress the drift warning until a real header is generated with
+// tools/o2r_harness/gen_ipl_expected.py.
 #if defined(__has_include)
 #if __has_include("gen/gdx_ipl_expected.h")
 #include "gen/gdx_ipl_expected.h"
@@ -63,7 +63,7 @@
 #define GDX_IPL_ARCHIVE_EXPECTED_SHA256 "0000000000000000000000000000000000000000000000000000000000000000"
 #endif
 
-// R8 Step 1: the 64DD EK disk archive's own golden constants. Like the IPL golden (R3), these are
+// The 64DD EK disk archive's own golden constants. Like the IPL golden, these are
 // PER-USER self-consistency / dev-drift diagnostics only — the runtime disk step never gates the
 // mount on them (fzerox-disk.o2r carries its own disk/identity entry, and absence falls back to the
 // managed copy / raw .ndd). Placeholder zeros compile cleanly and suppress the dev-drift warning
@@ -79,9 +79,9 @@
 #ifndef GDX_DISK_ARCHIVE_EXPECTED_SHA256
 #define GDX_DISK_ARCHIVE_EXPECTED_SHA256 "0000000000000000000000000000000000000000000000000000000000000000"
 #endif
-// R8 Step 2: the disk archive's entry count = 2 frozen disk/* entries + the ek/<symbol> per-asset
+// The disk archive's entry count = 2 frozen disk/* entries + the ek/<symbol> per-asset
 // entries. Data-driven (grows with the EK slice manifest), so the launcher reads it from the golden
-// header rather than hardcoding it. Falls back to the Step-1 value of 2 when the header is absent.
+// header rather than hardcoding it. Falls back to the base value of 2 when the header is absent.
 #ifndef GDX_DISK_EXPECTED_ENTRY_COUNT
 #define GDX_DISK_EXPECTED_ENTRY_COUNT 2
 #endif
@@ -127,36 +127,36 @@ namespace {
 // SoH/Starship convention of game-named archives). The extractor child itself always writes
 // Torch's fixed output name into the temp dir; the atomic install renames it.
 constexpr const char* kArchiveName = "fzerox.o2r";
-// R5 (C-R5.1): the JP-profile archive name. The extractor child always writes Torch's fixed
+// The JP-profile archive name. The extractor child always writes Torch's fixed
 // generic.o2r into the temp dir; the atomic install renames it to the selected profile's name.
 constexpr const char* kArchiveNameJp = "fzerox-jp.o2r";
 constexpr const char* kExtractorOutputName = "generic.o2r";
 constexpr const char* kSidecarName = "gdx_extract_state.cfg";
 constexpr const char* kRecipesDirName = "decomp-recipes";
 constexpr const char* kConfigYmlName = "config.yml";
-constexpr const char* kTorchHashName = "torch.hash.yml"; // stray artifact the extractor may leave (C2)
+constexpr const char* kTorchHashName = "torch.hash.yml"; // stray artifact the extractor may leave
 constexpr const char* kTempSubdir = ".gdx_extract.tmp";  // same-filesystem staging dir under dataDir
 
-// R3: the dedicated 64DD IPL font-block archive and the raw IPL ROM it is built from. The IPL step
+// The dedicated 64DD IPL font-block archive and the raw IPL ROM it is built from. The IPL step
 // (ensureIplArchive) is independent of the cartridge archive — different source media, own golden,
 // own sidecar keys — and its output is unversioned (mounts through the HasGameVersion gate).
 constexpr const char* kIplArchiveName = "n64ddipl.o2r";
 constexpr const char* kIplRomName = "N64DDIPLROM.n64";
 constexpr const char* kIplTempSubdir = ".gdx_ipl.tmp";
-constexpr int kIplExpectedEntryCount = 2; // ipl/font_block + ipl/identity (C-R3.1)
+constexpr int kIplExpectedEntryCount = 2; // ipl/font_block + ipl/identity
 
-// R8 Step 1: the dedicated 64DD EK disk-image archive. Same shape as the IPL step (own golden, own
+// The dedicated 64DD EK disk-image archive. Same shape as the IPL step (own golden, own
 // sidecar key, best-effort/non-gating). ensureDiskArchive runs after ensureIplArchive so a completed
-// setup can delete the raw .ndd AND the R7 managed copy once a boot proves byte-identity.
+// setup can delete the raw .ndd AND the managed copy once a boot proves byte-identity.
 constexpr const char* kDiskArchiveName = "fzerox-disk.o2r";
 constexpr const char* kDiskTempSubdir = ".gdx_disk.tmp";
-// disk/image + disk/identity + the ek/<symbol> per-asset entries (R8 Step 2). Data-driven from the
+// disk/image + disk/identity + the ek/<symbol> per-asset entries. Data-driven from the
 // golden header; == 2 when the EK slice manifest is absent at build/extract time.
 constexpr int kDiskExpectedEntryCount = GDX_DISK_EXPECTED_ENTRY_COUNT;
-// R8 Step 2: the EK slice manifest shipped alongside the recipes so ensureDiskArchive can pass it to
+// The EK slice manifest shipped alongside the recipes so ensureDiskArchive can pass it to
 // `gdx-extract disk -m`. Generated by tools/gen_ek_assets.py, copied into decomp-recipes/ at build.
 constexpr const char* kEkSliceManifestName = "ek_slice_manifest.txt";
-constexpr const char* kManagedMediaSubdir = "media"; // R7 managed-copy dir under the data dir
+constexpr const char* kManagedMediaSubdir = "media"; // managed-copy dir under the data dir
 // Disk source names, managed-copy-preferred order mirrors port/disk_buffer.cpp's search. The managed
 // copy is always kept under the translated leaf name (gdx_firstboot.cpp copies every source to it),
 // so the .ndd the archive is built from resolves under these names.
@@ -172,20 +172,20 @@ constexpr const char* kExtractBinaryName = "gdx-extract.exe";
 constexpr const char* kExtractBinaryName = "gdx-extract";
 #endif
 
-// C1 fallback ROM SHA-1 (US rev0, the key decomp/config.yml uses). Preferred source is config.yml at
+// Fallback ROM SHA-1 (US rev0, the key decomp/config.yml uses). Preferred source is config.yml at
 // runtime (recipes = single source of truth); this constant is only used if config.yml cannot be read.
 constexpr const char* kExpectedRomSha1Fallback = "5f658e88ffa9de23cba6986a8fd3d3a90d7b4340";
-// R5 (C-R5.4): JP rev0 ROM SHA-1 fallback (the a418b015... key in decomp/config.yml). Same
+// JP rev0 ROM SHA-1 fallback (the a418b015... key in decomp/config.yml). Same
 // resolution discipline as US — config.yml is authoritative at runtime; this is only the fallback.
 constexpr const char* kExpectedRomSha1FallbackJp = "a418b0151521b76691fa03f8658c8b567c69498b";
 
-// The config.yml `path:` selectors that key each recipe tree (C-R5.4: SHA1 -> recipe tree).
+// The config.yml `path:` selectors that key each recipe tree (SHA1 -> recipe tree).
 constexpr const char* kRecipePathUs = "assets/yaml/us/rev0";
 constexpr const char* kRecipePathJp = "assets/yaml/jp/rev0";
 
-// C4 version-entry contract: Torch stamps generic.o2r's game version = the US-rev0 ROM CRC.
+// Version-entry contract: Torch stamps generic.o2r's game version = the US-rev0 ROM CRC.
 constexpr std::uint32_t kExpectedRomCrc = 0x78D90EB3u;
-// R5: the JP-rev0 ROM CRC is not known in this repo (OWNER-RUN-REQUIRED). 0 == unknown; the JP
+// The JP-rev0 ROM CRC is not known here. 0 == unknown; the JP
 // extraction passes it as the -u version arg as-is and treats the resulting archive as experimental.
 constexpr std::uint32_t kExpectedRomCrcJp = 0u;
 
@@ -570,9 +570,9 @@ std::string sha256File(const fs::path& p) {
     return toHex(out, 32);
 }
 
-// ── config.yml expected-ROM-SHA-1 parse (C1: recipes are the single source of truth) ─────────────
+// ── config.yml expected-ROM-SHA-1 parse (recipes are the single source of truth) ──────────────────
 // The recipe config keys each recipe tree on the ROM SHA-1. We want the key whose block declares
-// `path: <recipePath>` (C-R5.4: this now selects US vs JP by the recipe subtree). Returns lowercase
+// `path: <recipePath>` (this selects US vs JP by the recipe subtree). Returns lowercase
 // hex, or empty if not found / unreadable. Default recipePath preserves the historical US callers.
 std::string expectedRomSha1FromConfig(const fs::path& configYml,
                                       const std::string& recipePath = kRecipePathUs) {
@@ -613,10 +613,10 @@ std::string expectedRomSha1FromConfig(const fs::path& configYml,
     return result;
 }
 
-// R5 (C-R5.1/C-R5.4): a resolved extraction profile. One is built per supported ROM dump; the gate
-// hashes the ROM once and matches it against every profile's expectedSha1 to pick recipe tree +
-// output archive name + golden. `experimental` is set when the profile has no real golden yet (JP
-// until the owner generates one) — the install then skips the SHA-256 / entry-count gates.
+// A resolved extraction profile. One is built per supported ROM dump; the gate hashes the ROM
+// once and matches it against every profile's expectedSha1 to pick recipe tree + output archive
+// name + golden. `experimental` is set when the profile has no real golden yet (JP today) — the
+// install then skips the SHA-256 / entry-count gates.
 struct RomProfile {
     const char* key;              // "us/rev0" / "jp/rev0"
     const char* recipePath;       // config.yml `path:` selector
@@ -713,7 +713,7 @@ long zipEntryCount(const fs::path& p) {
     return -1;
 }
 
-// ── Completion sidecar (C7): gdx_extract_state.cfg — key=value, same pattern as gdx_firstboot.cfg ─
+// ── Completion sidecar: gdx_extract_state.cfg — key=value, same pattern as gdx_firstboot.cfg ─────
 
 struct ExtractState {
     std::string extractorVersion;
@@ -722,19 +722,19 @@ struct ExtractState {
     std::string archiveSha256;
     std::uintmax_t romSize = 0;
     std::int64_t romMtime = 0;
-    // R7 (C-R7.1): managed Expansion Kit disk copy identity, recorded via GdxExtractRecordManagedDisk.
+    // Managed Expansion Kit disk copy identity, recorded via GdxExtractRecordManagedDisk.
     // Diagnostic only -- nothing in this file gates boot behavior on these fields.
     std::string diskSha256;
     std::uintmax_t diskSize = 0;
-    // R8 Step 1: SHA-256 of fzerox-disk.o2r itself (the container), authored by ensureDiskArchive.
+    // SHA-256 of fzerox-disk.o2r itself (the container), authored by ensureDiskArchive.
     // Used for the disk step's warm-boot check; diagnostic/self-consistency only, never gating.
     std::string diskArchiveSha256;
-    // R3 (C-R3.5): 64DD IPL identity + its archive's identity. iplSha256 is the SHA-256 of the
+    // 64DD IPL identity + its archive's identity. iplSha256 is the SHA-256 of the
     // NORMALIZED full IPL (the archive's ipl/identity, authored by the gdx-extract `ipl` step);
     // iplArchiveSha256 is the SHA-256 of n64ddipl.o2r itself. Diagnostic/self-consistency only.
     std::string iplSha256;
     std::string iplArchiveSha256;
-    // R5 (C-R5.1): which ROM profile this data-dir's cartridge archive was extracted for
+    // Which ROM profile this data-dir's cartridge archive was extracted for
     // ("us/rev0" / "jp/rev0"). Lets the shared launcher/wizard confirm the archive matches the
     // running binary's profile and offer to launch the matching binary on a mismatch.
     std::string profile;
@@ -865,9 +865,9 @@ bool atomicReplace(const fs::path& tmp, const fs::path& final) {
 #endif
 }
 
-// ── Best-effort parse of extractor stdout for diagnostic sidecar fields (C7) ─────────────────────
-// The extractor prints a recipe fingerprint and version on stdout. Exact wording is owned by the
-// extractor (Wave 1-A); we scan case-insensitively for "fingerprint" / "extractor" tokens and grab
+// ── Best-effort parse of extractor stdout for diagnostic sidecar fields ──────────────────────────
+// The extractor prints a recipe fingerprint and version on stdout. Exact wording is the
+// extractor's; we scan case-insensitively for "fingerprint" / "extractor" tokens and grab
 // the trailing value. These fields are diagnostic only — the golden SHA-256 is the gating authority —
 // so an unparsed line never affects correctness.
 void scanStdoutLine(const std::string& line, ExtractState& st) {
@@ -1205,12 +1205,12 @@ void removeIfExists(const fs::path& p) {
 }
 
 // ── Extraction orchestration ─────────────────────────────────────────────────────────────────────
-// Runs the extractor into a same-filesystem temp dir, validates the output (C5), and atomically
+// Runs the extractor into a same-filesystem temp dir, validates the output, and atomically
 // installs it. Returns Extracted on full success, FailedRawFallback otherwise. Never throws.
 ExtractOutcome runExtraction(const fs::path& dataDir, const fs::path& romPath, const fs::path& exeDir,
                              const std::string& romSha1, const RomProfile& profile) {
     std::error_code ec;
-    const char* archiveName = profile.archiveName; // fzerox.o2r (US) / fzerox-jp.o2r (JP), C-R5.1
+    const char* archiveName = profile.archiveName; // fzerox.o2r (US) / fzerox-jp.o2r (JP)
 
     const fs::path extractBin = exeDir / kExtractBinaryName;
     const fs::path recipesDir = exeDir / kRecipesDirName;
@@ -1368,11 +1368,10 @@ ExtractOutcome runExtraction(const fs::path& dataDir, const fs::path& romPath, c
         return ExtractOutcome::FailedRawFallback;
     }
 
-    // Step 2 + 3 are the GOLDEN gates: they only exist for a profile that HAS a validated golden
-    // (US today). For an experimental profile (JP until the owner generates a real
-    // gdx_o2r_expected.jp.h) there is no golden to compare against, so both gates are skipped and the
+    // The two gates below only exist for a profile that HAS a validated golden (US today). An
+    // experimental profile (JP) has no golden to compare against, so both gates are skipped and the
     // archive is installed with a loud EXPERIMENTAL warning. This is deliberately weaker than the US
-    // path — a JP archive is unverified until the JP golden/QA pipeline lands (C-R5.5).
+    // path: a JP archive is unverified.
     std::string archiveSha = sha256File(producedArchive);
     if (archiveSha.empty()) {
         gdx_port_logf("[extract] ERROR: could not hash the extracted archive. Booting from the raw ROM.\n");
@@ -1387,7 +1386,7 @@ ExtractOutcome runExtraction(const fs::path& dataDir, const fs::path& romPath, c
                       "unverified.\n  archive sha256: %s\n  entries: %ld\n",
                       profile.key, archiveName, archiveSha.c_str(), entries);
     } else {
-        // Step 2: entry count.
+        // Entry count.
         if (entries >= 0 && entries != profile.goldenEntryCount) {
             gdx_port_logf("[extract] ERROR: extracted archive has %ld entries, expected %ld. Discarding; "
                           "booting from the raw ROM.\n",
@@ -1398,9 +1397,9 @@ ExtractOutcome runExtraction(const fs::path& dataDir, const fs::path& romPath, c
             return ExtractOutcome::FailedRawFallback;
         }
 
-        // Step 3: archive SHA-256 == golden constant. This is the strongest gate and, because extraction
-        // is deterministic (C2), an exact match. It also transitively proves the version entry (C5 step 4)
-        // and full key completeness (C3/C6), since the archive is byte-identical to the golden reference.
+        // Archive SHA-256 == golden constant. This is the strongest gate and, because extraction is
+        // deterministic, an exact match. It also transitively proves the version entry and full key
+        // completeness, since the archive is byte-identical to the golden reference.
         const std::string& expectedSha = profile.goldenSha256;
         if (archiveSha != expectedSha) {
             gdx_port_logf("[extract] ERROR: extracted archive SHA-256 mismatch.\n"
@@ -1426,18 +1425,18 @@ ExtractOutcome runExtraction(const fs::path& dataDir, const fs::path& romPath, c
     }
     removeIfExists(tmpDir);
 
-    // Persist the completion sidecar (C7). `state` above was default-constructed for THIS
+    // Persist the completion sidecar. `state` above was default-constructed for THIS
     // extraction run's rom/archive/version fields (parsed fresh from extractor stdout, which must
-    // start empty — see the .empty() guards in the stdout parser). The R7 managed-disk identity is
+    // start empty — see the .empty() guards in the stdout parser). The managed-disk identity is
     // written independently, at disk-commit time, possibly long before or after this runs, so
     // preserve it explicitly rather than letting this fresh `state` wipe it back to empty/0.
     ExtractState existingForDisk = loadSidecar(dataDir);
     state.diskSha256 = existingForDisk.diskSha256;
     state.diskSize = existingForDisk.diskSize;
-    state.diskArchiveSha256 = existingForDisk.diskArchiveSha256; // R8: disk archive identity (RMW-preserved)
-    // R3: the IPL identity/archive fields are written independently by the IPL step (and firstboot's
+    state.diskArchiveSha256 = existingForDisk.diskArchiveSha256; // disk archive identity (RMW-preserved)
+    // The IPL identity/archive fields are written independently by the IPL step (and firstboot's
     // acquire-time record); preserve them here so a cart re-extraction never wipes them (same
-    // read-modify-write discipline the R7 disk fields use above).
+    // read-modify-write discipline the disk fields use above).
     state.iplSha256 = existingForDisk.iplSha256;
     state.iplArchiveSha256 = existingForDisk.iplArchiveSha256;
     state.romSha1 = toLowerHex(romSha1);
@@ -1445,7 +1444,7 @@ ExtractOutcome runExtraction(const fs::path& dataDir, const fs::path& romPath, c
     state.romSize = fs::file_size(romPath, ec);
     ec.clear();
     state.romMtime = fileMtime(romPath);
-    state.profile = profile.key; // R5 (C-R5.1): record which ROM profile this archive was built for
+    state.profile = profile.key; // record which ROM profile this archive was built for
     saveSidecar(dataDir, state);
 
     gdx_port_logf("[extract] installed %s [%s] (%ld entries, %s).\n", archiveName, profile.key,
@@ -1454,11 +1453,11 @@ ExtractOutcome runExtraction(const fs::path& dataDir, const fs::path& romPath, c
     return ExtractOutcome::Extracted;
 }
 
-// ── R3: build (or refresh) n64ddipl.o2r from the 64DD IPL ROM ─────────────────────────────────────
+// ── Build (or refresh) n64ddipl.o2r from the 64DD IPL ROM ────────────────────────────────────────
 // Independent of the cartridge archive (different source media, own golden, own sidecar keys). Runs
 // after the cart step inside GdxExtractEnsureArchive so a completed setup can delete N64DDIPLROM.n64.
-// Best-effort and NON-gating (C-R3.2/C-R3.3): a missing IPL, missing extractor, or failed run simply
-// leaves no archive and the port falls back to the raw IPL file (retained until R4). Never throws.
+// Best-effort and NON-gating: a missing IPL, missing extractor, or failed run simply leaves no
+// archive and the port falls back to the raw IPL file. Never throws.
 void ensureIplArchive(const fs::path& dataDir, const fs::path& exeDir) {
     std::error_code ec;
 
@@ -1489,14 +1488,24 @@ void ensureIplArchive(const fs::path& dataDir, const fs::path& exeDir) {
     }
 
     // Resolve the IPL source (needed only to (re)build): the canonical installed copy in the data dir
-    // first, then next to the exe (dev/portable layout). Both use the canonical name N64DDIPLROM.n64.
-    fs::path iplRom = dataDir / kIplRomName;
-    if (!fileExists(iplRom)) {
-        iplRom = exeDir / kIplRomName;
+    // first, then the accepted US-prototype alt name in the data dir, then
+    // the same two names next to the exe (dev/portable layout). Delegates to the shared
+    // GdxFindIplSourceInDir (gdx_firstboot.h) so this probe can never drift from the setup GUI's
+    // Recheck() or FirstBootRun's own probes again -- this is also where a stale
+    // Game.DdIplPath sidecar entry (recorded path no longer on disk) is naturally recovered, since the
+    // helper re-derives the path fresh from each directory instead of trusting any recorded value.
+    std::string foundIpl = GdxFindIplSourceInDir(dataDir.string());
+    if (foundIpl.empty()) {
+        foundIpl = GdxFindIplSourceInDir(exeDir.string());
     }
-    if (!fileExists(iplRom)) {
-        gdx_port_logf("[extract-ipl] no %s in the data or exe dir; skipping %s (raw-IPL fallback).\n",
-                      kIplRomName, kIplArchiveName);
+    fs::path iplRom = foundIpl.empty() ? fs::path() : fs::path(foundIpl);
+    if (iplRom.empty()) {
+        // This is the ONLY place the port can observe "no IPL archive AND no IPL ROM source" at boot --
+        // make it loud (Defect: this used to be a quiet skip line, so a data dir with neither
+        // N64DDIPLROM.n64 nor n64ddipl.o2r booted with silent 64DD-font loss and no diagnostic).
+        gdx_port_logf("[extract-ipl] WARNING: %s missing and no IPL ROM found (looked for %s, %s) — "
+                      "64DD error-screen font unavailable.\n",
+                      kIplArchiveName, kIplRomName, SetupIplFileNameUsProto());
         return;
     }
 
@@ -1558,7 +1567,7 @@ void ensureIplArchive(const fs::path& dataDir, const fs::path& exeDir) {
         return;
     }
 
-    // Structural check: exactly the two frozen entries (C-R3.1).
+    // Structural check: exactly the two frozen entries.
     long entries = zipEntryCount(produced);
     if (entries >= 0 && entries != kIplExpectedEntryCount) {
         gdx_port_logf("[extract-ipl] ERROR: %s has %ld entries, expected %d; discarding (raw-IPL "
@@ -1575,9 +1584,9 @@ void ensureIplArchive(const fs::path& dataDir, const fs::path& exeDir) {
         return;
     }
 
-    // Dev-drift warning ONLY (C-R3.5): the IPL golden is per-user self-consistency, so a mismatch is
-    // never fatal — it just flags that this build's owner-reference header does not match this machine's
-    // dump. The placeholder zero-hash suppresses the warning until a real header is generated.
+    // Dev-drift warning ONLY: the IPL golden is per-user self-consistency, so a mismatch is never
+    // fatal — it just flags that this build's reference header does not match this machine's dump.
+    // The placeholder zero-hash suppresses the warning until a real header is generated.
     const std::string expectedArchive = toLowerHex(std::string(GDX_IPL_ARCHIVE_EXPECTED_SHA256));
     static const std::string kIplPlaceholder(64, '0');
     if (expectedArchive != kIplPlaceholder && archiveSha != expectedArchive) {
@@ -1608,8 +1617,8 @@ void ensureIplArchive(const fs::path& dataDir, const fs::path& exeDir) {
                   st.iplSha256.empty() ? "unknown" : st.iplSha256.c_str());
 }
 
-// ── R8 Step 1: resolve the disk source (.ndd) the archive is built from ────────────────────────────
-// Managed-copy-preferred, mirroring port/disk_buffer.cpp's search order: the R7 managed copy under
+// ── Resolve the disk source (.ndd) the archive is built from ──────────────────────────────────────
+// Managed-copy-preferred, mirroring port/disk_buffer.cpp's search order: the managed copy under
 // <dataDir>/media first, then the data dir, then <exeDir>/media and the exe dir (portable installs
 // keep dataDir == exeDir, so these collapse). Returns an empty path when no source is found.
 fs::path resolveDiskSource(const fs::path& dataDir, const fs::path& exeDir) {
@@ -1626,11 +1635,11 @@ fs::path resolveDiskSource(const fs::path& dataDir, const fs::path& exeDir) {
     return {};
 }
 
-// ── R8 Step 1: build (or refresh) fzerox-disk.o2r from the 64DD EK disk image ──────────────────────
+// ── Build (or refresh) fzerox-disk.o2r from the 64DD EK disk image ────────────────────────────────
 // Independent of the cartridge/IPL archives (own golden, own sidecar key). Runs after ensureIplArchive
 // inside GdxExtractEnsureArchive. Best-effort and NON-gating: a missing disk, missing extractor, or
 // failed run simply leaves no archive and the port falls back to the managed copy / raw .ndd. The disk
-// image is stored VERBATIM (the loader never byte-swaps it), so SHA-256(disk/image) equals the R7
+// image is stored VERBATIM (the loader never byte-swaps it), so SHA-256(disk/image) equals the
 // managed-copy sha — that equivalence is what the boot-time deletion gate proves. Never throws.
 void ensureDiskArchive(const fs::path& dataDir, const fs::path& exeDir) {
     std::error_code ec;
@@ -1699,9 +1708,9 @@ void ensureDiskArchive(const fs::path& dataDir, const fs::path& exeDir) {
     }
     ec.clear();
 
-    // R8 Step 2: when the EK slice manifest ships next to the recipes, pass it so the archive also
+    // When the EK slice manifest ships next to the recipes, pass it so the archive also
     // carries the ek/<symbol> per-asset entries. Its absence is tolerated — the subcommand then emits
-    // only the two disk/* entries (Step-1 behaviour) — but the structural gate below expects
+    // only the two disk/* entries — but the structural gate below expects
     // GDX_DISK_EXPECTED_ENTRY_COUNT, so a mismatched (manifest-absent) build falls back cleanly.
     const fs::path manifestPath = exeDir / kRecipesDirName / kEkSliceManifestName;
     const bool haveManifest = fileExists(manifestPath);
@@ -1750,8 +1759,8 @@ void ensureDiskArchive(const fs::path& dataDir, const fs::path& exeDir) {
         return;
     }
 
-    // Structural check: the two frozen disk/* entries plus the ek/<symbol> per-asset entries (R8
-    // Step 2). The expected total is the data-driven GDX_DISK_EXPECTED_ENTRY_COUNT golden.
+    // Structural check: the two frozen disk/* entries plus the ek/<symbol> per-asset entries.
+    // The expected total is the data-driven GDX_DISK_EXPECTED_ENTRY_COUNT golden.
     long entries = zipEntryCount(produced);
     if (entries >= 0 && entries != kDiskExpectedEntryCount) {
         gdx_port_logf("[extract-disk] ERROR: %s has %ld entries, expected %d; discarding "
@@ -1827,11 +1836,11 @@ static ExtractOutcome ensureCartArchive(const char* dataDirC, const char* romPat
         return ExtractOutcome::UpToDate;
     }
 
-    // ── C7 warm-boot check, FIRST and ROM-independent ────────────────────────────────────────────
+    // ── Warm-boot check, FIRST and ROM-independent ───────────────────────────────────────────────
     // A present archive that hashes to the golden constant is valid regardless of the ROM's current
-    // state — accept it before any ROM checks. This also closes the F3 audit finding: without this
-    // ordering, an early ROM-related return would leave a stale/corrupt archive in place for the
-    // mount path (whose C4 gate checks only the version entry, which bit rot can preserve).
+    // state — accept it before any ROM checks. This ordering matters: an early ROM-related return
+    // would otherwise leave a stale/corrupt archive in place for the
+    // mount path (whose gate checks only the version entry, which bit rot can preserve).
     const std::string expectedSha = toLowerHex(std::string(GDX_O2R_EXPECTED_SHA256));
     if (fileExists(archive)) {
         std::string actual = sha256File(archive);
@@ -1855,14 +1864,14 @@ static ExtractOutcome ensureCartArchive(const char* dataDirC, const char* romPat
         gdx_port_logf("[extract] existing %s does not match this build's golden reference.\n", kArchiveName);
     }
 
-    // ── Resolve supported ROM profiles (US + JP) from the recipe config (C-R5.4) ───────────────────
+    // ── Resolve supported ROM profiles (US + JP) from the recipe config ────────────────────────────
     const fs::path configYml = exeDir / kRecipesDirName / kConfigYmlName;
     std::vector<RomProfile> profiles = buildRomProfiles(configYml);
     const RomProfile& usProfile = profiles[0];
     const RomProfile& jpProfile = profiles[1];
 
-    // ── JP warm-boot (C-R5.1) ──────────────────────────────────────────────────────────────────────
-    // The JP profile has no golden yet (OWNER-RUN-REQUIRED), so a present JP archive is validated for
+    // ── JP warm-boot ───────────────────────────────────────────────────────────────────────────────
+    // The JP profile has no golden yet, so a present JP archive is validated for
     // self-consistency via the sidecar (recorded profile==jp/rev0 + recorded archive SHA-256 == the
     // file's) rather than against a golden constant — the same per-user model the IPL step uses.
     {
@@ -1913,7 +1922,7 @@ static ExtractOutcome ensureCartArchive(const char* dataDirC, const char* romPat
         return failRawQuarantine();
     }
 
-    // ── C1 + C-R5.4: validate ROM identity BEFORE any spawn; match against every profile's SHA-1 ────
+    // ── Validate ROM identity BEFORE any spawn; match against every profile's SHA-1 ────────────────
     std::string romSha1 = toLowerHex(sha1File(romPath));
     if (romSha1.empty()) {
         gdx_port_logf("[extract] ERROR: could not hash the ROM at %s; skipping extraction (raw-ROM "
@@ -1957,13 +1966,13 @@ static ExtractOutcome ensureCartArchive(const char* dataDirC, const char* romPat
 
 ExtractOutcome GdxExtractEnsureArchive(const char* dataDirC, const char* romPathC, const char* exeDirC) {
     // Cartridge archive first (its outcome is what the caller logs/acts on), then the independent IPL
-    // archive step (R3, best-effort, non-gating). The IPL step resolves its own source from the data
+    // archive step (best-effort, non-gating). The IPL step resolves its own source from the data
     // or exe dir — the caller never passes an IPL path — so it needs only dataDir + exeDir and runs
     // regardless of the cart outcome (a valid, up-to-date cart archive must not skip IPL provisioning).
     ExtractOutcome outcome = ensureCartArchive(dataDirC, romPathC, exeDirC);
     if (dataDirC != nullptr && dataDirC[0] != '\0' && exeDirC != nullptr && exeDirC[0] != '\0') {
         ensureIplArchive(fs::path(dataDirC), fs::path(exeDirC));
-        // R8 Step 1: the EK disk archive step, after IPL (both best-effort, non-gating). Resolves its
+        // The EK disk archive step, after IPL (both best-effort, non-gating). Resolves its
         // own source (managed copy preferred) from dataDir/exeDir — the caller passes no disk path.
         ensureDiskArchive(fs::path(dataDirC), fs::path(exeDirC));
     }
@@ -2108,20 +2117,20 @@ void GdxExtractRecordIpl(const char* dataDirC, const char* iplSha256) {
     }
 }
 
-// ── R8 Step 1: disk deletion-gate helpers (see header) ─────────────────────────────────────────────
+// ── Disk deletion-gate helpers (see header) ───────────────────────────────────────────────────────
 
 std::string GdxExtractRecordedDiskSha256(const char* dataDirC) {
     if (dataDirC == nullptr || dataDirC[0] == '\0') {
         return {};
     }
-    return loadSidecar(fs::path(dataDirC)).diskSha256; // R7 managed-copy raw SHA-256 (lowercase hex)
+    return loadSidecar(fs::path(dataDirC)).diskSha256; // managed-copy raw SHA-256 (lowercase hex)
 }
 
 std::string GdxExtractRecordedDiskArchiveSha256(const char* dataDirC) {
     if (dataDirC == nullptr || dataDirC[0] == '\0') {
         return {};
     }
-    return loadSidecar(fs::path(dataDirC)).diskArchiveSha256; // R8 fzerox-disk.o2r container SHA-256
+    return loadSidecar(fs::path(dataDirC)).diskArchiveSha256; // fzerox-disk.o2r container SHA-256
 }
 
 std::string GdxExtractRecordedCartArchiveSha256(const char* dataDirC) {

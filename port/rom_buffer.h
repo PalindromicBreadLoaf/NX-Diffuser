@@ -13,7 +13,7 @@ extern size_t   gdx_rom_size;
  * been loaded yet. Used by disk_buffer.cpp to search for a 64DD disk image
  * next to the chosen ROM before falling back to the exe directory. */
 extern char gdx_rom_path[1024];
-/* R4 (C-R4.1): archivesValidated is the caller-computed "no-ROM boot is safe" predicate --
+/* archivesValidated is the caller-computed "no-ROM boot is safe" predicate --
  * non-zero iff the fzerox.o2r/generic.o2r game archive is mounted AND survived the post-mount
  * CRC gate (main.cpp's InitResourceManager version check). When resolution fails:
  *   - archivesValidated != 0  -> archive-only boot: log and return with gdx_rom_buffer/gdx_rom_size

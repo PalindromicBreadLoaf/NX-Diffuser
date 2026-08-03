@@ -1,5 +1,4 @@
-// G-Diffuser — first-boot setup + per-user data directory resolution. See gdx_firstboot.h and
-// docs/FIRST_BOOT_DESIGN.md.
+// G-Diffuser — first-boot setup + per-user data directory resolution. See gdx_firstboot.h.
 //
 // This TU is part of the G-Diffuser exe target (not the decomp game library), so it may freely use
 // the host CRT, <filesystem>, and the Win32 common-dialog picker (Comdlg32 is already linked for
@@ -7,7 +6,7 @@
 // own gdx_port_logf and touches no LUS state.
 
 #include "gdx_firstboot.h"
-#include "gdx_extract_launch.h" // GdxExtractFileSha256 / GdxExtractRecordManagedDisk (R7 sidecar note)
+#include "gdx_extract_launch.h" // GdxExtractFileSha256 / GdxExtractRecordManagedDisk
 #include "port_log.h"
 
 #include <cstdint>
@@ -33,7 +32,7 @@ namespace fs = std::filesystem;
 namespace gdx {
 namespace {
 
-// ── Structural validation constants (see docs/FIRST_BOOT_DESIGN.md §3.1) ─────────────────────────
+// ── Structural validation constants ──────────────────────────────────────────────────────────────
 constexpr std::uintmax_t kRomMinBytes = 16u * 1024u * 1024u;   // F-Zero X images are 16 MiB.
 constexpr std::uintmax_t kDiskExactBytes = 64931840u;          // Retail/translated 64DD image size.
 constexpr std::uintmax_t kIplMinBytes = 4u * 1024u * 1024u;    // 64DD IPL dumps are 4 MiB.
@@ -45,13 +44,13 @@ constexpr const char* kRomName = "baserom.us.rev0.z64";
 constexpr const char* kDiskName = "baserom.translated.ek.ndd";
 constexpr const char* kIplName = "N64DDIPLROM.n64";
 constexpr const char* kGameArchiveName = "fzerox.o2r";
-// R3's dedicated IPL archive (port/gdx_extract_launch.cpp's kIplArchiveName / main.cpp:229's mount
-// group). Only the literal is needed here (a presence probe for the R4 diagnostic below), so this
+// The dedicated IPL archive (port/gdx_extract_launch.cpp's kIplArchiveName / main.cpp's mount
+// group). Only the literal is needed here (a presence probe for the missing-input diagnostic), so this
 // stays a local constant rather than a cross-TU export.
 constexpr const char* kIplArchiveName = "n64ddipl.o2r";
-// R8 Step 1's dedicated EK disk archive (port/gdx_extract_launch.cpp's kDiskArchiveName /
+// The dedicated EK disk archive (port/gdx_extract_launch.cpp's kDiskArchiveName /
 // main.cpp's mount group). A valid fzerox-disk.o2r satisfies the disk requirement exactly like the
-// managed copy does (gdx_disk_load is archive-first once it is mounted), so the raw .ndd AND the R7
+// managed copy does (gdx_disk_load is archive-first once it is mounted), so the raw .ndd AND the
 // managed copy can be deleted once a boot has reconstructed + verified from it.
 constexpr const char* kDiskArchiveName = "fzerox-disk.o2r";
 // The dev-tree default output name (tools/gen_f3d_o2r.py / Torch's default), still used unrenamed by
@@ -59,30 +58,78 @@ constexpr const char* kDiskArchiveName = "fzerox-disk.o2r";
 // above). GdxFirstBootDescribeMissing accepts either name as satisfying the game-archive input.
 constexpr const char* kGameArchiveDevName = "generic.o2r";
 
-// ── Known-good SHA-1 identity tables (Defect 2: region/dump recognition) ────────────────────────────
+// ── Known-good SHA-1 identity tables (region/dump recognition) ──────────────────────────────────────
 // Named tables so the future JP build can reuse the exact same sets (a JP build would simply accept
 // kRomSha1JpRev0 as VerifiedKnown and reject the US hash with the mirror message). All lowercase hex.
 //   * The US-rev0 ROM's accepted hash (5f658e88ffa9de23cba6986a8fd3d3a90d7b4340) is NOT duplicated
 //     here: it lives in decomp-recipes/config.yml (recipes = single source of truth) and is read at
 //     runtime via GdxExtractExpectedRomSha1 — the ROM accept decision uses that, not a local constant.
 constexpr const char* kRomSha1JpRev0 = "a418b0151521b76691fa03f8658c8b567c69498b"; // F-Zero X (Japan)
-// Alternate canonical filenames for the Japanese dumps (owner decision, 2026-07-23): the wizard
+// Alternate canonical filenames for the Japanese dumps: the wizard
 // accepts these names directly so a JP test folder needs no renaming. The JP ROM boots RAW
 // (experimental; the US recipe tree cannot extract it, so no archives are built for it) — see the
 // jpRom handling in GdxRecognizeInput and the raw-boot branch in FirstBootRun's fast path.
 constexpr const char* kRomNameJp = "baserom.jp.rev0.z64";
 constexpr const char* kDiskNameJp = "baserom.jp.ek.ndd";
-constexpr const char* kIplSha1Known = "bf861922dcb78c316360e3e742f4f70ff63c9bc3";  // N64DDIPLROM.n64
+// Accepted alternate filename for the US prototype IPL dump, so a folder holding it under its
+// original dump name needs no renaming — see
+// kIplNameUsProto below and SetupIplFileNameUsProto()'s doc comment in gdx_firstboot.h.
+constexpr const char* kIplNameUsProto = "64DD_IPL_US_MJR.n64";
 struct KnownDiskDump {
+    const char* sha1;
+    const char* label;  // shown as the OK row header: "OK (<label>)"
+    bool japanese;      // Japanese-region dump — refused unless kAllowJapaneseInputs (see below)
+};
+constexpr KnownDiskDump kKnownDiskDumps[] = {
+    { "fde9fa6f29a52be0144bda74caf8583c036c20ce", "translated Expansion Kit disk", false },
+    { "7e8badf857f1fce8aa59307c0fd318128c44418b", "retail Japanese Expansion Kit disk", true },
+};
+// Known-good 64DD IPL dumps (mirrors KnownDiskDump's structure/purpose). The US prototype dump is
+// recognized alongside the JP retail one, each labelled
+// distinctly so the two are never confused in the setup UI.
+struct KnownIplDump {
     const char* sha1;
     const char* label; // shown as the OK row header: "OK (<label>)"
 };
-constexpr KnownDiskDump kKnownDiskDumps[] = {
-    { "fde9fa6f29a52be0144bda74caf8583c036c20ce", "translated Expansion Kit disk" },
-    { "7e8badf857f1fce8aa59307c0fd318128c44418b", "retail Japanese Expansion Kit disk" },
+constexpr KnownIplDump kKnownIplDumps[] = {
+    { "bf861922dcb78c316360e3e742f4f70ff63c9bc3", "64DD IPL (Japan retail)" },       // N64DDIPLROM.n64
+    { "3c5b93ca231550c68693a14f03cea8d5dbd1be9e", "64DD IPL (USA prototype)" },      // 64DD_IPL_US_MJR.n64
 };
 
-// R7 (C-R7.1): subdirectory of dataDir holding the permanent managed disk copy, kept under the same
+// ── Japanese-region input gate (CMake option GDX_ALLOW_JP_INPUTS, default OFF) ───────────────────
+// The full rationale lives with the option in port/CMakeLists.txt. Short version: this binary
+// accepts the Japanese cartridge dump today on an EXPERIMENTAL raw boot with no asset extraction,
+// and that boot was OBSERVED in hands-on testing to produce loud static and blasting sounds (the
+// cause is unconfirmed; the leading suspect is US-profile asset binding offsets applied to a
+// Japanese image). That is an ear-safety hazard, so a plain (release) configure refuses Japanese
+// game data outright instead of half-booting it.
+//
+// This is a GATE, NOT A REMOVAL. Japanese support ships in a later release, so every piece of JP
+// identification below stays intact — kRomSha1JpRev0, the retail-JP row in kKnownDiskDumps, and the
+// JP alternate filenames (kRomNameJp/kDiskNameJp, still probed by the wizard) — precisely so the
+// refusal can say "this is the Japanese release" instead of "unrecognised file".
+//
+// Written as a constexpr bool rather than #ifdef-ing each call site so BOTH paths keep compiling in
+// both configurations (the JP path cannot bit-rot behind the gate) and the compiler folds away
+// whichever branch is dead.
+#ifdef GDX_ALLOW_JP_INPUTS
+constexpr bool kAllowJapaneseInputs = true;
+#else
+constexpr bool kAllowJapaneseInputs = false;
+#endif
+
+// Refusal text shown verbatim on the wizard's row. Deliberately plain and non-alarming: the user's
+// file is not corrupt or suspect, this build simply does not enable the region yet.
+constexpr const char* kJpRefusedRomMessage =
+    "This is the Japanese release of F-Zero X. Japanese-region support is not enabled in this "
+    "build of G-Diffuser — it is planned for a later release.\n"
+    "Please use the North American (US rev0) cartridge dump.";
+constexpr const char* kJpRefusedDiskMessage =
+    "This is the retail Japanese Expansion Kit disk. Japanese-region support is not enabled in "
+    "this build of G-Diffuser — it is planned for a later release.\n"
+    "Please use the English (translated) Expansion Kit disk image.";
+
+// Subdirectory of dataDir holding the permanent managed disk copy, kept under the same
 // canonical leaf name so it satisfies gdx_disk_load's search AND preserves the existing .gdd save key
 // (which derives from the leaf name only — see gdx_firstboot.h's ManagedDiskPath doc comment).
 constexpr const char* kManagedMediaSubdir = "media";
@@ -120,7 +167,7 @@ fs::path executableDir(const char* argv0) {
 }
 
 // NOTE: G-Diffuser is always portable — no per-user data directory exists. The game folder is the
-// data directory on every platform (product decision, 2026-07-18); AppData/XDG are never touched.
+// data directory on every platform; AppData/XDG are never touched.
 
 bool fileExists(const fs::path& p) {
     std::error_code ec;
@@ -167,6 +214,38 @@ bool hasZ64Magic(const fs::path& p) {
     return got == 4 && m[0] == 0x80 && m[1] == 0x37 && m[2] == 0x12 && m[3] == 0x40;
 }
 
+// Country code from the standard N64 ROM header (offset 0x3E — 'J' Japan, 'E' North America).
+// Only meaningful for a NATIVE big-endian .z64 image, so the magic word is re-checked here and a
+// byte/word-swapped dump reports 0 rather than a garbage code. One 64-byte read; no hashing.
+char romHeaderCountryCode(const fs::path& p) {
+    FILE* f = nullptr;
+#ifdef _MSC_VER
+    if (fopen_s(&f, p.string().c_str(), "rb") != 0) {
+        return '\0';
+    }
+#else
+    f = fopen(p.string().c_str(), "rb");
+#endif
+    if (f == nullptr) {
+        return '\0';
+    }
+    unsigned char hdr[0x40] = {};
+    size_t got = fread(hdr, 1, sizeof(hdr), f);
+    fclose(f);
+    if (got != sizeof(hdr) || hdr[0] != 0x80 || hdr[1] != 0x37 || hdr[2] != 0x12 || hdr[3] != 0x40) {
+        return '\0';
+    }
+    return static_cast<char>(hdr[0x3E]);
+}
+
+// True when `p` is a Japanese-region cartridge image AND this build does not accept Japanese
+// inputs. Catches EVERY Japanese dump — including ones whose SHA-1 this build has never seen —
+// which is what makes the header check worth having alongside the exact-hash check in
+// GdxRecognizeInput. Cheap enough (one 64-byte read) to sit on the dev-tree boot path.
+bool romIsRefusedJapanese(const fs::path& p) {
+    return !kAllowJapaneseInputs && romHeaderCountryCode(p) == 'J';
+}
+
 bool validateRom(const fs::path& p, std::string& why) {
     if (fileSize(p) < kRomMinBytes) {
         why = "not a complete 16 MiB image";
@@ -209,7 +288,7 @@ bool copyInto(const fs::path& src, const fs::path& dstDir, const char* dstName) 
     return true;
 }
 
-// ── Managed disk copy (R7: disk internalization) ────────────────────────────────────────────────
+// ── Managed disk copy (disk internalization) ────────────────────────────────────────────────────
 fs::path managedDiskPath(const fs::path& dataDir) {
     return dataDir / kManagedMediaSubdir / kDiskName;
 }
@@ -290,7 +369,7 @@ bool ensureManagedDiskCopy(const fs::path& dataDir, const fs::path& validatedSrc
     gdx_port_logf("[firstboot] managed disk copy created: %s (%llu bytes)\n", outDst.string().c_str(),
                   static_cast<unsigned long long>(kDiskExactBytes));
 
-    // Best-effort: record the copy's identity in the extraction sidecar (C-R7.1's sidecar note).
+    // Best-effort: record the copy's identity in the extraction sidecar.
     // Diagnostic bookkeeping only -- the file on disk is always the source of truth, and a failure
     // here never fails the copy itself. GdxExtractFileSha256 streams the hash (no full-file load
     // beyond a 64 KiB buffer), so this is a one-time ~150 ms cost paid only at copy-creation time.
@@ -412,7 +491,7 @@ fs::path pickFile(const wchar_t* title, const wchar_t* filter) {
 }
 #endif
 
-// R3 (C-R3.4/C-R3.5): record the acquire-time SHA-256 of the IPL ROM into the extraction sidecar so
+// Record the acquire-time SHA-256 of the IPL ROM into the extraction sidecar so
 // one file documents every verified input. Best-effort/diagnostic — a hash failure never fails setup.
 // The dedicated IPL extraction step later refreshes ipl_sha256 to the byte-order-normalized identity;
 // for the common native (z64) dump the two are equal. Idempotent, so calling it on every boot is fine.
@@ -462,7 +541,7 @@ bool diskArchiveSatisfies(const fs::path& dataDir) {
     // main.cpp's presence-based mount list (findArchivePaths) can never pick up the corrupt file --
     // otherwise the disk stayed mounted (archive-first) while the wizard nagged about "setup" on top of
     // an already-half-working boot. Recovery is stated source-agnostically: ensureDiskArchive rebuilds
-    // automatically from any disk source resolveDiskSource accepts (translated/JP .ndd or the R7
+    // automatically from any disk source resolveDiskSource accepts (translated/JP .ndd or the
     // managed copy); with none present, setup re-runs.
     gdx_port_logf(
         "[firstboot] %s failed verification (does not match the recorded disk_archive_sha256); "
@@ -584,6 +663,19 @@ FirstBootResult FirstBootRun(const char* argv0) {
                 break;
             }
         }
+        // Japanese-region gate: the dev fast path hashes nothing (it validates by size + z64 magic
+        // only), so a Japanese cartridge dump sitting under any of kRomDevCandidates' US filenames
+        // would otherwise boot HEADLESSLY here — past the wizard, past every message. Refuse it by
+        // ROM-header country code before anything else in this branch runs. Falling through to the
+        // in-window wizard is deliberate: it is the surface that can actually explain the refusal.
+        if (!romCand.empty() && romIsRefusedJapanese(romCand)) {
+            gdx_port_logf(
+                "[firstboot] development tree ROM %s is the JAPANESE release; Japanese-region "
+                "support is not enabled in this build (configure with -DGDX_ALLOW_JP_INPUTS=ON to "
+                "enable it). Refusing the headless dev boot and deferring to the setup screen.\n",
+                romCand.string().c_str());
+            romCand.clear();
+        }
         if (!romCand.empty()) {
             // G-Diffuser is Expansion-Kit-MANDATORY: the game is built EK-only and crashes/degrades
             // without the 64DD disk, so the dev fast path must not bypass the wizard unless a valid
@@ -604,8 +696,12 @@ FirstBootResult FirstBootRun(const char* argv0) {
                     }
                 }
                 if (iplCand.empty()) {
-                    fs::path i = dir / kIplName;
-                    if (fileExists(i)) {
+                    // Probes the canonical name, then the accepted US-prototype alt name
+                    // -- see GdxFindIplSourceInDir's doc comment in
+                    // gdx_firstboot.h; shared with ensureIplArchive and the wizard's Recheck().
+                    std::string found = GdxFindIplSourceInDir(dir.string());
+                    if (!found.empty()) {
+                        fs::path i(found);
                         iplFound = true;
                         if (validateIpl(i, iplWhy)) {
                             iplCand = i;
@@ -613,7 +709,7 @@ FirstBootResult FirstBootRun(const char* argv0) {
                     }
                 }
             }
-            // R7 (C-R7.1/C-R7.2): a byte-identical managed copy of the disk lives under
+            // A byte-identical managed copy of the disk lives under
             // <dataDir>/media (dataDir == exeDir in DevLayout — see result.dataDir below), so the
             // user's original .ndd is deletable exactly like the ROM/IPL. If a valid original was
             // found, ensure the managed copy exists (idempotent — a no-op past the first time). If
@@ -649,7 +745,7 @@ FirstBootResult FirstBootRun(const char* argv0) {
                 result.diskPath = fs::absolute(diskCand, ec).string();
                 result.iplPath = fs::absolute(iplCand, ec).string();
                 result.dataDir = exeDir.string();
-                recordIplIdentity(exeDir, iplCand); // acquire-time IPL identity (R3)
+                recordIplIdentity(exeDir, iplCand); // acquire-time IPL identity
                 gdx_port_logf("[firstboot] development tree: ROM=%s disk=%s ipl=%s; setup not required\n",
                               result.romPath.c_str(), result.diskPath.c_str(), result.iplPath.c_str());
                 return result;
@@ -699,17 +795,22 @@ FirstBootResult FirstBootRun(const char* argv0) {
     SetupState st = loadState(dataDir);
 
     // Fast path: setup was previously completed AND every input is still satisfied. Each of the three
-    // canonical inputs is satisfied by the R7/R8 ACCEPTANCE CHAIN — in order: its validated installed
+    // canonical inputs is satisfied by the ACCEPTANCE CHAIN — in order: its validated installed
     // ARCHIVE (so the ORIGINAL is deletable; the game boots archive-only exactly as rom_buffer.cpp /
     // disk_buffer.cpp already do), else the managed media/ copy (disk only), else the original file.
-    // The old predicate demanded the ORIGINAL ROM and ORIGINAL IPL files on disk, so deleting them
-    // after a fully-installed setup dragged the wizard back even though fzerox.o2r / n64ddipl.o2r /
-    // fzerox-disk.o2r cover them — the invariant violation this fixes (Defect 1).
+    // Demanding the ORIGINAL ROM and IPL files here would drag the wizard back after a fully-
+    // installed setup whose originals were deleted, even though the archives cover them.
     fs::path romInData = dataDir / kRomName;
     fs::path diskInData = dataDir / kDiskName;
     if (st.complete) {
         std::string why;
-        fs::path iplCheck = dataDir / kIplName;
+        // Resolve the canonical name OR the accepted US-prototype alt name, never just the
+        // canonical one -- this is also where a stale
+        // st.iplPath/Game.DdIplPath sidecar entry (recorded path no longer on disk) is naturally
+        // recovered: this probe re-derives the path fresh from the data dir on every boot instead of
+        // trusting the recorded value. Shared with ensureIplArchive/Recheck() via GdxFindIplSourceInDir.
+        std::string iplFoundPath = GdxFindIplSourceInDir(dataDir.string());
+        fs::path iplCheck = iplFoundPath.empty() ? (dataDir / kIplName) : fs::path(iplFoundPath);
         fs::path managedDisk = managedDiskPath(dataDir);
         bool managedDiskValid = fileExists(managedDisk) && fileSize(managedDisk) == kDiskExactBytes;
 
@@ -735,10 +836,25 @@ FirstBootResult FirstBootRun(const char* argv0) {
         // ROM itself (re-hashed every boot so a swapped file cannot ride the recorded acceptance),
         // plus the same IPL/disk chains as the US path. This branch cannot be reached by an
         // interrupted US extraction: those record the US hash (or none), never kRomSha1JpRev0.
+        //
+        // Japanese-region gate: when this build does not accept Japanese inputs the recorded-JP-hash
+        // fast path is DISABLED — otherwise a gdx_firstboot.cfg written by a JP-enabled (dev) build,
+        // or carried over in a copied game folder, would keep booting the Japanese ROM raw in a
+        // release binary with no wizard and no message. Refusing here drops through to the
+        // "input unsatisfied" branch below, which re-runs setup; the wizard's ROM row then states
+        // the actual reason (GdxRecognizeInput refuses the JP hash with kJpRefusedRomMessage).
         bool jpRawBootSatisfied = false;
         if (!gameArchiveValid && st.romSha1 == kRomSha1JpRev0 && !st.romPath.empty() &&
             fileExists(fs::path(st.romPath)) && iplSatisfied && diskSatisfied) {
-            jpRawBootSatisfied = (GdxExtractFileSha1(st.romPath.c_str()) == kRomSha1JpRev0);
+            if (kAllowJapaneseInputs) {
+                jpRawBootSatisfied = (GdxExtractFileSha1(st.romPath.c_str()) == kRomSha1JpRev0);
+            } else {
+                gdx_port_logf(
+                    "[firstboot] this install was set up with the JAPANESE ROM (%s), but "
+                    "Japanese-region support is not enabled in this build; re-running setup "
+                    "(configure with -DGDX_ALLOW_JP_INPUTS=ON to enable it)\n",
+                    st.romPath.c_str());
+            }
         }
         if (jpRawBootSatisfied) {
             result.status = FirstBootStatus::SetupComplete;
@@ -764,7 +880,7 @@ FirstBootResult FirstBootRun(const char* argv0) {
             // threads `archivesValidated` into gdx_init_rom for exactly this case).
             result.romPath = fileExists(romInData) ? fs::absolute(romInData, ec).string() : std::string();
             if (fileExists(iplCheck)) {
-                recordIplIdentity(dataDir, iplCheck); // keep the acquire-time IPL identity fresh (R3)
+                recordIplIdentity(dataDir, iplCheck); // keep the acquire-time IPL identity fresh
             }
             // Annotate the disk source disk_buffer.cpp will actually use: it is ARCHIVE-FIRST (a
             // mounted fzerox-disk.o2r reconstructs the image before the managed-copy/original search),
@@ -816,6 +932,24 @@ const char* SetupDiskFileName() {
 
 const char* SetupIplFileName() {
     return kIplName;
+}
+
+const char* SetupIplFileNameUsProto() {
+    return kIplNameUsProto;
+}
+
+std::string GdxFindIplSourceInDir(const std::string& dir) {
+    std::error_code ec;
+    fs::path canonical = fs::path(dir) / kIplName;
+    if (fs::is_regular_file(canonical, ec)) {
+        return canonical.string();
+    }
+    ec.clear();
+    fs::path alt = fs::path(dir) / kIplNameUsProto;
+    if (fs::is_regular_file(alt, ec)) {
+        return alt.string();
+    }
+    return std::string();
 }
 
 const char* SetupRomFileNameJp() {
@@ -871,7 +1005,15 @@ GdxInputRecognition GdxRecognizeInput(const std::string& canonicalName, const st
             r.verdict = GdxInputVerdict::VerifiedKnown;
             r.message = "SHA-1 verified: " + r.sha1;
         } else if (r.sha1 == kRomSha1JpRev0) {
-            // Owner decision (2026-07-23): accept the Japanese dump. It boots RAW — the US recipe
+            if (!kAllowJapaneseInputs) {
+                // Japanese-region gate (see kAllowJapaneseInputs). The dump is RECOGNIZED — that is
+                // the whole point of keeping kRomSha1JpRev0 — so the row can name it precisely
+                // instead of falling through to the generic "SHA-1 mismatch" text below.
+                r.verdict = GdxInputVerdict::Rejected;
+                r.message = kJpRefusedRomMessage;
+                return r;
+            }
+            // Accept the Japanese dump. It boots RAW — the US recipe
             // tree cannot extract it, so setup skips archive extraction entirely for this ROM and
             // the boot uses the raw-ROM path (no fzerox.o2r, no archive-only mode, no deletable ROM).
             r.verdict = GdxInputVerdict::AcceptedUnknownWarn;
@@ -880,6 +1022,13 @@ GdxInputRecognition GdxRecognizeInput(const std::string& canonicalName, const st
             r.message = "Japanese ROM accepted (SHA-1 verified). Experimental: boots directly from "
                         "the ROM; asset extraction and archive features are unavailable for the "
                         "Japanese version, so keep this ROM file in place.";
+        } else if (romIsRefusedJapanese(fs::path(path))) {
+            // A Japanese dump this build has no hash for (alternate dump, trimmed/overdumped image,
+            // a revision we have not catalogued). The header country code still identifies it, so
+            // say WHY it is refused rather than "this is not the US cartridge".
+            r.verdict = GdxInputVerdict::Rejected;
+            r.message = std::string(kJpRefusedRomMessage) + "\n(identified from the ROM header "
+                        "country code; SHA-1 " + r.sha1 + ")";
         } else {
             r.verdict = GdxInputVerdict::Rejected;
             r.message = "SHA-1 mismatch — this dump is not the US rev0 cartridge\nyours:    " + r.sha1 +
@@ -888,16 +1037,20 @@ GdxInputRecognition GdxRecognizeInput(const std::string& canonicalName, const st
         return r;
     }
 
-    // IPL — accept any correctly-sized dump; label the one known-good, warn on the rest.
+    // IPL — accept any correctly-sized dump; label the known-good ones (JP retail, US prototype), warn
+    // on the rest.
     if (canonicalName == kIplName) {
-        if (r.sha1 == kIplSha1Known) {
-            r.verdict = GdxInputVerdict::VerifiedKnown;
-            r.message = "Recognized 64DD IPL ROM — SHA-1 verified: " + r.sha1;
-        } else {
-            r.verdict = GdxInputVerdict::AcceptedUnknownWarn;
-            r.message = "Unrecognized IPL dump (SHA-1 " + r.sha1 +
-                        ") — proceeding, but this dump is untested.";
+        for (const KnownIplDump& d : kKnownIplDumps) {
+            if (r.sha1 == d.sha1) {
+                r.verdict = GdxInputVerdict::VerifiedKnown;
+                r.okHeaderOverride = d.label;
+                r.message = std::string("Recognized ") + d.label + " — SHA-1 verified: " + r.sha1;
+                return r;
+            }
         }
+        r.verdict = GdxInputVerdict::AcceptedUnknownWarn;
+        r.message = "Unrecognized IPL dump (SHA-1 " + r.sha1 +
+                    ") — proceeding, but this dump is untested.";
         return r;
     }
 
@@ -905,12 +1058,25 @@ GdxInputRecognition GdxRecognizeInput(const std::string& canonicalName, const st
     if (canonicalName == kDiskName) {
         for (const KnownDiskDump& d : kKnownDiskDumps) {
             if (r.sha1 == d.sha1) {
+                if (d.japanese && !kAllowJapaneseInputs) {
+                    // Japanese-region gate (see kAllowJapaneseInputs). Recognized, then refused, so
+                    // the row names the disk rather than reporting an unknown image.
+                    r.verdict = GdxInputVerdict::Rejected;
+                    r.message = kJpRefusedDiskMessage;
+                    return r;
+                }
                 r.verdict = GdxInputVerdict::VerifiedKnown;
                 r.okHeaderOverride = d.label;
                 r.message = std::string("OK (") + d.label + ") — SHA-1 " + r.sha1;
                 return r;
             }
         }
+        // NOTE: an UNRECOGNIZED but correctly-sized image is still accepted-with-warning, in both
+        // gate states. There is no cheap region marker on a 64DD image the way there is on a
+        // cartridge header (the fan-translated disk is itself a modified Japanese disk, so any
+        // region field it carries still reads as Japan), so "unknown" cannot be narrowed to
+        // "Japanese" here without guessing. Refusing every unknown dump would break legitimate
+        // re-dumps; the identity gate stays exact-hash only.
         r.verdict = GdxInputVerdict::AcceptedUnknownWarn;
         r.message = "Unrecognized Expansion Kit disk (SHA-1 " + r.sha1 +
                     ") — proceeding, but this dump is untested.";
@@ -944,13 +1110,13 @@ bool WriteSetupComplete(const std::string& dataDir, const std::string& romPath,
     // Recorded so the completed-setup fast path can recognize a Japanese-ROM raw-boot install
     // (no fzerox.o2r ever exists for it) without weakening the US game-archive gate.
     st.romSha1 = GdxExtractFileSha1(romPath.c_str());
-    // R3: record the acquire-time IPL identity as setup finalizes (best-effort; the dedicated IPL
+    // Record the acquire-time IPL identity as setup finalizes (best-effort; the dedicated IPL
     // extraction step refreshes it to the normalized identity once it runs).
     recordIplIdentity(fs::path(dataDir), fs::path(iplPath));
     return saveState(fs::path(dataDir), st);
 }
 
-// ── Missing-input diagnostic (R4 C-R4.1 UX helper; see doc comment in gdx_firstboot.h) ────────────
+// ── Missing-input diagnostic (see doc comment in gdx_firstboot.h) ─────────────────────────────────
 std::string GdxFirstBootDescribeMissing(const std::string& dataDirIn) {
     std::error_code ec;
     fs::path dataDir = dataDirIn.empty() ? fs::current_path(ec) : fs::path(dataDirIn);
@@ -967,7 +1133,7 @@ std::string GdxFirstBootDescribeMissing(const std::string& dataDirIn) {
         lines.push_back(std::string(kRomName) + " (F-Zero X ROM): invalid -- " + why);
     }
 
-    // 64DD IPL ROM: the raw file OR the dedicated archive satisfies this input (R3, C-R3.2 --
+    // 64DD IPL ROM: the raw file OR the dedicated archive satisfies this input (
     // gdx_ddipl_load is archive-first once n64ddipl.o2r is mounted).
     fs::path iplPath = dataDir / kIplName;
     bool iplArchivePresent = fileExists(dataDir / kIplArchiveName);
@@ -981,7 +1147,7 @@ std::string GdxFirstBootDescribeMissing(const std::string& dataDirIn) {
     }
 
     // Expansion Kit disk: the original OR the managed copy under media/ OR the dedicated disk archive
-    // satisfies this input (R7 C-R7.2 managed copy + R8 Step 1 archive-first; gdx_disk_load resolves
+    // satisfies this input (managed copy + archive-first; gdx_disk_load resolves
     // archive → managed copy → original).
     fs::path diskPath = dataDir / kDiskName;
     fs::path managedDisk = managedDiskPath(dataDir);

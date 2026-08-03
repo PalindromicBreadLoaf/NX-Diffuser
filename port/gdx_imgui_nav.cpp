@@ -1,30 +1,27 @@
 #include "gdx_imgui_nav.h"
 
-#include <cmath> // fabsf (analog scroll response curve)
-
 #include <imgui.h>
 #include <SDL2/SDL.h>
+
+#include "ship/Context.h"
+#include "ship/window/Window.h"
+#include "ship/window/gui/Gui.h" // Gui::GetMenuOrMenubarVisible (nav-flag sync)
 
 #include "libultraship/bridge/consolevariablebridge.h" // CVarGetInteger
 
 namespace {
 
-// Our own controller handle for menu navigation. libultraship's ControlDeck opens the controller
-// for game input; ImGui's platform backend may open it for its own nav reader. Opening it a third
-// time here is harmless (SDL allows multiple handles) and keeps this module self-contained: we read
-// physical state directly rather than the game-facing pad, which is intentionally zeroed while the
-// menu blocks game input.
+// Our own controller handle for menu navigation: the game-facing pad is intentionally zeroed while
+// the menu blocks game input, so this reads physical state instead. SDL allows several open handles
+// on one device, so this does not disturb the ControlDeck or an ImGui backend.
 SDL_GameController* sController = nullptr;
 
-// Left stick -> directional nav (digital, folded into the D-pad — see the tick below). A firm
-// threshold so a deliberate push registers one move and resting drift never does. Menu nav is
-// discrete, so this behaves like a D-pad press, not a variable-speed axis.
-constexpr float kNavStickThreshold = 0.50f;
+// True while this module, rather than an ImGui platform backend, is the source of the gamepad keys.
+bool sOwnsFeed = false;
 
-// Right stick -> content-pane scroll. Onset deadzone for the analog scroll feed; below this the
-// stick is centered. Lower than the nav threshold because scrolling is a continuous, forgiving
-// action where an early, smooth onset feels better than a firm detent.
-constexpr float kScrollDeadzone = 0.30f;
+// ImGui_ImplSDL2_UpdateGamepadAnalog's thumb deadzone, normalized. Matching it keeps the stick
+// feeling identical whichever of the two feeds is live on a given platform.
+constexpr float kStickDeadzone = 8000.0f / 32767.0f;
 
 SDL_GameController* AcquireController() {
     if (sController != nullptr && SDL_GameControllerGetAttached(sController)) {
@@ -50,38 +47,72 @@ void FeedButton(ImGuiIO& io, SDL_GameController* c, SDL_GameControllerButton sdl
     io.AddKeyEvent(key, SDL_GameControllerGetButton(c, sdlBtn) != 0);
 }
 
-// Read one stick axis as a normalized -1..1 value.
-float ReadAxis(SDL_GameController* c, SDL_GameControllerAxis axis) {
-    return static_cast<float>(SDL_GameControllerGetAxis(c, axis)) / 32767.0f;
-}
-
-// Map one stick axis (raw -32768..32767) to a pair of opposing analog nav keys (0..1 each) with a
-// rescaled deadzone and a mild ease-in curve: past the deadzone the value ramps from 0 (not from a
-// hard 0.30 step), and the quadratic curve gives finer control near center. Used for the right
-// stick's content-pane scroll, which ImGui drives from the LStick* analog keys.
-void FeedScrollAxis(ImGuiIO& io, SDL_GameController* c, SDL_GameControllerAxis axis, ImGuiKey negKey,
-                    ImGuiKey posKey) {
-    const float v = ReadAxis(c, axis);
-    const float mag = fabsf(v);
+// One stick axis -> a pair of opposing analog nav keys, rescaled so the magnitude ramps from 0 at
+// the deadzone edge instead of stepping. Mirrors ImGui_ImplSDL2_UpdateGamepadAnalog.
+void FeedAxis(ImGuiIO& io, SDL_GameController* c, SDL_GameControllerAxis axis, ImGuiKey negKey,
+              ImGuiKey posKey) {
+    const float v = static_cast<float>(SDL_GameControllerGetAxis(c, axis)) / 32767.0f;
+    const float mag = (v < 0.0f) ? -v : v;
     float out = 0.0f;
-    if (mag > kScrollDeadzone) {
-        const float rescaled = (mag - kScrollDeadzone) / (1.0f - kScrollDeadzone); // 0..1 past deadzone
-        out = rescaled * rescaled;                                                 // quadratic ease-in
+    if (mag > kStickDeadzone) {
+        out = (mag - kStickDeadzone) / (1.0f - kStickDeadzone);
+        if (out > 1.0f) {
+            out = 1.0f;
+        }
     }
-    const float neg = (v < -kScrollDeadzone) ? out : 0.0f;
-    const float pos = (v > kScrollDeadzone) ? out : 0.0f;
+    const float neg = (v < 0.0f) ? out : 0.0f;
+    const float pos = (v > 0.0f) ? out : 0.0f;
     io.AddKeyAnalogEvent(negKey, neg > 0.0f, neg);
     io.AddKeyAnalogEvent(posKey, pos > 0.0f, pos);
+}
+
+bool MenuVisible() {
+    auto ctx = Ship::Context::GetInstance();
+    if (ctx == nullptr) {
+        return false;
+    }
+    auto window = ctx->GetWindow();
+    if (window == nullptr) {
+        return false;
+    }
+    auto gui = window->GetGui();
+    return gui != nullptr && gui->GetMenuOrMenubarVisible();
 }
 
 } // namespace
 
 extern "C" void gdx_imgui_nav_tick(void) {
-    // Stock behavior unless the user enabled gamepad menu navigation.
-    if (CVarGetInteger("gControlNav", 0) == 0) {
+    if (ImGui::GetCurrentContext() == nullptr) {
         return;
     }
-    if (ImGui::GetCurrentContext() == nullptr) {
+    ImGuiIO& io = ImGui::GetIO();
+
+    // Drop last frame's claim before testing the flag, so whatever remains was set by a backend.
+    if (sOwnsFeed) {
+        io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
+        sOwnsFeed = false;
+    }
+
+    // libultraship recomputes this flag only on the frame its own toggle key fires (Gui.cpp
+    // DrawMenu), so closing the menu with B or its close button left ImGui nav live over the running
+    // game. Re-asserting LUS's own rule every frame keeps it honest whatever closed the menu.
+    const bool navOn = CVarGetInteger("gControlNav", 0) != 0;
+    if (navOn && MenuVisible()) {
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+    } else {
+        io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
+    }
+    if (!navOn) {
+        return;
+    }
+
+    // Exactly one writer per ImGuiKey. Two readers queueing different values for one key in a frame
+    // make ImGui stop applying the rest of the event queue (imgui.cpp UpdateInputEvents' trickling
+    // rule), which shows up as nav that fires every other frame and input that lands late. The SDL2
+    // backend feeds the whole gamepad itself, so we only step in where no backend does: Win32/DX11,
+    // whose XInput reader is compiled out (IMGUI_IMPL_WIN32_DISABLE_GAMEPAD, windows.cmake) because
+    // it cannot see a raw DualSense.
+    if (io.BackendFlags & ImGuiBackendFlags_HasGamepad) {
         return;
     }
 
@@ -89,55 +120,32 @@ extern "C" void gdx_imgui_nav_tick(void) {
     if (c == nullptr) {
         return;
     }
-
-    ImGuiIO& io = ImGui::GetIO();
-
-    // ImGui's nav system ignores gamepad keys unless a backend declares
-    // ImGuiBackendFlags_HasGamepad. On Windows the Win32 backend's XInput
-    // reader is compiled out (IMGUI_IMPL_WIN32_DISABLE_GAMEPAD in
-    // libultraship/cmake/dependencies/windows.cmake) so this feed owns the
-    // flag; on SDL-backend platforms the backend also sets it — harmless.
     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+    sOwnsFeed = true;
 
-    // Menu toggle (Back/Create/View) — fed every frame so libultraship's Gui toggle can open the
-    // menu from a closed state, and D-pad + face buttons for navigation once it is open. When the
-    // menu is closed ImGui ignores the nav keys (NavEnableGamepad is off) but still reads the toggle.
+    // Read by libultraship's Gui toggle even while the menu is closed.
     FeedButton(io, c, SDL_CONTROLLER_BUTTON_BACK, ImGuiKey_GamepadBack);
     FeedButton(io, c, SDL_CONTROLLER_BUTTON_START, ImGuiKey_GamepadStart);
 
-    // Directional navigation: D-pad OR left stick. ImGui's menu nav reads ONLY the D-pad keys for
-    // item movement (imgui.cpp NavUpdate) — it never moves the selection from the analog LStick*
-    // keys (those only scroll or move windows). So a raw left stick feels dead in menus. We fix that
-    // by folding the left stick into the D-pad: either input navigates. Holding a direction lets
-    // ImGui's own typematic repeat scroll a long list. The left stick uses a firm threshold so it
-    // acts like a discrete D-pad press rather than a variable-speed axis.
-    const float lx = ReadAxis(c, SDL_CONTROLLER_AXIS_LEFTX);
-    const float ly = ReadAxis(c, SDL_CONTROLLER_AXIS_LEFTY); // SDL: up is negative
-    io.AddKeyEvent(ImGuiKey_GamepadDpadUp,
-                   SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0 || ly < -kNavStickThreshold);
-    io.AddKeyEvent(ImGuiKey_GamepadDpadDown,
-                   SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0 || ly > kNavStickThreshold);
-    io.AddKeyEvent(ImGuiKey_GamepadDpadLeft,
-                   SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_LEFT) != 0 || lx < -kNavStickThreshold);
-    io.AddKeyEvent(ImGuiKey_GamepadDpadRight,
-                   SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) != 0 || lx > kNavStickThreshold);
+    FeedButton(io, c, SDL_CONTROLLER_BUTTON_DPAD_UP, ImGuiKey_GamepadDpadUp);
+    FeedButton(io, c, SDL_CONTROLLER_BUTTON_DPAD_DOWN, ImGuiKey_GamepadDpadDown);
+    FeedButton(io, c, SDL_CONTROLLER_BUTTON_DPAD_LEFT, ImGuiKey_GamepadDpadLeft);
+    FeedButton(io, c, SDL_CONTROLLER_BUTTON_DPAD_RIGHT, ImGuiKey_GamepadDpadRight);
 
-    // Face buttons — SDL A/B/X/Y are position-named (A = bottom). ImGui's Face* keys are also
-    // position-named: FaceDown activates, FaceRight cancels/back. This keeps the physical bottom
-    // button = "confirm" on both Xbox and DualSense (Cross), matching ImGui's default expectation.
+    // SDL and ImGui both name face buttons by position, so the physical bottom button confirms and
+    // the right one cancels on Xbox and DualSense alike. FaceLeft is deliberately unfed: ImGui
+    // spends it on window switching and the menu-bar layer, neither of which this menu has, so a
+    // press only flashes the window-switcher overlay and drops the active widget.
     FeedButton(io, c, SDL_CONTROLLER_BUTTON_A, ImGuiKey_GamepadFaceDown);
     FeedButton(io, c, SDL_CONTROLLER_BUTTON_B, ImGuiKey_GamepadFaceRight);
-    FeedButton(io, c, SDL_CONTROLLER_BUTTON_X, ImGuiKey_GamepadFaceLeft);
     FeedButton(io, c, SDL_CONTROLLER_BUTTON_Y, ImGuiKey_GamepadFaceUp);
 
-    // Shoulders — ImGui uses L1/R1 to switch focus between windows/columns.
+    // Fine/coarse slider tweak while a widget is active; the menu also cycles header tabs with them.
     FeedButton(io, c, SDL_CONTROLLER_BUTTON_LEFTSHOULDER, ImGuiKey_GamepadL1);
     FeedButton(io, c, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, ImGuiKey_GamepadR1);
 
-    // Right stick scrolls the focused content pane. ImGui reads scroll from the LStick* analog keys
-    // (imgui.cpp NavUpdate "Manual scroll with LStick"), so we feed the RIGHT stick into those keys:
-    // left stick = navigate, right stick = scroll — the console-standard split. The RStick* ImGui
-    // keys are not consumed by nav in this build, so they are intentionally left unfed.
-    FeedScrollAxis(io, c, SDL_CONTROLLER_AXIS_RIGHTX, ImGuiKey_GamepadLStickLeft, ImGuiKey_GamepadLStickRight);
-    FeedScrollAxis(io, c, SDL_CONTROLLER_AXIS_RIGHTY, ImGuiKey_GamepadLStickUp, ImGuiKey_GamepadLStickDown);
+    // Left stick scrolls the focused pane; the D-pad moves the selection. That split is ImGui's own
+    // and the only one the SDL backend can also produce, so both platforms feel the same.
+    FeedAxis(io, c, SDL_CONTROLLER_AXIS_LEFTX, ImGuiKey_GamepadLStickLeft, ImGuiKey_GamepadLStickRight);
+    FeedAxis(io, c, SDL_CONTROLLER_AXIS_LEFTY, ImGuiKey_GamepadLStickUp, ImGuiKey_GamepadLStickDown);
 }

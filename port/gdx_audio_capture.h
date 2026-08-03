@@ -1,9 +1,10 @@
-/* G-Diffuser -- streaming PCM capture for the R2 bit-identical audio gate (C-R2.3).
+/* G-Diffuser -- streaming PCM capture for the bit-identical audio gate.
  *
  * A dormant diagnostic (gdx_unlock_audio_capture_ai_buffer in gdx_audio_lle.c) already existed
  * upstream of ALL host post-processing (low-pass, volume, underrun-fade), but the tap call site
- * at decomp/src/audio/disk/lib/thread.c:84-88 that wires this module into the scheduler is new in
- * this batch. This module is the streaming replacement used by the PCM-parity harness: instead of
+ * at decomp/src/audio/disk/lib/thread.c:87-96 (AudioThread_CreateTaskImpl, immediately before its
+ * osAiSetNextBuffer) is what wires this module into the scheduler; both taps run, side by side.
+ * This module is the streaming replacement used by the PCM-parity harness: instead of
  * a fixed 64000-frame RAM ring it appends raw interleaved s16 stereo samples straight to
  * <prefix>.pcm and, on finalize, writes a SHA-256 sidecar the harness compares run-to-run.
  *
@@ -52,8 +53,9 @@ void gdx_pcm_capture_arm(void);
 void gdx_pcm_capture_feed(const int16_t* frames, unsigned int frameCount, unsigned int sampleRate);
 
 /* 1 while a capture window is armed and not yet finalized. Gates the deterministic-RNG
-   substitution at thread.c:194 -- 0 in all normal (unconfigured) play, so that site keeps its
-   original hardware-entropy expression. */
+   substitution at thread.c:205-226 (the osGetCount() pin inside AudioThread_CreateTaskImpl) -- 0
+   in all normal (unconfigured) play, so that site keeps its original hardware-entropy
+   expression. */
 int gdx_pcm_capture_active(void);
 
 /* 1 once the capture window has finalized (frame cap reached, or shutdown). Polled by the

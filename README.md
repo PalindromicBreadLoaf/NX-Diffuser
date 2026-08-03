@@ -44,8 +44,8 @@ legally obtained dumps; game data is extracted or loaded locally from the files 
   (`gEnhancements.Practice.ShowLapDeltas`).
 - **Texture-pack modding** — drop `.o2r` packs in a `mods/` folder to override textures
   (`gEnhancements.Workshop.TexturePacks`), with hot reload from the menu.
-- **Texture dumping** — dump every decoded texture while you play to build your own packs
-  (`gEnhancements.Workshop.TextureDump`).
+- **Asset dumping** — decode named assets straight from the extracted archive, per class, from the
+  Workshop tab. See `docs/MODDING_GUIDE.md` for which dumper to use when building a pack.
 - **Durable 64DD save sidecar** — Course Edit saves and disk writes are journaled to a sidecar
   file next to the game; your original `.ndd` disk image is **never** modified.
 - **Modern rendering knobs** — internal resolution scale, MSAA, texture filtering, VSync,
@@ -60,10 +60,11 @@ legally obtained dumps; game data is extracted or loaded locally from the files 
 > **You must provide your own legally-obtained F-Zero X ROM. G-Diffuser does not, and will
 > never, distribute copyrighted game files.**
 
-1. **Get the game files you own.** G-Diffuser needs an F-Zero X **US rev0** ROM dump, named
-   `baserom.us.rev0.z64` (the loader also accepts `fzerox.z64` / `f-zero-x.z64` as alternate
-   names). The dump must be **big-endian (`.z64`) byte order** — the loader does not byte-swap,
-   so a `.n64` or `.v64` dump must be converted to `.z64` first or it will be rejected.
+1. **Get the game files you own.** G-Diffuser needs an F-Zero X **US rev0** ROM dump. It must be
+   **big-endian (`.z64`) byte order** — the loader does not byte-swap, so a `.n64` or `.v64` dump
+   must be converted to `.z64` first or it will be rejected. Setup auto-detects a ROM named
+   `baserom.us.rev0.z64` beside the executable; any other filename works too, as long as you point
+   the first-boot wizard at it with **Browse** — it is copied in under the canonical name.
 2. **Download** a G-Diffuser release for your platform, or build it yourself (see
    [Building](#building)).
 3. **Launch** the executable. On first boot the setup screen detects files already beside the
@@ -81,7 +82,7 @@ ROM:
 | File | What it is |
 | --- | --- |
 | `baserom.translated.ek.ndd` | The fan-translated Expansion Kit disk image (English translation by Zoinkity, adapted to the 64DD disk image by LuigiBlood). The loader also accepts `baserom.jp.ek.ndd` for the original Japanese disk. A retail 64DD image is ~64.9 MB. |
-| `N64DDIPLROM.n64` | A 64DD IPL / drive ROM dump (~4 MB). Supplies the drive's built-in font. |
+| `N64DDIPLROM.n64` | A 64DD IPL / drive ROM dump (~4 MB). Supplies the drive's built-in font. The US prototype dump is also accepted under its own name, `64DD_IPL_US_MJR.n64` — no renaming needed. |
 
 Place them next to your ROM (or feed them to the first-boot wizard). Setup will not complete
 without them.
@@ -126,39 +127,67 @@ git clone --recursive https://github.com/Zorkats/G-Diffuser.git
 
 ### Windows
 
-- **Visual Studio 2022** (MSVC toolset) with the C++ workload
-- **CMake** and **Ninja**
-- **vcpkg** for libultraship's C++ dependencies
+| Prerequisite | Notes |
+| --- | --- |
+| **Visual Studio 2022** | MSVC toolset, "Desktop development with C++" workload |
+| **CMake 3.20+** | |
+| **Python 3** | Required, not optional — CMake configure fails without an interpreter (build-time asset generators) |
 
 > Build from a clean shell **without** MSYS2/MinGW on your `PATH`, or MSVC may pick up MinGW
 > headers. Use a Developer Command Prompt (`vcvars64`).
 
 ```sh
-# Install libultraship's dependencies via vcpkg
-vcpkg install zlib bzip2 sdl2 glew libzip nlohmann-json tinyxml2 spdlog fmt --triplet x64-windows
+# Configure. Visual Studio is CMake's default generator on Windows; USE_AUTO_VCPKG lets
+# libultraship bootstrap its own vcpkg into the build tree, so no manual vcpkg install is needed.
+cmake -S . -B build/x64 -DUSE_AUTO_VCPKG=ON
 
-# Configure + build
-cmake -G Ninja -S . -B build/x64 \
+# Build. --config Release is REQUIRED here: the Visual Studio generator is multi-config, so it
+# ignores -DCMAKE_BUILD_TYPE and picks the configuration at build time.
+cmake --build build/x64 --config Release --target G-Diffuser
+```
+
+The executable lands in `build/x64/port/Release/`. Other targets: `ALL_BUILD` builds everything
+including the console test executables; `G-Diffuser-JP` exists only when you configure with
+`-DGDX_BUILD_JP=ON`.
+
+<details>
+<summary><b>Alternative: Ninja</b></summary>
+
+Ninja is single-config, so `-DCMAKE_BUILD_TYPE` selects the configuration and `--config` does
+nothing. libultraship's auto-vcpkg derives its triplet from the Visual Studio generator, so on the
+Ninja path supply your own vcpkg instead:
+
+```sh
+vcpkg install zlib bzip2 sdl2 glew libzip nlohmann-json tinyxml2 spdlog --triplet x64-windows
+
+cmake -S . -B build/x64-ninja -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake \
   -DVCPKG_TARGET_TRIPLET=x64-windows
-cmake --build build/x64
+cmake --build build/x64-ninja --target G-Diffuser
 ```
+
+</details>
 
 ### Linux
 
-Install the toolchain and libultraship's dependencies from your distribution (CMake, Ninja, a
-C++20 compiler, SDL2, GLEW, zlib, bzip2, libzip, nlohmann-json, tinyxml2, spdlog, fmt), then:
+Install the toolchain and libultraship's dependencies from your distribution (CMake 3.20+, Ninja, a
+C++20 compiler, Python 3, SDL2, GLEW, zlib, bzip2, libzip, nlohmann-json, tinyxml2, spdlog), then:
 
 ```sh
-cmake -G Ninja -S . -B build/x64 -DCMAKE_BUILD_TYPE=Release
-cmake --build build/x64
+cmake -S . -B build/x64-linux -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build/x64-linux --target G-Diffuser
 ```
 
 ### Expansion Kit build
 
-Expansion Kit support is a build option (`GDX_EXPANSION_KIT`). Enable it when you want the disk
-loader, Course Edit, and DD cups compiled in.
+Expansion Kit support is **on by default** (`GDX_EXPANSION_KIT=ON`) and is the supported
+configuration — it is what makes the disk loader, Course Edit, and the DD cups part of the build,
+and it is why the [Expansion Kit files](#expansion-kit-files-required) are required at runtime.
+
+Configuring `-DGDX_EXPANSION_KIT=OFF` produces a cartridge-only binary with the disk subsystem,
+Course Edit, and the DD cups excluded. That build does not need the disk image or IPL, but it is not
+what releases ship and it is not the experience this port is for.
 
 ## FAQ
 
@@ -185,9 +214,49 @@ vsync isn't capping the frame rate, the game can run faster than 60 FPS. Open th
 (**F1**), go to the graphics settings, and enable the **Frame Pacer** — it holds the game to its
 intended 60 FPS. The setting persists across launches.
 
-**Diagnostic logging.** Log output is opt-in. Set the environment variable `GDX_LOG=1` before
-launching to write a `gdiffuser-run.log` file next to the executable; without it, no run log is
-created.
+**Diagnostic logging.** Log output is opt-in; without it, no run log is created. Two ways to turn it
+on:
+
+| How | What it does |
+| --- | --- |
+| **Environment variables** | `GDX_LOG=1` writes `gdiffuser-run.log` next to the executable. `GDX_TRACE=1` adds the high-frequency per-frame trace lines (and opens the log file on its own). A variable exported at launch pins that setting for the whole run, including boot, and the menu shows it as locked. |
+| **In-game** | **F1 → Dev Tools → General → Developer gates → Logging**: *Write gdiffuser-run.log* and *High-frequency trace*. These persist in `gdiffuser.cfg.json`, but they are read at startup — tick one and **restart** to capture boot. |
+
+> **`GDX_TRACE` is off by default in release builds** (it is on by default in Debug builds). That is
+> usually why a log has none of the interesting per-frame lines in it. Set it explicitly.
+
+Those two are what a bug report needs. The full set of 29 developer gates is reference material: it
+lives on that same Dev Tools page, and in `port/gdx_dev_gates.c` in the source, each with its own
+description.
+
+**Crash reports.** On Windows a crash always writes `gdiffuser-crash.txt` next to the executable —
+no environment variable required. Attach it if you have one.
+
+## Reporting a bug
+
+Open an issue at [github.com/Zorkats/G-Diffuser/issues](https://github.com/Zorkats/G-Diffuser/issues).
+
+Generate a log first:
+
+```sh
+# Windows (PowerShell)
+$env:GDX_LOG="1"; $env:GDX_TRACE="1"; .\G-Diffuser.exe
+
+# Linux
+GDX_LOG=1 GDX_TRACE=1 ./G-Diffuser
+```
+
+Then reproduce the problem, quit, and include:
+
+- [ ] **Platform and renderer** — Windows/D3D11 or Linux/OpenGL
+- [ ] **Which build** — release version, or the commit you built
+- [ ] **ROM region and dump** — F-Zero X US rev0, plus whether the Expansion Kit disk is the
+      translated or the Japanese image
+- [ ] **Repro steps** — what you did, what you expected, what happened
+- [ ] **`gdiffuser-run.log`** — from the run above, found next to the executable
+- [ ] **`gdiffuser-crash.txt`** — if the game crashed
+
+Please do not attach ROMs, disk images, IPL dumps, or your generated `fzerox.o2r`.
 
 ## Credits
 

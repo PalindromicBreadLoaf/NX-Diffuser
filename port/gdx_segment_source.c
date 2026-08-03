@@ -1,4 +1,4 @@
-/* R1 single byte-source shim (contract C-R1.3). See gdx_segment_source.h.
+/* Single byte-source shim. See gdx_segment_source.h.
  *
  * Resolves an absolute ROM read archive-first via the generated segment_blob
  * table (port/gen/AssetBindings.c), falling back to the raw ROM image
@@ -64,13 +64,13 @@ extern size_t gdx_rom_size;
 
 /* Raw archive-file reader (port/AssetLoader.cpp): copies min(fileSize, outSize)
  * bytes of the o2r file INCLUDING its 0x40 Torch resource header, returns 1 on
- * success. NOTE the real definition uses size_t (the R1-A prompt's `unsigned int`
- * was approximate); match it exactly so the C prototype agrees with the C++
+ * success. NOTE the real definition uses size_t; match it exactly so the C
+ * prototype agrees with the C++
  * extern "C" definition. */
 extern int GDiffuser_LoadArchiveFileBytes(const char* key, void* out, size_t outSize,
                                           size_t* copiedSize);
 
-/* Archive entry framing (R1-A): 0x40-byte Torch header, u32 little-endian
+/* Archive entry framing: 0x40-byte Torch header, u32 little-endian
  * payload size at 0x40, verbatim ROM-slice payload begins at 0x44. */
 #define GDX_ARCHIVE_HEADER_BYTES 0x40u
 #define GDX_ARCHIVE_SIZE_FIELD_BYTES 0x04u
@@ -79,7 +79,7 @@ extern int GDiffuser_LoadArchiveFileBytes(const char* key, void* out, size_t out
 /* Per-family cache + telemetry slots, discovered lazily by blob-entry identity
  * (the generated table is static, so entry pointers are stable). The table holds
  * the 22 venue/geometry families plus the audio_blob families appended by the
- * concurrent R2 work that this same shim also serves (C-R2.2); 128 leaves ample
+ * audio_blob families this same shim also serves; 128 leaves ample
  * headroom for the full launch set. A family beyond the cap still serves correct
  * bytes via the raw-ROM fallback -- it just is not cached or tracked. */
 #define GDX_SEG_FAMILY_MAX 128
@@ -90,7 +90,7 @@ typedef struct {
                                         * lock-free read fast path publishes this last */
     volatile unsigned int payloadSize; /* usable payload bytes at `payload` */
     int loadState;                     /* 0 = unattempted, 1 = loaded, 2 = failed */
-    unsigned int fallbackReads;        /* C-R1.6 per-family raw-ROM fallbacks */
+    unsigned int fallbackReads;        /* per-family raw-ROM fallbacks */
     int loggedFallback;                /* rate-limit: first fallback per family logs once */
 } GdxSegFamilySlot;
 
@@ -102,7 +102,7 @@ static volatile unsigned int sFamilyCount;
 static unsigned int sUnmappedFallback; /* fallbacks where no blob contains the read */
 static int sUnmappedLogged;
 
-/* C-R4.2 strict archive mode. GDX_STRICT_ARCHIVE (any non-empty, non-"0" value)
+/* Strict archive mode. GDX_STRICT_ARCHIVE (any non-empty, non-"0" value)
  * turns EVERY raw-ROM fallback into a logged defect -- the soak evidence collector.
  * It NEVER aborts (logged-defect semantics): a fallback still serves byte-identical
  * raw ROM. The per-family "log once" rate-limit is lifted to one line per 100

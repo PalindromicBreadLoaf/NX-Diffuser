@@ -1,7 +1,7 @@
-// port/n64_gfx_convert.h -- Phase G2 boundary converters.
+// port/n64_gfx_convert.h -- narrow-to-wide display-list boundary converters.
 //
 // Converts a binary N64-format (8-byte) display list into the wide 16-byte
-// layout the Phase G1 bridge fast-path consumes, ONCE, and caches the result so
+// layout the bridge's wide fast-path consumes, ONCE, and caches the result so
 // the per-frame path never re-parses the narrow list nor consults the guessing
 // resolver for the pointers this stage already resolved deterministically.
 //
@@ -96,7 +96,7 @@ class GfxWideCache {
     size_t CachedCount() const { return mCache.size(); }
     bool Contains(const void* src) const { return mCache.find(src) != mCache.end(); }
 
-    // Frame-boundary bookkeeping (deep-audit M1): the bridge calls this once per
+    // Frame-boundary bookkeeping: the bridge calls this once per
     // gdx_gfx_run, before any GetOrBuild calls for that frame. Advances the
     // internal frame counter and, only once the cache has grown past
     // kEvictHighWatermark entries, sweeps it in a single O(size) pass evicting

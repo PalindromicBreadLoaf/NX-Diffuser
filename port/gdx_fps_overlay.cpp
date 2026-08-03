@@ -42,7 +42,7 @@ void GdxFpsOverlay::Draw() {
     SyncVisibilityConsoleVariable();
 }
 
-// Real-FPS visibility (owner requirement, 2026-07-23). When Frame Interpolation is ON the sim runs
+// Real-FPS visibility. When Frame Interpolation is ON the sim runs
 // at 60 Hz but the renderer PRESENTS multiple sub-frames per tick (each a full ImGui frame), so
 // io.Framerate already tracks true presents/sec — but the raw number alone hides that the 60 Hz
 // logic rate is unchanged. Annotate it as "144.0 FPS (sim 60 Hz)" so the presented rate and the fixed

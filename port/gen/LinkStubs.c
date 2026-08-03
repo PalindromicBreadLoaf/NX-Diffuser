@@ -233,7 +233,7 @@ long LeoResetClear() { return 0; }
    Save_SaveCourseRecordProfiles/Save_SaveDeathRaceProfiles/Save_SaveGhost/
    Save_UpdateCharacterSave/Save_UpdateCourseCharacterSave/Save_UpdateCupCompletion/
    Save_UpdateCupSave/Sram_Init/Sram_ReadWrite are real now: save.c (save-system slice). */
-long _Printf() { return 0; }
+/* _Printf is real now: port/shims.c (vsnprintf-backed libultra formatter). */
 long __osExceptionPreamble() { return 0; }
 long __osGetSR() { return 0; }
 long __osHwIntTable() { return 0; }

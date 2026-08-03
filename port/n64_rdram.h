@@ -27,7 +27,8 @@ static inline void* gdx_rdram_ptr(unsigned int phys) {
     return gdx_rdram + phys;
 }
 
-/* Allocate 8MB buffer, zero it, place GfxPool pointer, register host range. Fatal on failure. */
+/* Allocate the GDX_RDRAM_SIZE buffer, zero it, place the GfxPool pointer, register the host
+   range. Fatal on failure. */
 void gdx_rdram_init(void);
 
 /* Bump-allocate from the RDRAM arena. Fatal if exhausted. */

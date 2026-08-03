@@ -68,7 +68,7 @@
 // this C TU does not pull the C++ bridge header.
 extern int CVarGetInteger(const char* name, int defaultValue);
 
-// R6-P2 finding fix (MEDIUM): port/n64_gfx_bridge.cpp's per-tick truth, NOT the raw
+// Read port/n64_gfx_bridge.cpp's per-tick truth, NOT the raw
 // gEnhancements.Graphics.FrameInterpolation CVar. main.cpp's per-tick interpOn also forces the
 // classic single-present branch (which calls gdx_frame_pacer_tick()) while an EK editor (Course
 // Edit / Create Machine) is active, even though the FrameInterpolation CVar itself stays 1. Reading
@@ -154,7 +154,7 @@ void gdx_frame_pacer_tick(void) {
     LARGE_INTEGER now;
     LONGLONG remaining;
 
-    // R6-P2 mutual exclusion: frame interpolation and frame pacing are opposed pacing owners. When
+    // Mutual exclusion: frame interpolation and frame pacing are opposed pacing owners. When
     // interpolation actually drove THIS tick, the host paces the SIM to the logic deadline
     // (port/main.cpp) and presents run VSync-paced inside the sub-frame loop; this fixed 59.94 Hz
     // pacer must NOT also throttle the loop (it would fight the accumulator and starve the
@@ -307,7 +307,7 @@ void gdx_frame_pacer_tick(void) {
     int64_t now;
     int64_t remaining;
 
-    // R6-P2 mutual exclusion (POSIX): see the Windows path above. Interpolation owns pacing only on
+    // Mutual exclusion (POSIX): see the Windows path above. Interpolation owns pacing only on
     // the ticks it actually drove (per-tick truth, not the raw CVar -- see the comment above).
     if (gdx_gfx_interp_tick_active() != 0) {
         sPosixNextDeadlineNs = 0;

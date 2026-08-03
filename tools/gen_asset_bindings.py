@@ -37,6 +37,7 @@ import argparse
 import glob
 import os
 import re
+import sys
 import yaml
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -170,9 +171,42 @@ def jp_experimental_banner(profile):
     return "\n".join(lines) + "\n"
 
 
-def generate(profile, out_override):
+def is_tracked_binding_path(path):
+    """True if `path` resolves to the checked-in, hand-maintained AssetBindings.c.
+
+    Comparison is by realpath so both the historical default resolution AND an
+    explicit --out that happens to point at the same file are caught -- either
+    way, writing there clobbers hand-maintained real array sizes with generator
+    stubs (see US_HANDEDIT_CLASSES).
+    """
+    tracked = os.path.join(REPO, "port", "gen", "AssetBindings.c")
+    return os.path.realpath(path) == os.path.realpath(tracked)
+
+
+def generate(profile, out_override, force_overwrite=False, lint_only=False):
     asset_yaml_dir, binding_c = resolve_paths(profile, out_override)
-    os.makedirs(os.path.dirname(binding_c), exist_ok=True)
+
+    if not lint_only and is_tracked_binding_path(binding_c) and not force_overwrite:
+        print(
+            "ERROR: refusing to overwrite the tracked, hand-maintained {}\n"
+            "\n"
+            "This file is generator output PLUS hand-maintained real array sizes on\n"
+            "top (see the US_HANDEDIT_CLASSES doc in this module) -- a bare regenerate\n"
+            "silently truncates every array back to a 1-element stub, which still\n"
+            "compiles but corrupts every asset it touches.\n"
+            "\n"
+            "Safe options:\n"
+            "  --lint-only            run the duplicate-offset lint, write nothing\n"
+            "  --out <scratch-path>   generate to a scratch file to diff against the\n"
+            "                         tracked file before deciding what to apply\n"
+            "  --force-overwrite      regenerate the tracked file for real -- you MUST\n"
+            "                         re-apply hand-maintained array sizes afterward\n".format(binding_c),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not lint_only:
+        os.makedirs(os.path.dirname(binding_c), exist_ok=True)
 
     defs = []
     total = 0
@@ -198,6 +232,16 @@ def generate(profile, out_override):
     asset_fixup_entries = []
     segment_images = {}
     asset_load_entries = []
+
+    # Lint-only (non-fatal): flag two DIFFERENTLY-NAMED symbols that claim the same
+    # (offset) within the same image (segment_id, rom_base, compressed). This class of
+    # bug is exactly what caused the LINE menu strip to read MARK emblem art on the US
+    # cart (EK reconciliation Phase 3/F3): a stale/renamed symbol's yaml `offset:` was
+    # never updated and silently landed on another symbol's slot. Keyed per-image
+    # because the same numeric offset legitimately repeats across different images
+    # (segments/ROM bases). Two entries for the SAME symbol name at the same offset
+    # (e.g. re-processed duplicate yaml keys) are not warned about here.
+    seen_image_offsets = {}
 
     for path in sorted(glob.glob(os.path.join(asset_yaml_dir, "*.yaml"))):
         fname = os.path.basename(path)
@@ -314,6 +358,21 @@ def generate(profile, out_override):
                         declared = max(0, int(gfx_end if gfx_end is not None else offset) - offset)
 
                     image_key = (int(segment_id), int(rom_base), int(compressed))
+
+                    offset_key = (image_key, offset)
+                    prior_sym = seen_image_offsets.get(offset_key)
+                    if prior_sym is not None and prior_sym != sym:
+                        print(
+                            "WARNING: duplicate-offset in {}: {} and {} both claim offset "
+                            "0x{:X} in image (segment=0x{:X}, rom_base=0x{:X}, compressed={}) "
+                            "-- one of them is likely reading the other's data".format(
+                                yaml_stem, prior_sym, sym, offset, image_key[0], image_key[1], image_key[2]
+                            ),
+                            file=sys.stderr,
+                        )
+                    else:
+                        seen_image_offsets[offset_key] = sym
+
                     image_size = segment_images.get(image_key, 0)
                     if segment_declared_size > 0:
                         image_size = max(image_size, segment_declared_size)
@@ -625,6 +684,11 @@ def generate(profile, out_override):
     blob_lines.append("#endif /* PORT */")
 
     is_us_default = (profile == "us/rev0")
+    if lint_only:
+        print("LINT-ONLY [{}]: {} asset symbols scanned, nothing written (target would have been {})".format(
+            profile, total, binding_c))
+        return
+
     with open(binding_c, "w", encoding="utf-8", newline="\n") as f:
         if not is_us_default:
             f.write(jp_experimental_banner(profile))
@@ -671,8 +735,17 @@ def main():
     ap.add_argument("--out", default=None,
                     help="override output path (e.g. a scratch path to diff generated-pure vs "
                          "the checked-in hand-edited US file without overwriting it)")
+    ap.add_argument("--force-overwrite", action="store_true",
+                    help="allow writing over the tracked, hand-maintained port/gen/AssetBindings.c. "
+                         "Without this, writing to that path is refused because it silently truncates "
+                         "every hand-maintained array size back to a 1-element generator stub. You MUST "
+                         "re-apply the hand-edited sizes afterward if you use this.")
+    ap.add_argument("--lint-only", action="store_true",
+                    help="run the duplicate-offset lint (and the rest of the yaml scan) without "
+                         "writing any file -- safe to run at any time, including against the tracked "
+                         "US output path")
     args = ap.parse_args()
-    generate(args.profile, args.out)
+    generate(args.profile, args.out, force_overwrite=args.force_overwrite, lint_only=args.lint_only)
 
 
 if __name__ == "__main__":

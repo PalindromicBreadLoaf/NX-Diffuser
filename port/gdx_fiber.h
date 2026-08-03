@@ -1,6 +1,6 @@
 /* port/gdx_fiber.h -- cooperative context (fiber) abstraction.
  *
- * The R6 scheduler (port/n64_sched.c) runs the decomp's real N64 threads as
+ * The cooperative scheduler (port/n64_sched.c) runs the decomp's real N64 threads as
  * cooperative contexts on a single OS thread. On Windows those are Win32 fibers
  * (CreateFiber/SwitchToFiber/ConvertThreadToFiber); on POSIX they are ucontext_t
  * contexts (getcontext/makecontext/swapcontext). This header is the seam that

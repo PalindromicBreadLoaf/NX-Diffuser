@@ -1,6 +1,7 @@
 // G-Diffuser — lightweight frame-time telemetry. See gdx_perf.h for the contract.
 
 #include "gdx_perf.h"
+#include "gdx_dev_gates.h" // GDX_PERF is now a Dev Tools gate (Bucket A), re-latched per frame
 #include "port_log.h"
 
 #include <algorithm>
@@ -55,14 +56,11 @@ double subLogicMs(double gametickMs, const double* sub) {
 PerfState& state() {
     static PerfState s; // holds a mutex — must be constructed in place, never copied
     static const bool initialized = [] {
-        const char* v = std::getenv("GDX_PERF");
-        s.enabled = (v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0'));
-        if (s.enabled) {
-            s.frameTotals.reserve(kSummaryWindowFrames);
-            s.audioTicks.reserve(2048);
-            gdx_port_logf("[GDX perf] telemetry enabled (spike threshold %.0f ms, summary every %d frames)\n",
-                          kSpikeThresholdMs, kSummaryWindowFrames);
-        }
+        // Reserve unconditionally (a few tens of KB) so that enabling telemetry from the Dev Tools
+        // menu mid-session never allocates on the frame loop's first measured frame. `enabled`
+        // itself is re-latched once per frame in PerfFrameBegin from the gate cache.
+        s.frameTotals.reserve(kSummaryWindowFrames);
+        s.audioTicks.reserve(2048);
         return true;
     }();
     (void) initialized;
@@ -139,6 +137,15 @@ bool PerfEnabled() {
 
 void PerfFrameBegin() {
     PerfState& s = state();
+    // Re-latch the gate ONCE per frame, here, before any PerfPhaseBegin runs. Every other entry
+    // point below tests the latched flag, so a toggle mid-frame can never leave a Begin without its
+    // End (or vice versa) — the whole frame is measured or none of it is.
+    const bool wasEnabled = s.enabled;
+    s.enabled = gdx_dev_gate(GDX_GATE_PERF) != 0;
+    if (s.enabled && !wasEnabled) {
+        gdx_port_logf("[GDX perf] telemetry enabled (spike threshold %.0f ms, summary every %d frames)\n",
+                      kSpikeThresholdMs, kSummaryWindowFrames);
+    }
     if (!s.enabled) {
         return;
     }

@@ -1,4 +1,4 @@
-// port/gdx_interp.cpp — R6-P1: matrix frame-interpolation math + per-tick snap state.
+// port/gdx_interp.cpp — matrix frame-interpolation math + per-tick snap state.
 // See gdx_interp.h for the architecture context. Everything here is a no-op unless
 // GDX_INTERP_P1 is set. Render-only: nothing in this file writes back into game logic.
 
@@ -15,12 +15,12 @@
 #endif
 
 // gdx_port_logf is a header-only static-inline facility (port/port_log.h pulls only <stdio.h> etc.
-// plus a lean <windows.h>), so include it in the .cpp for the P3 cut telemetry. The header
+// plus a lean <windows.h>), so include it in the .cpp for the cut telemetry. The header
 // interface stays free of any port/decomp/LUS dependency (per gdx_interp.h's standalone contract).
 #include "port_log.h"
 
 // =============================================================================================
-// P3 cut epoch (Step 7 / Step 8). Bumped by the discontinuity sites via gdx_interp_mark_cut*;
+// P3 cut epoch. Bumped by the discontinuity sites via gdx_interp_mark_cut*;
 // consumed once per rendered tick by gdx_interp::CutPendingForThisTick. Kept at global scope with
 // C linkage so the one-line PORT-gated decomp shims reach it without any C++/namespace surface.
 // atomic is defensive: today every producer (decomp game fibers) and the single consumer (the gfx
@@ -36,7 +36,7 @@ static void GdxInterpMarkCutImpl(const char* tag) {
     // not interpolation is enabled.
     const std::uint32_t ep = g_cutEpoch.fetch_add(1, std::memory_order_relaxed) + 1u;
 
-    // Telemetry (spec item 5): the "[interp-p3] cut" line exists so QA can confirm cuts are caught,
+    // Telemetry: the "[interp-p3] cut" line exists so cuts can be confirmed caught,
     // which only matters while interpolation is on — so gate the LOG (not the bump) on interp being
     // active, matching the [interp-p2] convention and keeping normal-play logs clean. It is further
     // rate-limited so a shim that ends up in a hot path (fires every tick) cannot spam 60 lines/s:
@@ -120,7 +120,7 @@ static P1Config ParseP1() {
     if (end != v && d > 0.0 && d < 1.0) {
         float t = static_cast<float>(d);
         if (t > 0.999f) {
-            t = 0.999f; // never let the presented sub-frame reach live state (Step 2a)
+            t = 0.999f; // never let the presented sub-frame reach live state
         }
         return P1Config{true, P1Mode::Numeric, t};
     }
@@ -179,7 +179,7 @@ void MtxFromF(const float mf[4][4], void* mtx) {
 }
 
 // =============================================================================================
-// Per-element float lerp (Step 5) — SoH interpolate_mtxf.
+// Per-element float lerp — SoH interpolate_mtxf.
 // =============================================================================================
 void LerpMtx(const void* prev, const void* cur, float t, void* out) {
     float pf[4][4];
@@ -197,14 +197,34 @@ void LerpMtx(const void* prev, const void* cur, float t, void* out) {
 }
 
 // =============================================================================================
-// Translation-magnitude teleport snap (Correction 2 belt-and-suspenders).
+// Translation-magnitude teleport snap (belt-and-suspenders).
 // Threshold in camera-space units per tick. Normal inter-tick motion at 60 Hz is a few tens of
-// units; a respawn/cut/teleport is hundreds to thousands. This is intentionally conservative —
-// the authoritative cut coverage is P3's gdx_interp_mark_cut(); this only catches gross jumps
-// that no event shim has been wired for yet. Tunable.
-const float kTeleportThreshold = 2000.0f;
+// units; a respawn/cut/teleport is hundreds to thousands. The authoritative cut coverage is P3's
+// gdx_interp_mark_cut(); this catches gross jumps that no event shim has been wired for yet.
+//
+// RETUNED 2026-08-01 FROM 2000 TO 300, ON MEASUREMENT. At 2000 this guard was not conservative,
+// it was inert for the fault that actually mattered. Slot identity is a GfxPool byte offset
+// (n64_gfx_bridge.cpp GdxP0RerouteMtx), so when the pool layout shifts -- the visible set changes
+// as the camera turns and the track-chunk cull admits different geometry -- offset N pairs against
+// a DIFFERENT object than last tick, and the lerp runs between two unrelated transforms. That is
+// the floor flicker, and it is why the flicker tracks camera angle.
+//
+// The [interp-pair] probe measured the two populations in a Mute City race and they separate
+// cleanly, with nothing in between:
+//   correctly paired windows : per-tick max 0-203 units
+//   mispairing bursts        : per-tick max 495, 610, 762, 1206, 1740  (223 events / 41893 pairings)
+// Every one of those sailed under 2000. 300 sits above the clean population with margin and below
+// the lowest observed mispairing, and still leaves large headroom over real motion: a machine at
+// 3000 km/h -- the game's speed ceiling -- covers roughly 140 units per tick.
+//
+// The asymmetry justifies erring toward snapping: a snapped slot costs ONE tick of
+// non-interpolation and is imperceptible, while a mispaired slot is a visible flicker. This is a
+// MITIGATION, not the architectural fix -- byte-offset identity is still the wrong key, and a
+// mispairing between two objects that happen to sit closer than 300 units apart is still silent.
+// The real fix is a stable per-object key (Starship records the destination Mtx* instead).
+const float kTeleportThreshold = 300.0f;
 
-bool TranslationTeleport(const void* prev, const void* cur) {
+float TranslationDelta(const void* prev, const void* cur) {
     float pf[4][4];
     float cf[4][4];
     MtxToF(prev, pf);
@@ -213,12 +233,15 @@ bool TranslationTeleport(const void* prev, const void* cur) {
     const float dx = cf[3][0] - pf[3][0];
     const float dy = cf[3][1] - pf[3][1];
     const float dz = cf[3][2] - pf[3][2];
-    const float dist2 = dx * dx + dy * dy + dz * dz;
-    return dist2 > (kTeleportThreshold * kTeleportThreshold);
+    return sqrtf((dx * dx) + (dy * dy) + (dz * dz));
+}
+
+bool TranslationTeleport(const void* prev, const void* cur) {
+    return TranslationDelta(prev, cur) > kTeleportThreshold;
 }
 
 // =============================================================================================
-// Referenced-set tracking (Correction 2 primary). Graphics-thread only; no locking.
+// Referenced-set tracking. Graphics-thread only; no locking.
 // =============================================================================================
 static std::unordered_set<uint32_t>& CurSet() {
     static std::unordered_set<uint32_t> s;
@@ -244,33 +267,28 @@ void CommitTick() {
 }
 
 // =============================================================================================
-// Dual-pool resolution (Step 2 + Correction 1). All GfxPool-layout knowledge lives here.
+// Dual-pool resolution. All GfxPool-layout knowledge lives here.
 // =============================================================================================
 extern "C" {
 extern unsigned char D_8024DCE0[]; // decomp: GfxPool D_8024DCE0[2]; addressed as raw bytes here
 extern int D_800DCCFC;             // decomp: s32 double-buffer parity toggle
 }
 
-// GfxPool size selects on EXPANSION_KIT (decomp/include/sys.h). The G-Diffuser exe target and the
-// gdiffuser_game object library are both compiled EXPANSION_KIT=1, so this matches the array the
-// decomp allocated. PrevPoolBase self-verifies against gSegments[1] and bails on any mismatch, so
-// a wrong constant safely disables interpolation instead of corrupting memory.
+// The N64 struct-comment GfxPool size from decomp/include/sys.h, selected on EXPANSION_KIT. This
+// is NOT the host stride: on a 64-bit host sizeof(Gfx) doubles (pointer-width w1), inflating
+// gfxBuffer[13313] by 0x1A008, so the real pool is 0x50738 rather than 0x36730. Kept only as the
+// reference value the one-time stride log reports against.
 #ifdef EXPANSION_KIT
 static constexpr size_t kGfxPoolSize = 0x36730;
 #else
 static constexpr size_t kGfxPoolSize = 0x2C6F0;
 #endif
 
-// R6-P2 FIELD-DEFECT FIX (2026-07-23): the hand-copied kGfxPoolSize (the N64 struct-comment size
-// in decomp/include/sys.h) is the WRONG inter-pool stride on the 64-bit host. sizeof(Gfx) doubles
-// there (pointer-width w1), so gfxBuffer[13313] — and therefore the whole GfxPool — is 0x1A008
-// bytes larger than the N64 layout (measured: host sizeof = 0x50738 vs const 0x36730). The old code
-// treated that mismatch as a hard-disable: PrevPoolBase returned 0 forever, every P1 slot snapped to
-// cur (t=1), GdxP1Lerped() stayed 0, and the P2 sub-frame loop went permanently degenerate — one
-// t=1 present per tick, i.e. interpolation paid full cost while rendering the disabled path (the
-// owner's "no smoothness" report). The array stride between D_8024DCE0[0] and [1] is exactly
-// sizeof(GfxPool), so use the decomp TU's ground-truth sizeof as the stride instead of a constant.
-// port/decomp_port.c compiles WITH the real GfxPool type, so gdx_gfxpool_sizeof() is authoritative.
+// The array stride between D_8024DCE0[0] and [1] is exactly sizeof(GfxPool), and port/decomp_port.c
+// compiles WITH the real GfxPool type, so gdx_gfxpool_sizeof() is the authoritative stride.
+// Using the N64 constant instead put every modelview matrix outside GdxP0MtxInPoolSpan's bound:
+// PrevPoolBase returned 0 forever, every slot snapped to t=1, and the sub-frame loop paid full
+// cost while rendering the disabled path.
 extern "C" size_t gdx_gfxpool_sizeof(void);
 
 // The real host inter-pool stride, latched once. Logs the N64-vs-host delta the first time so the
@@ -310,7 +328,7 @@ int PoolParity() {
 }
 
 // =============================================================================================
-// P2 activation (R6-P2). CVar bridge declared locally (same minimal-include idiom as
+// P2 activation. CVar bridge declared locally (same minimal-include idiom as
 // port/gdx_frame_pacer.c and port/input_bridge.c) so this standalone TU does not pull the LUS
 // C++ console-variable header. CVarGetInteger is linked from libultraship in the same target.
 // =============================================================================================
@@ -330,8 +348,28 @@ bool P2HostActive() {
     if (P2EnvOverride()) {
         return true; // forced on for testing regardless of the CVar
     }
-    // Live read so the menu toggle (P5) applies on the next tick, exactly like FramePacing.
+    // Live read so the menu toggle applies on the next tick, exactly like FramePacing.
     return CVarGetInteger("gEnhancements.Graphics.FrameInterpolation", 0) != 0;
+}
+
+// Cached for the process lifetime -- same idiom as P2EnvOverride: an env override is a test hook,
+// so it must not be re-read per call and must never be written back to the user's config.
+static bool CameraEnvOverride() {
+    static const bool on = [] {
+        char envBuf[8] = {0}; // only v[0]/v[1] are inspected
+        const char* v = GdxGetEnvVarWinAware("GDX_INTERP_CAMERA", envBuf, sizeof(envBuf));
+        return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+    }();
+    return on;
+}
+
+bool CameraInterpActive() {
+    if (CameraEnvOverride()) {
+        return true;
+    }
+    // Live read so the menu toggle applies on the next tick. Default 1: see gdx_interp.h for why
+    // this one ships on while FrameInterpolation itself defaults off.
+    return CVarGetInteger("gEnhancements.Graphics.InterpolateCamera", 1) != 0;
 }
 
 } // namespace gdx_interp

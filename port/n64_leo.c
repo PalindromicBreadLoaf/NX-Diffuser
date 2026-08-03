@@ -294,7 +294,7 @@ static s16 gdx_rom_s16(u32 off) {
     return (s16)((gdx_rom_buffer[off] << 8) | gdx_rom_buffer[off + 1]);
 }
 
-/* R4 (C-R4.1): the kanji index table and the ANK metrics table are contiguous in
+/* The kanji index table and the ANK metrics table are contiguous in
  * the cart ROM and covered by a single `kanji_tables` blob [0x80960, +0x2EEC) =
  * [0x80960, 0x8384C) -- the index table (0xA48 B), a small gap, and the ANK table
  * (0x908 entries x 4 B, last entry ending at 0x83848). LeoGetKAdr/LeoGetAAdr are

@@ -6,6 +6,8 @@
 #include "ship/window/gui/Fonts.h"
 #include "ship/window/gui/IconsFontAwesome4.h"
 
+#include "gdx_imgui_nav.h"
+
 namespace {
 
 ImFont* sFontStandard = nullptr;
@@ -60,6 +62,14 @@ void GdxFast3dGui::ImGuiWMInit() {
     if (sFontStandard != nullptr) {
         ImGui::GetIO().FontDefault = sFontStandard;
     }
+}
+
+void GdxFast3dGui::ImGuiWMNewFrame() {
+    Fast::Fast3dGui::ImGuiWMNewFrame();
+    // Must land between the platform backend's gamepad poll (just above) and ImGui::NewFrame, which
+    // the caller runs next: the feed both reads the backend's HasGamepad claim and queues key events
+    // for this frame. See port/gdx_imgui_nav.h.
+    gdx_imgui_nav_tick();
 }
 
 ImFont* GdxGuiFontStandard() {

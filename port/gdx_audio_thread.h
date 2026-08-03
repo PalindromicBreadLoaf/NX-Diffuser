@@ -36,15 +36,15 @@ void gdx_audio_thread_notify_frame(void);
 //     whether the old under-report cushion is still needed (only for the legacy fiber path).
 int gdx_audio_thread_active(void);
 
-// Guards the thread-cmd queue handoff between the game thread (producer —
-// AudioThread_QueueCmd*/AudioThread_ScheduleProcessCmds, decomp/src/audio/disk/lib/thread.c
-// + external.c, ~20 call sites) and the audio thread (consumer — AudioThread_CreateTask's
-// drain loop, same file). gdx_audio_thread.cpp already takes this lock around its own
-// per-tick production call; see that file's header comment for why the PRODUCER side is not
-// currently locked (decomp/src/audio/disk/lib/thread.c is outside this phase's file-ownership
-// scope) and exactly what a follow-up patch there needs to add. Exposed with C linkage so a
-// future thread.c patch can take/release it without pulling in <mutex>/C++ headers into that
-// TU.
+// Guards the threadCmdBuf handoff between the game thread (producer — AudioThread_QueueCmd,
+// decomp/src/audio/disk/lib/thread.c, reached from external.c's ~20 call sites) and the audio
+// thread (consumer — AudioThread_CreateTask's drain loop, same file). Both sides take it:
+// gdx_audio_thread.cpp holds it across its whole per-tick production call, and thread.c's
+// AudioThread_QueueCmd takes it under #ifdef PORT around the ring write — that one function is
+// the chokepoint every QueueCmd* variant funnels through. RECURSIVE: a command handler inside
+// the mutexed drain may re-enter QueueCmd, which a plain mutex would self-deadlock on.
+// Exposed with C linkage so thread.c can take/release it without pulling <mutex> or any C++
+// header into that TU. See gdx_audio_thread.cpp's MUTEX BOUNDARY comment.
 void gdx_audio_ctx_lock(void);
 void gdx_audio_ctx_unlock(void);
 

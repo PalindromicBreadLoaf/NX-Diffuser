@@ -1,11 +1,11 @@
-// port/gdx_dump_launch.h — R8 Step 4b / Wave 4: per-class offline "Dump All" launcher.
+// port/gdx_dump_launch.h — per-class offline "Dump All" launcher.
 //
 // The in-game Workshop "Asset Dump" section (port/gdx_menu.cpp) drives the offline dump surface, one
 // child process PER SELECTED CLASS so a single broken class can never abort the rest of the batch.
 // This header is the seam between the ImGui UI (which only READS the shared snapshot) and the detached
 // worker thread (which spawns the child processes).
 //
-// NATIVE-FIRST (Wave 4): when the native `gdx-extract.exe` ships next to the game exe (the deployed
+// NATIVE-FIRST: when the native `gdx-extract.exe` ships next to the game exe (the deployed
 // layout, and dev builds that copy it there), the launcher drives `gdx-extract dump` for everything —
 // the --list-classes probe AND the per-class runs — with no Python required. The Python interpreter +
 // tools/gen_dump_all.py path remains only as a DEV FALLBACK for source checkouts where the native

@@ -33,13 +33,22 @@ VERSION_ENTRY_LEN = 5                  # 1 endianness byte + 4 CRC bytes
 # 4240-records / 664-duplicates / 3576-unique split described the pre-2026-07-18 archive (Windows
 # double-emit bug) and no longer applies after the Torch parity fix.
 #
+# 3608 = 3604 prior census + 4 create_machine_textures records (2026-07-25).
+#
 # 3604 = 3576 pre-R1 base + 22 R1 segment_blob families + 3 R2 audio_blob families + 3 R4
 # segment_blob families (common_assets_compressed, kanji_tables, rom_boot_tuning -- W-R4.S1
 # census). The base 3576 includes the portVersion entry, which Torch only emits when gdx-extract
 # is run with `-u <version>` (the runtime passes `-u 2027490995`, the US-rev0 ROM CRC 0x78D90EB3).
 # The gauntlet MUST pass the same `-u` or it will mint a golden that is one record short and whose
 # SHA-256 will not match the runtime archive.
-EXPECTED_ENTRY_COUNT = 3604
+#
+# The +4 comes from the create_machine_textures re-slice in port/gen/AssetBindings.c: four slots
+# that had been reading a neighbour's bytes were given symbols of their own (D_4002F40_2640,
+# D_4003180, D_40033C0, D_4003600) and the four around them were repointed at their correct
+# segment offsets. Blessed only after checking the shape of the change: the new archive is a
+# strict SUPERSET of the old one -- 4 records added, 0 removed, 0 payloads altered, each new
+# record a real 656-byte texture rather than the blank a half-populated family would produce.
+EXPECTED_ENTRY_COUNT = 3608
 
 # Macro names are a frozen code-level contract with agent 1-B (C3).
 MACRO_SHA256 = "GDX_O2R_EXPECTED_SHA256"

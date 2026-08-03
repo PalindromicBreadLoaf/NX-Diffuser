@@ -13,10 +13,13 @@
  *
  * SCOPE: base-course player ghosts (courses 0..23). This intentionally does NOT touch the
  * 64DD/Expansion-Kit per-course ghost cache (COURSE_CONTEXT()->ghostSave[i], DDSave_*
- * in decomp/src/overlays/ovl_i2/dd_save.c) -- that path is dead on the port (no real 64DD
- * drive) and is out of scope for this ticket. docs/ONLINE_ECOSYSTEM_BLUEPRINT.md:223-278
- * sketches a fuller ".gdg" container (JSON metadata, optional input-replay chunks, a
- * ghost registry) for a later P1 slice; this header implements just the "GDG1" magic +
+ * in decomp/src/overlays/ovl_i2/dd_save.c). That path is LIVE on the default build --
+ * GDX_EXPANSION_KIT compiles dd_save.c in, the drive is emulated (port/n64_leo.c over the
+ * disk image in port/disk_buffer.cpp), and its writes are made durable by the .gdd journal
+ * sidecar (port/disk_savefile.cpp) -- so this library deliberately stays out of it rather
+ * than adding a second owner for the same records. A fuller ".gdg" container (JSON metadata,
+ * optional input-replay chunks, a ghost registry) is possible later; this header implements just
+ * the "GDG1" magic +
  * verbatim-payload core of that design, which is forward-compatible with it (a v1 file
  * is a strict prefix of what a later version could still call "GDG1" data, but this
  * loader intentionally rejects anything that isn't byte-for-byte the v1 shape below --
@@ -57,9 +60,9 @@
  * order of what they copy. The port currently only targets little-endian hosts (x86/
  * x64; port/sram_buffer.cpp's own comment notes persistence is Windows-only so far), so
  * "the payload's native byte order" and "little-endian" are the same thing today. The
- * .gdg payload therefore intentionally matches fzerox.sav's own convention (this is also
- * what docs/ONLINE_ECOSYSTEM_BLUEPRINT.md:230 specifies: "GhostSave: 0x3FC0 native bytes
- * -- GhostRecord + GhostData, verbatim") rather than re-encoding every u16/s32 field by
+ * .gdg payload therefore intentionally matches fzerox.sav's own convention -- GhostSave is
+ * 0x3FC0 native bytes, GhostRecord + GhostData verbatim -- rather than re-encoding every
+ * u16/s32 field by
  * hand, which would just be a second, independent place that byte order could get out of
  * sync with the SRAM path it mirrors. If this port ever grows a big-endian host target,
  * the payload would need an explicit per-field re-encode at that point -- this is called
@@ -72,8 +75,8 @@
  *   3. GhostRecord.checksum matches Save_CalculateGhostRecordChecksum(record) and
  *      GhostData.replayInfo.checksum matches Save_CalculateGhostDataChecksum(data) --
  *      THE GAME'S OWN checksum routines (decomp/src/overlays/ovl_i2/save.c:1935-1941),
- *      called directly, not reimplemented -- this is the "game's own checksum validation
- *      becomes the import sanity check" (docs/ONLINE_ECOSYSTEM_BLUEPRINT.md:244-245).
+ *      called directly, not reimplemented, so the game's own checksum validation IS the
+ *      import sanity check.
  *   4. The derived course (encodedCourseIndex & 0x1F, mirroring save.c's
  *      func_i2_80101590) is in range [0, 24) and matches the header's courseId.
  *   5. ghostType is one of the defined GhostType values (fzx_save.h:7-13), excluding

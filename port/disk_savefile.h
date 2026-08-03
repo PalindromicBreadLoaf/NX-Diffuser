@@ -29,6 +29,13 @@
 extern "C" {
 #endif
 
+/* CRC-64/XZ (ECMA-182 polynomial, reflected 0xC96C5795D7870F42) of an arbitrary byte buffer --
+ * the SAME table-based implementation gdx_disk_save_init below uses internally to fingerprint the
+ * pristine disk. Exposed so other host TUs (port/disk_buffer.cpp's EK translated-disk variant
+ * detection, EK reconciliation Phase 3) can compute the identical fingerprint without duplicating
+ * the CRC-64 table generation/implementation in a second place. */
+unsigned long long gdx_disk_crc64(const unsigned char* data, unsigned long long length);
+
 /* Compute the pristine disk fingerprint, resolve the sidecar path
  * (saves/<diskName>.gdd next to the exe) and load + validate any existing
  * sidecar into the in-memory journal. `pristine` must point at the freshly

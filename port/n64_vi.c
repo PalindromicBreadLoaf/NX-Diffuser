@@ -1,4 +1,4 @@
-// port/n64_vi.c — R6 piece 3: VI (video interface) bridge.
+// port/n64_vi.c — VI (video interface) bridge.
 //
 // libultraship's VI stubs (os_vi.cpp) are disabled for this port (os_vi.cpp is filtered out of the
 // libultraship build). We provide the VI surface here so the decomp's frame pacing works under the

@@ -1,4 +1,4 @@
-// G-Diffuser — asset loader (Slice 4c / R2 integration).
+// G-Diffuser — asset loader.
 // Bridges the generated AssetBindings (C) to libultraship's ResourceManager: given an o2r
 // resource key "category/symbol", load it and return the raw data pointer the game expects.
 // C linkage so the generated C binding table can call it.
@@ -34,7 +34,7 @@ extern "C" void* GDiffuser_LoadAsset(const char* key) {
     }
     // Ensure the resource is parsed/cached, then hand back its raw data pointer.
     if (rm->LoadResource(key) == nullptr) {
-        return nullptr; // not present or no factory yet (e.g. custom F-Zero-X types — R1b/R6)
+        return nullptr; // not present, or no factory registered for this resource type
     }
     return rm->GetResourceRawPointer(key);
 }
@@ -59,7 +59,7 @@ extern "C" int GDiffuser_LoadAssetBytes(const char* key, void* out, size_t outSi
         return 0;
     }
 
-    /* Contract note (2026-07-10 delivery audit): LUS resource factories
+    /* LUS resource factories
      * consume the 64-byte OTR header (ResourceLoader.cpp BufferOffset) and
      * the per-type sub-header BEFORE the resource is handed back --
      * GetRawPointer()/GetPointerSize() are already payload-only (e.g.
@@ -99,7 +99,7 @@ extern "C" int GDiffuser_LoadArchiveFileBytes(const char* key, void* out, size_t
 
     /* Raw archive-file bytes, bypassing resource-factory deserialization.
      * Staff-ghost records are stored in the o2r as Torch "GhostRecord" resources,
-     * for which the port registers NO libultraship factory yet (see the R1b TODO in
+     * for which the port registers NO libultraship factory yet (see the TODO in
      * port/resource/ResourceFactories.cpp). GDiffuser_LoadAssetBytes therefore cannot
      * serve them -- LoadResource() returns nullptr without a factory. LoadFileProcess
      * hands back the untouched file buffer (64-byte OTR/Torch header followed by the

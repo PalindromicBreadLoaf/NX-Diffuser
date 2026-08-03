@@ -22,6 +22,14 @@ uint8_t* gdx_rom_buffer = nullptr;
 size_t   gdx_rom_size   = 0;
 char     gdx_rom_path[1024] = {};
 
+/* Japanese-region gate (CMake option GDX_ALLOW_JP_INPUTS, default OFF — see port/CMakeLists.txt
+   for the reasoning). The setup wizard refuses Japanese game data at the validation layer, but the
+   wizard is not the only way a ROM reaches this loader: gdx_init_rom below also honours a command
+   line argument, the Win32 picker, FZEROX_ROM, and a bare file sitting next to the executable, none
+   of which pass through first-boot validation at all. This flag records that at least one candidate
+   was turned away for being Japanese, purely so the fatal dialog at the end can say so. */
+static bool s_refusedJapaneseRom = false;
+
 static FILE* open_file_utf8(const char* path) {
     FILE* f = nullptr;
 #ifdef _MSC_VER
@@ -39,14 +47,14 @@ static void load_rom_from_file(FILE* f, const char* displayPath) {
     fseek(f, 0, SEEK_END);
     long szl = ftell(f);
     fseek(f, 0, SEEK_SET);
-    /* Deep-audit M2: a 0-byte (or unreadable) ROM previously "loaded"
+    /* A 0-byte (or unreadable) ROM previously "loaded"
        successfully (malloc(0) + fread of 0 bytes), half-booting to a blank
        screen past the null-buffer guard. Reject it here. */
     if (szl <= 0) {
         fclose(f);
         return;
     }
-    /* Codebase-audit P1: fixed-offset consumers (segment loads, setup_gfx at
+    /* Fixed-offset consumers (segment loads, setup_gfx at
        0x17B1E0, course_track_gfx, EK asset tables) assume a complete image and
        read high ROM offsets without per-read bounds checks. A truncated or
        partial download would boot past the null-buffer guard and OOB-read the
@@ -69,6 +77,24 @@ static void load_rom_from_file(FILE* f, const char* displayPath) {
         free(buf);
         return;
     }
+#ifndef GDX_ALLOW_JP_INPUTS
+    /* Japanese-region gate — the last line of defence, and the only one every ROM source shares.
+       Offset 0x3E is the country code in the standard N64 header ('J' Japan, 'E' North America);
+       the magic word checked directly above already guarantees the header is in native byte order,
+       so the byte can be read at face value. This deliberately catches ANY Japanese dump, not just
+       the one SHA-1 the wizard knows, and it costs a single byte comparison on a buffer that is
+       already resident. See port/CMakeLists.txt's GDX_ALLOW_JP_INPUTS block for why the Japanese
+       raw-ROM path is unsafe to ship (audio streamed from US offsets: static and blasting). */
+    if (buf[0x3E] == 'J') {
+        gdx_port_logf("[rom] REJECTED %s: this is the Japanese release of F-Zero X. Japanese-region "
+                      "support is not enabled in this build (configure with "
+                      "-DGDX_ALLOW_JP_INPUTS=ON to enable it).\n",
+                      displayPath);
+        s_refusedJapaneseRom = true;
+        free(buf);
+        return;
+    }
+#endif
     gdx_rom_buffer = buf;
     gdx_rom_size   = sz;
     strncpy(gdx_rom_path, displayPath, sizeof(gdx_rom_path) - 1);
@@ -244,19 +270,14 @@ void gdx_init_rom(int argc, char** argv, int archivesValidated) {
         return;
     }
 
-    /* R4 (C-R4.1): archives validated (fzerox.o2r mounted AND survived the post-mount CRC gate)
-       means every family that today streams raw+MIO0/big-endian bytes from gdx_rom_buffer has
-       an archive-first path (the segment_blob, audio_blob and ipl namespaces) whose shim already tolerates
-       gdx_rom_buffer==NULL and returns 0 on a total miss (GdxSegmentSourceRead's raw-fallback
-       guard, gdx_segment_source.c:299; gdx_rom_read32 -> 0 on miss, decomp_port.c:342-356;
-       GDX_LoadRawRomAsset's own NULL guard zero-fills, decomp/src/game/object.c:108-116). So a
-       missing ROM is no longer an automatic half-boot -- it degrades to "assets served from
-       fzerox.o2r, raw-ROM fallback disabled by absence" instead of undefined blank reads.
-       Booting archive-only is gated on R4's soak evidence (C-R4.2: gdx_rom_fallback_reads == 0
-       across the full matrix before any family's raw fallback is retired); GDX_STRICT_ARCHIVE
-       (gdx_segment_source.c) is the telemetry collector that must show zero archive-miss reads
-       during that soak -- a NULL ROM turning any archive miss into a silently-blank asset is
-       exactly the regression the soak exists to catch. */
+    /* archivesValidated (fzerox.o2r mounted AND survived the post-mount CRC gate) means every
+       family that today streams raw+MIO0/big-endian bytes from gdx_rom_buffer has an archive-first
+       path (the segment_blob, audio_blob and ipl namespaces) whose shim already tolerates
+       gdx_rom_buffer==NULL and returns 0 on a total miss. So a missing ROM is not an automatic
+       half-boot -- it degrades to "assets served from fzerox.o2r, raw-ROM fallback disabled by
+       absence" instead of undefined blank reads. GDX_STRICT_ARCHIVE (gdx_segment_source.c) is the
+       telemetry that must show zero archive-miss reads before relying on this: a NULL ROM turns
+       any archive miss into a silently-blank asset. */
     if (archivesValidated) {
         gdx_port_logf("[rom] no ROM image found; booting archive-only (assets served from "
                        "fzerox.o2r; raw-ROM fallback disabled by absence)\n");
@@ -267,6 +288,21 @@ void gdx_init_rom(int argc, char** argv, int archivesValidated) {
 
     /* Without a ROM AND without a validated archive the game "runs" but every DMA read is
        blank — a confusing half-boot. Require one or the other rather than continuing silently. */
+    if (s_refusedJapaneseRom) {
+        /* Every candidate we saw was Japanese. Say that plainly instead of the generic
+           "no ROM found", which would read as "your file is missing/corrupt" when it is neither. */
+        gdx_port_logf("[rom] FATAL: the only ROM(s) found are the Japanese release of F-Zero X, and "
+                       "Japanese-region support is not enabled in this build. Supply the North "
+                       "American (US rev0) cartridge dump.\n");
+#ifdef _WIN32
+        MessageBoxW(nullptr,
+                    L"This build of G-Diffuser does not support the Japanese release of F-Zero X.\n\n"
+                    L"Japanese-region support is planned for a later release. To play now, supply "
+                    L"the North American (US rev0) F-Zero X ROM.",
+                    L"G-Diffuser - Japanese ROM not supported", MB_OK | MB_ICONINFORMATION);
+#endif
+        exit(1);
+    }
     if (pickerCancelled) {
         gdx_port_logf("[rom] FATAL: picker cancelled and no fallback ROM found "
                        "(FZEROX_ROM unset/invalid, no baserom next to the exe), and no completed "

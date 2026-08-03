@@ -47,8 +47,8 @@
 // purpose; this file reuses them unchanged instead of reimplementing address reconstruction.
 // (This file does NOT modify n64_gfx_bridge.cpp -- only calls its existing exported API.)
 //
-// Note on OSMesg width (the OTHER half of the uintptr32 hazard class, per the prior audio-slice
-// session): that hazard is about osRecvMesg writing a pointer-width OSMesg into a narrower C
+// Note on OSMesg width (the OTHER half of the uintptr32 hazard class): that hazard is about
+// osRecvMesg writing a pointer-width OSMesg into a narrower C
 // local. It does not apply here -- this file never calls osRecvMesg/osSendMesg; the task's
 // `data_ptr`/`data_size` (PR/sptask.h: `u64* data_ptr; u32 data_size;`) are already pointer-width
 // fields read directly out of the OSTask by n64_sched.c, so no message-queue narrowing occurs
@@ -78,7 +78,7 @@
 // per mupen64plus-rsp-hle alist.c#L621-639, revamp v2 task A5); A_FILTER (two-averaged-LUT,
 // cross-block-windowed FIR reimplemented from alist_filter's documented BEHAVIOR -- see
 // RunFilter's header comment for exactly what was and wasn't adopted from the GPLv2 reference,
-// revamp v2 task A3 -- still gated by GDX_HLE_FILTER, default off, pending a user A/B run).
+// still gated by GDX_HLE_FILTER).
 //
 // Deliberately a safe no-op (left the DMEM buffer unchanged) because the semantics are under-
 // documented and it's a secondary/rare path, NOT required for primary note audibility:
@@ -86,7 +86,7 @@
 // A_INTERL is implemented as a best-guess decimation (out[k] = in[2k]) for the rare
 // "two-part" note split path.
 //
-// KNOWN OPEN QUESTION (documented, not fixed here -- out of this slice's scope): whether
+// KNOWN OPEN QUESTION: whether
 // ROM-sourced 16-bit audio data (ADPCM codebooks, loop predictor-history) is byte-swapped
 // anywhere in this port's asset/DMA pipeline before decomp C code reads it as host `s16`.
 // decomp code reads these fields as ordinary native shorts everywhere (not just here), so this
@@ -103,6 +103,7 @@
 #include <math.h>
 
 #include "port_log.h"
+#include "gdx_dev_gates.h" /* Dev Tools gate layer: GDX_SEQ_ADPCM / GDX_HLE_FILTER / GDX_NO_REVERB */
 
 // ---- Cross-TU pointer resolvers (defined in port/n64_gfx_bridge.cpp; NOT modified here) ----
 // Deliberately `unsigned int`, matching how these are already declared on both sides of the TU
@@ -177,20 +178,20 @@ enum {
 #define GDX_DMEM_SIZE 0x1000u
 #define GDX_DMEM_MASK (GDX_DMEM_SIZE - 1u)
 static uint8_t sDmem[GDX_DMEM_SIZE];
-/* [spike] last-writer tracker (grain, round 4): every DMEM write records the opcode
+/* [spike] last-writer tracker: every DMEM write records the opcode
    that made it, per 16-byte block, so a spike found at interleave time can NAME its
    writer instead of us inferring one. 0xFF = never written this session. */
 static uint8_t sDmemLastOp[GDX_DMEM_SIZE >> 4];
 static uint8_t sDmemCurOp = 0xFF;
 
-/* File-based audio-stage bypass toggles (grain ear-localization). Env vars proved
-   unreliable in the owner's shell, so read flags ONCE from gdx-audio-debug.txt next
+/* File-based audio-stage bypass toggles (stage localization by ear). Env vars proved
+   unreliable in the target shell, so read flags ONCE from gdx-audio-debug.txt next
    to the exe. Space/newline-separated keywords, any subset:
      nofilter  -- skip the per-voice A_FILTER (8-tap FIR)
      flatvol   -- envmixer applies constant volume per tick (no 8-block ramp staircase)
      noreverb  -- skip the reverb wet->dry return
      nointerl  -- skip the nParts==2 "best-guess decimation" path
-   The owner enables ONE at a time and reports which kills the grain. */
+   Enable ONE at a time to attribute an artifact to a stage. */
 static int GdxAudioDbg(void) {
     static int sFlags = -1;
     if (sFlags == -1) {
@@ -1023,7 +1024,7 @@ static void RunAdpcm(const GdxBufDesc* buf, uint32_t flags, int16_t* state, cons
         return;
     }
 
-    /* THE LAST-FRAME PREAMBLE CONTRACT (2026-07-11, root cause of the sustained-note
+    /* THE LAST-FRAME PREAMBLE CONTRACT (root cause of the sustained-note
        "garbage/buzz": booster, low-health, engine drones). The real aspMain ADPCM op --
        and mupen64plus-rsp-hle's alist_adpcm verbatim -- does three things this function
        previously did not:
@@ -1104,19 +1105,25 @@ static void RunAdpcm(const GdxBufDesc* buf, uint32_t flags, int16_t* state, cons
            residual convolution, truncating ONCE per output, matching the block form.
            Only the standard 4-bit codec; small-ADPCM keeps the sequential path. */
         {
-            /* DEFAULT ON (2026-07-11): block-convolution is the hardware-correct decode;
-               the env-var A/B silently no-op'd (var never reached the process), so the
-               grain test was never actually run. Flip to default-on and log it
-               unconditionally so the log PROVES which path executed; GDX_SEQ_ADPCM=1
-               forces the old sequential path for revert/comparison. */
-            static int sBlockAdpcm = -1;
-            if (sBlockAdpcm == -1) {
-                const char* e = getenv("GDX_SEQ_ADPCM");
-                sBlockAdpcm = (e != NULL && e[0] == '1') ? 0 : 1;
-                gdx_port_logf("[audio] VADPCM decode = %s\n",
-                              sBlockAdpcm ? "block-convolution (hardware-correct)" : "sequential (GDX_SEQ_ADPCM=1)");
+            /* DEFAULT ON: block-convolution is the hardware-correct decode.
+               The old env-var A/B silently no-op'd (the var never reached the process),
+               so the grain test was never actually run — which is precisely the failure
+               the developer-gate layer exists to prevent. The switch now lives in
+               Dev Tools > Behavior overrides > "Legacy sequential VADPCM" (or
+               GDX_SEQ_ADPCM=1 at launch), read live as a single int load. Bucket B, so
+               it is a compile-time 0 in a build without GDX_DEV_TOOLS and the sequential
+               path is unreachable there. The log line still fires once and PROVES which
+               path the current setting selected. */
+            const int blockAdpcm = !gdx_dev_gate(GDX_GATE_SEQ_ADPCM);
+            {
+                static int sAdpcmLogged = 0;
+                if (!sAdpcmLogged) {
+                    sAdpcmLogged = 1;
+                    gdx_port_logf("[audio] VADPCM decode = %s\n",
+                                  blockAdpcm ? "block-convolution (hardware-correct)" : "sequential (GDX_SEQ_ADPCM=1)");
+                }
             }
-            if (sBlockAdpcm && !smallAdpcm) {
+            if (blockAdpcm && !smallAdpcm) {
                 int32_t eH2 = (int32_t)clHist2; /* sub-block entry history: older */
                 int32_t eH1 = (int32_t)clHist1; /* newer */
                 uint32_t sub;
@@ -1318,8 +1325,7 @@ static void RunS8Dec(const GdxBufDesc* buf, uint32_t flags, int16_t* state) {
 // [64 * 4]`, from which these values were transcribed). Those projects extracted the values
 // directly from the RSP microcode's data section, so this is the same table the real hardware
 // convolves, not an approximation. (This replaces the earlier runtime-generated windowed-sinc
-// table, which was audibly close but not bit-exact -- see engram architecture/audio-pipeline-
-// verdict hardening item #2.)
+// table, which was audibly close but not bit-exact.)
 //
 // TAP / PHASE LAYOUT (verified 1:1 against this port's RunResample below and mupen's
 // alist_resample): for phase index `p` = top 6 bits of the Q16 fractional accumulator
@@ -1528,7 +1534,7 @@ static void RunResample(const GdxBufDesc* buf, uint32_t flags, int16_t* state) {
 //   * State carry: the previous call's final 8 INPUT samples become the next call's "previous tail",
 //     so the FIR is continuous across command lists. A_INIT zeroes the tail history.
 //
-// BYTE ORDER (verified 2026-07-10, correcting the port-layer audit's F1 "big-endian coef" claim):
+// BYTE ORDER (RULED OUT: the coefficient table is NOT big-endian):
 // the coefficient table is NEVER byte-swapped here and MUST NOT be. It originates as the
 // compile-time host-order s16 array gLowPassFilterData[] (disk/lib/filter_data.c), is copied
 // element-by-element into reverb->filterLeft/Right by AudioHeap_LoadLowPassFilter (heap.c: a plain
@@ -1552,7 +1558,7 @@ static void RunFilter(uint32_t dmemBuf, uint32_t sizeBytes, uint32_t flags, int1
     uint32_t blk;
     int t;
 
-    /* Gate lifted: default ON (2026-07-10). The A/B run confirmed the
+    /* Gate lifted: default ON. An A/B run confirmed the
        corrected direct-FIR path is healthy (boot riff plays, tunnel boom
        gone with GDX_HLE_FILTER=1). This low-pass is the only thing bleeding
        high-frequency energy out of the engine-echo reverb feedback loop
@@ -1560,15 +1566,10 @@ static void RunFilter(uint32_t dmemBuf, uint32_t sizeBytes, uint32_t flags, int1
        lets that loop slowly diverge -- the progressive race static. The
        pre-revamp build ran this FIR unconditionally. GDX_HLE_FILTER=0
        remains as the kill switch. */
-    {
-        static int sFilterEnabled = -1;
-        if (sFilterEnabled < 0) {
-            const char* env = getenv("GDX_HLE_FILTER");
-            sFilterEnabled = (env == NULL || env[0] != '0') ? 1 : 0;
-        }
-        if (!sFilterEnabled) {
-            return;
-        }
+    /* Live gate read: the switch is normalized to "disable the filter" (0 = stock = filter on),
+       which is what lets Bucket B compile out of Release without silencing the FIR. */
+    if (gdx_dev_gate(GDX_GATE_NO_HLE_FILTER)) {
+        return;
     }
 
     if (state == NULL || coef == NULL || numSamples == 0u) {
@@ -1727,7 +1728,7 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                        here means the corruption arrived FROM RDRAM (reverb ring
                        content, resample state area, etc.), i.e. it was created on a
                        PREVIOUS tick's save side, not by this tick's mixing.
-                       Gate LOWERED to >=0x20 (workflow RANK 2): the reverb ring wrap
+                       Gate LOWERED to >=0x20: the reverb ring wrap
                        splits a tick into pieces as small as 0x10, and the old >=0x100
                        gate left every wrap tick's small piece UNSCANNED -- the one
                        proven route for unscanned wet content to reach the dry buses.
@@ -1799,7 +1800,7 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 sRsCapAdpcmCnt = pendingBuf.count;
                 RunAdpcm(&pendingBuf, flags, state, sPendingLoopState);
                 GdxUnlockStageCaptureDecode(stageTarget, &pendingBuf, flags);
-                /* [pcm-cap] (2026-07-11, audio decode ground-truth capture):
+                /* [pcm-cap] (audio decode ground-truth capture):
                    one block per UNIQUE sample source. Logs the input identity
                    (resolved src + raw), the book head, the first compressed
                    bytes, and the first 8 DECODED s16 samples from DMEM. The
@@ -1816,7 +1817,7 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                     {
                         extern int gGdxRaceActive;
                         if (!gGdxRaceActive) {
-                            /* Retargeted 2026-07-11: boot/menu samples burned
+                            /* Retargeted: boot/menu samples burned
                                the budget before any garbage race SFX played.
                                Race sounds are the open investigation. */
                             break;
@@ -2013,22 +2014,18 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                          default LLE engine the reverb is the ucode's own and this A_MIXER path is
                          not taken, so the toggle has no audible effect there -- it is still wired
                          correctly for the HLE fallback path.
-                     (2) GDX_NO_REVERB=1 env var: kept as the RELIABLE A/B dev fallback (the
-                         decomp-side toggle at synthesis.c:587 silently no-ops because that TU's
-                         getenv returns NULL). Cached once.
+                     (2) The GDX_NO_REVERB dev gate (Dev Tools > Behavior overrides > "Disable
+                         reverb wet return", or GDX_NO_REVERB=1 at launch): the RELIABLE A/B dev
+                         fallback, since the decomp-side toggle in synthesis.c used to silently
+                         no-op when that TU's getenv returned NULL. Now both sides read the same
+                         gate cache, so they can no longer disagree. Bucket B: a compile-time 0
+                         in a build without GDX_DEV_TOOLS.
                      (3) The GdxAudioDbg()&4 debug bit, exactly as before. */
                 {
-                    static int sNoReverbEnv = -1;
                     int reverbOff; /* declared at block top (project C style; see gdx_audio_lle.c) */
-                    if (sNoReverbEnv == -1) {
-                        const char* e = getenv("GDX_NO_REVERB");
-                        sNoReverbEnv = (e != NULL && e[0] == '1') ? 1 : 0;
-                        if (sNoReverbEnv) {
-                            gdx_port_logf("[audio] GDX_NO_REVERB=1: reverb wet->dry return DISABLED\n");
-                        }
-                    }
-                    /* Live CVar read: reverb OFF when the CVar is 0 (default 1 = on). */
-                    reverbOff = sNoReverbEnv || !CVarGetInteger("gEnhancements.Audio.Reverb", 1);
+                    /* Both reads are live (one int load + one CVar read). */
+                    reverbOff = gdx_dev_gate(GDX_GATE_NO_REVERB) ||
+                                !CVarGetInteger("gEnhancements.Audio.Reverb", 1);
                     if ((reverbOff || (GdxAudioDbg() & 4)) && dmemOut == 0x940u) {
                         break;
                     }
@@ -2039,7 +2036,7 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                     out = out + ((in * gain) >> 15);
                     DmemSetS16(dmemOut + k * 2u, ClampS16(out));
                 }
-                /* [spike] MASTER BISECTION (grain, workflow verdict): scan the dry bus
+                /* [spike] bisection: scan the dry bus
                    immediately after the reverb wet->dry return (dmemOut==LEFT_CH 0x940,
                    the only A_MIXER writing a dry bus; the decay mix is 0xC80->0xC80).
                    The two surviving candidates split HERE:
@@ -2067,7 +2064,7 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
             }
 
             case GDX_A_ADDMIXER: {
-                /* Task A6 audit result: mupen64plus-rsp-hle's alist_add (alist.c#L595-609) is a
+                /* mupen64plus-rsp-hle's alist_add (alist.c#L595-609) is a
                    GAINLESS clamped unity add -- `*dst = clamp_s16(*dst + *src)`, no multiply at
                    all. This op is not called anywhere in decomp/src/audio/disk/lib/synthesis.c
                    (checked: no aAddMixer call sites exist in this decomp), so there is no real
@@ -2261,7 +2258,7 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                     curVolR += envRampRight;
                     curReverb += envRampReverb;
                 }
-                /* [spike] mix-stage bisection (grain, round 3): post-resample is now
+                /* [spike] mix-stage bisection: post-resample is now
                    clean but pre-interleave still spikes -- scan this op's own INPUT and
                    all four output buses so one run says whether the corruption arrives
                    WITH the source (upstream, e.g. DMEM_TEMP after filter/comb), is
@@ -2296,7 +2293,7 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
             }
 
             case GDX_A_HILOGAIN: {
-                /* IN-PLACE op (2026-07-11, missing booster/low-health root
+                /* IN-PLACE op (missing booster/low-health root
                    cause): the real ucode scales the buffer at w1>>16 IN PLACE;
                    w1's low 16 bits are unused padding -- synthesis.c:1069
                    emits AudioSynth_HiLoGain(..., DMEM_TEMP, /out=/ 0, ...).

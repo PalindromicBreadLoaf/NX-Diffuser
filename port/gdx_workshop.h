@@ -1,7 +1,7 @@
-// port/gdx_workshop.h — Workshop W0 texture-pack + dump support.
+// port/gdx_workshop.h — Workshop texture-pack + dump support.
 //
 // Central seam for the community-content "Workshop" tab's texture-pack feature (see
-// docs/MODDING_IMPLEMENTATION_PLAN.md and docs/menu/WORKSHOP_TAB.md). All behavior is opt-in via
+// docs/MODDING_GUIDE.md). All behavior is opt-in via
 // CVars that default OFF, so a fresh gdiffuser.cfg.json renders byte-identically to stock:
 //   - gEnhancements.Workshop.TexturePacks (int, 0): master switch for the Tier-B override shim.
 //   - gEnhancements.Workshop.TextureDump  (int, 0): dump every decoded texture to dump/<key>.png.

@@ -25,7 +25,8 @@
 //               EINTR-safe wait fixes that regardless of VSync or refresh rate.
 //
 // See gdx_frame_pacer.c for the full rationale and the VSync interaction. Interpolated
-// high-FPS rendering (>60 fps by tweening two sim ticks) is intentionally out of scope.
+// high-FPS rendering (>60 fps by tweening two sim ticks) is not this module's job — see
+// port/gdx_interp.h.
 
 #ifdef __cplusplus
 extern "C" {

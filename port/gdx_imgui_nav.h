@@ -1,22 +1,27 @@
-// port/gdx_imgui_nav.h — feed ImGui menu navigation from the SDL controller.
+// port/gdx_imgui_nav.h — gamepad menu navigation glue for ImGui.
 //
-// WHY: libultraship drives ImGui gamepad navigation through the ImGui platform backend's own
-// gamepad reader — ImGui_ImplSDL2 (Linux) or ImGui_ImplWin32 (Windows). The Win32 backend reads
-// gamepads via XInput, which does NOT see a raw DualSense (a HID/PS5 device). So on Windows a
-// DualSense can drive the game (libultraship reads it via SDL) but cannot navigate the menu. This
-// module closes that gap: it reads the first connected SDL game controller directly and feeds the
-// ImGui gamepad nav keys, so ANY SDL-recognized pad drives the menu on every platform, regardless
-// of the ImGui backend. Gated on the "gControlNav" CVar (off => no feed, stock behavior).
+// Two jobs:
 //
-// Call gdx_imgui_nav_tick() once per frame BEFORE the Gui's StartDraw() (which runs ImGui's
-// NewFrame): the fed key events are consumed by that frame's ImGui::NewFrame.
+// 1. Fallback gamepad feed. libultraship drives ImGui gamepad nav through the ImGui platform
+//    backend's own reader. The SDL2 backend feeds every gamepad key itself; the Win32 backend reads
+//    XInput, which cannot see a raw DualSense, so libultraship compiles its gamepad path out and
+//    nothing feeds ImGui on DX11. This module fills that gap for any SDL-recognized pad. It feeds
+//    ONLY when no backend has claimed ImGuiBackendFlags_HasGamepad — two writers on one ImGuiKey
+//    stall ImGui's event queue (see the comment on the check in gdx_imgui_nav.cpp).
+//
+// 2. Keeps ImGuiConfigFlags_NavEnableGamepad in sync with (gControlNav && menu visible) every
+//    frame. libultraship only re-evaluates it when its own toggle key fires.
+//
+// Called from GdxFast3dGui::ImGuiWMNewFrame (port/gdx_gui.cpp), i.e. after the platform backend's
+// per-frame gamepad poll and before ImGui::NewFrame consumes the queued events. Both halves of that
+// ordering are load-bearing.
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Read the active SDL controller and feed ImGui gamepad nav keys for this frame. No-op when
-// gControlNav is 0 or no controller is connected. Safe to call every frame from boot.
+// Sync the nav config flag and, where no backend feeds one, publish the SDL controller's state as
+// ImGui gamepad keys. Safe to call every frame from boot; no-op without a controller.
 void gdx_imgui_nav_tick(void);
 
 #ifdef __cplusplus

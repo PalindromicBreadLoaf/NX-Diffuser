@@ -1,4 +1,4 @@
-// port/gdx_dump_launch.cpp — R8 Step 4b / Wave 4: per-class offline "Dump All" launcher. See the
+// port/gdx_dump_launch.cpp — per-class offline "Dump All" launcher. See the
 // header for the contract. The UI thread only ever READS GdxDumpSnapshot(); all child-process work
 // happens on a detached worker thread. Per-class failure isolation is the load-bearing property: the
 // batch runs one child PER CLASS, so a class that exits non-zero is recorded and the worker moves on.
@@ -703,7 +703,7 @@ void GdxDumpBeginClassListProbe(const DumpEnvironment& env) {
     DumpEnvironment envCopy = env;
     std::thread([envCopy]() {
         // Try `python <tool> --list-classes`; one class name per line, exit 0. If the flag is unknown
-        // (concurrent tool work not landed yet) the child errors and we keep the fallback list.
+        // (an older tool build without the flag) the child errors and we keep the fallback list.
         int exitCode = 1, items = -1;
         std::string lastLine;
         // Capture the full stdout ourselves via a dedicated collector: reuse runChild but it only keeps

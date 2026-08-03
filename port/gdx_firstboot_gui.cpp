@@ -66,7 +66,7 @@ struct Row {
                                // the archive-satisfied message when the original file is gone)
     // The actual filesystem path Recheck() resolved and validated this row against -- normally
     // equal to RowPath(i) (the canonical dataDir path), but for the disk row it may instead be the
-    // managed-copy fallback path (see Recheck's C-R7.2 handling), and for the ROM/disk rows it may
+    // managed-copy fallback path (see Recheck's managed-copy handling), and for the ROM/disk rows it may
     // be the accepted Japanese alternate name (SetupRomFileNameJp/SetupDiskFileNameJp). Callers that
     // need the row's real on-disk location (rather than always the canonical path) must use this,
     // not RowPath(i).
@@ -167,7 +167,7 @@ class SetupScreen {
         return (fs::path(mDataDir) / mRows[i].canonicalName).string();
     }
 
-    // Name of the installed archive that satisfies a given row's input (R7/R8: originals are deletable
+    // Name of the installed archive that satisfies a given row's input (originals are deletable
     // once the archive covers them). Empty string for an unrecognized canonical name.
     static const char* ArchiveForCanonical(const char* canonicalName) {
         if (std::string(canonicalName) == SetupRomFileName())  return SetupGameArchiveFileName();
@@ -196,22 +196,33 @@ class SetupScreen {
         r.okHeader.clear();
         r.jpRom = false;
         if (!fs::is_regular_file(fs::path(dst), ec)) {
-            // Accepted Japanese alternate names: probe them before any derived fallback so a JP test
-            // folder is detected without renaming (baserom.jp.rev0.z64 / baserom.jp.ek.ndd).
-            const char* jpAlt = nullptr;
-            if (std::string(r.canonicalName) == SetupRomFileName()) {
-                jpAlt = SetupRomFileNameJp();
-            } else if (std::string(r.canonicalName) == SetupDiskFileName()) {
-                jpAlt = SetupDiskFileNameJp();
-            }
-            if (jpAlt != nullptr) {
-                std::string alt = (fs::path(mDataDir) / jpAlt).string();
-                std::error_code altEc;
-                if (fs::is_regular_file(fs::path(alt), altEc)) {
-                    dst = alt;
+            // Accepted alternate names: probe them before any derived fallback so a JP test folder
+            // (baserom.jp.rev0.z64 / baserom.jp.ek.ndd) or a folder holding the US prototype IPL
+            // dump filename (64DD_IPL_US_MJR.n64) is detected without renaming.
+            if (std::string(r.canonicalName) == SetupIplFileName()) {
+                // Shared with the boot path (gdx_firstboot.cpp's FirstBootRun, gdx_extract_launch.cpp's
+                // ensureIplArchive) via GdxFindIplSourceInDir so the accepted IPL alt name can never
+                // drift between the wizard and boot-time extraction again.
+                std::string found = GdxFindIplSourceInDir(mDataDir);
+                if (!found.empty()) {
+                    dst = found;
+                }
+            } else {
+                const char* altName = nullptr;
+                if (std::string(r.canonicalName) == SetupRomFileName()) {
+                    altName = SetupRomFileNameJp();
+                } else if (std::string(r.canonicalName) == SetupDiskFileName()) {
+                    altName = SetupDiskFileNameJp();
+                }
+                if (altName != nullptr) {
+                    std::string alt = (fs::path(mDataDir) / altName).string();
+                    std::error_code altEc;
+                    if (fs::is_regular_file(fs::path(alt), altEc)) {
+                        dst = alt;
+                    }
                 }
             }
-            // R7 (C-R7.2): the disk row's canonical copy may be gone because the user deleted their
+            // The disk row's canonical copy may be gone because the user deleted their
             // original .ndd after a PRIOR setup already created the managed backup under
             // <dataDir>/media. Resolve against that managed copy rather than reporting Missing.
             if (!fs::is_regular_file(fs::path(dst), ec) &&
@@ -223,7 +234,7 @@ class SetupScreen {
                 }
             }
             if (!fs::is_regular_file(fs::path(dst), ec)) {
-                // R7/R8 acceptance chain: before reporting Missing, honor the fact that a requirement
+                // Acceptance chain: before reporting Missing, honor the fact that a requirement
                 // met by its INSTALLED ARCHIVE is satisfied, not missing — the original file is
                 // deletable and the game boots archive-only from it (rom_buffer.cpp / disk_buffer.cpp).
                 // Show that truthfully in the OK/green state instead of falsely demanding the original.
@@ -264,7 +275,7 @@ class SetupScreen {
         r.status = RowStatus::Ok;
         r.reason.clear();
         // Record the path actually resolved above (canonical dataDir path, or the managed-copy fallback
-        // for the disk row per C-R7.2) so callers needing the real on-disk location -- e.g.
+        // for the disk row) so callers needing the real on-disk location -- e.g.
         // ConfirmAndStartExtraction's WriteSetupComplete/EnsureManagedDiskCopy calls, and the "File:"
         // provenance line in DrawAcquire -- don't re-derive it and risk showing the wrong path.
         r.resolvedPath = dst;
@@ -349,7 +360,7 @@ class SetupScreen {
             return;
         }
         // Use the disk row's Recheck-resolved actual path, not always RowPath(1): a managed-copy-only
-        // re-run (C-R7.2 -- original .ndd deleted after a prior setup already created the managed
+        // re-run (original .ndd deleted after a prior setup already created the managed
         // backup) resolves and validates against <dataDir>/media, not the canonical dataDir path.
         // Passing RowPath(1) here would record a nonexistent canonical path in the sidecar and make
         // EnsureManagedDiskCopy warn spuriously about failing to (re)create a copy that already exists.
@@ -362,7 +373,7 @@ class SetupScreen {
             mDropError = "Could not save the setup state next to the game.";
             return;
         }
-        // R7 (C-R7.1): the disk row is validated and committed at dataDir/kDiskName (via
+        // The disk row is validated and committed at dataDir/kDiskName (via
         // CopyInputInto in Browse()/HandleDrop()); now create the SEPARATE managed backup copy
         // under <dataDir>/media so the user's original .ndd (wherever it was picked/dropped from)
         // becomes deletable, matching the ROM/IPL posture. Idempotent and best-effort: a failure here
@@ -462,7 +473,7 @@ class SetupScreen {
         const ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
                                        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                                        ImGuiWindowFlags_NoDocking;
-        if (!ImGui::Begin("G-Diffuser — First-Time Setup", nullptr, flags)) {
+        if (!ImGui::Begin("G-Diffuser - First-Time Setup", nullptr, flags)) {
             ImGui::End();
             return;
         }
@@ -536,11 +547,11 @@ class SetupScreen {
             }
 
             if (NativeFilePickerAvailable()) {
-                if (ImGui::Button(r.status == RowStatus::Ok ? "Replace…" : "Browse…")) {
+                if (ImGui::Button(r.status == RowStatus::Ok ? "Replace..." : "Browse...")) {
                     Browse(r);
                 }
                 ImGui::SameLine();
-                ImGui::TextDisabled("…or drag & drop the file onto this window");
+                ImGui::TextDisabled("...or drag & drop the file onto this window");
             } else {
                 ImGui::TextDisabled("Drag & drop the file onto this window");
             }
@@ -554,12 +565,11 @@ class SetupScreen {
         if (AllRowsOk()) {
             ImGui::TextColored(ImVec4(0.35f, 0.80f, 0.35f, 1.0f), "All three files are verified.");
             ImGui::TextWrapped("Confirm to build fzerox.o2r from your ROM and continue to the game.");
-            // C-R4.3 / C-R7.3 / R8: the deletable-files statement. Named per-file so the reader
-            // never has to guess which originals are safe to remove. R8 reword: the media/ managed
-            // copy is TRANSITIONAL (deletable once the disk archive verifies -- the green line in
-            // Data & Files), and saves live ONLY in saves/*.gdd; the old text wrongly told users to
-            // back up the 62 MB media/ copy to preserve progress.
-            // JP exception (judge finding): an accepted Japanese ROM boots RAW -- no fzerox.o2r is
+            // The deletable-files statement. Named per-file so the reader never has to guess which
+            // originals are safe to remove. The media/ managed copy is TRANSITIONAL (deletable once
+            // the disk archive verifies — the green line in Data & Files), and saves live ONLY in
+            // saves/*.gdd.
+            // JP exception: an accepted Japanese ROM boots RAW -- no fzerox.o2r is
             // ever built for it, so the ROM file is the ONLY copy of the game data. The generic
             // "all deletable" paragraph told JP users to delete a file the app privately requires;
             // gate it and state the JP truth instead.
@@ -591,11 +601,11 @@ class SetupScreen {
     void DrawExtracting() {
         // Stage label (matches gdx_extract_launch.h's ExtractProgress::subStage contract: 0 = cart,
         // 1 = validating the cart archive, 2 = the independent IPL font-block archive).
-        const char* stageLabel = "Extracting game assets…";
+        const char* stageLabel = "Extracting game assets...";
         if (mSubStage == 1) {
-            stageLabel = "Validating extracted archive…";
+            stageLabel = "Validating extracted archive...";
         } else if (mSubStage == 2) {
-            stageLabel = "Extracting IPL font data…";
+            stageLabel = "Extracting IPL font data...";
         }
         ImGui::TextUnformatted(stageLabel);
         ImGui::TextWrapped("This happens once and usually takes only a few seconds.");
@@ -619,7 +629,7 @@ class SetupScreen {
             // No reliable count for this sub-stage (placeholder golden header, or mid-validation) --
             // indeterminate animated bar (ImGui renders a moving indicator for a negative fraction).
             ImGui::ProgressBar(-1.0f * static_cast<float>(ImGui::GetTime()), ImVec2(-1.0f, 0.0f),
-                               mStage.empty() ? "working…" : mStage.c_str());
+                               mStage.empty() ? "working..." : mStage.c_str());
         }
 
         ImGui::Spacing();

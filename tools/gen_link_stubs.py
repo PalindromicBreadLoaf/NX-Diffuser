@@ -81,6 +81,11 @@ EXCLUDE = {
     "osViSetXScale", "osViSetYScale", "osMemSize",
     # PC has no 64DD medium; shims.c reports that state with the real signature.
     "LeoTestUnitReady",
+    # Real libultra formatter in shims.c (vsnprintf-backed). Stubbing it to `return 0`
+    # is silent rather than fatal — callers gate their draw on the returned character
+    # count — which blanked the Course Edit info panels, the Create Machine machine
+    # names, the disk file list, and the N64 crash screen.
+    "_Printf",
     # libultra globals the decomp uses as ARRAYS (must be real writable data, not function stubs).
     "osAppNMIBuffer",
     # Save-system slice: decomp/src/overlays/ovl_i2/save.c is now compiled (real

@@ -9,9 +9,9 @@
  * addressing alongside the 12-13MB GFX working set) -- or falls back to the existing
  * software HLE interpreter (gdx_audio_hle_run).
  *
- * Toggle is FILE-based (env vars are unreliable in the target shell): LLE is ON by
- * default (the owner-confirmed, grain-free audio path); a file `gdx-audio-lle.txt`
- * whose first byte is '0' forces the HLE fallback. Read once and cached.
+ * Toggle is FILE-based (env vars proved unreliable in the target shell): LLE is ON by
+ * default -- it is the grain-free path -- and a file `gdx-audio-lle.txt` whose first
+ * byte is '0' forces the HLE fallback. Read once and cached.
  *
  * ============================================================================
  * THE MEMORY-MODEL BRIDGE (gdx_audio_lle_bridge_run)
@@ -119,7 +119,7 @@ static int gdx_audio_lle_enabled(void) {
     /* Live from the ImGui Audio tab (F1 > Audio > Engine): gEnhancements.Audio.LLE
      * (1 = LLE, 0 = HLE). Read each tick on the audio thread; the CVar is pre-registered at
      * boot so a concurrent menu write is a benign int-value race (worst case one tick sees the
-     * old value). Default 1 = LLE on -- the owner-confirmed audio path -- so behavior is
+     * old value). Default 1 = LLE on -- the shipping audio path -- so behavior is
      * unchanged if the menu is never touched. */
     return CVarGetInteger("gEnhancements.Audio.LLE", 1) != 0;
 }

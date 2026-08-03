@@ -4,6 +4,19 @@
 // public ImGui + CVar API. All feature controls retain their original CVar names, defaults, and
 // callbacks; this file changes their presentation and information architecture only.
 //
+// WHAT LIVES WHERE
+// ----------------
+// This file is the SHELL and the draw dispatcher:
+//   - the window, header tab strip, sidebar, content pane, search box and quit modal;
+//   - MenuDrawItem(), which turns one registered GdxUI::WidgetInfo into ImGui calls;
+//   - DrawSearchResults(), which walks the same registry to find INDIVIDUAL controls;
+//   - the WIDGET_CUSTOM blocks (status read-outs, tables, modals) that no generic widget can
+//     express.
+// The menu's CONTENTS — every section, page and control — are declared as data in
+// port/gdx_menu_registry.cpp against the model in port/ui/MenuTypes.h. Adding a control means
+// adding one AddWidget() entry there; it then appears on its page AND in search, with its disable
+// reasons and tooltip, with no edit to this file.
+//
 // CVar NAMES ARE STRING LITERALS ON PURPOSE
 // -----------------------------------------
 // libultraship defines CVAR_* macros (e.g. CVAR_MENU_BAR_OPEN) in cmake/cvars.cmake, but that
@@ -24,6 +37,7 @@
 #endif
 
 #include "gdx_menu.h"
+#include "gdx_menu_internal.h" // the helpers below, shared with port/gdx_menu_registry.cpp
 
 #include <imgui.h> // vendored in libultraship's imgui; already on the port target's include path
                    // (main.cpp already pulls it transitively via GuiWindow.h). Mirrors the
@@ -53,19 +67,28 @@ extern "C" const char* SDL_GetCurrentAudioDriver(void);
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>  // std::sin (the search-navigation highlight pulse in MenuDrawItem)
 #include <cstdio> // snprintf (Practice-tab ghost import/export status line)
 #include <cstdlib> // std::system (non-Windows open-folder fallback)
 #include <memory> // std::dynamic_pointer_cast (null-safe downcast to Fast::Fast3dWindow)
 #include <string>
 
+#include "ui/UIWidgets.hpp" // CVar-bound ImGui widgets: read + draw + write + persist + tooltip in
+                           // one call, replacing the hand-written CVarGet/CVarSet/GdxSaveCvars/
+                           // SetTooltip quadruple this file used to spell out per option. port/ is
+                           // already an include dir on this target, so the "ui/" prefix needs no
+                           // CMake change (port/CMakeLists.txt:325-329).
+
+#include "gdx_console_log.h" // Console page: drains the queued port-log lines into the LUS console
 #include "gdx_ghost_io.h" // .gdg ghost import/export C API (Practice tab Export / Import buttons)
 #include "gdx_gui.h"
 #include "gdx_workshop.h"    // Workshop tab: texture-pack listing, override count, reload, dump dir
-#include "gdx_dump_launch.h" // Workshop tab "Asset Dump" section: per-class offline gen_dump_all.py launcher
+#include "gdx_dump_launch.h" // Workshop tab "Asset Dump" section: per-class offline dump launcher
 #include "disk_savefile.h"   // Workshop tab "DD Save" subsection: sidecar status + one-shot format
 #include "rom_buffer.h"      // Data & Files: gdx_rom_buffer/gdx_rom_path (live ROM residency signal)
 #include "gdx_firstboot.h"   // Data & Files: canonical file names + gdx::ManagedDiskPath
-#include "gdx_segment_source.h" // Data & Files: R1 archive-coverage telemetry (fallback counters)
+#include "gdx_segment_source.h" // Data & Files: archive-coverage telemetry (fallback counters)
+#include "gdx_dev_gates.h"   // Dev Tools: the developer-gate table driving DrawDevGates()
 
 #include <vector>
 #include <filesystem>
@@ -74,17 +97,17 @@ extern "C" const char* SDL_GetCurrentAudioDriver(void);
 // SRAM ghost slot, which must not race the game fiber, so the Import button is disabled in-race.
 extern "C" int gdx_input_in_gameplay(void);
 extern "C" void gdx_game_request_reset(void);
-// R8 Step 1: deletion-gate verdict (port/disk_buffer.cpp). 1 iff this boot reconstructed the EK disk
-// from fzerox-disk.o2r AND proved it byte-identical to the R7 managed copy. The Data & Files panel
+// Deletion-gate verdict (port/disk_buffer.cpp). 1 iff this boot reconstructed the EK disk from
+// fzerox-disk.o2r AND proved it byte-identical to the managed copy. The Data & Files panel
 // offers disk deletion ONLY on a passed verdict; it never deletes anything itself.
 extern "C" int gdx_disk_archive_verified(void);
 
-// From port/n64_gfx_bridge.cpp: R6-P2 frame-interpolation telemetry for the Graphics tab's
+// From port/n64_gfx_bridge.cpp: frame-interpolation telemetry for the Graphics tab's
 // "subframes last tick" status line. Declared here rather than pulling in n64_gfx_bridge.h (this
 // TU doesn't otherwise need the gfx bridge's internals) — signatures match the header exactly.
 extern "C" int gdx_gfx_interp_last_subframes(void);
 extern "C" double gdx_gfx_interp_last_t(void);
-// Real-FPS visibility (owner requirement, 2026-07-23): true presented frames/sec, the live master
+// Real-FPS visibility: true presented frames/sec, the live master
 // toggle state, and last-tick per-slot tween/snap counts — shown on the Stats page.
 extern "C" int gdx_gfx_interp_host_active(void);
 extern "C" double gdx_gfx_interp_presents_per_sec(void);
@@ -97,9 +120,16 @@ extern "C" int gdx_gfx_interp_tick_active(void);
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // Small helpers (main-thread only — the whole menu draws inside Gui::StartDraw/EndDraw).
+//
+// These used to live in an anonymous namespace. They are now a named one, declared in
+// port/gdx_menu_internal.h, because port/gdx_menu_registry.cpp needs them too: the registry's
+// callbacks are what apply the live side effects (SetResolutionMultiplier, SetFullscreen,
+// ToggleVisibility, the CVar flush), and duplicating a second copy of each in that TU is exactly
+// how two copies drift apart. The `using namespace` below keeps every call site in this file
+// spelling them unqualified, as before.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
-namespace {
+namespace gdxmenu {
 
 // Returns the live Gui, or nullptr if the window/gui is not up yet (defensive; the menu only
 // draws once the Gui exists, so this is essentially always non-null while visible).
@@ -150,15 +180,29 @@ void GdxSaveCvars() {
 // window checks its in-memory mIsVisible each frame (the CVar is read only once, at construction).
 // ToggleVisibility() flips mIsVisible AND mirrors+persists the CVar (GuiWindow.cpp), which is what
 // we want for a live toggle.
-void GdxToggleWindow(const char* name) {
+// Returns false when the named window does not exist, so callers can say so instead of leaving a
+// button that silently does nothing.
+bool GdxToggleWindow(const char* name) {
     auto gui = GdxGui();
     if (gui == nullptr) {
-        return;
+        return false;
     }
     auto window = gui->GetGuiWindow(name);
-    if (window != nullptr) {
-        window->ToggleVisibility();
+    if (window == nullptr) {
+        return false;
     }
+    window->ToggleVisibility();
+
+    // Raise it. Gui::Draw() draws the full-screen menu BEFORE the tool windows, and libultraship
+    // registers the Console with ImGuiWindowFlags_NoFocusOnAppearing, so a window turned on from
+    // inside the menu appears UNFOCUSED and therefore behind the menu that opened it. The window is
+    // genuinely open and genuinely drawing -- it is just underneath an opaque full-screen panel,
+    // which is indistinguishable from a dead button. Focusing it on the frame it becomes visible
+    // puts it on top; on the way back to hidden there is nothing to focus.
+    if (window->IsVisible()) {
+        ImGui::SetWindowFocus(name);
+    }
+    return true;
 }
 
 // True if the named window exists and is currently shown (drives the menu-item checkmark).
@@ -186,9 +230,7 @@ void GdxModifiedMarker(bool changed) {
     }
     ImGui::SameLine();
     ImGui::TextColored(ImVec4(0.63f, 0.76f, 1.0f, 1.0f), "*");
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Changed from the default (stock) value.");
-    }
+    UIWidgets::Tooltip("Changed from the default (stock) value.");
 }
 
 // Opens a filesystem directory in the host file browser (Workshop "Open ... folder" buttons). The
@@ -260,12 +302,11 @@ std::string GdxLowercase(std::string value) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-// "Data & Files" (General tab): live on-disk state for the three original setup inputs, per
-// R4/R7's C-R4.3/C-R7.3 UX contract. Every line below is backed by a live, cheaply-rechecked
-// signal rather than static copy -- see the per-row comments for exactly what is and is not
-// determinable from this file (gdx_menu.cpp cannot touch disk_buffer.cpp, which owns the IPL/EK
-// disk load state and is out of scope for this wave; we report filesystem + archive-mount facts
-// instead of guessing which source disk_buffer.cpp actually read from).
+// "Data & Files" (General tab): live on-disk state for the three original setup inputs. Every
+// line below is backed by a live, cheaply-rechecked signal rather than static copy -- see the
+// per-row comments for exactly what is and is not determinable from this file. gdx_menu.cpp
+// cannot reach disk_buffer.cpp's IPL/EK disk load state, so it reports filesystem +
+// archive-mount facts instead of guessing which source was actually read.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
 // True if any mounted archive's filename (case-insensitive) matches `basename` exactly. Mirrors
@@ -329,8 +370,8 @@ void GdxDrawDataAndFilesPanel() {
         "full play session.");
 
     // ── 64DD IPL ROM ─────────────────────────────────────────────────────────────────────────
-    // No live "which source is loaded" getter is exposed outside disk_buffer.cpp (out of scope this
-    // wave), so this reports the two independently-checkable facts instead of guessing: whether the
+    // No live "which source is loaded" getter is exposed outside disk_buffer.cpp, so this reports
+    // the two independently-checkable facts instead of guessing: whether the
     // original file is present next to the game, and whether the dedicated archive is mounted.
     ImGui::SeparatorText("64DD IPL ROM (N64DDIPLROM.n64)");
     {
@@ -350,7 +391,7 @@ void GdxDrawDataAndFilesPanel() {
     ImGui::TextDisabled("Deletable once setup has completed (the port never reads the IPL file again after that).");
 
     // ── Expansion Kit disk ───────────────────────────────────────────────────────────────────
-    // Reports presence of the original, of the R7 managed copy (gdx::ManagedDiskPath), and of the R8
+    // Reports presence of the original, of the managed copy (gdx::ManagedDiskPath), and of the
     // disk archive, plus the boot-time deletion-gate verdict. The deletable line is shown ONLY on a
     // passed verdict (gdx_disk_archive_verified) -- otherwise the panel never suggests deletion.
     ImGui::SeparatorText("Expansion Kit disk (.ndd)");
@@ -385,7 +426,7 @@ void GdxDrawDataAndFilesPanel() {
         "\"verified byte-identical\" (a boot reconstructed the disk from the archive and proved it "
         "matches). Your saves live in saves/*.gdd -- back those up regardless.");
 
-    // ── Archive coverage (R1 telemetry: gdx_segment_source_fallback_total / FamilyStats) ───────
+    // ── Archive coverage (gdx_segment_source_fallback_total / FamilyStats) ─────────────────────
     ImGui::Spacing();
     ImGui::SeparatorText("Archive coverage");
     unsigned int fallbackTotal = gdx_segment_source_fallback_total();
@@ -415,7 +456,9 @@ void GdxDrawDataAndFilesPanel() {
     ImGui::TextDisabled("Run with GDX_STRICT_ARCHIVE=1 during a soak to log every raw-ROM fallback.");
 }
 
-} // namespace
+} // namespace gdxmenu
+
+using namespace gdxmenu;
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // Construction — pin visibility CVar + register the port's gEnhancements.* CVars at 1:1 defaults.
@@ -426,8 +469,12 @@ void GdxDrawDataAndFilesPanel() {
 // hidden (isVisible=false) — the menu is opt-in via F1.
 GdxMenu::GdxMenu() : Ship::GuiWindow("gOpenMenuBar", false, "G-Diffuser Menu") {
     CVarRegisterFloat("gSettings.Menu.BackgroundOpacity", 0.85f);
-    CVarRegisterInteger("gSettings.Menu.ActiveHeader", static_cast<int>(Header::Settings));
-    CVarRegisterInteger("gSettings.Menu.ActivePage", static_cast<int>(Page::General));
+    // Section and per-section sidebar selection are persisted BY NAME (see gdx_menu.h). The
+    // integer gSettings.Menu.ActiveHeader / ActivePage pair this replaces stored positions in an
+    // enum, so any page reorder silently re-pointed a stored selection at a different page — which
+    // is what the kMenuLayoutVersion reset existed to paper over. A name cannot drift; at worst it
+    // names a page that no longer exists, which falls back to the section's first page.
+    CVarRegisterString("gSettings.Menu.ActiveSection", "Settings");
     // Gamepad menu navigation ON by default. This is the LUS "gControlNav" CVar; enabling it lets a
     // connected pad both OPEN the menu (Gamepad Back) and navigate it, and blocks game input while
     // the menu is up (see libultraship Gui.cpp / ControlDeck.cpp). Essential on the ROG Ally (no
@@ -485,18 +532,42 @@ GdxMenu::GdxMenu() : Ship::GuiWindow("gOpenMenuBar", false, "G-Diffuser Menu") {
     //                                                      live in interpreter.cpp AdjXForAspectRatio;
     //                                                      1 = current 16:9 hor+ (byte-identical),
     //                                                      0 = 4:3 pillarbox.
-    //   gEnhancements.Graphics.WidescreenUI       = 0   -> stock proportional 4:3 UI placement;
-    //                                                      1 = true-corner 1P HUD + selected
-    //                                                      full-width 2D scopes.
+    //   gEnhancements.Graphics.WidescreenUI       = 1   -> true-corner 1P HUD + selected full-width
+    //                                                      2D scopes. 0 = stock proportional 4:3 UI
+    //                                                      placement. See the default note below.
     //   gEnhancements.Graphics.DrawDistance       = 100 -> per-venue far-render scale in %. 100 = stock
     //                                                      (1.0x, bit-exact). course.c Course_Draw,
     //                                                      clamped 100..300.
     //   gEnhancements.Graphics.ForceMaxMachineLOD = 0   -> 0 = stock distance-based machine LOD; 1 pins
     //                                                      the highest-detail model. racer.c Racer_Draw.
     CVarRegisterInteger("gEnhancements.Graphics.Widescreen", 1);
-    // Opt-in 2D widescreen layout: true-corner 1P HUD, full-width SELECT MACHINE blue
-    // background, and full-width race transitions. Other menu artwork remains 4:3.
-    CVarRegisterInteger("gEnhancements.Graphics.WidescreenUI", 0);
+    // 2D widescreen layout: true-corner 1P HUD, full-width SELECT MACHINE blue background, and
+    // full-width race transitions. Other menu artwork remains 4:3.
+    //
+    // DEFAULT ON, and this is the second deliberate exception to the "every default reproduces
+    // stock" rule above (Widescreen itself is the first). Shipping 3D widescreen ON while the HUD
+    // stays proportional 4:3 is the jarring half-state: the world fills the screen and the HUD
+    // floats inboard of the corners it belongs in, which reads as a defect rather than a choice.
+    // The two switches describe one feature, so they ship together.
+    CVarRegisterInteger("gEnhancements.Graphics.WidescreenUI", 1);
+    // One-time migration: this registered (and therefore persisted) as 0 before the default
+    // flipped, so existing configs pin the old value and would never see the new default. Same
+    // marker pattern as gdx.Migrations.ControlNavDefaultOn / ReduceEditorFlashingOn below; a later
+    // deliberate OFF stays untouched because the marker is only ever written once.
+    if (CVarGetInteger("gdx.Migrations.WidescreenUiDefaultOn", 0) == 0) {
+        CVarSetInteger("gdx.Migrations.WidescreenUiDefaultOn", 1);
+        CVarSetInteger("gEnhancements.Graphics.WidescreenUI", 1);
+        CVarSave();
+    }
+    // Split-screen HUD anchoring (2P/3P/4P). Consumed by gdx_widescreen_split_ui_active()
+    // (port/input_bridge.c), which requires gdx_widescreen_ui_active() as well — this is a strict
+    // subset, not an independent feature, and it is inert while the switch above is off.
+    //
+    // Its own switch rather than an overload of WidescreenUI: the split-screen HUD is authored to a
+    // per-column grid rather than to screen edges, so a handful of mid-column elements (interval,
+    // reverse, the 3P spare minimap) stay on the stock centred path by design. That is a judgment
+    // call about layout, and a judgment call deserves its own opt-out.
+    CVarRegisterInteger("gEnhancements.Graphics.WidescreenSplitUI", 1);
     CVarRegisterInteger("gEnhancements.Graphics.DrawDistance", 100);
     CVarRegisterInteger("gEnhancements.Graphics.ForceMaxMachineLOD", 0);
     //   gEnhancements.Graphics.FramePacing = 0 -> off = stock. libultraship's Fast3D backend already
@@ -529,6 +600,17 @@ GdxMenu::GdxMenu() : Ship::GuiWindow("gOpenMenuBar", false, "G-Diffuser Menu") {
     //                                             rate waste GPU without improving output.
     CVarRegisterInteger("gEnhancements.Graphics.InterpTargetMode", 0);
     CVarRegisterInteger("gEnhancements.Graphics.InterpTargetFps", 120);
+    //   gEnhancements.Graphics.InterpolateCamera = 1 -> ON. Also interpolates G_MTX_PROJECTION pool
+    //                                             matrices. Only consulted while FrameInterpolation
+    //                                             is on, so the default cannot alter stock behavior;
+    //                                             it selects what interpolation MEANS once enabled.
+    //                                             race.c loads the combined projection*view camera
+    //                                             with G_MTX_PROJECTION and course.c emits no
+    //                                             gSPMatrix at all, so with this off the camera AND
+    //                                             the entire track stay at 60 Hz while machines
+    //                                             interpolate -- objects smoothed against a static
+    //                                             world. Off is offered only as an escape hatch.
+    CVarRegisterInteger("gEnhancements.Graphics.InterpolateCamera", 1);
 
     // GAMEPLAY tab CVars. Every default reproduces stock behavior (the optionality constitution):
     //   gEnhancements.Gameplay.AutosaveOnRecord  = 0    -> off. Stock F-Zero X already commits the
@@ -575,15 +657,18 @@ GdxMenu::GdxMenu() : Ship::GuiWindow("gOpenMenuBar", false, "G-Diffuser Menu") {
     //                                           registered by the GuiWindow ctor in main.cpp.)
     CVarRegisterInteger("gEnhancements.Practice.PhotoMode", 0);
 
-    // Workshop W0 (texture packs + dump). Every knob defaults OFF/empty per the optionality
+    // Workshop (texture packs + dump). Every knob defaults OFF/empty per the optionality
     // constitution: a fresh config mounts no override behavior and renders bit-identically to stock.
     //   gEnhancements.Workshop.TexturePacks = 0 -> off = stock rendering. When on, the Tier-B shim
     //                                              (n64_gfx_bridge.cpp) rewrites a common-asset load
     //                                              to a mounted pack's "textures/pack/<key>" resource.
     CVarRegisterInteger("gEnhancements.Workshop.TexturePacks", 0);
-    //   gEnhancements.Workshop.TextureDump = 0 -> off. When on, every decoded texture is written to
-    //                                             dump/<key>.png + dump/manifest.tsv (first-seen-wins).
-    CVarRegisterInteger("gEnhancements.Workshop.TextureDump", 0);
+    //   gEnhancements.Workshop.TextureDump — RETIRED. Asset Dump supersedes it: that path decodes
+    //   named assets straight from the archive instead of waiting for gameplay to walk past each
+    //   texture, so it is both complete and reproducible. The runtime hook in gdx_workshop.cpp still
+    //   reads this CVar, so it is forced to 0 here rather than merely un-registered -- a user who had
+    //   it ON would otherwise keep dumping forever with no surviving checkbox to turn it off.
+    CVarSetInteger("gEnhancements.Workshop.TextureDump", 0);
     //   gEnhancements.Workshop.DisabledPacks = "" -> comma-joined mods/*.o2r basenames to skip at
     //                                               mount time (per-pack enable toggles in the tab).
     CVarRegisterString("gEnhancements.Workshop.DisabledPacks", "");
@@ -600,53 +685,46 @@ GdxMenu::GdxMenu() : Ship::GuiWindow("gOpenMenuBar", false, "G-Diffuser Menu") {
     }
 }
 
-// Bump whenever the Page/Header enum ordering changes so persisted ActivePage/ActiveHeader ints
-// from an older layout aren't reinterpreted against the new ordering (same numeric header/page
-// value can silently point at a different tab after a reorder).
-static constexpr int kMenuLayoutVersion = 2;
-
 void GdxMenu::InitElement() {
-    const int header = CVarGetInteger("gSettings.Menu.ActiveHeader", static_cast<int>(Header::Settings));
-    const int page = CVarGetInteger("gSettings.Menu.ActivePage", static_cast<int>(Page::General));
-    const int layoutVersion = CVarGetInteger("gSettings.Menu.LayoutVersion", 0);
-    if (header >= static_cast<int>(Header::Settings) && header <= static_cast<int>(Header::DevTools)) {
-        mActiveHeader = static_cast<Header>(header);
+    // Build the registry once. InitElement runs on the ImGui thread after the Gui exists, which is
+    // what the CVar reads inside the registration (defaults, combo lists) and the disable-reason
+    // evaluations both assume.
+    if (!mRegistered) {
+        mRegistered = true;
+        RegisterDisableReasons();
+        RegisterMenu();
     }
-    if (page >= static_cast<int>(Page::General) && page <= static_cast<int>(Page::GfxDebugger)) {
-        mActivePage = static_cast<Page>(page);
-    }
-    if (HeaderForPage(mActivePage) != mActiveHeader) {
-        mActivePage = FirstPageForHeader(mActiveHeader);
-    }
-    if (layoutVersion != kMenuLayoutVersion) {
-        // Stored page/header indices were persisted under a different Page/Header ordering;
-        // a matching numeric value could now name a different tab, so reset to defaults rather
-        // than trust the stale mapping.
-        mActiveHeader = Header::Settings;
-        mActivePage = Page::General;
-        CVarSetInteger("gSettings.Menu.ActiveHeader", static_cast<int>(mActiveHeader));
-        CVarSetInteger("gSettings.Menu.ActivePage", static_cast<int>(mActivePage));
-        CVarSetInteger("gSettings.Menu.LayoutVersion", kMenuLayoutVersion);
-        CVarSave();
+
+    // Restore the last section by NAME, falling back to the first registered section when the
+    // stored name is unknown (a renamed or removed tab) rather than to a stale index.
+    const std::string storedSection = CVarGetString("gSettings.Menu.ActiveSection", "Settings");
+    if (mMenuEntries.count(storedSection) != 0) {
+        mActiveSection = storedSection;
+    } else if (!mMenuOrder.empty()) {
+        mActiveSection = mMenuOrder.front();
     }
 }
 
 void GdxMenu::UpdateElement() {
+    // Gui::DrawMenu calls this before it draws the registered windows, and always on the ImGui
+    // thread — the one place the queued log lines can safely reach the Console window.
+    GdxConsoleLogDrain();
 }
 
 void GdxMenu::Draw() {
     if (!IsVisible()) {
-        // Menu just closed (or was never open this frame): undo any nav-repeat tuning we applied and
-        // clear the open-transition latch so focus is re-seeded the next time the menu opens.
-        RestoreNavRepeatTuning();
+        // Menu just closed (or was never open this frame): undo any nav tuning we applied and clear
+        // the open-transition latches so focus is re-seeded the next time the menu opens.
+        RestoreNavTuning();
         mMenuWasVisible = false;
+        mNavCancelHadTarget = false;
         return;
     }
     DrawElement();
     SyncVisibilityConsoleVariable();
 }
 
-void GdxMenu::RestoreNavRepeatTuning() {
+void GdxMenu::RestoreNavTuning() {
     if (!mNavTuningApplied) {
         return;
     }
@@ -654,11 +732,52 @@ void GdxMenu::RestoreNavRepeatTuning() {
         ImGuiIO& io = ImGui::GetIO();
         io.KeyRepeatDelay = mSavedKeyRepeatDelay;
         io.KeyRepeatRate = mSavedKeyRepeatRate;
+        io.ConfigNavCursorVisibleAlways = mSavedNavCursorAlways;
     }
     mNavTuningApplied = false;
 }
 
 void GdxMenu::DrawElement() {
+    // Defensive: the registry is built in InitElement(), which libultraship calls before any Draw.
+    // Building it here too costs one bool test per frame and removes the possibility of drawing an
+    // empty menu (or indexing an empty mDisabledInfo) if that ordering ever changes.
+    if (!mRegistered) {
+        InitElement();
+    }
+
+    // ONCE PER FRAME, before anything draws. Every disable/hide reason is evaluated here and the
+    // answer cached in DisabledInfo::active; MenuDrawItem only ever reads the cached bool. This is
+    // the whole reason DisabledInfo exists (port/ui/MenuTypes.h): several controls share the same
+    // condition, and without the cache each would re-read the same CVar (or re-query the window)
+    // once per frame per widget.
+    for (GdxUI::DisabledInfo& info : mDisabledInfo) {
+        if (info.evaluation != nullptr) {
+            info.active = info.evaluation(info);
+        }
+    }
+
+    // Consume a pending "jump to this control" request from the search results. Deferred to the top
+    // of the next frame rather than applied inside DrawSearchResults, because that runs mid-layout:
+    // switching section and sidebar there would tear down the child window the result button was
+    // just submitted into.
+    if (mNavigateRequested) {
+        mNavigateRequested = false;
+        auto section = mMenuEntries.find(mNavigateSection);
+        if (section != mMenuEntries.end() && section->second.sidebars.count(mNavigateSidebar) != 0) {
+            mSearch[0] = '\0';
+            mActiveSection = mNavigateSection;
+            CVarSetString("gSettings.Menu.ActiveSection", mActiveSection.c_str());
+            CVarSetString(section->second.sidebarCvar, mNavigateSidebar.c_str());
+            GdxSaveCvars();
+            // Arm the highlight: MenuDrawItem outlines the named control and scrolls it into view
+            // for the next few seconds. Without this, "navigate" drops you on a page of thirty
+            // controls with no indication which one you were looking for.
+            mHighlightWidget = mNavigateWidget;
+            mHighlightUntil = ImGui::GetTime() + 3.0;
+            mHighlightScrollPending = true;
+        }
+    }
+
     const bool navActive = CVarGetInteger("gControlNav", 0) != 0;
 
     // On each open, seed nav focus onto the active sidebar page (consumed in DrawSidebar). Only when
@@ -668,21 +787,29 @@ void GdxMenu::DrawElement() {
         mFocusSidebar = navActive;
     }
 
-    // Snappier held-direction navigation while the pad drives our menu. ImGui derives nav-move repeat
-    // from io.KeyRepeatDelay/Rate (NavMove = Delay*0.72, Rate*0.80). Tightening them a touch makes
-    // holding a direction feel responsive instead of laggy when scrolling a long sidebar/page. Values
-    // are conservative (defaults are 0.275 / 0.050) and applied only while THIS menu is open with
-    // gamepad nav on; restored on close (Draw) or when the user turns nav off. Game input is blocked
-    // while the menu is up, so this never affects gameplay. Tune here if it still feels off.
+    // Nav feel, applied only while THIS menu is open with gamepad nav on and restored on close
+    // (Draw) or when the user turns nav off. Tune here if it still feels off.
+    //
+    // ImGui derives its repeat rates from io.KeyRepeat*: nav moves at Delay*0.72 / Rate*0.80, slider
+    // tweaks at Delay*0.72 / Rate*0.30. The stock 0.275/0.050 gives 25 selection moves per second,
+    // which overshoots badly on a pad; 0.40/0.105 lands at ~12 moves/s while still tweaking a slider
+    // at ~32 steps/s (and L1/R1 remain the fine/coarse modifiers).
+    //
+    // ConfigNavCursorVisibleAlways is what makes the focus rectangle actually appear: both of the
+    // ways this menu parks focus hide it. SetKeyboardFocusHere passes NoSetNavCursorVisible, and
+    // SetFocusID hides the cursor outright unless the last activation came from a pad — so the menu
+    // opened with a real NavId and nothing drawn, and the first press looked like it did nothing.
     if (navActive && !mNavTuningApplied) {
         ImGuiIO& io = ImGui::GetIO();
         mSavedKeyRepeatDelay = io.KeyRepeatDelay;
         mSavedKeyRepeatRate = io.KeyRepeatRate;
-        io.KeyRepeatDelay = 0.22f;
-        io.KeyRepeatRate = 0.045f;
+        mSavedNavCursorAlways = io.ConfigNavCursorVisibleAlways;
+        io.KeyRepeatDelay = 0.40f;
+        io.KeyRepeatRate = 0.105f;
+        io.ConfigNavCursorVisibleAlways = true;
         mNavTuningApplied = true;
     } else if (!navActive && mNavTuningApplied) {
-        RestoreNavRepeatTuning();
+        RestoreNavTuning();
     }
 
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -738,12 +865,23 @@ void GdxMenu::DrawElement() {
                 if (GdxGuiFontLarge() != nullptr) {
                     ImGui::PushFont(GdxGuiFontLarge());
                 }
-                ImGui::TextUnformatted(mSearch[0] != '\0' ? "Search Results" : PageTitle(mActivePage));
+                ImGui::TextUnformatted(mSearch[0] != '\0' ? "Search Results" : ActiveSidebar().c_str());
                 if (GdxGuiFontLarge() != nullptr) {
                     ImGui::PopFont();
                 }
                 ImGui::Separator();
                 DrawCurrentPage();
+
+                // Bring a search-navigated control into view. Done here, in the scrolling content
+                // pane and after the page has laid out, because the control itself may have been
+                // drawn inside a non-scrolling column child. Screen-space Y is converted back to
+                // this window's scroll space, then centred.
+                if (mHighlightScrollPending && mHighlightScreenY != 0.0f) {
+                    const float local = mHighlightScreenY - ImGui::GetWindowPos().y + ImGui::GetScrollY();
+                    ImGui::SetScrollY(local - ImGui::GetWindowHeight() * 0.5f);
+                    mHighlightScrollPending = false;
+                    mHighlightScreenY = 0.0f;
+                }
             }
             ImGui::EndChild();
         }
@@ -751,15 +889,19 @@ void GdxMenu::DrawElement() {
 
         DrawQuitModal();
 
-        // B / Circle = "back". If a widget is actively being edited or a popup (e.g. the quit modal,
-        // a combo) is open, ImGui already uses B to cancel that — leave it alone. Otherwise, at the
-        // top level, B closes the menu, matching console expectations. Edge-triggered so a held B does
-        // not re-fire. Only when gamepad nav is on.
-        if (navActive && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) &&
-            !ImGui::IsAnyItemActive() &&
-            !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
+        // B / Circle = "back": close the menu, but only when ImGui had nothing of its own to cancel.
+        // Testing that here is too late — NavUpdateCancelRequest ran back in NewFrame and has already
+        // dropped the slider or popup the press was meant to leave, so a live check sees a clean menu
+        // and one B would both back out and close. The end-of-frame snapshot below is the state ImGui
+        // itself saw. Edge-triggered so a held B does not re-fire.
+        const bool cancelWasConsumed = mNavCancelHadTarget;
+        const bool popupOpen =
+            ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+        if (navActive && !cancelWasConsumed && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) &&
+            !ImGui::IsAnyItemActive() && !popupOpen) {
             Hide();
         }
+        mNavCancelHadTarget = ImGui::IsAnyItemActive() || popupOpen;
     }
     ImGui::End();
     ImGui::PopStyleColor();
@@ -775,19 +917,26 @@ void GdxMenu::DrawHeader() {
     // this single fullscreen window hits neither of those paths, so an edge-triggered read is safe
     // and needs no SetKeyOwner juggling. Suppressed while any item is active so we never yank focus
     // out of a slider/text field mid-edit.
-    if (navActive && !ImGui::IsAnyItemActive()) {
+    // Tab count and labels come from the registry now (mMenuOrder), not from a hardcoded array that
+    // had to be kept in step with the Header enum by hand.
+    const int tabCount = static_cast<int>(mMenuOrder.size());
+    if (navActive && !ImGui::IsAnyItemActive() && tabCount > 0) {
         int dir = 0;
         if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false)) dir += 1;
         if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false)) dir -= 1;
         if (dir != 0) {
-            const int count = 5;
-            const int idx = (static_cast<int>(mActiveHeader) + dir + count) % count;
+            int cur = 0;
+            for (int i = 0; i < tabCount; ++i) {
+                if (mMenuOrder[i] == mActiveSection) {
+                    cur = i;
+                }
+            }
+            const int idx = (cur + dir + tabCount) % tabCount;
             mSearch[0] = '\0';
-            SelectHeader(static_cast<Header>(idx)); // sets mFocusSidebar -> focus lands on the new tab
+            SelectSection(mMenuOrder[idx]); // sets mFocusSidebar -> focus lands on the new tab
         }
     }
 
-    const char* labels[] = { "Settings", "Enhancements", "Workshop", "Online", "Dev Tools" };
     const float height = ImGui::GetFrameHeight() + 4.0f;
     const float controlsWidth = ImGui::GetFrameHeight() * 3.0f + ImGui::GetStyle().ItemSpacing.x * 2.0f;
     const float searchWidth = ImGui::GetContentRegionAvail().x >= 900.0f ? 210.0f : 140.0f;
@@ -799,31 +948,36 @@ void GdxMenu::DrawHeader() {
         ImGui::TableNextRow();
 
         ImGui::TableSetColumnIndex(0);
-        if (ImGui::BeginChild("##HeaderNavigation", ImVec2(0, height), ImGuiChildFlags_None,
+        // Flattened like the sidebar and content children: an unflattened child is a single nav item
+        // that a pad has to press A to enter and B to leave, which made the tab strip feel like a
+        // dead block. Flattened, Up from the sidebar lands straight on a tab.
+        if (ImGui::BeginChild("##HeaderNavigation", ImVec2(0, height), ImGuiChildFlags_NavFlattened,
                               ImGuiWindowFlags_HorizontalScrollbar)) {
             // Discoverability: flank the tab strip with shoulder-button hints when gamepad nav is on,
             // so the L1/R1 tab-cycling is visible rather than hidden.
             if (navActive) {
                 ImGui::AlignTextToFramePadding();
                 ImGui::TextDisabled(ICON_FA_CHEVRON_LEFT " LB");
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Previous tab (L1 / LB)");
+                // UIWidgets::Tooltip is the IsItemHovered + SetTooltip pair (UIWidgets.cpp:98), so
+                // these stay attached to the item just submitted exactly as before.
+                UIWidgets::Tooltip("Previous tab (L1 / LB)");
             }
-            for (int i = 0; i < 5; ++i) {
+            for (int i = 0; i < tabCount; ++i) {
                 if (i > 0 || navActive) {
                     ImGui::SameLine();
                 }
-                const Header header = static_cast<Header>(i);
-                const ImVec2 buttonSize(ImGui::CalcTextSize(labels[i]).x + 20.0f, ImGui::GetFrameHeight());
-                if (GdxNavigationButton(labels[i], mActiveHeader == header, buttonSize)) {
+                const char* label = mMenuOrder[i].c_str();
+                const ImVec2 buttonSize(ImGui::CalcTextSize(label).x + 20.0f, ImGui::GetFrameHeight());
+                if (GdxNavigationButton(label, mActiveSection == mMenuOrder[i], buttonSize)) {
                     mSearch[0] = '\0';
-                    SelectHeader(header);
+                    SelectSection(mMenuOrder[i]);
                 }
             }
             if (navActive) {
                 ImGui::SameLine();
                 ImGui::AlignTextToFramePadding();
                 ImGui::TextDisabled("RB " ICON_FA_CHEVRON_RIGHT);
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Next tab (R1 / RB)");
+                UIWidgets::Tooltip("Next tab (R1 / RB)");
             }
         }
         ImGui::EndChild();
@@ -839,14 +993,14 @@ void GdxMenu::DrawHeader() {
         if (ImGui::Button(ICON_FA_POWER_OFF "##Quit", actionSize)) {
             mOpenQuitModal = true;
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Quit G-Diffuser");
+        UIWidgets::Tooltip("Quit G-Diffuser");
         ImGui::SameLine();
         if (ImGui::Button(ICON_FA_UNDO "##Reset", actionSize)) {
             // The menu is already on the host/UI side of the bridge; request the reset directly.
             // Ctrl+R still uses the console command, and both converge on the same deferred flag.
             gdx_game_request_reset();
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reset game (Ctrl+R)");
+        UIWidgets::Tooltip("Reset game (Ctrl+R)");
         ImGui::PopStyleColor(2);
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.31f, 0.32f, 0.35f, 1.0f));
@@ -855,7 +1009,7 @@ void GdxMenu::DrawHeader() {
             Hide();
         }
         ImGui::PopStyleColor(2);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Close menu (Esc or F1)");
+        UIWidgets::Tooltip("Close menu (Esc or F1)");
         ImGui::EndTable();
     }
 }
@@ -868,132 +1022,217 @@ void GdxMenu::DrawSidebar() {
     // hands off to the content pane via ImGui's spatial nav.
     const bool wantFocus = mFocusSidebar && CVarGetInteger("gControlNav", 0) != 0;
 
-    auto pageButton = [&](Page page) {
-        const char* title = PageTitle(page);
-        const bool isActive = mSearch[0] == '\0' && mActivePage == page;
+    auto sidebarButton = [&](const std::string& sidebar) {
+        const bool isActive = mSearch[0] == '\0' && ActiveSidebar() == sidebar;
         if (wantFocus && isActive) {
             ImGui::SetKeyboardFocusHere();
         }
-        if (GdxNavigationButton(title, isActive, ImVec2(ImGui::GetContentRegionAvail().x, 0.0f))) {
+        if (GdxNavigationButton(sidebar.c_str(), isActive, ImVec2(ImGui::GetContentRegionAvail().x, 0.0f))) {
             mSearch[0] = '\0';
-            SelectPage(page);
+            SelectSidebar(sidebar);
         }
         if (wantFocus && isActive) {
             ImGui::SetItemDefaultFocus();
         }
     };
 
-    switch (mActiveHeader) {
-        case Header::Settings:
-            pageButton(Page::General);
-            pageButton(Page::Graphics);
-            pageButton(Page::Audio);
-            pageButton(Page::Controls);
-            break;
-        case Header::Enhancements:
-            pageButton(Page::EnhancementGraphics);
-            pageButton(Page::Gameplay);
-            pageButton(Page::Practice);
-            break;
-        case Header::Workshop:
-            pageButton(Page::Ghosts);
-            pageButton(Page::Content);
-            break;
-        case Header::Online:
-            pageButton(Page::OnlineOverview);
-            break;
-        case Header::DevTools:
-            pageButton(Page::DeveloperGeneral);
-            pageButton(Page::Stats);
-            pageButton(Page::InputViewer);
-            pageButton(Page::Console);
-            pageButton(Page::GfxDebugger);
-            break;
+    // The page list IS the registry's sidebarOrder for the active section. The switch over ~15
+    // Page enum values this replaces had to be edited in lockstep with the enum, PageTitle() and
+    // HeaderForPage(); the three could and did drift.
+    auto section = mMenuEntries.find(mActiveSection);
+    if (section != mMenuEntries.end()) {
+        for (const std::string& sidebar : section->second.sidebarOrder) {
+            sidebarButton(sidebar);
+        }
     }
 
     // One-shot: focus request (if any) has now been submitted for this frame.
     mFocusSidebar = false;
 }
 
+// Draws the active page: its registered widgets, laid out across SidebarEntry::columnCount columns.
+//
+// Columns are what stop a dense page from being one long scroll. The registration decides how many
+// (1-3) and which column each control belongs to; this only performs the layout, and collapses to a
+// single column on a narrow content pane, where two columns would be narrower than the widgets in
+// them.
 void GdxMenu::DrawCurrentPage() {
     if (mSearch[0] != '\0') {
-        DrawSearchResults();
+        if (DrawSearchResults() == 0) {
+            ImGui::TextDisabled("No settings or tools match \"%s\".", mSearch);
+        }
         return;
     }
 
-    switch (mActivePage) {
-        case Page::General: DrawGeneralPage(); break;
-        case Page::Audio: DrawAudioMenu(); break;
-        case Page::Graphics: DrawGraphicsMenu(false); break;
-        case Page::Controls: DrawControlsMenu(); break;
-        case Page::InputViewer: DrawInputViewerMenu(); break;
-        case Page::EnhancementGraphics: DrawGraphicsMenu(true); break;
-        case Page::Gameplay: DrawGameplayMenu(); break;
-        case Page::Practice: DrawPracticeMenu(); break;
-        case Page::Ghosts: DrawGhostsMenu(); break;
-        case Page::Content: DrawWorkshopMenu(); break;
-        case Page::OnlineOverview: DrawOnlineMenu(); break;
-        case Page::DeveloperGeneral: DrawDeveloperMenu(); break;
-        case Page::Stats: DrawStatsMenu(); break;
-        case Page::Console:
-            DrawToolWindowPage("Console", "Developer console and command history.");
-            break;
-        case Page::GfxDebugger:
-            DrawToolWindowPage("Gfx Debugger", "Inspect Fast3D display-list execution and rendering state.");
-            break;
+    GdxUI::SidebarEntry* entry = ActiveSidebarEntry();
+    if (entry == nullptr) {
+        return;
+    }
+
+    const float available = ImGui::GetContentRegionAvail().x;
+    int columns = static_cast<int>(entry->columnCount);
+    if (columns < 1) {
+        columns = 1;
+    }
+    // 420px per column is the width below which this menu's widest controls (a slider with its
+    // label positioned Near, or a combobox sized to its longest entry) start truncating.
+    while (columns > 1 && available / static_cast<float>(columns) < 420.0f) {
+        --columns;
+    }
+
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float columnWidth = (available - style.ItemSpacing.x * static_cast<float>(columns - 1)) /
+                              static_cast<float>(columns);
+    const int columnGroups = static_cast<int>(entry->columnWidgets.size());
+
+    for (int i = 0; i < columnGroups; ++i) {
+        const bool useColumns = columns > 1 && i < columns;
+        if (useColumns) {
+            // NavFlattened for the same reason as every other child in this menu (see DrawElement):
+            // an unflattened child is one nav stop a pad must press A to enter, so the second column
+            // would be unreachable by gamepad.
+            ImGui::BeginChild(("##PageColumn" + std::to_string(i)).c_str(), ImVec2(columnWidth, 0.0f),
+                              ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_NavFlattened);
+        }
+        for (GdxUI::WidgetInfo& widget : entry->columnWidgets[i]) {
+            MenuDrawItem(widget);
+        }
+        if (useColumns) {
+            ImGui::EndChild();
+            if (i < columns - 1) {
+                ImGui::SameLine();
+            }
+        }
     }
 }
 
-void GdxMenu::DrawSearchResults() {
-    struct SearchPage {
-        Page page;
-        const char* terms;
-    };
-    static const SearchPage pages[] = {
-        { Page::General, "general menu opacity controller navigation about credits licenses" },
-        { Page::Audio, "audio lle hle filter low pass volume reverb latency buffer" },
-        { Page::Graphics, "graphics internal resolution msaa texture filter vsync fullscreen z fighting" },
-        { Page::Controls, "controls controller configuration keyboard gamepad mouse bindings remap" },
-        { Page::InputViewer, "input viewer overlay analog stick buttons speedrun" },
-        { Page::EnhancementGraphics, "graphics enhancements widescreen hud ui draw distance lod frame pacing" },
-        { Page::Gameplay, "gameplay transitions autosave ghost" },
-        { Page::Practice, "practice lap delta ghost import export photo mode free camera replay" },
-        { Page::Ghosts, "ghost browser replay library opponents import export staff player" },
-        { Page::Content, "workshop content texture packs track cup machine mods dump reload hi-res font" },
-        { Page::OnlineOverview, "online leaderboard ghost upload download netplay spectator" },
-        { Page::DeveloperGeneral, "developer multi viewport tools" },
-        { Page::Stats, "stats fps frame timing performance" },
-        { Page::Console, "console commands log reset" },
-        { Page::GfxDebugger, "gfx graphics debugger display list rendering" },
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// WIDGET-LEVEL SEARCH.
+//
+// This walks the SAME registry MenuDrawItem draws from, so anything on a page is findable and
+// anything findable is really on a page. What it replaces was a hand-typed table of PAGE keywords:
+// searching "reverb" could at best offer you "the Audio page", and a control whose keyword nobody
+// remembered to type was invisible to search entirely.
+//
+// Each hit draws the LIVE control (so it can be changed right there, without navigating) followed
+// by a button naming where it lives — "Enhancements -> Visuals, Col 2" — which jumps the menu to
+// that page and briefly outlines the control.
+//
+// Page-level hits are still produced, from SidebarEntry::searchTerms, which is where the old
+// keyword table's terms were carried to. Nothing that used to be findable stopped being findable.
+// Returns the number of results drawn.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+uint32_t GdxMenu::DrawSearchResults() {
+    // Spaces are stripped from BOTH sides of the comparison (upstream does the same), so "lowpass"
+    // finds "Low-pass"-adjacent wording and "framepacing" finds "Frame pacing".
+    std::string query = GdxLowercase(mSearch);
+    query.erase(std::remove(query.begin(), query.end(), ' '), query.end());
+    if (query.empty()) {
+        return 0;
+    }
+
+    auto normalise = [](std::string value) {
+        value = GdxLowercase(std::move(value));
+        value.erase(std::remove(value.begin(), value.end(), ' '), value.end());
+        return value;
     };
 
-    const std::string query = GdxLowercase(mSearch);
-    int matches = 0;
-    for (const SearchPage& entry : pages) {
-        const std::string haystack = GdxLowercase(std::string(PageTitle(entry.page)) + " " + entry.terms);
-        if (haystack.find(query) == std::string::npos) {
-            continue;
+    uint32_t matches = 0;
+
+    // ── Page hits ────────────────────────────────────────────────────────────────────────────
+    for (const std::string& sectionName : mMenuOrder) {
+        GdxUI::MainMenuEntry& section = mMenuEntries.at(sectionName);
+        for (const std::string& sidebarName : section.sidebarOrder) {
+            const GdxUI::SidebarEntry& sidebar = section.sidebars.at(sidebarName);
+            if (normalise(sectionName + " " + sidebarName + " " + sidebar.searchTerms).find(query) ==
+                std::string::npos) {
+                continue;
+            }
+            ++matches;
+            ImGui::PushID(("page_" + sectionName + sidebarName).c_str());
+            if (ImGui::Button(sidebarName.c_str(),
+                              ImVec2((std::min)(430.0f, ImGui::GetContentRegionAvail().x), 0.0f))) {
+                mSearch[0] = '\0';
+                mActiveSection = sectionName;
+                CVarSetString("gSettings.Menu.ActiveSection", mActiveSection.c_str());
+                SelectSidebar(sidebarName);
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", sectionName.c_str());
+            ImGui::PopID();
         }
-        ++matches;
-        ImGui::PushID(static_cast<int>(entry.page));
-        if (ImGui::Button(PageTitle(entry.page),
-                          ImVec2((std::min)(430.0f, ImGui::GetContentRegionAvail().x), 0.0f))) {
-            mSearch[0] = '\0';
-            SelectPage(entry.page);
+    }
+
+    // ── Control hits ─────────────────────────────────────────────────────────────────────────
+    for (const std::string& sectionName : mMenuOrder) {
+        GdxUI::MainMenuEntry& section = mMenuEntries.at(sectionName);
+        for (const std::string& sidebarName : section.sidebarOrder) {
+            GdxUI::SidebarEntry& sidebar = section.sidebars.at(sidebarName);
+            for (size_t col = 0; col < sidebar.columnWidgets.size(); ++col) {
+                for (GdxUI::WidgetInfo& widget : sidebar.columnWidgets[col]) {
+                    // Decoration carries no setting, so it is never a search result.
+                    if (widget.hideInSearch || widget.type == GdxUI::WIDGET_SEPARATOR ||
+                        widget.type == GdxUI::WIDGET_SEPARATOR_TEXT || widget.type == GdxUI::WIDGET_TEXT ||
+                        widget.type == GdxUI::WIDGET_TEXT_DISABLED) {
+                        continue;
+                    }
+                    // A control its own page would not show is a dead end: MenuDrawItem would draw
+                    // nothing and the "go there" button would land on a page without it. The hide
+                    // conditions are re-checked here rather than trusting WidgetInfo::isHidden,
+                    // which is only refreshed for widgets that were drawn this frame — i.e. for the
+                    // ACTIVE page. Reads the same once-per-frame cache, so it costs nothing.
+                    bool hidden = false;
+                    for (GdxUI::DisableOption reason : widget.hideWhen) {
+                        if (mDisabledInfo[reason].active) {
+                            hidden = true;
+                        }
+                    }
+                    if (hidden) {
+                        continue;
+                    }
+                    const char* tooltip = widget.options != nullptr ? widget.options->tooltip : "";
+                    const std::string haystack = normalise(
+                        widget.name + " " + (tooltip != nullptr ? tooltip : "") + " " + widget.searchTerms);
+                    if (haystack.find(query) == std::string::npos) {
+                        continue;
+                    }
+                    ++matches;
+
+                    ImGui::PushID(("hit_" + sectionName + sidebarName + std::to_string(col) + widget.name).c_str());
+                    if (widget.type == GdxUI::WIDGET_CUSTOM) {
+                        // A custom block is a whole sub-panel (a table, a modal owner, a status
+                        // read-out). Rendering one inside the result list would duplicate its
+                        // ImGui IDs against the copy on its own page and, for the dev-gate table,
+                        // dwarf every other result. Name it and offer the jump instead.
+                        ImGui::AlignTextToFramePadding();
+                        ImGui::TextUnformatted(widget.name.c_str());
+                    } else {
+                        MenuDrawItem(widget);
+                    }
+
+                    // "Go there" affordance. Deliberately a button rather than plain text: this is
+                    // the navigate half of the feature, and a label that merely tells you where to
+                    // look is not navigation.
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+                    const std::string origin = "  " ICON_FA_ARROW_RIGHT "  " + sectionName + " -> " + sidebarName +
+                                               ", Col " + std::to_string(col + 1);
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.57f, 0.64f, 1.0f));
+                    const bool go = ImGui::Button(origin.c_str());
+                    ImGui::PopStyleColor(2);
+                    UIWidgets::Tooltip("Go to this setting on its own page.");
+                    if (go) {
+                        mNavigateRequested = true;
+                        mNavigateSection = sectionName;
+                        mNavigateSidebar = sidebarName;
+                        mNavigateWidget = widget.name;
+                    }
+                    ImGui::PopID();
+                }
+            }
         }
-        ImGui::SameLine();
-        const Header header = HeaderForPage(entry.page);
-        const char* headerName = header == Header::Settings       ? "Settings"
-                                 : header == Header::Enhancements ? "Enhancements"
-                                 : header == Header::Workshop     ? "Workshop"
-                                 : header == Header::Online       ? "Online"
-                                                                    : "Dev Tools";
-        ImGui::TextDisabled("%s", headerName);
-        ImGui::PopID();
     }
-    if (matches == 0) {
-        ImGui::TextDisabled("No settings or tools match \"%s\".", mSearch);
-    }
+
+    return matches;
 }
 
 void GdxMenu::DrawQuitModal() {
@@ -1021,11 +1260,16 @@ void GdxMenu::DrawQuitModal() {
     }
 }
 
-void GdxMenu::SelectHeader(Header header) {
-    mActiveHeader = header;
-    mActivePage = FirstPageForHeader(header);
-    CVarSetInteger("gSettings.Menu.ActiveHeader", static_cast<int>(mActiveHeader));
-    CVarSetInteger("gSettings.Menu.ActivePage", static_cast<int>(mActivePage));
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Section / sidebar selection and registry construction.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+void GdxMenu::SelectSection(const std::string& section) {
+    if (mMenuEntries.count(section) == 0) {
+        return;
+    }
+    mActiveSection = section;
+    CVarSetString("gSettings.Menu.ActiveSection", mActiveSection.c_str());
     GdxSaveCvars();
     // A tab change moves the whole page list; re-park the nav cursor on the new tab's first page so
     // the pad does not end up focused on a now-hidden item. Harmless with mouse/keyboard (gated in
@@ -1033,943 +1277,498 @@ void GdxMenu::SelectHeader(Header header) {
     mFocusSidebar = true;
 }
 
-void GdxMenu::SelectPage(Page page) {
-    mActivePage = page;
-    mActiveHeader = HeaderForPage(page);
-    CVarSetInteger("gSettings.Menu.ActiveHeader", static_cast<int>(mActiveHeader));
-    CVarSetInteger("gSettings.Menu.ActivePage", static_cast<int>(mActivePage));
+void GdxMenu::SelectSidebar(const std::string& sidebar) {
+    auto section = mMenuEntries.find(mActiveSection);
+    if (section == mMenuEntries.end() || section->second.sidebars.count(sidebar) == 0) {
+        return;
+    }
+    // Persisted per SECTION, so each tab remembers where you were in it independently — the single
+    // global "active page" integer could only remember one.
+    CVarSetString(section->second.sidebarCvar, sidebar.c_str());
     GdxSaveCvars();
 }
 
-GdxMenu::Header GdxMenu::HeaderForPage(Page page) const {
-    if (page <= Page::Controls) return Header::Settings;      // General .. Controls
-    if (page <= Page::Practice) return Header::Enhancements;  // EnhancementGraphics .. Practice
-    if (page <= Page::Content) return Header::Workshop;       // Ghosts .. Content
-    if (page == Page::OnlineOverview) return Header::Online;
-    return Header::DevTools;                                  // DeveloperGeneral .. GfxDebugger
+// The active page of the active section, falling back to that section's first page when the stored
+// name is unknown (page renamed, removed, or never set).
+const std::string& GdxMenu::ActiveSidebar() {
+    static const std::string kNone;
+    auto section = mMenuEntries.find(mActiveSection);
+    if (section == mMenuEntries.end() || section->second.sidebarOrder.empty()) {
+        return kNone;
+    }
+    const std::string stored = CVarGetString(section->second.sidebarCvar, "");
+    for (const std::string& name : section->second.sidebarOrder) {
+        if (name == stored) {
+            return section->second.sidebars.find(name)->first;
+        }
+    }
+    return section->second.sidebarOrder.front();
 }
 
-GdxMenu::Page GdxMenu::FirstPageForHeader(Header header) const {
-    switch (header) {
-        case Header::Settings: return Page::General;
-        case Header::Enhancements: return Page::EnhancementGraphics;
-        case Header::Workshop: return Page::Ghosts;
-        case Header::Online: return Page::OnlineOverview;
-        case Header::DevTools: return Page::DeveloperGeneral;
+GdxUI::SidebarEntry* GdxMenu::ActiveSidebarEntry() {
+    auto section = mMenuEntries.find(mActiveSection);
+    if (section == mMenuEntries.end()) {
+        return nullptr;
     }
-    return Page::General;
+    auto sidebar = section->second.sidebars.find(ActiveSidebar());
+    return sidebar != section->second.sidebars.end() ? &sidebar->second : nullptr;
 }
 
-const char* GdxMenu::PageTitle(Page page) const {
-    switch (page) {
-        case Page::General: return "General";
-        case Page::Audio: return "Audio";
-        case Page::Graphics: return "Graphics";
-        case Page::Controls: return "Controls";
-        case Page::InputViewer: return "Input Viewer";
-        case Page::EnhancementGraphics: return "Graphics";
-        case Page::Gameplay: return "Gameplay";
-        case Page::Practice: return "Practice";
-        case Page::Ghosts: return "Ghosts";
-        case Page::Content: return "Content";
-        case Page::OnlineOverview: return "Overview";
-        case Page::DeveloperGeneral: return "General";
-        case Page::Stats: return "Stats";
-        case Page::Console: return "Console";
-        case Page::GfxDebugger: return "Gfx Debugger";
-    }
-    return "General";
+void GdxMenu::AddMenuEntry(const std::string& label, const char* sidebarCvar) {
+    GdxUI::MainMenuEntry entry;
+    entry.label = label;
+    entry.sidebarCvar = sidebarCvar;
+    mMenuEntries.emplace(label, std::move(entry));
+    mMenuOrder.push_back(label);
 }
 
-void GdxMenu::DrawGeneralPage() {
-    ImGui::SeparatorText("Menu Settings");
-    float opacity = std::clamp(CVarGetFloat("gSettings.Menu.BackgroundOpacity", 0.85f), 0.35f, 1.0f);
-    int opacityPercent = static_cast<int>(opacity * 100.0f + 0.5f);
-    if (ImGui::SliderInt("Menu background opacity", &opacityPercent, 35, 100, "%d%%",
-                         ImGuiSliderFlags_AlwaysClamp)) {
-        CVarSetFloat("gSettings.Menu.BackgroundOpacity", static_cast<float>(opacityPercent) / 100.0f);
-        GdxSaveCvars();
+void GdxMenu::AddSidebarEntry(const std::string& section, const std::string& sidebar, uint32_t columnCount,
+                              const std::string& searchTerms) {
+    auto it = mMenuEntries.find(section);
+    if (it == mMenuEntries.end()) {
+        return;
     }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("How opaque this menu's backdrop is over the game (35%% = most see-through).");
+    GdxUI::SidebarEntry entry;
+    entry.columnCount = columnCount == 0 ? 1 : columnCount;
+    // One widget vector per declared column, allocated up front so AddWidget can index straight in
+    // and a page may legally leave a column empty.
+    entry.columnWidgets.resize(entry.columnCount);
+    entry.searchTerms = searchTerms;
+    it->second.sidebars.emplace(sidebar, std::move(entry));
+    it->second.sidebarOrder.push_back(sidebar);
+}
+
+void GdxMenu::AddWidget(const std::string& section, const std::string& sidebar, GdxUI::SectionColumns column,
+                        GdxUI::WidgetInfo widget) {
+    auto sectionIt = mMenuEntries.find(section);
+    if (sectionIt == mMenuEntries.end()) {
+        return;
     }
-    bool controllerNav = CVarGetInteger("gControlNav", 0) != 0;
-    if (ImGui::Checkbox("Menu controller navigation", &controllerNav)) {
-        CVarSetInteger("gControlNav", controllerNav ? 1 : 0);
-        GdxSaveCvars();
+    auto sidebarIt = sectionIt->second.sidebars.find(sidebar);
+    if (sidebarIt == sectionIt->second.sidebars.end()) {
+        return;
     }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Lets a connected gamepad navigate the menu. Game input is blocked while the menu is open.");
+    // Every widget must carry an Options struct: MenuDrawItem writes options->disabled /
+    // ->disabledTooltip for the named disable reasons, and the search reads options->tooltip.
+    //
+    // It must be the struct MATCHING widget.type, not the base. MenuDrawItem reaches its options
+    // through static_pointer_cast, which does no checking: handed a plain WidgetOptions for a
+    // WIDGET_TEXT, `options->color` reads past the end of the allocation, and the garbage enum that
+    // comes back is then fed to ColorValues.at() -- which throws std::out_of_range. Nothing catches
+    // it, so the process dies.
+    //
+    // That is exactly what happened: the first control on Dev Tools -> General is a WIDGET_TEXT
+    // registered with no .Options() (gdx_menu_registry.cpp:1061), so opening Dev Tools killed the
+    // game the instant the page drew. Settings -> Controls (:695) carried the same latent crash.
+    // Allocating by type fixes the whole class, rather than requiring every future registration to
+    // remember .Options() on precisely the subset of types that dereference it.
+    if (widget.options == nullptr) {
+        switch (widget.type) {
+            case GdxUI::WIDGET_TEXT:
+                widget.options = std::make_shared<UIWidgets::TextOptions>();
+                break;
+            case GdxUI::WIDGET_BUTTON:
+                widget.options = std::make_shared<UIWidgets::ButtonOptions>();
+                break;
+            case GdxUI::WIDGET_CHECKBOX:
+            case GdxUI::WIDGET_CVAR_CHECKBOX:
+                widget.options = std::make_shared<UIWidgets::CheckboxOptions>();
+                break;
+            case GdxUI::WIDGET_COMBOBOX:
+            case GdxUI::WIDGET_CVAR_COMBOBOX:
+                widget.options = std::make_shared<UIWidgets::ComboboxOptions>();
+                break;
+            case GdxUI::WIDGET_SLIDER_INT:
+            case GdxUI::WIDGET_CVAR_SLIDER_INT:
+                widget.options = std::make_shared<UIWidgets::IntSliderOptions>();
+                break;
+            case GdxUI::WIDGET_SLIDER_FLOAT:
+            case GdxUI::WIDGET_CVAR_SLIDER_FLOAT:
+                widget.options = std::make_shared<UIWidgets::FloatSliderOptions>();
+                break;
+            case GdxUI::WIDGET_CVAR_RADIO_BUTTON:
+                widget.options = std::make_shared<UIWidgets::RadioButtonsOptions>();
+                break;
+            default:
+                // Decorative and custom types (separators, custom blocks) never downcast; they only
+                // ever read the base fields, so the base struct is the correct allocation.
+                widget.options = std::make_shared<UIWidgets::WidgetOptions>();
+                break;
+        }
     }
-    ImGui::TextDisabled("Open or close this menu with F1, Escape, or Gamepad Back.");
-    ImGui::Spacing();
-    GdxDrawDataAndFilesPanel();
-    ImGui::Spacing();
-    DrawAboutMenu();
+    auto& columns = sidebarIt->second.columnWidgets;
+    size_t index = static_cast<size_t>(column);
+    if (index >= columns.size()) {
+        index = columns.empty() ? 0 : columns.size() - 1; // declared fewer columns than requested
+    }
+    if (columns.empty()) {
+        columns.resize(1);
+    }
+    columns[index].push_back(std::move(widget));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-// 1) GRAPHICS — LUS "courtesy panel" CVars (READY, wired) + port features (Coming soon).
-//    docs/menu/GRAPHICS_TAB.md. The read-once trio (internal res / MSAA / texture filter) is
-//    consumed by the backend only at window Init, so a plain CVar write is inert until the matching
-//    LUS setter is called. We now call those setters ON CHANGE so the controls apply LIVE (the
-//    standard SoH apply pattern: CVarSet + CVarSave + Set...()):
-//      - internal res -> Ship::Window::SetResolutionMultiplier(float)  (Window.h:140, base virtual)
-//      - MSAA         -> Ship::Window::SetMsaaLevel(uint32_t)          (Window.h:145, base virtual)
-//      - tex filter   -> Fast::Fast3dWindow::SetTextureFilter(FilteringMode) (Fast3dWindow.h:81 —
-//                        Fast3d-only, so a null-safe downcast; skipped w/ CVar-only fallback if the
-//                        backend is not Fast3d).
-//    The setters run on the render/GUI thread the menu already draws on (no new thread path). VSync
-//    and z-fighting are read live by the backend, while fullscreen uses the active Window API.
+// MenuDrawItem — one registered WidgetInfo -> ImGui.
+//
+// Order of operations, and why:
+//   1. hideWhen / preFunc            decide whether the control exists this frame at all
+//   2. disableWhen                   turn the active named reasons into ONE tooltip that lists
+//                                    every reason, so a control greyed for two reasons says both
+//   3. the widget itself             via the UIWidgets CVar-bound library
+//   4. callback                      side effects, only when the widget reported a change
+//   5. modified marker / note        the "* changed from default" cue and the "(restart)" suffix
+//   6. postFunc                      anything that has to react to state the widget cannot report
+//   7. highlight                     the search-navigation outline
+//
+// NOTE: unlike Lighthouse's MenuDrawItem, this does NOT overwrite options->color with a global
+// theme colour. Each Options struct's own default (LightBlue for checkboxes, Gray for sliders) is
+// what every one of this menu's call sites already used, and forcing one colour on all of them
+// would silently restyle the entire menu.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-void GdxMenu::DrawGraphicsMenu(bool enhancementsOnly) {
-    if (!enhancementsOnly) {
-    ImGui::SeparatorText("Renderer");
+void GdxMenu::MenuDrawItem(GdxUI::WidgetInfo& widget) {
+    widget.ResetDisables();
 
-    // Internal resolution — CVar gInternalResolution (float multiplier), default 1.0. Read once at
-    // Init (interpreter.cpp); applied LIVE here via SetResolutionMultiplier (base Ship::Window
-    // virtual — no downcast needed).
-    {
-        float mult = CVarGetFloat("gInternalResolution", 1.0f);
-        if (ImGui::SliderFloat("Internal resolution (x)", &mult, 0.5f, 4.0f, "%.2f")) {
-            if (mult < 0.5f) {
-                mult = 0.5f;
-            }
-            CVarSetFloat("gInternalResolution", mult);
-            GdxSaveCvars();
-            auto window = GdxWindow();
-            if (window != nullptr) {
-                window->SetResolutionMultiplier(mult); // apply live (Fast3dWindow.cpp:315)
-            }
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Render scale relative to the window size. 1.00x = native; higher is\n"
-                              "sharper but costs GPU. Applies immediately.");
+    // Hide conditions are evaluated from the same once-per-frame cache as the disable conditions.
+    for (GdxUI::DisableOption reason : widget.hideWhen) {
+        if (mDisabledInfo[reason].active) {
+            widget.isHidden = true;
         }
     }
-
-    // MSAA — CVar gMSAAValue (int sample count), default 1 (= off). Read once at Init; applied LIVE
-    // here via SetMsaaLevel (base Ship::Window virtual — no downcast needed).
-    {
-        static const int kMsaaValues[] = { 1, 2, 4, 8 };
-        static const char* const kMsaaLabels[] = { "Off (1x)", "2x", "4x", "8x" };
-        int cur = CVarGetInteger("gMSAAValue", 1);
-        int idx = 0;
-        for (int i = 0; i < 4; ++i) {
-            if (kMsaaValues[i] == cur) {
-                idx = i;
-            }
-        }
-        if (ImGui::Combo("MSAA", &idx, kMsaaLabels, 4)) {
-            CVarSetInteger("gMSAAValue", kMsaaValues[idx]);
-            GdxSaveCvars();
-            auto window = GdxWindow();
-            if (window != nullptr) {
-                window->SetMsaaLevel((uint32_t)kMsaaValues[idx]); // apply live (Fast3dWindow.cpp:319)
-            }
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Multi-sample anti-aliasing. Higher smooths edges at a GPU cost.\n"
-                              "Off (1x) = stock. Applies immediately.");
-        }
+    if (widget.preFunc != nullptr) {
+        widget.preFunc(widget);
     }
-
-    // Texture filtering — CVar gTextureFilter (enum FilteringMode), default FILTER_THREE_POINT.
-    // Enum order is fixed by LUS: gfx_rendering_api.h -> { FILTER_THREE_POINT=0, FILTER_LINEAR=1,
-    // FILTER_NONE=2 }. Combo index maps 1:1 to the enum value. Read once at Init; applied LIVE here
-    // via Fast::Fast3dWindow::SetTextureFilter (Fast3dWindow.cpp:162). That setter is Fast3d-only
-    // (it takes a Fast::FilteringMode), so it needs the downcast — null-safe: on a non-Fast3d
-    // backend the CVar is still saved and takes effect on the next restart.
-    {
-        static const char* const kFilterLabels[] = {
-            "Three-point (N64)", // FILTER_THREE_POINT = 0 (the 1:1 default)
-            "Linear",            // FILTER_LINEAR      = 1
-            "None (sharp)"       // FILTER_NONE        = 2
-        };
-        int idx = CVarGetInteger("gTextureFilter", 0 /* FILTER_THREE_POINT */);
-        if (idx < 0 || idx > 2) {
-            idx = 0;
-        }
-        if (ImGui::Combo("Texture filter", &idx, kFilterLabels, 3)) {
-            CVarSetInteger("gTextureFilter", idx);
-            GdxSaveCvars();
-            auto fast = GdxFast3dWindow();
-            if (fast != nullptr) {
-                fast->SetTextureFilter(static_cast<Fast::FilteringMode>(idx)); // apply live
-            }
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("How textures are sampled. Three-point mimics the N64 (stock);\n"
-                              "Linear is smoother; None is sharp/pixelated. Applies immediately.");
-        }
-    }
-
-    ImGui::Separator();
-
-    // VSync — CVar gVsyncEnabled (bool), default 1 (on). Read live per-present, so a plain write
-    // takes effect immediately.
-    {
-        bool on = CVarGetInteger("gVsyncEnabled", 1) != 0;
-        if (ImGui::Checkbox("VSync", &on)) {
-            CVarSetInteger("gVsyncEnabled", on ? 1 : 0);
-            GdxSaveCvars();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Syncs presentation to the display refresh to avoid tearing.\n"
-                              "On = stock. Turn off if you use Frame pacing.");
-        }
-    }
-
-    // Fullscreen is live window state, not a CVar. Ship::Window routes this through the active
-    // backend (DXGI borderless on Windows, SDL fullscreen elsewhere) and persists the result via
-    // Fast3dWindow's fullscreen-changed callback, exactly like the F11 shortcut.
-    {
-        auto window = GdxWindow();
-        bool on = window != nullptr && window->IsFullscreen();
-        ImGui::BeginDisabled(window == nullptr);
-        if (ImGui::Checkbox("Fullscreen", &on) && window != nullptr) {
-            window->SetFullscreen(on);
-        }
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Uses the active window backend (borderless fullscreen on DX11).\n"
-                              "The F11 shortcut controls the same setting.");
-        }
-    }
-
-    // Z-fighting mode — CVar gZFightingMode (enum), default 0 (= 1:1). Consumed live by the active
-    // Fast3D backend when it builds the rasterizer state for DECAL z-mode polygons: it sets the
-    // SlopeScaledDepthBias applied to coplanar decal surfaces (track markings, shadows, surface
-    // text) so they don't z-fight against the geometry they sit on (gfx_direct3d11.cpp:724, and the
-    // matching gfx_opengl/gfx_metal switches). Mode 1 scales the bias by render height to mimic the
-    // N64's own decal offset; Mode 2 uses a stronger bias that stops far decals from vanishing.
-    // Only visible where decal geometry coexists with its base surface, so the effect is subtle.
-    {
-        static const char* const kZLabels[] = { "Disabled", "N64-style (scaled)", "No vanishing decals" };
-        int idx = CVarGetInteger("gZFightingMode", 0);
-        if (idx < 0 || idx > 2) {
-            idx = 0;
-        }
-        if (ImGui::Combo("Z-fighting reduction", &idx, kZLabels, 3)) {
-            CVarSetInteger("gZFightingMode", idx);
-            GdxSaveCvars();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Adjusts the depth bias on decal surfaces (track markings, shadows)\n"
-                              "so they don't shimmer against the road. Disabled = stock.");
-        }
-    }
-
+    if (widget.isHidden) {
         return;
     }
 
-    ImGui::SeparatorText("Visual Enhancements");
-
-    // Widescreen (16:9) — CVar gEnhancements.Graphics.Widescreen, default 1 (= today's behavior).
-    // Read live in interpreter.cpp AdjXForAspectRatio: 1 keeps the current 16:9 hor+ aspect
-    // correction (byte-identical default), 0 renders 4:3 with pillarbox bars. OFF has two documented
-    // edge cases (MSAA>1 at exactly 1x internal res; AdvancedResolution takes precedence).
-    {
-        bool on = CVarGetInteger("gEnhancements.Graphics.Widescreen", 1) != 0;
-        if (ImGui::Checkbox("Widescreen (16:9)", &on)) {
-            CVarSetInteger("gEnhancements.Graphics.Widescreen", on ? 1 : 0);
-            GdxSaveCvars();
+    for (GdxUI::DisableOption reason : widget.disableWhen) {
+        if (mDisabledInfo[reason].active) {
+            widget.activeDisables.push_back(reason);
         }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("On: fills the window in 16:9 (hor+).\n"
-                              "Off: renders 4:3 with pillarbox bars on the sides.");
+    }
+    if (!widget.activeDisables.empty()) {
+        // The named-reason payoff: a greyed control states WHY, and can state several reasons at
+        // once. Built into a member string because UIWidgets' Options structs borrow the pointer.
+        mDisabledTooltip = "This setting is unavailable because:";
+        for (GdxUI::DisableOption reason : widget.activeDisables) {
+            mDisabledTooltip += "\n  - ";
+            mDisabledTooltip += mDisabledInfo[reason].reason;
         }
-        GdxModifiedMarker(!on); // default is on
+        widget.options->disabled = true;
+        widget.options->disabledTooltip = mDisabledTooltip.c_str();
     }
 
-    {
-        bool widescreenOn = CVarGetInteger("gEnhancements.Graphics.Widescreen", 1) != 0;
-        bool on = CVarGetInteger("gEnhancements.Graphics.WidescreenUI", 0) != 0;
-        ImGui::BeginDisabled(!widescreenOn);
-        if (ImGui::Checkbox("True widescreen HUD/UI", &on)) {
-            CVarSetInteger("gEnhancements.Graphics.WidescreenUI", on ? 1 : 0);
-            GdxSaveCvars();
-        }
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-            ImGui::SetTooltip("Anchors the single-player HUD to the true screen edges and extends\n"
-                              "the SELECT MACHINE blue background and race transitions. Other\n"
-                              "menu artwork stays proportional in 4:3. Requires Widescreen.");
-        }
-        GdxModifiedMarker(on); // default is off
+    if (widget.sameLine) {
+        ImGui::SameLine();
     }
 
-    // Draw distance — CVar gEnhancements.Graphics.DrawDistance (%, default 100 = stock). Scales each
-    // course's own far-render cutoff per-venue (course.c Course_Draw); 100% is bit-exact.
+    const bool highlight = !mHighlightWidget.empty() && widget.name == mHighlightWidget &&
+                           ImGui::GetTime() < mHighlightUntil;
+    if (highlight) {
+        // Group the whole control so the outline below covers the label + widget + any inline
+        // buttons, not just whichever ImGui item happened to be submitted last.
+        ImGui::BeginGroup();
+    }
+
+    // A widget registered WITHOUT .Options() must fall back to that widget type's defaults, never
+    // dereference null. WidgetInfo::options is a shared_ptr populated only by .Options(), and it is
+    // legitimately absent for the decorative types (WIDGET_SEPARATOR, WIDGET_CUSTOM, ...) — so
+    // "absent" cannot be treated as a programming error the switch is allowed to assume away.
     //
-    // SLIDER CAPPED AT 200% ON PURPOSE (effective ceiling, honest UI). The CVar multiplies the
-    // per-chunk cull threshold (sCourseFarRenderDistance * scale), but the track itself is streamed
-    // as a fixed set of chunks that Course_SegmentsInit builds only out to a bounded horizon
-    // (gSegmentChunks, capped at SEGMENT_CHUNK_COUNT — course.c). By ~200% the raised cull threshold
-    // already clears the depth of the furthest chunk that was ever built, so pushing the scale
-    // higher un-culls nothing: there is no loaded geometry beyond that point to draw. Anything past
-    // ~200% therefore produced no visible change (owner-observed), so the slider stops at the real
-    // maximum rather than advertising dead range. This is a content/streaming limit, not a code
-    // clamp that could simply be raised.
-    {
-        int dd = CVarGetInteger("gEnhancements.Graphics.DrawDistance", 100);
-        if (dd < 100) {
-            dd = 100;
-        }
-        if (dd > 200) {
-            dd = 200;
-        }
-        if (ImGui::SliderInt("Draw distance (%)", &dd, 100, 200)) {
-            if (dd < 100) {
-                dd = 100;
-            }
-            if (dd > 200) {
-                dd = 200;
-            }
-            CVarSetInteger("gEnhancements.Graphics.DrawDistance", dd);
-            GdxSaveCvars();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Extends how far each track's own geometry renders (100%% = stock,\n"
-                              "scales per-venue). 200%% is the effective max: beyond it the track's\n"
-                              "streamed geometry runs out, so there is nothing further to draw.");
-        }
-    }
+    // It bit us immediately: the first control on Dev Tools -> General is a WIDGET_TEXT registered
+    // with no Options (gdx_menu_registry.cpp:1061), and the unguarded
+    //   auto options = std::static_pointer_cast<TextOptions>(widget.options); options->color
+    // dereferenced null the instant that page drew, so opening Dev Tools killed the process. The
+    // same latent crash sat on Settings -> Controls (gdx_menu_registry.cpp:695).
+    //
+    // Fixing it here rather than only at those two call sites is deliberate: the registry is meant
+    // to be edited by hand and grown, and "you must remember .Options() on this subset of types or
+    // the game dies on that page" is not a contract worth shipping.
+    // The argument is a type tag only; the fallback it names is a function-local static, so the
+    // returned reference stays valid after the call (returning a reference to the caller's
+    // temporary would trade the null deref for a dangling one).
+    const auto optionsOr = [&widget](auto tag) -> const decltype(tag)& {
+        using T = decltype(tag);
+        static const T kDefaults{};
+        return widget.options != nullptr ? *std::static_pointer_cast<T>(widget.options) : kDefaults;
+    };
 
-    // Force max machine detail — CVar gEnhancements.Graphics.ForceMaxMachineLOD (default 0 = stock
-    // distance-based LOD). When on, every machine draws at its highest-detail model (racer.c).
-    {
-        bool on = CVarGetInteger("gEnhancements.Graphics.ForceMaxMachineLOD", 0) != 0;
-        if (ImGui::Checkbox("Force max machine detail", &on)) {
-            CVarSetInteger("gEnhancements.Graphics.ForceMaxMachineLOD", on ? 1 : 0);
-            GdxSaveCvars();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Always renders every machine at its highest-detail model,\n"
-                              "ignoring distance. Off = stock distance-based detail.");
-        }
-        GdxModifiedMarker(on); // default is off
-    }
-
-    ImGui::Separator();
-    ImGui::TextDisabled("Enhancements (parity-gated)");
-    // Frame pacing — CVar gEnhancements.Graphics.FramePacing, default 0. libultraship's Fast3D
-    // backend already caps the loop to ~60fps, so this is opt-in: when on, port/gdx_frame_pacer.c
-    // holds the host loop to the true N64 NTSC field rate (~59.94Hz) with a wall-clock sleep+spin.
-    // Recommend VSync OFF while on (a display-refresh present beats against the fixed schedule).
-    {
-        bool interpOn = CVarGetInteger("gEnhancements.Graphics.FrameInterpolation", 0) != 0;
-        bool on = CVarGetInteger("gEnhancements.Graphics.FramePacing", 0) != 0;
-        ImGui::BeginDisabled(interpOn);
-        if (ImGui::Checkbox("Frame pacing (59.94 Hz)", &on)) {
-            CVarSetInteger("gEnhancements.Graphics.FramePacing", on ? 1 : 0);
-            GdxSaveCvars();
-        }
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-            if (interpOn) {
-                ImGui::SetTooltip("Interpolation owns pacing; frame pacing is unavailable while on.");
-            } else {
-                ImGui::SetTooltip("Experimental. The renderer already limits the game to ~60 fps; this\n"
-                                  "pins the loop to the true N64 rate (59.94 Hz). Turn VSync OFF when using it.");
+    bool changed = false;
+    switch (widget.type) {
+        case GdxUI::WIDGET_SEPARATOR:
+            ImGui::Separator();
+            break;
+        case GdxUI::WIDGET_SEPARATOR_TEXT:
+            ImGui::SeparatorText(widget.name.c_str());
+            break;
+        case GdxUI::WIDGET_TEXT: {
+            const UIWidgets::TextOptions& options = optionsOr(UIWidgets::TextOptions{});
+            const bool coloured = options.color != UIWidgets::Colors::NoColor;
+            if (coloured) {
+                ImGui::PushStyleColor(ImGuiCol_Text, UIWidgets::ColorValues.at(options.color));
             }
+            ImGui::TextWrapped("%s", widget.name.c_str());
+            if (coloured) {
+                ImGui::PopStyleColor();
+            }
+            break;
         }
-        GdxModifiedMarker(on); // default is off
-    }
-
-    // Frame interpolation — CVar gEnhancements.Graphics.FrameInterpolation, default 0. EXPERIMENTAL.
-    // Read LIVE every tick (gdx_interp::P2HostActive / port/gdx_frame_pacer.c), so this toggle takes
-    // effect on the next tick like FramePacing above — no restart needed. Mutually exclusive with
-    // Frame pacing (both are pacing owners); this one takes priority when on (see BeginDisabled above).
-    {
-        bool on = CVarGetInteger("gEnhancements.Graphics.FrameInterpolation", 0) != 0;
-        if (ImGui::Checkbox("Frame Interpolation (EXPERIMENTAL)", &on)) {
-            CVarSetInteger("gEnhancements.Graphics.FrameInterpolation", on ? 1 : 0);
-            GdxSaveCvars();
+        case GdxUI::WIDGET_TEXT_DISABLED:
+            ImGui::TextDisabled("%s", widget.name.c_str());
+            break;
+        case GdxUI::WIDGET_COMING_SOON:
+            GdxComingSoon(widget.name.c_str());
+            break;
+        case GdxUI::WIDGET_CHECKBOX: {
+            bool* value = std::get<bool*>(widget.valuePointer);
+            if (value == nullptr) {
+                break;
+            }
+            changed = UIWidgets::Checkbox(widget.name.c_str(), value,
+                                          optionsOr(UIWidgets::CheckboxOptions{}));
+            break;
         }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Interpolates rendering between 60Hz logic ticks for smoother motion on\n"
-                              "high-refresh displays. EXPERIMENTAL: visual artifacts are possible during\n"
-                              "camera cuts/transitions until further phases mature. VSync ON is\n"
-                              "recommended. Adds about half a tick of latency. Bypasses Frame pacing\n"
-                              "while on. Default OFF.");
+        case GdxUI::WIDGET_CVAR_CHECKBOX:
+            changed = UIWidgets::CVarCheckbox(widget.name.c_str(), widget.cVar,
+                                              optionsOr(UIWidgets::CheckboxOptions{}));
+            break;
+        case GdxUI::WIDGET_COMBOBOX: {
+            int32_t* value = std::get<int32_t*>(widget.valuePointer);
+            if (value == nullptr) {
+                break;
+            }
+            changed = UIWidgets::Combobox<int32_t>(widget.name.c_str(), value, widget.comboItems,
+                                                   optionsOr(UIWidgets::ComboboxOptions{}));
+            break;
         }
-        GdxModifiedMarker(on); // default is off
-        if (on) {
-            // P5 completeness: gEnhancements.Graphics.InterpDebugOverlay, default 0. Purely
-            // diagnostic (no rendering/pacing effect) — gates the "subframes last tick" line so it
-            // is opt-in rather than always-on clutter once interpolation is enabled. Indented under
-            // the toggle it belongs to and only shown while Frame Interpolation is on.
-            ImGui::Indent();
-            bool overlayOn = CVarGetInteger("gEnhancements.Graphics.InterpDebugOverlay", 0) != 0;
-            if (ImGui::Checkbox("Debug overlay", &overlayOn)) {
-                CVarSetInteger("gEnhancements.Graphics.InterpDebugOverlay", overlayOn ? 1 : 0);
-                GdxSaveCvars();
+        case GdxUI::WIDGET_CVAR_COMBOBOX:
+            changed = UIWidgets::CVarCombobox(widget.name.c_str(), widget.cVar, widget.comboItems,
+                                              optionsOr(UIWidgets::ComboboxOptions{}));
+            break;
+        case GdxUI::WIDGET_SLIDER_INT: {
+            int32_t* value = std::get<int32_t*>(widget.valuePointer);
+            if (value == nullptr) {
+                break;
             }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Show live sub-frame statistics.");
+            changed = UIWidgets::SliderInt(widget.name.c_str(), value,
+                                           optionsOr(UIWidgets::IntSliderOptions{}));
+            break;
+        }
+        case GdxUI::WIDGET_CVAR_SLIDER_INT:
+            changed = UIWidgets::CVarSliderInt(widget.name.c_str(), widget.cVar,
+                                               optionsOr(UIWidgets::IntSliderOptions{}));
+            break;
+        case GdxUI::WIDGET_SLIDER_FLOAT: {
+            float* value = std::get<float*>(widget.valuePointer);
+            if (value == nullptr) {
+                break;
             }
-            if (overlayOn) {
-                const int sub = gdx_gfx_interp_last_subframes();
-                const double t = gdx_gfx_interp_last_t();
-                ImGui::TextDisabled("subframes last tick: %d (t=%.2f)", sub, t);
-            }
-
-            // Target-rate mode — CVar gEnhancements.Graphics.InterpTargetMode, default 0 (Match
-            // Refresh Rate). Read LIVE by main.cpp's per-tick M derivation, same idiom as the master
-            // toggle above. The checkbox itself is never disabled (it IS the mode switch); it gates
-            // the Target FPS slider below via BeginDisabled, mirroring the FramePacing/
-            // FrameInterpolation disabled-dependency idiom further up this function.
-            bool matchRefresh = CVarGetInteger("gEnhancements.Graphics.InterpTargetMode", 0) == 0;
-            if (ImGui::Checkbox("Match Refresh Rate", &matchRefresh)) {
-                CVarSetInteger("gEnhancements.Graphics.InterpTargetMode", matchRefresh ? 0 : 1);
-                GdxSaveCvars();
-            }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Targets your monitor's current refresh rate.");
-            }
-
-            // Target FPS — CVar gEnhancements.Graphics.InterpTargetFps, default 120. Only consulted
-            // in Capped mode (Match Refresh Rate off); disabled here otherwise, like FramePacing is
-            // disabled while FrameInterpolation owns pacing.
-            {
-                int targetFps = CVarGetInteger("gEnhancements.Graphics.InterpTargetFps", 120);
-                if (targetFps < 60) {
-                    targetFps = 60;
-                }
-                if (targetFps > 480) {
-                    targetFps = 480;
-                }
-                ImGui::BeginDisabled(matchRefresh);
-                if (ImGui::SliderInt("Target FPS", &targetFps, 60, 480, "%d FPS")) {
-                    if (targetFps < 60) {
-                        targetFps = 60;
-                    }
-                    if (targetFps > 480) {
-                        targetFps = 480;
-                    }
-                    CVarSetInteger("gEnhancements.Graphics.InterpTargetFps", targetFps);
-                    GdxSaveCvars();
-                }
-                ImGui::EndDisabled();
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-                    if (matchRefresh) {
-                        ImGui::SetTooltip("Match Refresh Rate is on; the target follows your monitor\n"
-                                          "instead. Disable it to set a fixed target here.");
-                    } else {
-                        ImGui::SetTooltip("Interpolation target frame rate. Values above your refresh rate\n"
-                                          "waste GPU without improving output. Each 60fps of target adds a\n"
-                                          "full render pass per tick.");
-                    }
+            changed = UIWidgets::SliderFloat(widget.name.c_str(), value,
+                                             optionsOr(UIWidgets::FloatSliderOptions{}));
+            break;
+        }
+        case GdxUI::WIDGET_CVAR_SLIDER_FLOAT:
+            changed =
+                UIWidgets::CVarSliderFloat(widget.name.c_str(), widget.cVar,
+                                           optionsOr(UIWidgets::FloatSliderOptions{}));
+            break;
+        case GdxUI::WIDGET_BUTTON: {
+            // Plain ImGui::Button, NOT UIWidgets::Button: this menu's shell already styles buttons
+            // through GdxPushModernStyle (the G-Diffuser blue), and UIWidgets::Button unconditionally
+            // pushes its own palette from ButtonOptions::color, which would repaint every button in
+            // the menu grey. Only the disabled handling and tooltip are taken from the Options.
+            const UIWidgets::ButtonOptions& options = optionsOr(UIWidgets::ButtonOptions{});
+            ImGui::BeginDisabled(options.disabled);
+            changed = ImGui::Button(widget.name.c_str(), options.size);
+            ImGui::EndDisabled();
+            // AllowWhenDisabled so a greyed button is exactly the one that explains itself.
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                const char* text = options.disabled && !UIWidgets::IsCStringEmpty(options.disabledTooltip)
+                                       ? options.disabledTooltip
+                                       : options.tooltip;
+                if (!UIWidgets::IsCStringEmpty(text)) {
+                    ImGui::SetTooltip("%s", UIWidgets::WrappedText(text).c_str());
                 }
             }
-            ImGui::Unindent();
+            break;
         }
-    }
-    GdxComingSoon("Mirror mode");
-    GdxComingSoon("FLX reflection quality");
-
-}
-
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// 2) AUDIO — the P0 pilot. Engine LLE/HLE radio + reconstruction filter enable/cutoff (READY).
-//    docs/AUDIO_SETTINGS_SCOPE.md. These write port-owned CVars; the live-read plumbing on the
-//    audio thread (gdx_audio_lle.c / os.cpp via extern) is a separate slice — here we only own
-//    the UI + CVar state.
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-void GdxMenu::DrawAudioMenu() {
-    // Live output-path status. Diagnostic first-class citizen: a "no audio" report is
-    // undebuggable remotely without knowing which backend the session picked and whether
-    // samples are actually queued. Reports the ACTUAL active AudioPlayer backend (via
-    // AudioPlayerBackendName) rather than SDL_GetCurrentAudioDriver(), which returns "none" for
-    // the WASAPI/CoreAudio backends even when they are working — misleading on Windows. For the
-    // SDL backend we additionally surface SDL_GetCurrentAudioDriver() (e.g. "pipewire"/"pulse"),
-    // where a "dummy" driver means the launch environment lost the audio socket (sandboxed/naked
-    // launcher env): the game synthesizes fine but the samples go nowhere.
-    {
-        const char* backend = AudioPlayerBackendName();
-        const bool isSdl = std::strcmp(backend, "SDL") == 0;
-        const char* sdlDriver = isSdl ? SDL_GetCurrentAudioDriver() : nullptr;
-        const int32_t buffered = AudioPlayerBuffered();
-        const int32_t desired = AudioPlayerGetDesiredBuffered();
-
-        ImGui::SeparatorText("Output status");
-        if (isSdl) {
-            ImGui::Text("Active backend: SDL (%s)", sdlDriver != nullptr ? sdlDriver : "no driver");
-        } else {
-            ImGui::Text("Active backend: %s", backend);
-        }
-        ImGui::Text("Queued samples: %d / %d desired", buffered, desired);
-
-        // The red warning is meaningful ONLY when SDL is the active backend and its underlying
-        // driver is missing or "dummy". WASAPI/CoreAudio legitimately report no SDL driver, so
-        // suppress the warning for them (it would be a false alarm).
-        if (isSdl && sdlDriver == nullptr) {
-            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
-                               "No SDL audio device is open. Audio is synthesized but discarded.");
-        } else if (isSdl && std::strcmp(sdlDriver, "dummy") == 0) {
-            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
-                               "SDL fell back to the dummy driver: this launch environment has no\n"
-                               "audio socket. Launch from a terminal or fix the launcher's env.");
-        }
-    }
-
-    // Output backend selection — CVar gEnhancements.Audio.Backend (0=Auto, 1=WASAPI, 2=SDL).
-    // Applied at startup in main.cpp's InitAudio; Auto keeps libultraship's per-platform default
-    // (WASAPI on Windows, SDL on Linux). Only backends that exist on this platform are offered:
-    // WASAPI is Windows-only, and on Linux SDL routes to PipeWire/PulseAudio/ALSA.
-    ImGui::SeparatorText("Output Device");
-    {
-        int sel = CVarGetInteger("gEnhancements.Audio.Backend", 0);
-#ifdef _WIN32
-        const char* const items[] = { "Auto", "WASAPI", "SDL" };
-        int uiIndex = (sel >= 0 && sel <= 2) ? sel : 0;
-        if (ImGui::Combo("Output backend", &uiIndex, items, 3)) {
-            CVarSetInteger("gEnhancements.Audio.Backend", uiIndex);
-            GdxSaveCvars();
-        }
-#else
-        const char* const items[] = { "Auto", "SDL" };
-        int uiIndex = (sel == 2) ? 1 : 0; // map stored CVar (2 = SDL) into the reduced list
-        if (ImGui::Combo("Output backend", &uiIndex, items, 2)) {
-            CVarSetInteger("gEnhancements.Audio.Backend", uiIndex == 1 ? 2 : 0);
-            GdxSaveCvars();
-        }
-#endif
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Which OS audio output path to use. Auto keeps the platform default\n"
-                              "(WASAPI on Windows, SDL elsewhere). Applies on restart.");
-        }
-        ImGui::TextDisabled("Applies on restart.");
-    }
-
-    // Engine — CVar gEnhancements.Audio.LLE, default 1. LLE = accurate (cxd4 RSP), HLE = fast.
-    ImGui::SeparatorText("Synthesis Engine");
-    {
-        int lle = CVarGetInteger("gEnhancements.Audio.LLE", 1);
-        if (ImGui::RadioButton("LLE (accurate)", lle == 1)) {
-            CVarSetInteger("gEnhancements.Audio.LLE", 1);
-            GdxSaveCvars();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Low-level RSP emulation (cxd4). Most accurate; the default.");
-        }
-        if (ImGui::RadioButton("HLE (fast)", lle == 0)) {
-            CVarSetInteger("gEnhancements.Audio.LLE", 0);
-            GdxSaveCvars();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("High-level audio emulation. Faster, less accurate.");
-        }
-        GdxModifiedMarker(lle == 0); // default is LLE
-    }
-
-    // Output reconstruction filter — CVar gEnhancements.Audio.LowPassHz, default 15000. A value of
-    // 0 disables the filter; any value 500..16000 is the low-pass cutoff. The enable checkbox
-    // toggles between 0 (off) and the remembered/last cutoff (on).
-    ImGui::SeparatorText("Reconstruction Filter");
-    {
-        int hz = CVarGetInteger("gEnhancements.Audio.LowPassHz", 15000);
-        bool filterOn = hz > 0;
-
-        if (ImGui::Checkbox("Enable filter", &filterOn)) {
-            if (filterOn) {
-                int restore = mLastLowPassHz > 0 ? mLastLowPassHz : 15000;
-                CVarSetInteger("gEnhancements.Audio.LowPassHz", restore);
-            } else {
-                if (hz > 0) {
-                    mLastLowPassHz = hz; // remember so re-enabling restores the same cutoff
-                }
-                CVarSetInteger("gEnhancements.Audio.LowPassHz", 0);
+        case GdxUI::WIDGET_CVAR_RADIO_BUTTON:
+            changed = UIWidgets::CVarRadioButton(widget.name.c_str(), widget.cVar, widget.radioValue,
+                                                 optionsOr(UIWidgets::RadioButtonsOptions{}));
+            break;
+        case GdxUI::WIDGET_CUSTOM:
+            if (widget.customFunction != nullptr) {
+                widget.customFunction(widget);
             }
-            GdxSaveCvars();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Low-pass filter on the reconstructed output, softening high-frequency\n"
-                              "aliasing. On = stock. Off disables the filter entirely.");
-        }
-        GdxModifiedMarker(!filterOn); // default is on
-
-        // Re-read after the checkbox so the slider reflects the change within the same frame.
-        int hzNow = CVarGetInteger("gEnhancements.Audio.LowPassHz", 15000);
-        int cutoff = hzNow > 0 ? hzNow : (mLastLowPassHz > 0 ? mLastLowPassHz : 15000);
-
-        ImGui::BeginDisabled(!filterOn);
-        if (ImGui::SliderInt("Cutoff (Hz)", &cutoff, 500, 16000)) {
-            if (cutoff < 500) {
-                cutoff = 500;
-            }
-            CVarSetInteger("gEnhancements.Audio.LowPassHz", cutoff);
-            mLastLowPassHz = cutoff;
-            GdxSaveCvars();
-        }
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-            ImGui::SetTooltip("Cutoff frequency of the reconstruction low-pass. Lower = softer/darker.\n"
-                              "Enable the filter above to adjust this.");
-        }
+            break;
     }
 
-    // Master volume — CVar gEnhancements.Audio.MasterVolume (0..100 %, default 100). Applied as a
-    // final-stage gain multiply on the s16 output copy in os.cpp's osAiSetNextBuffer, read live
-    // there each buffer (same live-CVar pattern as the low-pass). 100 = no-op (the multiply is
-    // skipped entirely), so the default is bit-exact.
-    ImGui::SeparatorText("Levels");
-    {
-        int vol = CVarGetInteger("gEnhancements.Audio.MasterVolume", 100);
-        if (vol < 0) {
-            vol = 0;
-        }
-        if (vol > 100) {
-            vol = 100;
-        }
-        if (ImGui::SliderInt("Master volume (%)", &vol, 0, 100)) {
-            if (vol < 0) {
-                vol = 0;
-            }
-            if (vol > 100) {
-                vol = 100;
-            }
-            CVarSetInteger("gEnhancements.Audio.MasterVolume", vol);
-            GdxSaveCvars();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Final output gain. 100%% = stock (bit-exact, no gain applied).");
-        }
+    if (changed && widget.callback != nullptr) {
+        widget.callback(widget);
     }
 
-    // Reverb — CVar gEnhancements.Audio.Reverb (default 1 = on). Wired to the HLE reverb kill switch
-    // in n64_audio_hle.c (the A_MIXER wet->dry return), read live there. NOTE: this affects the HLE
-    // audio engine ONLY; under the default LLE engine reverb is produced by the audio microcode
-    // itself, so toggling this has no audible effect while LLE is selected. Still wired correctly
-    // for the HLE fallback path.
-    {
-        bool reverbOn = CVarGetInteger("gEnhancements.Audio.Reverb", 1) != 0;
-        if (ImGui::Checkbox("Reverb", &reverbOn)) {
-            CVarSetInteger("gEnhancements.Audio.Reverb", reverbOn ? 1 : 0);
-            GdxSaveCvars();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Affects the HLE audio engine only.\n"
-                              "Under the default LLE engine, reverb is the microcode's own.");
-        }
-        GdxModifiedMarker(!reverbOn); // default is on
+    // "Changed from the stock default" asterisk. The default comes from the widget's own
+    // CheckboxOptions::defaultValue, so the marker and the control can never disagree about what
+    // stock is (this is what the old GdxCVarCheckboxMarked helper guaranteed by hand).
+    if (widget.modifiedMarker && widget.type == GdxUI::WIDGET_CVAR_CHECKBOX) {
+        const bool def = optionsOr(UIWidgets::CheckboxOptions{}).defaultValue;
+        GdxModifiedMarker((CVarGetInteger(widget.cVar, def) != 0) != def);
     }
 
-    // Latency / buffer size — CVar gEnhancements.Audio.BufferFrames (frames, default 4096, range
-    // 1024..8192). Read ONCE at InitAudio (main.cpp), so a change applies only on the next restart
-    // (hence the note). A larger reservoir rides out host scheduling jitter better but adds output
-    // latency; a smaller one is snappier but more underrun-prone.
-    ImGui::SeparatorText("Latency");
-    {
-        int frames = CVarGetInteger("gEnhancements.Audio.BufferFrames", 4096);
-        if (frames < 1024) {
-            frames = 1024;
-        }
-        if (frames > 8192) {
-            frames = 8192;
-        }
-        if (ImGui::SliderInt("Buffer size (frames)", &frames, 1024, 8192)) {
-            if (frames < 1024) {
-                frames = 1024;
-            }
-            if (frames > 8192) {
-                frames = 8192;
-            }
-            CVarSetInteger("gEnhancements.Audio.BufferFrames", frames);
-            GdxSaveCvars();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Audio buffer size. Larger rides out host jitter (fewer dropouts) but\n"
-                              "adds latency; smaller is snappier but more underrun-prone. Applies on restart.");
-        }
+    // The greyed suffix ("(restart)", "(applies on restart)", "(disabled in-race)"). UIWidgets has
+    // no slot for one, and every one of these was a deliberate SameLine + TextDisabled at the old
+    // call site, so it stays exactly that — just declared rather than written out.
+    if (!UIWidgets::IsCStringEmpty(widget.note)) {
         ImGui::SameLine();
-        ImGui::TextDisabled("(applies on restart)");
+        ImGui::TextDisabled("%s", widget.note);
     }
 
-    ImGui::SeparatorText("More");
-    GdxComingSoon("Sound test / jukebox");
+    if (widget.postFunc != nullptr) {
+        widget.postFunc(widget);
+    }
 
+    if (highlight) {
+        ImGui::EndGroup();
+        // Pulsing outline around the control the search sent us to. ImGui has no "flash this item"
+        // primitive, and Lighthouse's own highlightWidget/navigateWidgetName globals (Menu.cpp:29-33)
+        // are declared but never read, so this is ours.
+        const ImVec2 min = ImGui::GetItemRectMin() - ImVec2(4.0f, 3.0f);
+        const ImVec2 max = ImGui::GetItemRectMax() + ImVec2(4.0f, 3.0f);
+        const float pulse = 0.5f + 0.5f * std::sin(static_cast<float>(ImGui::GetTime()) * 6.0f);
+        ImGui::GetWindowDrawList()->AddRect(min, max,
+                                            ImGui::GetColorU32(ImVec4(0.63f, 0.76f, 1.0f, 0.35f + 0.55f * pulse)),
+                                            3.0f, 0, 2.0f);
+        if (mHighlightScrollPending) {
+            // Record where it landed; DrawElement scrolls the content pane to it once this page has
+            // finished laying out. Deliberately NOT ImGui::SetScrollHereY(): on a multi-column page
+            // this runs inside a non-scrolling column child, which has no scroll to set.
+            mHighlightScreenY = min.y;
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-// 3) GAMEPLAY — docs/menu/GAMEPLAY_TAB.md §4. Autosave-on-record and the other shipped controls are
-//    live; the owner removed the custom fast-restart shortcut in favor of vanilla retry behavior.
-//    Every control
-//    writes a port-owned gEnhancements.Gameplay.* CVar at a 1:1 default (feature off / stock
-//    behavior). The actual behavior lives in the game tick, not here:
-//      - Autosave-on-record-> decomp/src/overlays/ovl_i3/menus.c (Gdx_AutosaveGhostOnRecord) auto-
-//                             persists the best ghost per course at race finish; this tab owns the toggle.
+// Audio output status — WIDGET_CUSTOM (Settings -> Audio).
+//
+// Not expressible as a widget: it reads three live values and picks between three different
+// renderings. Diagnostic first-class citizen — a "no audio" report is undebuggable remotely
+// without knowing which backend the session picked and whether samples are actually queued.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-void GdxMenu::DrawGameplayMenu() {
-    // Skippable transitions — CVar gEnhancements.Gameplay.SkippableTransitions, default 0 (stock:
-    // transitions play fully). When on, transition.c Transition_Update re-runs its same per-tick
-    // logic in one call until finished (up to 128x), so screen wipes resolve near-instantly. The
-    // stock per-tick switch is byte-unchanged; only the surrounding loop budget differs. [PB].
-    {
-        bool on = CVarGetInteger("gEnhancements.Gameplay.SkippableTransitions", 0) != 0;
-        if (ImGui::Checkbox("Skip/shorten transitions", &on)) {
-            CVarSetInteger("gEnhancements.Gameplay.SkippableTransitions", on ? 1 : 0);
-            GdxSaveCvars();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Fast-completes screen-transition wipes instead of playing them in full.\n"
-                              "Off by default (parity).");
-        }
-        GdxModifiedMarker(on); // default is off
+void GdxMenu::DrawAudioStatus() {
+    // Reports the ACTUAL active AudioPlayer backend (via AudioPlayerBackendName) rather than
+    // SDL_GetCurrentAudioDriver(), which returns "none" for the WASAPI/CoreAudio backends even
+    // when they are working — misleading on Windows. For the SDL backend we additionally surface
+    // SDL_GetCurrentAudioDriver() (e.g. "pipewire"/"pulse"), where a "dummy" driver means the
+    // launch environment lost the audio socket (sandboxed/naked launcher env): the game
+    // synthesizes fine but the samples go nowhere.
+    const char* backend = AudioPlayerBackendName();
+    const bool isSdl = std::strcmp(backend, "SDL") == 0;
+    const char* sdlDriver = isSdl ? SDL_GetCurrentAudioDriver() : nullptr;
+    const int32_t buffered = AudioPlayerBuffered();
+    const int32_t desired = AudioPlayerGetDesiredBuffered();
+
+    ImGui::SeparatorText("Output status");
+    if (isSdl) {
+        ImGui::Text("Active backend: SDL (%s)", sdlDriver != nullptr ? sdlDriver : "no driver");
+    } else {
+        ImGui::Text("Active backend: %s", backend);
     }
+    ImGui::Text("Queued samples: %d / %d desired", buffered, desired);
 
-    // Reduce Course Edit flashing — CVar gEnhancements.Gameplay.ReduceEditorFlashing, default 0
-    // (stock N64 strobe). When on, the Course Edit node blink/checker parity and the flagged-node
-    // size pulse advance at half rate (course_edit/191080.c func_xk2_800E04E0, #ifdef PORT). Off is
-    // bit-identical to stock.
-    {
-        bool on = CVarGetInteger("gEnhancements.Gameplay.ReduceEditorFlashing", 0) != 0;
-        if (ImGui::Checkbox("Reduce Course Edit flashing", &on)) {
-            CVarSetInteger("gEnhancements.Gameplay.ReduceEditorFlashing", on ? 1 : 0);
-            GdxSaveCvars();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Halves the Course Edit blink/checker cadence. The 20Hz strobe is\n"
-                              "authentic N64 behavior; this calms it on modern displays.");
-        }
-        GdxModifiedMarker(!on); // default is on
+    // The red warning is meaningful ONLY when SDL is the active backend and its underlying
+    // driver is missing or "dummy". WASAPI/CoreAudio legitimately report no SDL driver, so
+    // suppress the warning for them (it would be a false alarm).
+    if (isSdl && sdlDriver == nullptr) {
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
+                           "No SDL audio device is open. Audio is synthesized but discarded.");
+    } else if (isSdl && std::strcmp(sdlDriver, "dummy") == 0) {
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
+                           "SDL fell back to the dummy driver: this launch environment has no\n"
+                           "audio socket. Launch from a terminal or fix the launcher's env.");
     }
-
-    ImGui::Separator();
-
-    // Autosave-on-record — CVar gEnhancements.Gameplay.AutosaveOnRecord, default 0.
-    // SCOPE (important): stock F-Zero X ALREADY commits numeric records (best times / best lap /
-    // max speed / death-race stats) to SRAM immediately on finishing a race (menus.c:252-268), and
-    // the port's SRAM is write-through to fzerox.sav (sram_buffer.cpp) — those autosave regardless
-    // of this toggle. What this toggle adds is auto-persisting the best GHOST replay, which stock
-    // F-Zero X saves only via the manual "Save Ghost" prompt (menus.c:2085-2101 / 2562-2581) — so
-    // quitting before that prompt loses the ghost. When on, the port writes the ghost via the
-    // per-course PC ghost library on a new best. The cartridge-compatible SRAM slot remains a
-    // mirror when it is empty or already holds the same course. Off by default so a fresh config
-    // keeps ghosts manual-save.
-    {
-        bool on = CVarGetInteger("gEnhancements.Gameplay.AutosaveOnRecord", 0) != 0;
-        if (ImGui::Checkbox("Autosave ghost on new record", &on)) {
-            CVarSetInteger("gEnhancements.Gameplay.AutosaveOnRecord", on ? 1 : 0);
-            GdxSaveCvars();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Auto-save your best Time Attack ghost replay when you beat it,\n"
-                              "without the manual Save-Ghost prompt.\n"
-                              "(Record TIMES already autosave in stock F-Zero X.) Off by default.");
-        }
-        GdxModifiedMarker(on); // default is off
-    }
-
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-// 4) PRACTICE / TOOLS — all future (docs/menu/PRACTICE_TAB.md).
+// Ghost import / export — WIDGET_CUSTOM (Enhancements -> Practice).
+//
+// Calls the port's gdx_ghost_io C API (port/gdx_ghost_io.c). Export is read-only. Import adds a
+// validated player replay to the per-course PC library and mirrors it into SRAM only when that does
+// not evict another course. It stays disabled while an on-track race is live to avoid mutating
+// ghost state alongside the game fiber. Both use the default path next to the exe
+// (ghost_export.gdg); a proper file picker remains future work.
+//
+// Stays a custom block rather than becoming two WIDGET_BUTTONs: the pair shares a status buffer and
+// a resolved path that both branches format into, and the export tooltip interpolates that path
+// (see the note at that call), which no Options struct can carry.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-void GdxMenu::DrawPracticeMenu() {
-    // Lap-split deltas — CVar gEnhancements.Practice.ShowLapDeltas, default 0 (stock: nothing drawn).
-    // When on, Practice mode draws how the last completed lap compares to the session best (or a
-    // loaded ghost's same lap, once ghosts populate outside Time Attack). Drawn in hud.c under
-    // #ifdef PORT; default 0 draws nothing. Owner-visual: on-screen position/colors to confirm.
-    {
-        bool on = CVarGetInteger("gEnhancements.Practice.ShowLapDeltas", 0) != 0;
-        if (ImGui::Checkbox("Show lap deltas", &on)) {
-            CVarSetInteger("gEnhancements.Practice.ShowLapDeltas", on ? 1 : 0);
-            GdxSaveCvars();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("In Practice mode, shows your last lap vs your session best\n"
-                              "(green = faster, red = slower). Off by default.");
-        }
-        GdxModifiedMarker(on); // default is off
-    }
-
-    ImGui::Separator();
-
-    // Ghost import / export (.gdg) — calls the port's gdx_ghost_io C API (port/gdx_ghost_io.c).
-    // Export is read-only. Import adds a validated player replay to the per-course PC library and
-    // mirrors it into SRAM only when that does not evict another course. It stays disabled while an
-    // on-track race is live to avoid mutating ghost state alongside the game fiber. Both use the
-    // default path next to the exe (ghost_export.gdg); a proper file picker remains future work.
+void GdxMenu::DrawGhostIo() {
     ImGui::TextDisabled("Ghost replay (.gdg)");
-    {
-        static char sGhostStatus[192] = { 0 };
-        char path[1024];
-        bool haveDefault = gdx_ghost_default_path(path, sizeof(path)) != 0;
 
-        if (ImGui::Button("Export saved ghost")) {
-            if (!haveDefault) {
-                snprintf(sGhostStatus, sizeof(sGhostStatus), "Export failed: could not resolve output path.");
+    static char sGhostStatus[192] = { 0 };
+    char path[1024];
+    bool haveDefault = gdx_ghost_default_path(path, sizeof(path)) != 0;
+
+    if (ImGui::Button("Export saved ghost")) {
+        if (!haveDefault) {
+            snprintf(sGhostStatus, sizeof(sGhostStatus), "Export failed: could not resolve output path.");
+        } else {
+            int rc = gdx_ghost_export(GDX_GHOST_ANY_COURSE, path);
+            if (rc == GDX_GHOST_OK) {
+                snprintf(sGhostStatus, sizeof(sGhostStatus), "Exported to %s", path);
+            } else if (rc == GDX_GHOST_ERR_NO_GHOST) {
+                snprintf(sGhostStatus, sizeof(sGhostStatus), "Export: no ghost is saved yet.");
             } else {
-                int rc = gdx_ghost_export(GDX_GHOST_ANY_COURSE, path);
-                if (rc == GDX_GHOST_OK) {
-                    snprintf(sGhostStatus, sizeof(sGhostStatus), "Exported to %s", path);
-                } else if (rc == GDX_GHOST_ERR_NO_GHOST) {
-                    snprintf(sGhostStatus, sizeof(sGhostStatus), "Export: no ghost is saved yet.");
-                } else {
-                    snprintf(sGhostStatus, sizeof(sGhostStatus), "Export failed (code %d).", rc);
-                }
+                snprintf(sGhostStatus, sizeof(sGhostStatus), "Export failed (code %d).", rc);
             }
         }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Writes the currently-saved ghost replay to:\n%s",
-                              haveDefault ? path : "(unavailable)");
-        }
+    }
+    // Left as a raw SetTooltip rather than UIWidgets::Tooltip: the text interpolates a runtime
+    // filesystem path, and UIWidgets::Tooltip runs every tooltip through WrappedText at 80
+    // columns (UIWidgets.cpp:98-102), which would insert newlines at the spaces inside a path
+    // like "...\Proyectos Mios\..." and make the destination unreadable.
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Writes the currently-saved ghost replay to:\n%s",
+                          haveDefault ? path : "(unavailable)");
+    }
 
+    ImGui::SameLine();
+
+    // The in-race lockout is a NAMED disable reason on this button
+    // (DISABLE_FOR_RACE_IN_PROGRESS, evaluated once per frame in RegisterDisableReasons), so the
+    // greyed button now states why it is greyed instead of only being annotated beside it. The
+    // "(disabled in-race)" label is kept as well, because it is visible without hovering.
+    const bool inGame = mDisabledInfo[GdxUI::DISABLE_FOR_RACE_IN_PROGRESS].active;
+    ImGui::BeginDisabled(inGame);
+    if (ImGui::Button("Import ghost")) {
+        if (!haveDefault) {
+            snprintf(sGhostStatus, sizeof(sGhostStatus), "Import failed: could not resolve input path.");
+        } else {
+            int rc = gdx_ghost_import(path);
+            if (rc == GDX_GHOST_OK) {
+                snprintf(sGhostStatus, sizeof(sGhostStatus), "Imported into the player ghost library: %s", path);
+            } else if (rc == GDX_GHOST_ERR_COURSE_MISMATCH) {
+                snprintf(sGhostStatus, sizeof(sGhostStatus),
+                         "Import refused: the save slot holds a different course's ghost.");
+            } else if (rc == GDX_GHOST_ERR_BAD_MAGIC || rc == GDX_GHOST_ERR_BAD_VERSION) {
+                snprintf(sGhostStatus, sizeof(sGhostStatus), "Import failed: not a valid .gdg file (code %d).", rc);
+            } else {
+                snprintf(sGhostStatus, sizeof(sGhostStatus), "Import failed (code %d).", rc);
+            }
+        }
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("%s", inGame ? "This setting is unavailable because:\n  - A race is in progress."
+                                       : "Reads ghost_export.gdg back into your per-course ghost library.");
+    }
+    if (inGame) {
         ImGui::SameLine();
-
-        bool inGame = gdx_input_in_gameplay() != 0;
-        ImGui::BeginDisabled(inGame);
-        if (ImGui::Button("Import ghost")) {
-            if (!haveDefault) {
-                snprintf(sGhostStatus, sizeof(sGhostStatus), "Import failed: could not resolve input path.");
-            } else {
-                int rc = gdx_ghost_import(path);
-                if (rc == GDX_GHOST_OK) {
-                    snprintf(sGhostStatus, sizeof(sGhostStatus), "Imported into the player ghost library: %s", path);
-                } else if (rc == GDX_GHOST_ERR_COURSE_MISMATCH) {
-                    snprintf(sGhostStatus, sizeof(sGhostStatus),
-                             "Import refused: the save slot holds a different course's ghost.");
-                } else if (rc == GDX_GHOST_ERR_BAD_MAGIC || rc == GDX_GHOST_ERR_BAD_VERSION) {
-                    snprintf(sGhostStatus, sizeof(sGhostStatus), "Import failed: not a valid .gdg file (code %d).", rc);
-                } else {
-                    snprintf(sGhostStatus, sizeof(sGhostStatus), "Import failed (code %d).", rc);
-                }
-            }
-        }
-        ImGui::EndDisabled();
-        if (inGame) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("(disabled in-race)");
-        }
-
-        if (sGhostStatus[0] != '\0') {
-            ImGui::TextWrapped("%s", sGhostStatus);
-        }
+        ImGui::TextDisabled("(disabled in-race)");
     }
 
-    ImGui::Separator();
-
-    // Ghost Browser window toggle (GdxGhostWindow, registered via AddGuiWindow in main.cpp). A
-    // browser of the per-course player-ghost library with an Export-to-.gdg button. Same live
-    // show/hide idiom as the Developer-tab windows (GdxWindowVisible reflects state, click flips it).
-    if (ImGui::Button(GdxWindowVisible("Ghost Browser") ? "Return Ghost Browser to menu"
-                                                         : "Open Ghost Browser window")) {
-        GdxToggleWindow("Ghost Browser");
+    if (sGhostStatus[0] != '\0') {
+        ImGui::TextWrapped("%s", sGhostStatus);
     }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Browse your per-course player-ghost library and export ghosts to .gdg.");
-    }
-
-    // Photo mode (free camera) is available in every race mode. When enabled, pausing suppresses
-    // all race HUD/pause overlays and reserves their controls for the free camera. Disabling the
-    // toggle restores the normal paused UI; unpausing restores the game camera exactly.
-    {
-        bool on = CVarGetInteger("gEnhancements.Practice.PhotoMode", 0) != 0;
-        if (ImGui::Checkbox("Photo mode (free camera)", &on)) {
-            CVarSetInteger("gEnhancements.Practice.PhotoMode", on ? 1 : 0);
-            GdxSaveCvars();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Pause during a race to hide the HUD and free-fly the camera.\n"
-                              "Stick: dolly/truck  -  C-buttons: look  -  L/R: FOV  -  hold Z: raise/lower.\n"
-                              "Unpausing or turning this off restores the game camera exactly. Off by default.");
-        }
-        GdxModifiedMarker(on); // default is off
-    }
-
-    ImGui::Separator();
-
-    GdxComingSoon("Replay theater");
-    GdxComingSoon("Diagnostic overlay");
-}
-
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// 5) CONTROLS / INPUT — surface the LUS Input Editor window (READY). docs/menu/CONTROLS_TAB.md.
-//    The InputEditorWindow is registered in main.cpp at boot under the name "Input Editor"; here
-//    we just toggle its live visibility. Keyboard remap is a separate port-side workstream.
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-void GdxMenu::DrawControlsMenu() {
-    DrawToolWindowPage("Input Editor",
-                       "Configure controllers, keyboard, mouse, deadzones, sensitivity, and per-port mappings.");
-}
-
-void GdxMenu::DrawInputViewerMenu() {
-    ImGui::SeparatorText("Input Viewer");
-    bool visible = GdxWindowVisible("Input Viewer");
-    if (ImGui::Checkbox("Show input viewer overlay", &visible)) {
-        GdxToggleWindow("Input Viewer");
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Shows the exact mapped N64 input state delivered to F-Zero X.");
-    }
-
-    float scale = std::clamp(CVarGetFloat("gInputViewer.Scale", 1.0f), 0.5f, 2.5f);
-    if (ImGui::SliderFloat("Overlay scale", &scale, 0.5f, 2.5f, "%.2fx", ImGuiSliderFlags_AlwaysClamp)) {
-        CVarSetFloat("gInputViewer.Scale", scale);
-        GdxSaveCvars();
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Size of the on-screen input overlay.");
-    }
-    float opacity = std::clamp(CVarGetFloat("gInputViewer.Opacity", 1.0f), 0.2f, 1.0f);
-    if (ImGui::SliderFloat("Overlay opacity", &opacity, 0.2f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
-        CVarSetFloat("gInputViewer.Opacity", opacity);
-        GdxSaveCvars();
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Transparency of the input overlay.");
-    }
-    bool dragging = CVarGetInteger("gInputViewer.EnableDragging", 1) != 0;
-    if (ImGui::Checkbox("Enable dragging", &dragging)) {
-        CVarSetInteger("gInputViewer.EnableDragging", dragging ? 1 : 0);
-        GdxSaveCvars();
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Lets you reposition the overlay by dragging it with the mouse.");
-    }
-    bool background = CVarGetInteger("gInputViewer.ShowBackground", 1) != 0;
-    if (ImGui::Checkbox("Show background layer", &background)) {
-        CVarSetInteger("gInputViewer.ShowBackground", background ? 1 : 0);
-        GdxSaveCvars();
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Draws the controller-body backdrop behind the buttons.");
-    }
-    bool dpad = CVarGetInteger("gInputViewer.ShowDpad", 0) != 0;
-    if (ImGui::Checkbox("Show D-pad layers", &dpad)) {
-        CVarSetInteger("gInputViewer.ShowDpad", dpad ? 1 : 0);
-        GdxSaveCvars();
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Includes the D-pad in the overlay (off by default; F-Zero X does not use it).");
-    }
-    int outlineMode = std::clamp(CVarGetInteger("gInputViewer.ButtonOutlineMode", 1), 0, 3);
-    const char* outlineLabels[] = { "Always shown", "Shown while released", "Shown while pressed", "Hidden" };
-    if (ImGui::Combo("Button outlines", &outlineMode, outlineLabels, IM_ARRAYSIZE(outlineLabels))) {
-        CVarSetInteger("gInputViewer.ButtonOutlineMode", outlineMode);
-        GdxSaveCvars();
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("When each button's outline is drawn relative to its pressed state.");
-    }
-    bool analogValues = CVarGetInteger("gInputViewer.ShowAnalogValues", 0) != 0;
-    if (ImGui::Checkbox("Show analog values", &analogValues)) {
-        CVarSetInteger("gInputViewer.ShowAnalogValues", analogValues ? 1 : 0);
-        GdxSaveCvars();
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Prints the raw analog-stick X/Y numbers next to the stick.");
-    }
-    ImGui::TextWrapped("The viewer reads G-Diffuser's final mapped N64 state, after controller bindings and analog "
-                       "curves. Inputs intentionally read neutral while this menu owns game input.");
-}
-
-void GdxMenu::DrawGhostsMenu() {
-    DrawToolWindowPage("Ghost Browser",
-                       "Manage multiple local and imported player ghosts per exact course and select up to three "
-                       "Time Attack opponents. Staff ghosts remain controlled by the base game.");
 }
 
 void GdxMenu::DrawToolWindowPage(const char* name, const char* description) {
@@ -1995,75 +1794,55 @@ void GdxMenu::DrawToolWindowPage(const char* name, const char* description) {
     }
 }
 
-void GdxMenu::DrawStatsMenu() {
-    bool showFps = GdxWindowVisible("FPS Counter");
-    if (ImGui::Checkbox("Show FPS counter overlay", &showFps)) {
-        GdxToggleWindow("FPS Counter");
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Frame-interpolation live statistics — WIDGET_CUSTOM (Dev Tools -> Stats).
+//
+// Real presented-FPS visibility. When Frame Interpolation is on the sim runs at 60 Hz but the
+// renderer presents multiple sub-frames per tick, so ImGui's own io.Framerate (which counts one
+// frame per present) is the true presented rate. We show it alongside the fixed 60 Hz logic rate
+// ("144 fps (sim 60 Hz)") plus the live sub-frame count and the previous tick's tween/snap
+// breakdown, so a "cost without benefit" regression (lerped == 0) is visible at a glance. These
+// reuse the existing bridge getters — no extra per-frame cost.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+void GdxMenu::DrawInterpStats() {
+    if (gdx_gfx_interp_host_active() == 0) {
+        return;
     }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Toggles a small always-on-top frames-per-second overlay.");
-    }
-    ImGui::SameLine();
-    ImGui::TextDisabled("Uses the same frame metrics as Stats");
-    ImGui::Separator();
-
-    // Real presented-FPS visibility (owner requirement, 2026-07-23). When Frame Interpolation is on
-    // the sim runs at 60 Hz but the renderer presents multiple sub-frames per tick, so ImGui's own
-    // io.Framerate (which counts one frame per present) is the true presented rate. We show it
-    // alongside the fixed 60 Hz logic rate ("144 fps (sim 60 Hz)") plus the live sub-frame count and
-    // the previous tick's tween/snap breakdown, so a "cost without benefit" regression (lerped == 0)
-    // is visible at a glance. These reuse the existing bridge getters — no extra per-frame cost.
-    if (gdx_gfx_interp_host_active() != 0) {
-        ImGui::SeparatorText("Frame Interpolation");
-        if (gdx_gfx_interp_tick_active() == 0) {
-            // The menu's toggle is on, but main.cpp forced interpolation off THIS tick (Course
-            // Edit / Create Machine editors force the stock single-present path). The live
-            // numbers below are from before the editor was entered, so show the paused truth
-            // instead of stale/misleading figures.
-            ImGui::TextDisabled("Interpolation paused (editor active)");
+    ImGui::SeparatorText("Frame Interpolation");
+    if (gdx_gfx_interp_tick_active() == 0) {
+        // The menu's toggle is on, but main.cpp forced interpolation off THIS tick (Course
+        // Edit / Create Machine editors force the stock single-present path). The live
+        // numbers below are from before the editor was entered, so show the paused truth
+        // instead of stale/misleading figures.
+        ImGui::TextDisabled("Interpolation paused (editor active)");
+    } else {
+        const double presentedFps = gdx_gfx_interp_presents_per_sec();
+        const float imguiFps = ImGui::GetIO().Framerate;
+        const int m = gdx_gfx_interp_last_subframes();
+        const int lerped = gdx_gfx_interp_last_lerped();
+        const int snapped = gdx_gfx_interp_last_snapped();
+        // presents/s meter is bridge-measured; fall back to ImGui's rate before the first window fills.
+        const double shownFps = (presentedFps > 0.0) ? presentedFps : static_cast<double>(imguiFps);
+        ImGui::Text("Presented: %.0f fps (sim 60 Hz)", shownFps);
+        ImGui::Text("Sub-frames/tick (M): %d", m);
+        if (lerped == 0) {
+            ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.20f, 1.0f),
+                               "Interpolated slots: 0 (no tween - snapping every tick)");
         } else {
-            const double presentedFps = gdx_gfx_interp_presents_per_sec();
-            const float imguiFps = ImGui::GetIO().Framerate;
-            const int m = gdx_gfx_interp_last_subframes();
-            const int lerped = gdx_gfx_interp_last_lerped();
-            const int snapped = gdx_gfx_interp_last_snapped();
-            // presents/s meter is bridge-measured; fall back to ImGui's rate before the first window fills.
-            const double shownFps = (presentedFps > 0.0) ? presentedFps : static_cast<double>(imguiFps);
-            ImGui::Text("Presented: %.0f fps (sim 60 Hz)", shownFps);
-            ImGui::Text("Sub-frames/tick (M): %d", m);
-            if (lerped == 0) {
-                ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.20f, 1.0f),
-                                   "Interpolated slots: 0 (no tween — snapping every tick)");
-            } else {
-                ImGui::Text("Interpolated slots: %d   Snapped: %d", lerped, snapped);
-            }
+            ImGui::Text("Interpolated slots: %d   Snapped: %d", lerped, snapped);
         }
-        ImGui::Separator();
     }
-
-    DrawToolWindowPage("Stats", "Live frame timing and renderer statistics.");
+    ImGui::Separator();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-// 6) WORKSHOP — all future / parity-blocked (docs/menu/WORKSHOP_TAB.md).
+// WORKSHOP — the three custom blocks. The "Enable texture packs" toggle and the Content Installs
+// roadmap lines are plain registry widgets; everything below needs a table, a subprocess snapshot
+// or a modal, so each is one WIDGET_CUSTOM entry.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-void GdxMenu::DrawWorkshopMenu() {
+void GdxMenu::DrawTexturePacks() {
     static char sReloadStatus[160] = "";
     const ImVec4 kRed = ImVec4(0.90f, 0.25f, 0.25f, 1.0f);
-
-    // ── Texture Packs ────────────────────────────────────────────────────────────────────────────
-    ImGui::SeparatorText("Texture Packs");
-    {
-        bool on = CVarGetInteger("gEnhancements.Workshop.TexturePacks", 0) != 0;
-        if (ImGui::Checkbox("Enable texture packs", &on)) {
-            CVarSetInteger("gEnhancements.Workshop.TexturePacks", on ? 1 : 0);
-            GdxSaveCvars();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Overrides game textures from mods/*.o2r packs.\nOff = stock rendering.");
-        }
-        GdxModifiedMarker(on); // default is off
-    }
 
     std::vector<GdxWorkshopPackInfo> packs = GdxWorkshopListPacks();
     ImGui::TextDisabled("%d override(s) available across mounted packs.", GdxWorkshopOverrideCount());
@@ -2083,14 +1862,18 @@ void GdxMenu::DrawWorkshopMenu() {
 
             ImGui::TableSetColumnIndex(0);
             bool enabled = !p.disabled;
+            // Deliberately still ImGui::Checkbox, not UIWidgets::Checkbox: this one lives in a
+            // 32px WidthFixed column, and UIWidgets' re-implementation always adds
+            // ItemInnerSpacing.x * 2 of label gutter to its bounding box even for an empty
+            // "##" label (UIWidgets.cpp:372-373), which would push it out of the column. Only the
+            // tooltip is folded. The pack state is not a CVar either -- it lives in the
+            // comma-joined DisabledPacks list that GdxWorkshopSetPackDisabled maintains.
             if (ImGui::Checkbox("##en", &enabled)) {
                 // Toggling the checkbox rewrites the persisted disable list; the change takes effect
                 // on the next Reload (or the next boot) since the archive set is mounted once.
                 GdxWorkshopSetPackDisabled(p.basename.c_str(), enabled ? 0 : 1);
             }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Enable or disable this pack. Takes effect on the next Reload or boot.");
-            }
+            UIWidgets::Tooltip("Enable or disable this pack. Takes effect on the next Reload or boot.");
 
             ImGui::TableSetColumnIndex(1);
             ImGui::TextUnformatted(p.basename.c_str());
@@ -2118,147 +1901,143 @@ void GdxMenu::DrawWorkshopMenu() {
     if (ImGui::Button("Reload packs")) {
         GdxWorkshopReload(sReloadStatus, sizeof(sReloadStatus));
     }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Re-scans mods/, re-mounts packs, and clears the texture cache so edits\n"
-                          "appear without restarting.");
-    }
+    UIWidgets::Tooltip("Re-scans mods/, re-mounts packs, and clears the texture cache so edits\n"
+                       "appear without restarting.");
     ImGui::SameLine();
     if (ImGui::Button("Open mods folder")) {
         GdxOpenFolder(GdxWorkshopModsDir(true));
     }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Open the mods/ folder in your file browser (created if absent).");
-    }
+    UIWidgets::Tooltip("Open the mods/ folder in your file browser (created if absent).");
     if (sReloadStatus[0] != '\0') {
         ImGui::TextDisabled("%s", sReloadStatus);
     }
 
-    // ── Texture Dump ─────────────────────────────────────────────────────────────────────────────
-    ImGui::SeparatorText("Texture Dump");
-    {
-        bool on = CVarGetInteger("gEnhancements.Workshop.TextureDump", 0) != 0;
-        if (ImGui::Checkbox("Dump textures while playing", &on)) {
-            CVarSetInteger("gEnhancements.Workshop.TextureDump", on ? 1 : 0);
-            GdxSaveCvars();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Writes every decoded texture to dump/<key>.png (first-seen-wins),\n"
-                              "with dump/manifest.tsv recording key, size, and format.");
-        }
-        GdxModifiedMarker(on); // default is off
+    // Texture Dump (the play-until-you-see-it runtime dumper) was retired here: Asset Dump below
+    // supersedes it, decoding named assets straight from the archive instead of depending on which
+    // textures gameplay happened to walk past. Its CVar is forced to 0 at registration so an
+    // already-on setting cannot outlive the checkbox. "Open dump folder" survives as part of the
+    // Asset Dump section -- both dumpers wrote to the same dump/ directory.
+}
+
+// Offline per-class asset dump, native-first via the bundled gdx-extract (falls back to
+// tools/gen_dump_all.py in dev checkouts without the native binary). Implementation lives in
+// port/gdx_dump_launch.{h,cpp}; this block only READS the shared snapshot -- every subprocess runs
+// on a detached worker thread, one child PER CLASS so a broken class never aborts the rest.
+//
+// Custom rather than registry data because the class list is DISCOVERED AT RUNTIME (an async
+// `--list-classes` probe), so the per-class checkboxes cannot be declared ahead of time; their
+// disabled state is therefore driven from the batch snapshot this block already reads, not from
+// the named-reason map (a reason evaluated once per frame would have to take the same snapshot a
+// second time, and the snapshot is a locked copy).
+void GdxMenu::DrawAssetDump() {
+    const ImVec4 kRed = ImVec4(0.90f, 0.25f, 0.25f, 1.0f);
+
+    // Discover the backend once (pure filesystem/PATH -- no subprocess), and kick the async
+    // `--list-classes` probe once. Both cached across frames via function-local statics.
+    static gdx::DumpEnvironment sDumpEnv = gdx::GdxDumpDiscover();
+    static bool sProbeKicked = (gdx::GdxDumpBeginClassListProbe(sDumpEnv), true);
+    (void)sProbeKicked;
+
+    ImGui::TextWrapped("Decode named assets straight from the extracted archive - no gameplay "
+                       "needed. Runs the bundled dump tool once per selected class; results land "
+                       "in dump/ (same place as the runtime texture dump).");
+    if (!sDumpEnv.available) {
+        ImGui::TextDisabled("%s", sDumpEnv.reason.c_str());
     }
-    ImGui::TextDisabled("Dumped %d texture(s) this session -> dump/", gdx_workshop_dump_count());
+
+    gdx::DumpBatchSnapshot snap = gdx::GdxDumpSnapshot();
+    const bool running = snap.running;
+    const std::vector<std::string> dumpClasses = gdx::GdxDumpCurrentClasses();
+
+    // -- Per-class checkboxes (persisted as gEnhancements.Workshop.DumpClass.<name>, default on) --
+    ImGui::BeginDisabled(!sDumpEnv.available || running);
+    if (ImGui::BeginTable("##DumpClasses", 2, ImGuiTableFlags_SizingStretchProp)) {
+        for (const auto& cls : dumpClasses) {
+            ImGui::TableNextColumn();
+            // Per-class CVar name is built at runtime, but CVarCheckbox takes the name as a
+            // plain const char* so the dynamic key works unchanged. DefaultValue(true) is the
+            // old `CVarGetInteger(key, 1)` default: every class starts checked. Nested inside
+            // the outer BeginDisabled above -- ImGui's BeginDisabled(false) preserves an
+            // already-disabled scope, so the rows stay greyed while a dump runs.
+            std::string cvarKey = "gEnhancements.Workshop.DumpClass." + cls;
+            std::string label = gdx::GdxDumpPrettyName(cls) + "##dumpclass_" + cls;
+            UIWidgets::CVarCheckbox(label.c_str(), cvarKey.c_str(),
+                                    UIWidgets::CheckboxOptions().DefaultValue(true));
+        }
+        ImGui::EndTable();
+    }
+    if (ImGui::Button("Dump selected")) {
+        std::vector<std::string> selected;
+        for (const auto& cls : dumpClasses) {
+            std::string cvarKey = "gEnhancements.Workshop.DumpClass." + cls;
+            if (CVarGetInteger(cvarKey.c_str(), 1) != 0) {
+                selected.push_back(cls);
+            }
+        }
+        gdx::GdxDumpStartBatch(sDumpEnv, selected, GdxWorkshopDumpDir(true));
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Dump everything")) {
+        gdx::GdxDumpStartBatch(sDumpEnv, dumpClasses, GdxWorkshopDumpDir(true));
+    }
+    ImGui::EndDisabled();
+
+    // -- Cancel (cooperative: stops AFTER the current class finishes) --
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!running || snap.cancelRequested);
+    if (ImGui::Button("Cancel")) {
+        gdx::GdxDumpRequestCancel();
+    }
+    ImGui::EndDisabled();
+    UIWidgets::Tooltip("Stops after the current class finishes. The running class is left to "
+                       "complete cleanly - no child process is killed.");
+
+    // -- Per-class progress lines + batch summary --
+    for (const auto& p : snap.classes) {
+        std::string pretty = gdx::GdxDumpPrettyName(p.name);
+        switch (p.phase) {
+        case gdx::DumpPhase::Queued:
+            ImGui::TextDisabled("%s: queued", pretty.c_str());
+            break;
+        case gdx::DumpPhase::Running: {
+            const char spin[] = {'|', '/', '-', '\\'};
+            ImGui::Text("%s: running %c", pretty.c_str(),
+                        spin[static_cast<int>(ImGui::GetTime() * 4.0) & 3]);
+            break;
+        }
+        case gdx::DumpPhase::Done:
+            if (p.itemsDumped >= 0) {
+                ImGui::Text("%s: done - %d item(s) in %.1fs", pretty.c_str(), p.itemsDumped,
+                            p.elapsedSeconds);
+            } else {
+                ImGui::Text("%s: done - %.1fs", pretty.c_str(), p.elapsedSeconds);
+            }
+            break;
+        case gdx::DumpPhase::Failed:
+            ImGui::TextColored(kRed, "%s: FAILED (exit %d) %s", pretty.c_str(), p.exitCode,
+                               p.lastLine.c_str());
+            break;
+        default:
+            ImGui::TextDisabled("%s: idle", pretty.c_str());
+            break;
+        }
+    }
+    if (!snap.summary.empty()) {
+        ImGui::TextDisabled("%s", snap.summary.c_str());
+    }
+
+    // Every dumper writes into the same dump/ directory, so one shortcut serves all of them.
+    // This is the only in-menu way to reach that folder.
     if (ImGui::Button("Open dump folder")) {
         GdxOpenFolder(GdxWorkshopDumpDir(true));
     }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Open the dump/ folder in your file browser (created if absent).");
-    }
+    UIWidgets::Tooltip("Open the dump/ folder in your file browser (created if absent).");
+}
 
-    // ── Asset Dump (per-class) ────────────────────────────────────────────────────────────────────
-    // R8 Step 4b / Wave 4: offline per-class dump, native-first via the bundled gdx-extract (falls
-    // back to tools/gen_dump_all.py in dev checkouts without the native binary). Implementation lives
-    // in port/gdx_dump_launch.{h,cpp}; this block only READS the shared snapshot — every subprocess
-    // runs on a detached worker thread, one child PER CLASS so a broken class never aborts the rest.
-    ImGui::SeparatorText("Asset Dump");
-    {
-        // Discover the backend once (pure filesystem/PATH — no subprocess), and kick the async
-        // `--list-classes` probe once. Both cached across frames via function-local statics.
-        static gdx::DumpEnvironment sDumpEnv = gdx::GdxDumpDiscover();
-        static bool sProbeKicked = (gdx::GdxDumpBeginClassListProbe(sDumpEnv), true);
-        (void)sProbeKicked;
+// 64DD durable-save sidecar status + the one-shot format authorization modal.
+void GdxMenu::DrawDdSave() {
+    const ImVec4 kRed = ImVec4(0.90f, 0.25f, 0.25f, 1.0f);
 
-        ImGui::TextWrapped("Decode named assets straight from the extracted archive — no gameplay "
-                           "needed. Runs the bundled dump tool once per selected class; results land "
-                           "in dump/ (same place as the runtime texture dump).");
-        if (!sDumpEnv.available) {
-            ImGui::TextDisabled("%s", sDumpEnv.reason.c_str());
-        }
-
-        gdx::DumpBatchSnapshot snap = gdx::GdxDumpSnapshot();
-        const bool running = snap.running;
-        const std::vector<std::string> dumpClasses = gdx::GdxDumpCurrentClasses();
-
-        // ── Per-class checkboxes (persisted as gEnhancements.Workshop.DumpClass.<name>, default on) ──
-        ImGui::BeginDisabled(!sDumpEnv.available || running);
-        if (ImGui::BeginTable("##DumpClasses", 2, ImGuiTableFlags_SizingStretchProp)) {
-            for (const auto& cls : dumpClasses) {
-                ImGui::TableNextColumn();
-                std::string cvarKey = "gEnhancements.Workshop.DumpClass." + cls;
-                bool on = CVarGetInteger(cvarKey.c_str(), 1) != 0; // default: every class checked
-                std::string label = gdx::GdxDumpPrettyName(cls) + "##dumpclass_" + cls;
-                if (ImGui::Checkbox(label.c_str(), &on)) {
-                    CVarSetInteger(cvarKey.c_str(), on ? 1 : 0);
-                    GdxSaveCvars();
-                }
-            }
-            ImGui::EndTable();
-        }
-        if (ImGui::Button("Dump selected")) {
-            std::vector<std::string> selected;
-            for (const auto& cls : dumpClasses) {
-                std::string cvarKey = "gEnhancements.Workshop.DumpClass." + cls;
-                if (CVarGetInteger(cvarKey.c_str(), 1) != 0) {
-                    selected.push_back(cls);
-                }
-            }
-            gdx::GdxDumpStartBatch(sDumpEnv, selected, GdxWorkshopDumpDir(true));
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Dump everything")) {
-            gdx::GdxDumpStartBatch(sDumpEnv, dumpClasses, GdxWorkshopDumpDir(true));
-        }
-        ImGui::EndDisabled();
-
-        // ── Cancel (cooperative: stops AFTER the current class finishes) ──
-        ImGui::SameLine();
-        ImGui::BeginDisabled(!running || snap.cancelRequested);
-        if (ImGui::Button("Cancel")) {
-            gdx::GdxDumpRequestCancel();
-        }
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Stops after the current class finishes. The running class is left to "
-                              "complete cleanly — no child process is killed.");
-        }
-
-        // ── Per-class progress lines + batch summary ──
-        for (const auto& p : snap.classes) {
-            std::string pretty = gdx::GdxDumpPrettyName(p.name);
-            switch (p.phase) {
-            case gdx::DumpPhase::Queued:
-                ImGui::TextDisabled("%s: queued", pretty.c_str());
-                break;
-            case gdx::DumpPhase::Running: {
-                const char spin[] = {'|', '/', '-', '\\'};
-                ImGui::Text("%s: running %c", pretty.c_str(),
-                            spin[static_cast<int>(ImGui::GetTime() * 4.0) & 3]);
-                break;
-            }
-            case gdx::DumpPhase::Done:
-                if (p.itemsDumped >= 0) {
-                    ImGui::Text("%s: done — %d item(s) in %.1fs", pretty.c_str(), p.itemsDumped,
-                                p.elapsedSeconds);
-                } else {
-                    ImGui::Text("%s: done — %.1fs", pretty.c_str(), p.elapsedSeconds);
-                }
-                break;
-            case gdx::DumpPhase::Failed:
-                ImGui::TextColored(kRed, "%s: FAILED (exit %d) %s", pretty.c_str(), p.exitCode,
-                                   p.lastLine.c_str());
-                break;
-            default:
-                ImGui::TextDisabled("%s: idle", pretty.c_str());
-                break;
-            }
-        }
-        if (!snap.summary.empty()) {
-            ImGui::TextDisabled("%s", snap.summary.c_str());
-        }
-    }
-
-    // ── DD Save (64DD durable-save sidecar status) ────────────────────────────────────────────────
-    ImGui::SeparatorText("DD Save (64DD sidecar)");
     ImGui::Text("Sidecar: %s", gdx_disk_sidecar_present() ? "present" : "none yet");
     ImGui::Text("Journal records: %d", gdx_disk_sidecar_record_count());
     ImGui::Text("Last flush: %s", gdx_disk_last_flush_ok() ? "ok" : "FAILED");
@@ -2267,9 +2046,7 @@ void GdxMenu::DrawWorkshopMenu() {
         if (ImGui::Button("Initialize DD save area")) {
             ImGui::OpenPopup("##ddformat");
         }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Authorizes a one-time format of the 64DD MFS save area on the NEXT boot.");
-        }
+        UIWidgets::Tooltip("Authorizes a one-time format of the 64DD MFS save area on the NEXT boot.");
         if (ImGui::BeginPopupModal("##ddformat", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::TextUnformatted(
                 "Initialize the 64DD MFS save area?\n\n"
@@ -2289,63 +2066,220 @@ void GdxMenu::DrawWorkshopMenu() {
             ImGui::EndPopup();
         }
     }
-
-    // ── Content Installs (W1/W2 — parity/infra gated) ─────────────────────────────────────────────
-    ImGui::SeparatorText("Content Installs");
-    GdxComingSoon("Track / cup / machine install (blocked: disk write-through, W1)");
-    GdxComingSoon("Installed-content library + quota manager (W2)");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-// 7) ONLINE / GHOSTS — all future / parity-blocked; netplay additionally decision-gated
-//    (docs/menu/ONLINE_TAB.md).
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-void GdxMenu::DrawOnlineMenu() {
-    GdxComingSoon("Leaderboards (per course)");
-    GdxComingSoon("Ghost upload / download");
-    GdxComingSoon("Netplay lobbies (after decision gate)");
-    GdxComingSoon("Spectator / director cam");
-}
-
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// 8) DEVELOPER — surface existing LUS dev windows (READY). docs/menu/DEVELOPER_TAB.md.
+// DEVELOPER — the pop-out buttons for the LUS dev windows.
 //    Console + Stats are auto-registered by the LUS Gui ctor; Gfx Debugger is registered in
-//    main.cpp at boot. Each menu item toggles the LIVE window via GetGuiWindow(name)->
+//    main.cpp at boot. Each button toggles the LIVE window via GetGuiWindow(name)->
 //    ToggleVisibility() (a bare CVarSet would not move an already-constructed window).
+//
+// Custom because the three share one error line: a missing window is REPORTED rather than
+// ignored, and the report belongs to the group, not to any one button.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-void GdxMenu::DrawDeveloperMenu() {
-    ImGui::TextWrapped("Developer tools can be embedded in this menu or popped out into independent windows.");
-    if (ImGui::Button("Open Stats")) GdxToggleWindow("Stats");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle the live frame-timing / renderer Stats window.");
-    ImGui::SameLine();
-    if (ImGui::Button("Open Console")) GdxToggleWindow("Console");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle the developer console and command history.");
-    ImGui::SameLine();
-    if (ImGui::Button("Open Gfx Debugger")) GdxToggleWindow("Gfx Debugger");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle the Fast3D display-list debugger.");
-    ImGui::SeparatorText("Windowing");
-
-    // Multi-viewport — CVar gEnableMultiViewports, default 1. The ImGui viewport flag is applied
-    // ONCE at Gui::Init(), so flipping the CVar at runtime persists the preference but only takes
-    // effect after a restart (we deliberately do not poke ImGui::GetIO() here). Hence the note.
-    {
-        bool mv = CVarGetInteger("gEnableMultiViewports", 1) != 0;
-        if (ImGui::Checkbox("Multi-viewport docking", &mv)) {
-            CVarSetInteger("gEnableMultiViewports", mv ? 1 : 0);
-            GdxSaveCvars();
+void GdxMenu::DrawDevToolButtons() {
+    // These names must match the registrations in main.cpp / the libultraship Gui ctor exactly, and
+    // a typo used to produce a button that looked fine and did nothing at all.
+    static std::string sToolStatus;
+    struct ToolButton {
+        const char* label;
+        const char* window;
+        const char* tip;
+    };
+    static const ToolButton kTools[] = {
+        { "Open Stats", "Stats", "Toggle the live frame-timing / renderer Stats window." },
+        { "Open Console", "Console", "Toggle the developer console and command history." },
+        { "Open Gfx Debugger", "Gfx Debugger", "Toggle the Fast3D display-list debugger." },
+    };
+    for (int i = 0; i < static_cast<int>(sizeof(kTools) / sizeof(kTools[0])); ++i) {
+        if (i != 0) {
+            ImGui::SameLine();
         }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Lets popped-out tool windows leave the main window (multi-monitor docking).\n"
-                              "Applies on restart.");
+        if (ImGui::Button(kTools[i].label)) {
+            if (GdxToggleWindow(kTools[i].window)) {
+                sToolStatus.clear();
+            } else {
+                sToolStatus = std::string(kTools[i].window) + " is not registered in this build.";
+            }
+        }
+        UIWidgets::Tooltip(kTools[i].tip);
+    }
+    if (!sToolStatus.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s", sToolStatus.c_str());
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// 8b) DEVELOPER GATES — the checkbox surface for port/gdx_dev_gates.{h,c}.
+//
+// These rows replace ~25 environment variables that were previously invisible and undiscoverable.
+// Everything here is table-driven: adding a gate to kGates in gdx_dev_gates.c makes it appear
+// with no edit to this function.
+//
+// Three sections, matching the bucket policy:
+//   Logging     (Bucket D) — persisted CVar adopted at boot; carries the honest "applies to new
+//                            output; restart to capture boot" caveat, and is DISABLED when an
+//                            environment variable pinned it for this run.
+//   Diagnostics (Bucket A) — logging only, safe to leave on, live.
+//   Behaviour   (Bucket B) — CHANGES RENDERING OR GAME BEHAVIOUR. Whole section compiled out
+//                            unless GDX_DEV_TOOLS (Debug-only by default; see port/CMakeLists.txt).
+//
+// A toggle writes the CVar, schedules the config save, and calls gdx_dev_gates_refresh() so the
+// change lands on the CURRENT frame rather than the next one (the frame loop's own refresh already
+// ran before the menu drew).
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+void GdxMenu::DrawDevGates() {
+    ImGui::SeparatorText("Developer gates");
+    ImGui::TextWrapped("These replace the port's GDX_* environment variables. Changes apply "
+                       "immediately and persist in gdiffuser.cfg.json. A variable exported at "
+                       "launch still works and is marked below.");
+
+    // Confirmed rather than immediate: this discards every gate the user set, across all three
+    // sections at once, and there is no undo once the config is saved. Someone half-way through
+    // bisecting a bug can lose the whole setup to one stray click.
+    if (ImGui::Button("Reset all gates to defaults")) {
+        ImGui::OpenPopup("##resetgates");
+    }
+    UIWidgets::Tooltip("Clears every gate back to stock. Gates pinned by an environment "
+                       "variable are unaffected until the next launch.");
+    if (ImGui::BeginPopupModal("##resetgates", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        int changed = 0;
+        for (int id = 0; id < gdx_dev_gate_count(); ++id) {
+            if ((gdx_dev_gate(id) != 0) != (gdx_dev_gate_default(id) != 0)) {
+                ++changed;
+            }
+        }
+        ImGui::TextUnformatted("Reset every developer gate to its default?");
+        ImGui::Separator();
+        if (changed == 0) {
+            ImGui::TextDisabled("Nothing to reset - every gate is already at its default.");
+        } else {
+            ImGui::Text("%d gate(s) will be turned back to stock. This cannot be undone.", changed);
+        }
+        ImGui::Separator();
+        if (ImGui::Button("Reset")) {
+            for (int id = 0; id < gdx_dev_gate_count(); ++id) {
+                CVarSetInteger(gdx_dev_gate_cvar_name(id), gdx_dev_gate_default(id));
+            }
+            GdxSaveCvars();
+            gdx_dev_gates_refresh();
+            ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("(restart)");
+        if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
     }
 
+    // Presentation order, which is NOT the enum order: logging first (it is the one a bug reporter
+    // needs), then read-only diagnostics, then the dangerous section last.
+    static const int kBucketOrder[] = { GDX_GATE_BUCKET_BOOT, GDX_GATE_BUCKET_DIAG,
+                                        GDX_GATE_BUCKET_BEHAVIOR };
+    for (int bucketIndex = 0; bucketIndex < (int) (sizeof(kBucketOrder) / sizeof(kBucketOrder[0]));
+         ++bucketIndex) {
+        const int bucket = kBucketOrder[bucketIndex];
+#ifndef GDX_DEV_TOOLS
+        // Bucket B is not compiled into this build: its gates are hard-wired to 0 with no getenv and
+        // no CVar read, so drawing live checkboxes would be a lie. Silently skipping the section was
+        // its own problem though -- the docs and the Behavior gates are referenced elsewhere, and a
+        // section that simply is not there reads as "this build is broken" rather than "this build
+        // deliberately excludes it". Say so instead of vanishing.
+        if (bucket == GDX_GATE_BUCKET_BEHAVIOR) {
+            ImGui::SeparatorText("Behavior overrides (not in this build)");
+            ImGui::TextDisabled("Compiled out of Release. These gates change what the game renders or\n"
+                                "how it sounds, and exist to bisect bugs rather than to play with.\n"
+                                "Configure with -DGDX_FORCE_DEV_TOOLS=ON to build them in.");
+            continue;
+        }
+#endif
+        if (bucket == GDX_GATE_BUCKET_BOOT) {
+            ImGui::SeparatorText("Logging");
+            ImGui::TextWrapped("Read at startup from the saved setting, so enabling one here and "
+                               "restarting captures the next boot.");
+        } else if (bucket == GDX_GATE_BUCKET_DIAG) {
+            ImGui::SeparatorText("Diagnostics");
+            ImGui::TextWrapped("Extra log output only. Safe to leave on; enable the Logging gates "
+                               "above so the lines reach gdiffuser-run.log.");
+        } else {
+            ImGui::SeparatorText("Behavior overrides (not for normal play)");
+            ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.30f, 1.0f),
+                               "WARNING: these change what the game renders or how it sounds. "
+                               "They exist to bisect bugs, not to play with. Leave them off unless "
+                               "you are reproducing a specific issue.");
+            ImGui::TextDisabled("Debug builds only - this section is compiled out of a Release build.");
+        }
+
+        for (int group = 0; group < GDX_GATE_GROUP_COUNT; ++group) {
+            bool groupHeaderDrawn = false;
+            for (int id = 0; id < gdx_dev_gate_count(); ++id) {
+                if (gdx_dev_gate_bucket(id) != bucket || gdx_dev_gate_group(id) != group) {
+                    continue;
+                }
+                // Only the Diagnostics and Behavior sections need a per-domain sub-header; the
+                // Logging bucket is a single group already named by its section title.
+                if (!groupHeaderDrawn && bucket != GDX_GATE_BUCKET_BOOT) {
+                    groupHeaderDrawn = true;
+                    ImGui::TextDisabled("%s", gdx_dev_gate_group_name(group));
+                }
+
+                const bool pinned = gdx_dev_gate_is_env_pinned(id) != 0;
+                bool value = gdx_dev_gate(id) != 0;
+
+                if (pinned) {
+                    ImGui::BeginDisabled();
+                }
+                if (ImGui::Checkbox(gdx_dev_gate_label(id), &value)) {
+                    CVarSetInteger(gdx_dev_gate_cvar_name(id), value ? 1 : 0);
+                    GdxSaveCvars();
+                    gdx_dev_gates_refresh(); // land the change on THIS frame
+                }
+                if (pinned) {
+                    ImGui::EndDisabled();
+                }
+
+                // AllowWhenDisabled: a pinned row is exactly the row a user most needs explained --
+                // without this flag ImGui suppresses hover on disabled items, so the one checkbox
+                // that refuses to move is also the only one that will not say why.
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    ImGui::SetTooltip("%s\n\nEnvironment: %s\nSetting: %s", gdx_dev_gate_help(id),
+                                      gdx_dev_gate_env_name(id), gdx_dev_gate_cvar_name(id));
+                }
+                GdxModifiedMarker(value != (gdx_dev_gate_default(id) != 0));
+
+                // Order matters. A BOOT gate that is merely PRESENT in the environment but resolved
+                // to off is now freely toggleable, so it gets the useful restart hint rather than a
+                // "(started from ...)" label that would be stale the moment the user ticked it.
+                if (pinned) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(pinned ON by %s this run)", gdx_dev_gate_env_name(id));
+                } else if (bucket == GDX_GATE_BUCKET_BOOT) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(applies to new output; restart to capture boot)");
+                } else if (gdx_dev_gate_from_env(id)) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(started from %s)", gdx_dev_gate_env_name(id));
+                }
+            }
+        }
+    }
+
+    // Environment variables that deliberately stay environment variables (Bucket C): they are
+    // consumed before the console exists, or they carry a value rather than a flag. Listed so the
+    // Dev Tools page is a complete map of the port's switches rather than a partial one.
+    ImGui::SeparatorText("Environment only (no setting)");
+    ImGui::TextWrapped("Consumed before the settings system exists, or not a simple on/off:");
+    ImGui::BulletText("GDX_INPUT_SCRIPT - deterministic input playback for unattended tests");
+    ImGui::BulletText("FZEROX_ROM, GDX_STRICT_ARCHIVE, GDX_DUMP_SELFTEST - boot and tooling paths");
+    ImGui::BulletText("GDX_CAPTURE_FRAMES / GDX_CAPTURE_MODE / GDX_CAPTURE_WINDOW - \"start:count\" captures");
+    ImGui::BulletText("GDX_PCM_CAPTURE, GDX_PCM_CAPTURE_FRAMES - audio capture prefix and length");
+    ImGui::BulletText("GDX_RAND_SEED1 / GDX_RAND_SEED2 - RNG determinism pins (numeric seeds)");
+    ImGui::BulletText("GDX_SEED_BOOT_LOGO, GDX_AUDIO_THREAD, GDX_AI_CUSHION - decided before this menu exists");
+    ImGui::BulletText("GDX_INTERP_P1 / GDX_INTERP_P2 - interpolation test overrides (see Graphics)");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-// 9) ABOUT — static text only (docs/menu/ABOUT_TAB.md). No version string exists in the port
+// 9) ABOUT — static text only. No version string exists in the port
 //    today, so we show a fixed pre-alpha label, the EK-required boot notice, and credits.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 void GdxMenu::DrawAboutMenu() {

@@ -1,4 +1,4 @@
-// G-Diffuser — decomp-side port subsystems (Slice 4c).
+// G-Diffuser — decomp-side port subsystems.
 // Compiled WITH the decomp's headers/flags (part of the gdiffuser_game target), so it uses
 // the real game types. Provides port reimplementations / placeholders for symbols that lived
 // in N64-platform files excluded from the host build (segment system, save, fixed-address
@@ -13,6 +13,10 @@
 /* port_log.h pulls in <stdio.h> which clashes with the decomp's libc/stdint.h.
    Use gdx_ck (defined in n64_sched.c, which CAN include stdio.h) for logging. */
 extern void gdx_ck(const char* s);
+/* Label+value sibling of gdx_ck (prints "<label>=<dec> (0x<hex>)"). Declared at file scope so
+   the RDRAM messages in gdx_rdram_init() can report GDX_RDRAM_SIZE itself instead of restating
+   the buffer size as a prose literal that has to be kept in sync by hand. */
+extern void gdx_cki(const char* s, int v);
 extern void gdx_seg_log(const char* kind, int seg, uintptr_t raw, void* resolved);
 extern void gdx_addr_log(const char* kind, uintptr_t raw, void* resolved);
 /* Printf-style sibling of gdx_ck, same stdio.h-avoidance reason (defined in
@@ -30,14 +34,15 @@ extern void* gdx_resolve_module_host_address(unsigned int addr);
 extern void* gdx_ensure_asset_segment_for_symbol(unsigned int symLow32, unsigned int* outOffset);
 extern int   gdx_load_venue_texture_segment(int venue);
 extern s32   gGameMode;
-/* Declared locally (not via <stdlib.h>, which -- like <stdio.h> above -- clashes
-   with the decomp's libc/stdint.h) so the [seg9diag] gate below can read GDX_LOG
-   without pulling in the standard header. */
-extern char* getenv(const char* name);
+/* Declared locally (not via the port headers, which pull in <stdio.h>/<stdlib.h>
+   and clash with the decomp's libc/stdint.h) so the [seg9diag] gate below can
+   read the GDX_LOG developer gate. Defined in port/gdx_dev_gates.c; see that
+   header for the bucket policy and the environment/setting precedence. */
+extern int gdx_dev_gate_log_file(void);
 
 extern unsigned char* gdx_rom_buffer;
 extern size_t gdx_rom_size;
-/* R1 (C-R1.3): single archive-first byte-source shim. The seg-9 machine_models
+/* Single archive-first byte-source shim. The seg-9 machine_models
  * and seg-5 podium loaders below stage their compressed MIO0 span through this
  * instead of reading gdx_rom_buffer directly; it returns verbatim ROM bytes, so
  * mio0Decode sees byte-identical input. See port/gdx_segment_source.{h,c}. */
@@ -74,8 +79,8 @@ static size_t Gdx_RomOffset(u32 addr) {
 
 extern void gdx_register_host_range(void* ptr, size_t size); // defined in n64_gfx_bridge.cpp
 extern void gdx_register_host_wide_command_range(void* ptr, size_t size);
-// A1/A2: same "known compiled-in host array" registration E3 uses for EK disk
-// assets (see its comment in n64_gfx_bridge.cpp), reused here for base-game
+// Same "known compiled-in host array" registration the EK disk assets use
+// (see its comment in n64_gfx_bridge.cpp), reused here for base-game
 // arrays. gdx_register_host_pointer_stub only affects RECOGNITION (silences the
 // "[stub-miss] ... taken verbatim" census for a legitimate module-resident
 // array); gdx_set_native_rgba16_texture_range additionally marks a range as
@@ -90,7 +95,7 @@ extern GfxPool D_8024DCE0[2];
 void gdx_rdram_init(void) {
     gdx_rdram = (unsigned char*)gdx_host_calloc(1, GDX_RDRAM_SIZE);
     if (gdx_rdram == NULL) {
-        gdx_ck("[rdram] FATAL: failed to allocate 8MB RDRAM buffer");
+        gdx_cki("[rdram] FATAL: failed to allocate RDRAM buffer, requested bytes", (int)GDX_RDRAM_SIZE);
         gdx_host_exit(1);
     }
 
@@ -160,7 +165,7 @@ void gdx_rdram_init(void) {
         gdx_register_host_range(D_A007000, 1);
         gdx_register_host_range(D_A008000, 1);
     }
-    // E4 (A3 follow-up): banks 9-11 (D_A009000..D_A00B000, decomp's
+    // Banks 9-11 (D_A009000..D_A00B000, decomp's
     // fzx_segmentA.h:15-17) -- same 1-byte-LinkStubs-on-Linux-PIE registration
     // as banks 0-8 above, extending the range n64_gfx_bridge.cpp's kBankLow32[]
     // now also covers. D_A009000/D_A00A000 are unreferenced placeholders (see
@@ -178,6 +183,30 @@ void gdx_rdram_init(void) {
     {
         extern unsigned char D_A00B000[];
         gdx_register_host_range(D_A00B000, 1);
+    }
+    {
+        extern unsigned char D_A00B240[];
+        gdx_register_host_range(D_A00B240, 1);
+    }
+    {
+        extern unsigned char D_A00B480[];
+        gdx_register_host_range(D_A00B480, 1);
+    }
+    {
+        extern unsigned char D_A00B6C0[];
+        gdx_register_host_range(D_A00B6C0, 1);
+    }
+    {
+        extern unsigned char D_A00B900[];
+        gdx_register_host_range(D_A00B900, 1);
+    }
+    {
+        extern unsigned char D_A00BB40[];
+        gdx_register_host_range(D_A00BB40, 1);
+    }
+    {
+        extern unsigned char D_A00BD80[];
+        gdx_register_host_range(D_A00BD80, 1);
     }
 #endif
 
@@ -231,13 +260,13 @@ void gdx_rdram_init(void) {
         gdx_cki("[rdram] sizeof GfxPool", (int)sizeof(GfxPool));
     }
 
-    gdx_ck("[rdram] 8MB buffer initialized");
+    gdx_cki("[rdram] buffer initialized, bytes", (int)GDX_RDRAM_SIZE);
 }
 
-// R6-P2 ground truth: the hand-copied kGfxPoolSize constant in port/gdx_interp.cpp cannot be
-// checked at parity 0 (its self-check degenerates to a tautology there — see PrevPoolBase). This
-// TU compiles WITH the real decomp GfxPool type, so it is the one place that can answer "how big
-// IS GfxPool, really" without guessing. gdx_interp verifies this ONCE against its constant.
+// Ground truth for the GfxPool inter-pool stride. gdx_interp.cpp's hand-copied kGfxPoolSize
+// cannot self-check at parity 0 (the check degenerates to a tautology there — see PrevPoolBase).
+// This TU compiles WITH the real decomp GfxPool type, so it is the one place that can answer how
+// big GfxPool actually is on the host.
 size_t gdx_gfxpool_sizeof(void) {
     return sizeof(GfxPool);
 }
@@ -273,7 +302,7 @@ void* gdx_rdram_persist_alloc_raw(size_t size, size_t align) {
     return gdx_rdram + base;
 }
 
-/* Deep-audit H1: ALLOC_PEEK on console returns the arena cursor WITHOUT
+/* ALLOC_PEEK on console returns the arena cursor WITHOUT
    advancing it (transient scratch, overwritten by the next real allocation).
    The bump shim previously served peeks straight from the mode arena cursor
    (gdx_rdram_bump). That is a race: the texture loader (object.c cases
@@ -333,7 +362,7 @@ void* gdx_rdram_peek_raw(size_t size, size_t align) {
     return gdx_rdram + base;
 }
 
-/* Deep-audit H1: console Arena_StartInit resets the arena at every game-mode
+/* Console Arena_StartInit resets the arena at every game-mode
    transition; the port shim was a no-op, leaking all mode-scoped allocations.
    The first StartInit call captures the post-boot cursor as the baseline
    (protecting boot-time persistent carve-outs made before any mode starts);
@@ -361,7 +390,7 @@ void gdx_rdram_mode_reset(void) {
     gdx_rdram_bump = gdx_rdram_mode_baseline;
 
 #ifdef PORT
-    /* SCRAMBLED-TEXT FIX (docs/investigation/2026-07-17/SCRAMBLED_TEXT.md).
+    /* SCRAMBLED-TEXT FIX.
        The glyph/texture decode cache stores HOST pointers (gdx_rdram + offset)
        into this bump arena. Rewinding the bump here re-issues those exact offsets
        to the next mode's decodes, so any cache entry that survives the rewind now
@@ -429,7 +458,7 @@ u32 osVirtualToPhysical(void* vaddr) {
 #endif
 
 u32 gdx_rom_read32(u32 addr) {
-    /* R4 (C-R4.1): single chokepoint for ~27 ROM_READ sites (racer.c/machine_draw.c/
+    /* Single chokepoint for ~27 ROM_READ sites (racer.c/machine_draw.c/
      * E7CF0.c). Read 4 bytes via the byte-source shim (archive-first, byte-identical
      * raw fallback) and assemble big-endian exactly as before. On a total miss the
      * shim returns 0 and leaves tmp untouched, so we return 0 -- the same value the
@@ -577,7 +606,7 @@ uintptr_t Segment_SegmentedToVirtual(uintptr_t segmentedAddr) {
 }
 
 uintptr_t Segment_SetPhysicalAddress(s32 segment, uintptr_t addr) {
-    /* Deep-audit M3: defensive bounds — gSegments has 16 slots. */
+    /* Defensive bounds — gSegments has 16 slots. */
     if ((unsigned)segment >= 16u) {
         return addr;
     }
@@ -589,7 +618,7 @@ uintptr_t Segment_SetPhysicalAddress(s32 segment, uintptr_t addr) {
 
 uintptr_t Segment_SetAddress(s32 segment, uintptr_t addr) {
     void* resolved;
-    /* Deep-audit M3: defensive bounds — gSegments has 16 slots. */
+    /* Defensive bounds — gSegments has 16 slots. */
     if ((unsigned)segment >= 16u) {
         return addr;
     }
@@ -670,7 +699,7 @@ extern uintptr_t gGdxCourseEditTexturesVramEnd;
 extern uintptr_t gSegment2738A0VramStart;
 extern uintptr_t gSegment2738A0VramEnd;
 
-/* Deep-audit / Phase 4 hitch fix: gSegment1B8550 (seg4) and gSegment1E23F0 (seg7) are two FIXED
+/* Mode-transition hitch fix: gSegment1B8550 (seg4) and gSegment1E23F0 (seg7) are two FIXED
    host buffers reused across every mode transition -- only their CONTENT rotates among a small,
    fixed set of ROM assets (hud_gfx/create_machine_textures for seg4; machine_global_gfx/
    expansion_kit_textures_beta for seg7). Profiling (`[transition] GMI_A..GMI_B (Controller_Reset +
@@ -697,7 +726,7 @@ static GdxSeg9Content sGdxSeg9Resident = GDX_SEG9_CONTENT_NONE;
 static GdxSeg9Content sGdxSeg9Active = GDX_SEG9_CONTENT_NONE;
 static size_t sGdxSeg9ActiveSize = 0;
 
-/* Carve byte-order pass (2026-07-11, served-copy family): the carves these
+/* Carve byte-order pass (served-copy family): the carves these
    loaders fill are what gSegments[4]/[7] serve at draw time, but only the
    bridge's separate heap images ever received the generated fixups. Seg-8's
    identical fix put the start arc and Nintex boards on screen; the same
@@ -796,7 +825,7 @@ static int gdx_activate_machine_models_segment9(void) {
     }
 
     if (sGdxSeg9Resident != GDX_SEG9_CONTENT_MACHINE_MODELS) {
-        /* Codebase-audit P3: the MIO0 header's decoded size (big-endian u32 at +4)
+        /* The MIO0 header's decoded size (big-endian u32 at +4)
          * was previously trusted implicitly; a corrupt ROM could decompress past the
          * RDRAM carve. Check it against the carve capacity before decoding (the EK
          * disk path below already does the equivalent required>capacity check). */
@@ -844,16 +873,14 @@ static int gdx_activate_machine_models_segment9(void) {
  * always reaches stderr/OutputDebugString regardless of env vars -- unlike
  * gdx_ck/gdx_cki it has no built-in opt-out -- so without this gate every
  * [seg9diag] line below would spam stderr/OutputDebugString on a normal run
- * even with no diagnostics requested. GDX_LOG opt-in, lazily cached (same
- * sentinel pattern as port_log.h's gdx_log_file_enabled; this TU cannot
- * include port_log.h, see the top-of-file comment). */
+ * even with no diagnostics requested. Reads the shared developer-gate cache
+ * (port/gdx_dev_gates.{h,c}) so the Dev Tools "Write gdiffuser-run.log" toggle
+ * and GDX_LOG can no longer disagree; the accessor is declared with the other
+ * externs at the top of this file because this TU cannot include the port
+ * headers (see the top-of-file note about <stdio.h> clashing with the decomp's
+ * libc/stdint.h). */
 static int gdx_seg9diag_enabled(void) {
-    static int sCached = -1;
-    if (sCached < 0) {
-        const char* log = getenv("GDX_LOG");
-        sCached = (log != NULL && log[0] != '\0' && log[0] != '0') ? 1 : 0;
-    }
-    return sCached;
+    return gdx_dev_gate_log_file();
 }
 
 #ifdef EXPANSION_KIT
@@ -919,17 +946,19 @@ static int gdx_activate_course_edit_segment9(void) {
 
 static void gdx_load_segment9_for_mode(void) {
     int loaded = 0;
-    /* Task 3 diag: one shared per-dispatch budget for both the entry and exit
-     * lines below (first 40 dispatches per boot). Every call here is a
-     * mode-transition event, not a per-frame one, so this stays low-noise even
-     * unbounded, but the cap matches the "first-N per boot" instruction. Also
-     * gated on gdx_seg9diag_enabled() (GDX_LOG) so a normal run stays silent. */
+    /* Shared per-boot budget for the entry/exit lines below, plus one guaranteed
+     * dispatch per game mode so menu churn cannot starve the late transitions. */
     static int sSeg9DispatchLogs = 0;
-    const int diagThisCall = (sSeg9DispatchLogs < 40) && gdx_seg9diag_enabled();
-    if (sSeg9DispatchLogs < 40) {
-        sSeg9DispatchLogs++;
-    }
+    static unsigned int sSeg9ModesLogged = 0;
+    const unsigned int modeBit = ((unsigned int)gGameMode < 32u) ? (1u << (unsigned int)gGameMode) : 0u;
+    const int firstForMode = (modeBit != 0u) && ((sSeg9ModesLogged & modeBit) == 0u);
+    const int diagThisCall = gdx_seg9diag_enabled() && ((sSeg9DispatchLogs < 40) || firstForMode);
+
     if (diagThisCall) {
+        sSeg9ModesLogged |= modeBit;
+        if (sSeg9DispatchLogs < 40) {
+            sSeg9DispatchLogs++;
+        }
         gdx_dbg_logf("[seg9diag] load_segment9_for_mode entry gameMode=%d\n", (int)gGameMode);
     }
 
@@ -992,7 +1021,7 @@ int gdx_resolve_mode_segment9(unsigned int raw, size_t requiredBytes, uintptr_t*
     return 1;
 }
 
-/* E2 (editor resolver diagnosis): while a mode owns segment 4/7/9, that live
+/* While a mode owns segment 4/7/9, that live
  * carve is authoritative and the ROM-backed AssetBindings.c table rows for the
  * SAME segment are stale context that must not be treated as a fallback match
  * by the generated-stub lookup in n64_gfx_bridge.cpp (ResolveGeneratedAssetStub,
@@ -1009,6 +1038,59 @@ int gdx_mode_owns_segment(unsigned int seg) {
             return sGdxSeg7Resident != GDX_SEG7_CONTENT_NONE;
         case 9u:
             return sGdxSeg9Active != GDX_SEG9_CONTENT_NONE;
+        default:
+            return 0;
+    }
+}
+
+/* Race-HUD-corruption follow-up (2026-07-2x): gdx_mode_owns_segment's blanket
+ * reject above starved every compiled-symbol reference into segments 4/7/9
+ * for the FULL duration of any mode that owns them (every race, not just a
+ * transition frame), because those segments' AssetBindings.c ROM rows never
+ * got a live-carve fallback the way segment 0x0A already has. Generalizing
+ * the 0x0A redirect to 4/7/9 needs one extra guard 0x0A does not: those three
+ * segments each multiplex MULTIPLE distinct ROM content families onto the
+ * same live carve (segment 4: hud_gfx / create_machine_textures / the
+ * never-port-loaded course_edit_textures_beta; segment 7: machine_global_gfx
+ * / expansion_kit_textures_beta; segment 9: machine_models / the disk-based,
+ * table-less course_edit_textures), so a row's offset is only valid in the
+ * live carve when the row's ROM family matches whichever content is
+ * CURRENTLY resident. Returns true only when `rom_base` is the ROM base of
+ * the family actually resident/active for `seg` right now; false rejects a
+ * stale-family row (e.g. a machine_models seg-9 row while Course Edit's
+ * course_edit_textures is active) back to the caller's normal reject path,
+ * preserving the original seg-9 editor-scatter fix intact. */
+int gdx_mode_segment_content_matches(unsigned int seg, unsigned int rom_base) {
+    switch (seg) {
+        case 4u:
+            switch (sGdxSeg4Resident) {
+                case GDX_SEG4_CONTENT_HUD_GFX:
+                    return rom_base == (unsigned int) PORT_hud_gfx_ROM_START;
+                case GDX_SEG4_CONTENT_CREATE_MACHINE:
+                    return rom_base == (unsigned int) PORT_create_machine_textures_ROM_START;
+                default:
+                    return 0;
+            }
+        case 7u:
+            switch (sGdxSeg7Resident) {
+                case GDX_SEG7_CONTENT_MACHINE_GLOBAL:
+                    return rom_base == (unsigned int) PORT_machine_global_gfx_ROM_START;
+                case GDX_SEG7_CONTENT_EK_TEXTURES:
+                    return rom_base == (unsigned int) PORT_expansion_kit_textures_beta_ROM_START;
+                default:
+                    return 0;
+            }
+        case 9u:
+            switch (sGdxSeg9Active) {
+                case GDX_SEG9_CONTENT_MACHINE_MODELS:
+                    return rom_base == (unsigned int) PORT_machine_models_ROM_START;
+                default:
+                    /* Course Edit's course_edit_textures has no AssetBindings.c
+                       ROM row family (it is filled from the EK disk image, not
+                       decoded from a cartridge ROM span), so no rom_base value
+                       can ever legitimately match it here. */
+                    return 0;
+            }
         default:
             return 0;
     }
@@ -1124,7 +1206,7 @@ static void gdx_load_segment5_for_mode(void) {
 
 static void gdx_load_mode_segments(void) {
     extern void gdx_cki(const char*, int);
-    /* P3 frame-interpolation cut epoch (MATRIX_INTERPOLATION_PLAN.md Step 7, event #5): this is the
+    /* Frame-interpolation cut epoch: this is the
        single port-side chokepoint every mode/screen transition passes through (Segment_LoadOverlays
        calls it on each mode change). Bumping the cut epoch here snaps the first rendered tick of the
        new mode so nothing streaks across SELECT MACHINE<->race, Course Edit<->play, GRAND PRIX
@@ -1236,13 +1318,18 @@ void Segment_LoadOverlays(void) {
 }
 
 // ---- Save system -------------------------------------------------------------
-// Save_LoadStaffGhostRecord and Save_SaveSettingsProfiles are real now: they're
-// defined in decomp/src/overlays/ovl_i2/save.c, which now compiles (save-system
-// slice). Save_LoadStaffGhostRecord still returns -1 on PORT (see the #ifdef PORT
-// guard in save.c) -- that piece needs the EK ROM segment table, a separate slice.
+// Save_LoadStaffGhostRecord and Save_SaveSettingsProfiles are defined in
+// decomp/src/overlays/ovl_i2/save.c, which compiles on the port -- no shim here.
+// Save_LoadStaffGhostRecord no longer returns -1 on PORT: its #ifdef PORT branch
+// pulls the raw archive-file bytes for the course's staff_ghost_records/* o2r entry
+// and parses the Torch payload in place, because no libultraship factory is
+// registered for that resource type (see the TODO in
+// port/resource/ResourceFactories.cpp). This matters beyond the ghost itself -- func_i10_8012B580 seeds every
+// standard-cup CPU pacing target from ghostInfo.raceTime, so the old -1 stub left
+// that seed uninitialized and degenerated CPU pacing.
 
 // ---- Graphics pool ---------------------------------------------------------
 // D_1000000: the N64 graphics pool (segment 0x01) — a real runtime buffer (NOT an o2r asset),
 // so display-list/matrix allocations have somewhere to live.
-// (aVp* viewports and D_80149A0 are real assets now provided by the R2 asset bindings.)
+// (aVp* viewports and D_80149A0 are real assets provided by the generated asset bindings.)
 GfxPool D_1000000;

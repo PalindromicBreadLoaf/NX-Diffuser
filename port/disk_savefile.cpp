@@ -340,6 +340,10 @@ const char* statusText(LoadStatus s) {
 
 extern "C" {
 
+unsigned long long gdx_disk_crc64(const unsigned char* data, unsigned long long length) {
+    return crc64(data, (size_t)length);
+}
+
 void gdx_disk_save_init(const char* diskName, const unsigned char* pristine, unsigned int size) {
     g_active = false;
     g_ranges.clear();
@@ -350,11 +354,9 @@ void gdx_disk_save_init(const char* diskName, const unsigned char* pristine, uns
     g_sidecarPresent = false;
     /* Reset the flush-status latch per boot/disk so a stale FAILED from a prior
      * disk cannot leak into this one. It stays the honest "not failed" state (true)
-     * until a flush is actually attempted. NOTE: the Workshop getter
-     * (gdx_disk_last_flush_ok) is binary and its read-only consumer renders it as
-     * "ok"/"FAILED" (gdx_menu.cpp), so "no flush attempted this boot" cannot be
-     * distinguished from "last flush succeeded" -- both read as "ok". Introducing a
-     * tri-state would require editing that consumer, which this change does not own. */
+     * until a flush is actually attempted. The getter (gdx_disk_last_flush_ok) is
+     * binary, so "no flush attempted this boot" and "last flush succeeded" both read
+     * as "ok" in the Workshop panel. */
     g_lastFlushOk = true;
 
     if (pristine == nullptr || size == 0) {

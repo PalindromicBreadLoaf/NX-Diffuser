@@ -1,4 +1,4 @@
-// port/n64_gfx_convert.cpp -- Phase G2 boundary converters (see header).
+// port/n64_gfx_convert.cpp -- narrow-to-wide display-list boundary converters (see header).
 
 #include "n64_gfx_convert.h"
 
