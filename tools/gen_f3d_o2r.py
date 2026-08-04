@@ -70,6 +70,16 @@ def write_deterministic(z, arc, full):
 
 entries = collect(SRC, "shaders/")
 
+# Port branding: the menu-resolution logo the About page renders via Fast3dGui's
+# LoadTextureFromRawImage. Original artwork by Kiziio (https://github.com/Kiziio1), owned by the
+# project — like the shaders, zero game-derived content, so it belongs in this archive under the
+# same licensing story. The full-resolution original stays in assets/branding for the README; this
+# 1024-wide copy exists so the GPU never holds a 3531px texture for a menu header.
+BRANDING_LOGO = os.path.join(REPO, "assets", "branding", "gdiffuser-logo-menu.png")
+if os.path.isfile(BRANDING_LOGO):
+    entries.append(("branding/gdiffuser-logo.png", BRANDING_LOGO))
+    entries = sorted(entries)
+
 # Optional: absent on a checkout that has never recorded one, which is not an error. The port
 # then behaves exactly as it did before seeds existed — first run compiles, later runs read the
 # sidecar it wrote.

@@ -452,6 +452,9 @@ target_compile_definitions(G-Diffuser PRIVATE ${GDX_DEV_TOOLS_DEFS} ${GDX_JP_INP
 
 if(WIN32)
     set_target_properties(G-Diffuser PROPERTIES WIN32_EXECUTABLE TRUE)
+    # Application icon (desktop/Explorer/taskbar + SDL window class). Windows-only: the .rc format
+    # is a Win32 resource script; Linux desktop entries carry their icon separately.
+    target_sources(G-Diffuser PRIVATE gdiffuser.rc)
     # Graphics wave W4: emit a linker .map so crash RVAs and low32 data
     # addresses in gdiffuser-run.log resolve to symbols without a debugger.
     if(MSVC)
@@ -474,6 +477,7 @@ add_custom_command(
     OUTPUT "${GDIFFUSER_ENGINE_O2R}"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/gen_f3d_o2r.py" "${GDIFFUSER_ENGINE_O2R}"
     DEPENDS "${CMAKE_SOURCE_DIR}/tools/gen_f3d_o2r.py"
+            "${CMAKE_SOURCE_DIR}/assets/branding/gdiffuser-logo-menu.png"
             ${GDIFFUSER_F3D_SHADER_SOURCES}
     COMMENT "Generating engine archive gdiffuser.o2r (Fast3D shaders)"
     VERBATIM)
@@ -948,6 +952,7 @@ if(GDX_BUILD_JP)
 
     if(WIN32)
         set_target_properties(G-Diffuser-JP PROPERTIES WIN32_EXECUTABLE TRUE)
+        target_sources(G-Diffuser-JP PRIVATE gdiffuser.rc)
         if(MSVC)
             target_link_options(G-Diffuser-JP PRIVATE "/MAP")
         endif()

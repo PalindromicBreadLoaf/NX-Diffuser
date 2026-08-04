@@ -49,6 +49,7 @@
 #include "ship/window/gui/Gui.h"    // Ship::Gui::{GetGuiWindow, SaveConsoleVariablesNextFrame}
 #include "ship/window/gui/IconsFontAwesome4.h"
 #include "fast/Fast3dWindow.h"      // Fast::Fast3dWindow::SetTextureFilter + Fast::FilteringMode
+#include "fast/Fast3dGui.h"         // About page: LoadTextureFromRawImage + GetTextureByName (logo)
                                     // (the texture-filter setter is Fast3d-only, not on the base
                                     // Ship::Window, so it needs a downcast — see DrawGraphicsMenu)
 #include "ship/resource/ResourceManager.h"       // Data & Files: ResourceManager::GetArchiveManager
@@ -2278,22 +2279,48 @@ void GdxMenu::DrawDevGates() {
     ImGui::BulletText("GDX_INTERP_P1 / GDX_INTERP_P2 - interpolation test overrides (see Graphics)");
 }
 
+// The port's release version, single source of truth for user-facing surfaces. Bumped by hand at
+// release points — there is deliberately no build-count automation, because a version a human
+// didn't choose is a build id, not a version.
+static constexpr const char* kGdxVersionString = "1.0.0";
+
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-// 9) ABOUT — static text only. No version string exists in the port
-//    today, so we show a fixed pre-alpha label, the EK-required boot notice, and credits.
+// 9) ABOUT — the Kiziio logo (loaded once from gdiffuser.o2r's branding/ entry via Fast3dGui),
+//    the version line, the EK-required boot notice, and credits.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 void GdxMenu::DrawAboutMenu() {
-    ImGui::Text("G-Diffuser (pre-alpha)");
+    // Lazy one-shot load on first open rather than at boot: the About page is visited rarely, and
+    // a failed load (archive predating the branding entry) must degrade to the text title, never
+    // block the menu. tried/loaded are separate so a failure doesn't retry every frame.
+    static bool sLogoTried = false;
+    static bool sLogoLoaded = false;
+    if (!sLogoTried) {
+        sLogoTried = true;
+        auto gui = std::dynamic_pointer_cast<Fast::Fast3dGui>(
+            Ship::Context::GetInstance()->GetWindow()->GetGui());
+        if (gui != nullptr) {
+            gui->LoadTextureFromRawImage("gdx-logo", "branding/gdiffuser-logo.png");
+            sLogoLoaded = gui->GetTextureByName("gdx-logo") != nullptr;
+        }
+    }
+    bool logoDrawn = false;
+    if (sLogoLoaded) {
+        auto gui = std::dynamic_pointer_cast<Fast::Fast3dGui>(
+            Ship::Context::GetInstance()->GetWindow()->GetGui());
+        ImTextureID logo = (gui != nullptr) ? gui->GetTextureByName("gdx-logo") : nullptr;
+        if (logo != nullptr) {
+            // Source is 1024x324; draw at a width that fits the pane, aspect preserved.
+            const float w = std::min(420.0f, ImGui::GetContentRegionAvail().x);
+            const float h = w * (324.0f / 1024.0f);
+            ImGui::Image(logo, ImVec2(w, h));
+            logoDrawn = true;
+        }
+    }
+    if (!logoDrawn) {
+        ImGui::Text("G-Diffuser");
+    }
+    ImGui::Text("Version %s", kGdxVersionString);
     ImGui::TextDisabled("A native PC source port of F-Zero X (N64) + Expansion Kit (64DD)");
-
-    ImGui::Separator();
-
-    // EK-required boot policy (VISION_X_EVOLVED.md F2). The Expansion Kit is REQUIRED; the
-    // supported config is cart ROM + EK disk image. Informational here (by the time the menu is
-    // reachable the ROM has loaded), restating the supported install.
-    ImGui::TextWrapped("Requires the F-Zero X Expansion Kit disk image (.ndd). Supported "
-                       "configuration: cart ROM + EK disk image. Obtaining the images is the "
-                       "user's responsibility.");
 
     ImGui::Separator();
 
@@ -2306,6 +2333,7 @@ void GdxMenu::DrawAboutMenu() {
     ImGui::BulletText("Dear ImGui (Omar Cornut) - MIT");
     ImGui::BulletText("SDL2 (Sam Lantinga) - zlib");
     ImGui::BulletText("Montserrat and Inconsolata fonts - SIL Open Font License 1.1");
+    ImGui::BulletText("Logo & icon artwork - Kiziio (github.com/Kiziio1)");
 
     ImGui::Separator();
     ImGui::TextDisabled("https://github.com/Zorkats/G-Diffuser");

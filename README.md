@@ -1,6 +1,6 @@
 <div align="center">
 
-# G-Diffuser
+<img src="assets/branding/gdiffuser-logo.png" alt="G-Diffuser" width="640">
 
 **A native PC port of F-Zero X (N64), including 64DD Expansion Kit support.**
 
@@ -267,6 +267,7 @@ G-Diffuser stands entirely on the shoulders of the people who did the hard found
 - **[LuigiBlood](https://github.com/LuigiBlood)** — for adapting and improving that translation into the 64DD disk image G-Diffuser loads, and for the extensive 64DD research and preservation work that makes the Course Edit / DD-cup support possible.
 - **[Kenix3](https://github.com/Kenix3) and the [libultraship](https://github.com/Kenix3/libultraship) project** — the runtime and Fast3D renderer G-Diffuser is built on.
 - **The [HarbourMasters](https://github.com/HarbourMasters) community** — [Ship of Harkinian](https://github.com/HarbourMasters/Shipwright) and [Starship](https://github.com/HarbourMasters/Starship) were both the inspiration for this project and the source of much shared technology and know-how.
+- **[Kiziio](https://github.com/Kiziio1)** — for the G-Diffuser logo and icon artwork.
 - **The wider N64 decompilation and modding community** — for the tools, documentation, and years of accumulated knowledge that make projects like this achievable.
 
 ## License and legal
