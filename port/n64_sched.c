@@ -760,10 +760,21 @@ void gdx_transition_step_flush(double thresholdMs) {
 // spun while the VI/RDP advanced in the background (e.g. `while (osViGetCurrentFramebuffer() !=
 // fb) {}`). Re-enqueue self on the run queue and return to the host so it can advance VI state,
 // then we get re-dispatched to re-check the condition.
+/* Count of completed yields. A yield hands control to the HOST fiber, which finishes its frame
+   before re-dispatching us -- so the cost of one yield is NOT fixed: it is however much of the
+   host frame remained when the yield landed, measured anywhere from ~1.5ms to ~15ms. Sampled
+   across the asset decode window in n64_gfx_bridge.cpp, this settled where the Cup Select stall
+   time went: the same twelve decodes that measured 4.5-134ms on the game fiber (yields=2..9 each)
+   complete in 2.2ms TOTAL on the host thread, where yielding is impossible. The time was yield
+   round-trips, not decode work. (An earlier version of this comment claimed a fixed ~16.7ms per
+   yield; the boot-warm A/B disproved that.) Read-only diagnostic; nothing branches on it. */
+unsigned long gdx_yield_count = 0;
+
 void gdx_yield(void) {
     if (__osRunningThread == NULL) {
         return; // host context: nothing to yield
     }
+    ++gdx_yield_count;
     // Re-enqueue as runnable, then return to the HOST loop (NOT __osDispatchThread, which would
     // just re-pick this same highest-priority thread and never let the host advance VI). The host
     // pumps a frame (gdx_vi_tick advances the framebuffer) and re-dispatches us to re-check.

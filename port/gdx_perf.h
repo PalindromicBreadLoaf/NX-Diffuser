@@ -39,8 +39,37 @@ extern "C" {
 
 enum GdxPerfSub {
     GDX_PERF_SUB_XLATE = 0, // DL translation (N64DisplayListAdapter::ConvertRoot in gdx_gfx_run)
-    GDX_PERF_SUB_RUN,       // Fast::Interpreter::Run (the interp->Run call)
+    GDX_PERF_SUB_RUN,       // the whole DrawAndRunGraphicsCommands call, summed over all sub-frames
     GDX_PERF_SUB_MIRROR,    // GdxUpdateFrameMirror (persistent frame-mirror refresh)
+    // Breakdown INSIDE run (Fast3dWindow::DrawAndRunGraphicsCommands). These are nested within RUN,
+    // not additional to it: gui + sframe + irun + eframe ~= run. They exist because "run" alone
+    // could not answer the question that actually decides frame interpolation's fate -- whether a
+    // sub-frame pass is expensive because it re-renders the game, or because it rebuilds the whole
+    // ImGui frame, or because it blocks on the present. Those have completely different fixes, and
+    // with M passes per 60 Hz tick the wrong guess costs a rebuild each time.
+    // NOTE: deliberately placed after MIRROR. The `logic` figure is derived by subtracting
+    // XLATE + RUN + MIRROR by explicit index, so appending here cannot corrupt it.
+    GDX_PERF_SUB_GUI,    // Gui::StartDraw + Gui::EndDraw (a complete ImGui frame, per pass)
+    GDX_PERF_SUB_SFRAME, // Interpreter::StartFrame (framebuffer/aspect setup, per pass)
+    GDX_PERF_SUB_IRUN,   // Interpreter::Run (the display-list re-execution itself, per pass)
+    GDX_PERF_SUB_EFRAME, // Interpreter::EndFrame (SwapBuffers; includes any vsync/latency block)
+    // The WHOLE of gdx_gfx_run, so "logic" stops absorbing bridge work that is not game logic.
+    // logic is derived by subtraction, and only ConvertRoot was timed (as xlate) -- so the texture-
+    // cache drain, wide-cache sweep, RGBA16 range clears, persistent-allocation reset and the
+    // frame-mirror refresh were all being reported as if the decomp were spending that time.
+    // With this seam: bridge overhead = gfxrun - xlate - run, and real decomp logic = gametick -
+    // gfxrun. Nested (it contains xlate and run), so it is excluded from the logic subtraction.
+    GDX_PERF_SUB_GFXRUN,
+    // Halves of the bridge overhead, to locate the 6.27 ms that gfxrun exposed. setup is everything
+    // before translation begins (segment binding, cache sweeps, endianness probe, texture-cache
+    // drain); post is everything after the sub-frame burst (frame flags, RGBA16 range clears,
+    // persistent-allocation reset, mirror, diagnostics). Both nested inside gfxrun.
+    GDX_PERF_SUB_SETUP,
+    GDX_PERF_SUB_POST,
+    // The end-of-task framebuffer mirror loop -- distinct from GDX_PERF_SUB_MIRROR, which times
+    // only GdxUpdateFrameMirror. This loop copies every N64 framebuffer that was targeted as CIMG
+    // anywhere in the task, and was the last untimed block inside POST.
+    GDX_PERF_SUB_FBMIRROR,
     GDX_PERF_SUB_COUNT
 };
 

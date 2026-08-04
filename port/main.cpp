@@ -83,6 +83,8 @@ extern "C" int  gdx_pcm_capture_finished(void);// gdx_audio_capture: 1 once the 
 extern "C" void gdx_pcm_capture_shutdown(void);// gdx_audio_capture: finalize an in-progress capture
 extern "C" int  GdxSegmentSourcePreload(uint32_t romBase);                                  // gdx_segment_source: force-load a blob family
 extern "C" int  GdxSegmentSourcePayload(uint32_t romBase, void** outPayload, uint32_t* outSize); // gdx_segment_source: resident payload getter
+extern "C" void gdx_boot_warm_asset_segments(void); // n64_gfx_bridge: decode expensive asset segments at boot (cache warm)
+extern "C" int  gdx_vi_divider(void);               // n64_vi: live VI retrace divider (1=60Hz, 3=Course Edit cursor ~20Hz)
 
 static void logStep(const char* s) {
     gdx_port_logf("[G-Diffuser] %s\n", s);
@@ -111,12 +113,37 @@ static constexpr double kGdxInterpTickSeconds = 1.001 / 60.0;
 // Target FPS ceiling (480/60 = 8) and a typical 480Hz+ "Match Refresh Rate" panel alike.
 static constexpr int kGdxInterpMaxSubframes = 8;
 
+// MEASURED simulation rate, in ticks per second. Written by the [interp-p2] block in the frame
+// loop; read there and by the FPS overlay.
+//
+// This exists because the sim rate was previously ASSERTED rather than measured, in both the
+// overlay (a hardcoded "(sim 60 Hz)" literal) and the [interp-p2] banner text. The assertion was
+// wrong: one host-loop iteration advances the game exactly one tick, the interpolation burst runs
+// M blocking presents inside that same iteration, and nothing recovers an overrun -- so the sim
+// silently ran as low as 8.6 Hz while every surface in the port still claimed 60. An unmeasured
+// status readout is worse than none, because it argues against the evidence.
+//
+// 0.0 means "not sampled yet"; callers must treat it as unknown rather than as a rate.
+static double gGdxSimHzMeasured = 0.0;
+extern "C" double gdx_host_sim_hz(void) {
+    return gGdxSimHzMeasured;
+}
+
 // Real-FPS visibility getters on the gfx bridge. Declared at file scope so no
 // n64_gfx_bridge.h change is needed — same minimal-include idiom gdx_menu.cpp uses for the existing
 // gdx_gfx_interp_last_* accessors. Used by the [interp-p2] telemetry line in the frame loop.
 extern "C" double gdx_gfx_interp_presents_per_sec(void);
 extern "C" int gdx_gfx_interp_last_lerped(void);
 extern "C" int gdx_gfx_interp_last_snapped(void);
+// Tick-budget reserve exchange with the sub-frame burst — see the block comment on
+// gdx_gfx_interp_set_nonburst_reserve in n64_gfx_bridge.cpp for why the host owns this measurement.
+extern "C" double gdx_gfx_interp_last_burst_seconds(void);
+extern "C" void gdx_gfx_interp_set_nonburst_reserve(double seconds);
+// Tier 2/3 coverage counters (carousel viewports, effects vertices) for the [interp-p2] line.
+extern "C" int gdx_gfx_interp_last_vp_lerped(void);
+extern "C" int gdx_gfx_interp_last_vp_snapped(void);
+extern "C" int gdx_gfx_interp_last_vtx_lerped(void);
+extern "C" int gdx_gfx_interp_last_vtx_snapped(void);
 
 // Monotonic seconds clock the gfx bridge samples to derive each sub-frame's t. Shared epoch so
 // the logic-deadline wait below converts a deadline back to the same time base.
@@ -1200,6 +1227,68 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Venue texture banks: same treatment, same boot window, for the same reason -- but this one
+    // is about frame pacing rather than audio delivery.
+    //
+    // MEASURED: entering Cup Select for the first time loads six venue banks, ONE PER GAME TICK
+    // (course_model.c:35-39 walks cupType*6 + n across consecutive ticks). Each load cost 8.8, 21.9,
+    // 25.3, 25.8, 26.4 and 5.9 ms -- and the whole tick budget is 16.68 ms, so a single load
+    // overruns a tick on its own. The simulation dropped to ~11 Hz for the duration.
+    //
+    // The cost is the LOAD, not what follows it. That was measured rather than assumed: the
+    // [venueload] probe logged translation cost for the eight ticks after each load and it stayed
+    // flat at 0.12-0.16 ms while the conversion epoch climbed 646->652. So the ++gConvertEpoch each
+    // load performs -- the obvious suspect, since it invalidates every cached display-list
+    // conversion -- costs nothing here; Cup Select's own display list is tiny (10 lists, 854
+    // commands). Preloading is therefore the right fix, and scoped epoch invalidation would have
+    // been wasted work.
+    //
+    // Warming here moves the archive read, the payload allocation and the copy to boot, where a few
+    // hundred milliseconds are invisible. The MIO0 decode and the endian fixups still happen lazily
+    // on first use, because those write into per-segment state the game must own.
+    //
+    // Bases are the ROM offsets encoded in the venue symbol names used by
+    // gdx_load_venue_texture_segment (D_A000000_235130 -> 0x235130), confirmed against the
+    // "[segload] MIO0-autodetect seg=10 romBase=00266C20" line for Silence. Absence degrades
+    // silently exactly as the audio blobs do: preload returns 0 and the lazy path still works.
+    {
+        static const uint32_t kVenueBlobBases[11] = {
+            0x00235130u, // Mute City
+            0x00239A80u, // Port Town
+            0x0023EC50u, // Big Blue
+            0x00243D90u, // Sand Ocean
+            0x0024A270u, // Devil's Forest
+            0x002507F0u, // White Land
+            0x00255100u, // Sector
+            0x00259600u, // Red Canyon
+            0x0025F360u, // Fire Field
+            0x00266C20u, // Silence
+            0x0026D780u, // Ending
+        };
+        int warmed = 0;
+        const double venueT0 = gdx_host_now_seconds();
+        for (uint32_t base : kVenueBlobBases) {
+            if (GdxSegmentSourcePreload(base)) {
+                ++warmed;
+            }
+        }
+        gdx_port_logf("[venue-blob] preloaded %d/11 venue texture banks in %.1fms\n", warmed,
+                      (gdx_host_now_seconds() - venueT0) * 1000.0);
+    }
+
+    // Now DECODE the expensive-at-runtime asset segments, not just fetch their compressed blobs.
+    // The preload above made the archive reads free and measurably fixed nothing; the stalls
+    // (133.95ms for course_track_gfx in one hit, 6-26ms per venue bank at first Cup Select entry,
+    // each overrunning the 16.68ms tick that carried it) came from running the load on the GAME
+    // FIBER, where the load path yields back to the host mid-work -- this exact loop completes in
+    // 2.2ms for all 12 segments here on the host thread, so the runtime cost was yield round-trips,
+    // not decode CPU. Decoded images live in a never-evicting cache, so warming here makes every
+    // runtime load a cache hit and removes both the work and the yields from the play path.
+    // The function snapshots and restores gSegments so boot ends with no segment bound that the
+    // game did not bind itself. See its definition in n64_gfx_bridge.cpp for the full evidence
+    // chain and the restore rationale.
+    gdx_boot_warm_asset_segments();
+
     // PCM-parity capture: arm before the audio thread starts producing ticks, so the
     // capture window and its deterministic-RNG gate are live on the first audio tick. No-op unless
     // GDX_PCM_CAPTURE is set — zero behavior change for normal play.
@@ -1243,13 +1332,26 @@ int main(int argc, char** argv) {
         // schedule must be live before any gfx work runs. Inert unless FrameInterpolation / GDX_INTERP_P2.
         // tickStart anchors the wall-clock accumulator; tickDuration is the fixed 60 Hz
         // logic budget — the SIM cadence never changes, only the number of presented sub-frames does.
-        // P3: gate interpolation OFF while an EK editor (Course Edit / Create
-        // Machine) forces the stock 4:3 pillarbox path. gdx_fixed_aspect_tick() above just
-        // published that state; gdx_get_force_fixed_aspect() reads the same interpreter global the
-        // pillarbox path uses. Editors are low-motion and their fresh mRendersToFb/aspect recompute
-        // must not run per sub-frame, so we drop to the single-present default path (M=1). The
-        // decomp_port.c mode-load cut shim snaps the first tick after leaving the editor.
-        const bool interpEditorActive = (gdx_get_force_fixed_aspect() != 0);
+        // P3: gate interpolation OFF only while an EK editor runs on a DIVIDED VI clock
+        // (D_800CCFBC > 1, i.e. Course Edit's ~20 Hz cursor mode). The original gate excluded every
+        // fixed-aspect (editor) tick, citing the per-sub-frame mRendersToFb/aspect recompute -- a
+        // fear that turned out to be obsolete: that recompute already runs M times per tick in
+        // every interpolated mode (each sub-frame pass is a full StartFrame+Run bracket), it is
+        // idempotent intra-tick (no flag writer can run between passes; both backends diff-guard
+        // UpdateFramebufferParameters), and Widescreen=0 users have driven the identical pillarbox
+        // path under interpolation since it shipped. What the blanket gate actually cost was
+        // Course Edit TEST RUNS -- the full race pipeline, pool-routed camera and racer matrices,
+        // a player literally driving at 60 Hz inside a 144 port -- plus Create Machine's rotatable
+        // 3D preview, because gGameMode stays at the editor mode throughout.
+        //
+        // The divider condition keeps cursor mode excluded on purpose, not out of caution: at
+        // ~20 Hz the tween would sweep each 50 ms step inside the first 16.7 ms window and then
+        // hold ("sweep-then-hold"), which looks no better than the clean 20 Hz steps it replaces,
+        // and its content is out-of-pool matrices, CPU-built course vertices and texrects anyway.
+        // Test runs set the divider back to 1 (188850.c) and Create Machine never touches it, so
+        // both interpolate under this gate. Divider flips are covered by cuts on both edges:
+        // Racer_Init on entry, the PORT-gated cut in func_xk2_800EC91C (19DD60.c) on exit.
+        const bool interpEditorActive = (gdx_get_force_fixed_aspect() != 0) && (gdx_vi_divider() > 1);
         const bool interpOn = (gdx_gfx_interp_host_active() != 0) && !interpEditorActive;
         const double interpTickStart = gdx_host_now_seconds();
         // SoH-style Frame Interpolation FPS control (gdx_menu.cpp UI, ~:1290-1380): derive this
@@ -1490,6 +1592,20 @@ int main(int argc, char** argv) {
             // sub-frame loop; this holds the host to the 60 Hz LOGIC deadline so the SIM cadence stays
             // locked at 60 Hz even when presents finished early (VSync-off case). Interpolation and
             // FramePacing are mutually-exclusive pacing owners.
+            // Publish the tick's NON-BURST work to the sub-frame budget guard, measured here
+            // because this is the only scope that can separate work from idle.
+            //
+            // Everything from interpTickStart to this point is real work: game logic before the gfx
+            // submission, the sub-frame burst, and the rest of the game frame after it. Subtracting
+            // the burst leaves exactly what the burst must NOT consume. Sampled BEFORE
+            // gdx_host_pace_logic_until below, so the pacer's sleep is never counted -- measuring
+            // after it would fold idle time into the reserve and drive the burst down to a single
+            // pass, which is precisely the failure recorded in the bridge's block comment.
+            const double interpWorkEnd = gdx_host_now_seconds();
+            const double interpNonBurst =
+                (interpWorkEnd - interpTickStart) - gdx_gfx_interp_last_burst_seconds();
+            gdx_gfx_interp_set_nonburst_reserve(interpNonBurst);
+
             gdx::PerfPhaseBegin(gdx::PerfPacer);
             // Pace the SIM against a RUNNING absolute schedule
             // (advance one tick each iteration), not a fresh interpTickStart+tick each tick. With the
@@ -1529,6 +1645,39 @@ int main(int argc, char** argv) {
                 const size_t tick = sInterpP2Tick++;
                 const int sub = gdx_gfx_interp_last_subframes();
                 sInterpP2SubAccum += (sub > 0) ? static_cast<size_t>(sub) : 0;
+                // sim_hz: the rate the SIMULATION actually advances, measured -- not asserted.
+                //
+                // One host-loop iteration advances the game exactly one tick (the single gdx_vi_tick
+                // call above), so counting iterations against the wall clock IS the sim rate. This
+                // has to be measured because the interpolation burst runs INSIDE that iteration: M
+                // blocking presents per tick means iteration length is set by presentation cost, and
+                // any overrun is time the 60 Hz sim never gets back (there is no catch-up loop).
+                //
+                // The failure this exists to catch obeys sim_hz == presents/s / avg_m, which is why
+                // both terms are on the same line: when that identity holds the sim is being paced by
+                // the present path, and the game runs in slow motion at exactly that ratio. A correct
+                // decoupled loop must BREAK the identity, holding sim_hz at 59.94 while presents/s
+                // moves independently. Measured against a 144 Hz target before this was addressed:
+                // sim_hz median 57.0, mean 52.1, min 8.6 -- i.e. down to 14% game speed.
+                //
+                // Sampled over a short rolling window rather than cumulatively so a dip shows up in
+                // the line that contains it instead of being averaged away over the whole session.
+                // Updated on its own 30-tick cadence, independently of the 120-tick log cadence, so
+                // the FPS overlay has a value that moves while the player watches it.
+                {
+                    static double sSimHzMarkTime = 0.0;
+                    static size_t sSimHzMarkTick = 0;
+                    if ((tick % 30) == 0) {
+                        const double nowSec = gdx_host_now_seconds();
+                        if (sSimHzMarkTime > 0.0 && nowSec > sSimHzMarkTime && tick > sSimHzMarkTick) {
+                            gGdxSimHzMeasured =
+                                static_cast<double>(tick - sSimHzMarkTick) / (nowSec - sSimHzMarkTime);
+                        }
+                        sSimHzMarkTime = nowSec;
+                        sSimHzMarkTick = tick;
+                    }
+                }
+                const double simHz = gGdxSimHzMeasured;
                 if (tick < 8 || (tick % 120) == 0) {
                     const double avg = (tick + 1 > 0)
                                            ? static_cast<double>(sInterpP2SubAccum) / static_cast<double>(tick + 1)
@@ -1543,12 +1692,16 @@ int main(int argc, char** argv) {
                     // gdx_gfx_interp_pair_max_delta in n64_gfx_bridge.h. Sweep the camera and watch
                     // these: a tail that appears only while the view rotates is the defect.
                     gdx_port_logf("[interp-p2] ticks=%zu subframes=%d dropped=%d avg_m=%.2f "
-                                  "t_last=%.3f tasks=%d lerped=%d snapped=%d presents/s=%.1f "
+                                  "sim_hz=%.1f "
+                                  "t_last=%.3f tasks=%d lerped=%d snapped=%d "
+                                  "vp=%d/%d vtx=%d/%d presents/s=%.1f "
                                   "pair_max=%.0f pair_susp=%d/%d idem_div=%d/%d\n",
-                                  tick + 1, sub, gdx_gfx_interp_last_dropped(), avg,
+                                  tick + 1, sub, gdx_gfx_interp_last_dropped(), avg, simHz,
                                   gdx_gfx_interp_last_t(), gdx_gfx_interp_last_tasks(),
                                   gdx_gfx_interp_last_lerped(),
                                   gdx_gfx_interp_last_snapped(),
+                                  gdx_gfx_interp_last_vp_lerped(), gdx_gfx_interp_last_vp_snapped(),
+                                  gdx_gfx_interp_last_vtx_lerped(), gdx_gfx_interp_last_vtx_snapped(),
                                   gdx_gfx_interp_presents_per_sec(),
                                   gdx_gfx_interp_pair_max_delta(), gdx_gfx_interp_pair_suspect(),
                                   gdx_gfx_interp_pair_lerped_total(),

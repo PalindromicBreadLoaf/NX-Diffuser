@@ -154,6 +154,9 @@ extern "C" uint8_t D_30006D0[];
    GDX_DIAG_SETUPDL probe in ProcessList. */
 extern "C" uint8_t D_8014040[];
 extern "C" uint8_t D_8014078[];
+/* course_track_gfx base (segment 8). Referenced by gdx_boot_warm_asset_segments: its MIO0 decode
+   measured 133.95ms in a single hit on the boot path -- the largest asset stall in the port. */
+extern "C" uint8_t D_8000000[];
 extern "C" uint8_t aVpFullScreen[];
 extern "C" uint16_t D_A000000_235130[];
 extern "C" uint16_t D_A000000_239A80[];
@@ -409,6 +412,18 @@ struct ResolvedAddress {
     uint32_t offset = 0;
     bool segmented = false;
 };
+
+// [venueload] Countdown of ticks whose translation cost should be logged after a venue segment
+// load. Set by gdx_load_venue_texture_segment, consumed in gdx_gfx_run. Declared up here because
+// both of those live far below and on opposite sides of the file. Exists to test whether the Cup
+// Select stall is the LOAD itself or the conversion-cache invalidation that follows it -- see the
+// block comment at the [venueload] emit site.
+static int gGdxVenueWatchTicks = 0;
+
+// Scheduler yield counter (n64_sched.c). Each yield returns to the host fiber, which pumps a whole
+// frame before re-dispatching, so one yield inside a load costs a full ~16.7ms tick of wall clock
+// irrespective of the load's own work. Used to tell real decode cost apart from yield latency.
+extern "C" unsigned long gdx_yield_count;
 
 struct ConversionStats {
     std::array<size_t, 256> opCounts{};
@@ -1040,6 +1055,17 @@ uintptr_t EnsureAssetSegmentImage(const AssetSegmentLookup& lookup) {
     // gLoadedAssetSegments hit loop above returns first), so it is one-time-per-
     // family and inherently thread-safe -- no shared static staging buffer to race
     // between the game and graphics threads, both of which reach this function.
+    // [venueload] Entry stamp for the read/decode half. Boot-preloading the archive blob made the
+    // source read free and moved the measured venue-load cost NOT AT ALL, and the fixup/range half
+    // separately measured under 1 ms, so by elimination the expense lives between here and the
+    // fixup timer below. This stamp closes the last gap.
+    const auto gdxDecodeT0 = std::chrono::steady_clock::now();
+    // Sample the scheduler's yield counter across the same window. A yield returns to the host
+    // fiber, which pumps a whole frame before re-dispatching, so each one costs a full ~16.7ms tick
+    // no matter how little work the load is doing. If yields > 0 correlates with the slow loads,
+    // the decode is not expensive and "decode earlier" would be the wrong fix.
+    const unsigned long gdxYieldsBefore = gdx_yield_count;
+
     auto stageAndDecodeMio0 = [&]() -> bool {
         uint32_t span = 0;
         size_t stageSize;
@@ -1129,16 +1155,33 @@ uintptr_t EnsureAssetSegmentImage(const AssetSegmentLookup& lookup) {
         }
     }
 
+    // [venueload] Split the post-read half of the load. Boot-preloading the archive blobs made the
+    // source read free and moved the measured cost NOT AT ALL (venue loads stayed 20-26 ms), so the
+    // expense is somewhere below this line. The two candidates do very different amounts of work
+    // per byte and need different fixes, so time them apart rather than reason about it.
+    const auto gdxFixT0 = std::chrono::steady_clock::now();
+    double gdxFixupMs = 0.0;
+    double gdxRangesMs = 0.0;
     if (!loaded.bytes.empty()) {
         gdx_fixup_asset_segment_image(lookup.segment,
                                       lookup.romBase,
                                       loaded.bytes.data(),
                                       static_cast<unsigned int>(std::min<size_t>(loaded.bytes.size(), UINT32_MAX)));
+        const auto gdxFixT1 = std::chrono::steady_clock::now();
+        gdxFixupMs = std::chrono::duration<double, std::milli>(gdxFixT1 - gdxFixT0).count();
         gdx_register_asset_segment_command_ranges(
             lookup.segment,
             lookup.romBase,
             loaded.bytes.data(),
             static_cast<unsigned int>(std::min<size_t>(loaded.bytes.size(), UINT32_MAX)));
+        gdxRangesMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gdxFixT1).count();
+    }
+    const double gdxDecodeMs = std::chrono::duration<double, std::milli>(gdxFixT0 - gdxDecodeT0).count();
+    if ((gdxDecodeMs + gdxFixupMs + gdxRangesMs) > 1.0) {
+        gdx_port_logf("[venueload] seg=%u bytes=%zu decode=%.2fms yields=%lu fixup=%.2fms ranges=%.2fms "
+                      "hostRanges=%zu\n",
+                      (unsigned) lookup.segment, loaded.bytes.size(), gdxDecodeMs,
+                      gdx_yield_count - gdxYieldsBefore, gdxFixupMs, gdxRangesMs, gHostRanges.size());
     }
 
     const uintptr_t base = reinterpret_cast<uintptr_t>(loaded.bytes.data());
@@ -2767,6 +2810,31 @@ static inline bool GdxP0MtxInPoolSpan(uintptr_t p) {
     return base != 0 && p >= base && p < base + kGdxP0GfxPoolSpanBytes;
 }
 
+// Effects-vertex span test, same ground-truth discipline as the pool span above and for the same
+// reason: offsetof from decomp_port.c (the TU with the real GfxPool type), never the N64
+// struct-comment constant 0x2A308 — the host offset is 0x1A008 higher because sizeof(Gfx) doubles,
+// and the stale constant would aim this test into courseVtxBuffer.
+extern "C" size_t gdx_gfxpool_effects_vtx_offset(void);
+extern "C" size_t gdx_gfxpool_effects_vtx_bytes(void);
+static inline bool GdxEffectsVtxInSpan(uintptr_t p, size_t bytes) {
+    static const size_t kOffset = gdx_gfxpool_effects_vtx_offset();
+    static const size_t kBytes = gdx_gfxpool_effects_vtx_bytes();
+    const uintptr_t base = static_cast<uintptr_t>(gSegments[1]);
+    if (base == 0) {
+        return false;
+    }
+    const uintptr_t lo = base + kOffset;
+    return p >= lo && (p + bytes) <= (lo + kBytes);
+}
+
+// Course-select carousel viewports (course_view.c: Vp D_i5_80118FF0[2][6], first index is the
+// D_800DCCFC parity). Referenced directly — the D_xk3_80138930 extern in gdx_ek_disk_overrides.c
+// is the precedent for naming an overlay symbol from port code; overlays are statically linked.
+// Declared as raw s16 lanes rather than the decomp Vp union so this TU stays free of the decomp
+// include tree; sizeof(Vp)==16 and the layout is vscale[4] then vtrans[4], asserted below.
+extern "C" int16_t D_i5_80118FF0[2][6][8];
+static_assert(sizeof(D_i5_80118FF0) == 2 * 6 * 16, "carousel viewport array shape");
+
 // FNV-1a accumulation over 64-bit command words.
 static inline void GdxP0FnvAccum(uint64_t& h, uint64_t word) {
     h ^= word;
@@ -2952,7 +3020,7 @@ class N64DisplayListAdapter {
     // push_back, so a scratch pointer baked into an earlier command stays valid as more matrices
     // are rerouted. In P0 this records (0, cur, scratch, false) and refill is an identity copy;
     // in P1 it derives the sibling-pool prev pointer and computes the per-slot snap decision.
-    uintptr_t GdxP0RerouteMtx(uintptr_t origPtr) {
+    uintptr_t GdxP0RerouteMtx(uintptr_t origPtr, bool isProj) {
         if (!mInterpEnabled || origPtr == 0 || ReadableByteLimit(origPtr) < 64u) {
             return origPtr; // defensive: leave the pointer untouched, bit-exact stock path
         }
@@ -3011,7 +3079,7 @@ class N64DisplayListAdapter {
             }
         }
 
-        mP0Records.push_back({ origPtr, prevPtr, slot, snap });
+        mP0Records.push_back({ origPtr, prevPtr, slot, snap, isProj });
         return reinterpret_cast<uintptr_t>(slot);
     }
 
@@ -3034,6 +3102,249 @@ class N64DisplayListAdapter {
             }
         }
     }
+
+    // --- Carousel viewport interpolation (Tier 2) -------------------------------------------------
+    //
+    // The course-select carousel slides by rewriting viewport vtrans[0] per tick (course_select.c
+    // Object_LerpPosXToClampedTargetMaxStep, up to 192 vtrans units = 48 screen px per tick) — no
+    // matrix carries this motion, so the pool-matrix lerp cannot smooth it. The viewports live in
+    // D_i5_80118FF0[2][6], parity-indexed by the SAME D_800DCCFC toggle as the GfxPool, so the
+    // previous tick's keyframe already exists at the sibling parity row: no snapshotting needed.
+    //
+    // Deliberately NOT reusing the matrix machinery's parts, per the differences that would corrupt
+    // it: the array is overlay BSS (outside the pool span), the prev keyframe is orig +/- 6*16
+    // bytes (not prevPoolBase + offset), and NoteReferencedOffset's set is keyed on pool offsets a
+    // viewport pointer would collide with. The slot index i is the identity here, and it is
+    // perfectly stable — far stronger than the byte-offset identity the matrices live with.
+    struct alignas(8) GdxVpSlot {
+        int16_t v[8]; // vscale[4], vtrans[4] — layout of the libultra Vp_t, host-native
+    };
+    struct GdxVpRecord {
+        uintptr_t orig;    // &D_i5_80118FF0[parity][i], the game's live viewport for this tick
+        uintptr_t prev;    // sibling parity row, same slot (previous tick's values)
+        GdxVpSlot* scratch;
+        bool snap;
+    };
+    std::deque<GdxVpSlot> mVpScratch; // deque: element addresses must survive later push_backs
+    std::vector<GdxVpRecord> mVpRecords;
+    size_t mVpLerped = 0;
+    size_t mVpSnapped = 0;
+
+    uintptr_t GdxVpReroute(uintptr_t origPtr) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(&D_i5_80118FF0[0][0][0]);
+        if (!mInterpEnabled || origPtr < base || origPtr >= base + sizeof(D_i5_80118FF0) ||
+            ((origPtr - base) % sizeof(GdxVpSlot)) != 0) {
+            return origPtr;
+        }
+        const size_t flat = (origPtr - base) / sizeof(GdxVpSlot); // 0..11
+        const size_t slot = flat % 6;
+        const size_t parity = flat / 6;
+        const uintptr_t prevPtr = base + ((parity ^ 1u) * 6 + slot) * sizeof(GdxVpSlot);
+
+        mVpScratch.emplace_back();
+        GdxVpSlot* scratch = &mVpScratch.back();
+        std::memcpy(scratch, reinterpret_cast<const void*>(origPtr), sizeof(GdxVpSlot));
+
+        // Snap on the whole-frame cut, and on any vtrans[0] delta beyond the game's own per-tick
+        // clamp: legit carousel motion never exceeds 192 units, so anything larger is the
+        // GAMEMODE_FLX_GP_RACE_NEXT_COURSE instant warp or a tick where the writer was skipped and
+        // the sibling row is two ticks stale. One test covers both.
+        bool snap = mForceCutSnap || !mP1Enabled;
+        if (!snap) {
+            const int16_t* cur = reinterpret_cast<const int16_t*>(origPtr);
+            const int16_t* prv = reinterpret_cast<const int16_t*>(prevPtr);
+            const int delta = static_cast<int>(cur[4]) - static_cast<int>(prv[4]); // vtrans[0]
+            if (delta > 192 || delta < -192) {
+                snap = true;
+            }
+        }
+        if (snap) {
+            ++mVpSnapped;
+        } else {
+            ++mVpLerped;
+        }
+        mVpRecords.push_back({ origPtr, prevPtr, scratch, snap });
+        return reinterpret_cast<uintptr_t>(scratch);
+    }
+
+    void GdxVpRefillScratch(float t) {
+        for (const GdxVpRecord& r : mVpRecords) {
+            // t>=1 must be a byte-exact copy (same Correction-1 transparency contract as the
+            // matrices); the lerp rounds to nearest so the carousel cannot bias a sub-pixel toward
+            // the stale keyframe on every pass.
+            if (r.snap || t >= 1.0f) {
+                std::memcpy(r.scratch, reinterpret_cast<const void*>(r.orig), sizeof(GdxVpSlot));
+                continue;
+            }
+            const int16_t* cur = reinterpret_cast<const int16_t*>(r.orig);
+            const int16_t* prv = reinterpret_cast<const int16_t*>(r.prev);
+            for (int i = 0; i < 8; ++i) {
+                const float v = static_cast<float>(prv[i]) +
+                                (static_cast<float>(cur[i]) - static_cast<float>(prv[i])) * t;
+                r.scratch->v[i] = static_cast<int16_t>(std::lround(v));
+            }
+        }
+    }
+
+    // --- Effects vertex interpolation (Tier 3: booster flames / side-attack quads) ----------------
+    //
+    // racer.c computes the flame/effect vertex positions on the CPU per tick from racer->modelMatrix
+    // and bumps them into gGfxPool->effectsVtxBuffer — no gSPMatrix anywhere in that path, so at
+    // sub-frame t the machine body renders at the lerped pose while its flame stays baked at the
+    // tick-end pose: the owner's "afterimage". The pool is double-buffered, so the previous tick's
+    // vertices sit at prevPoolBase + the same offset, and the pool-quiescence proof (see the loop's
+    // parity latch) covers vertex bytes exactly as it covers matrices.
+    //
+    // Identity is the batch's pool byte offset — a MUCH higher-churn keyspace than matrices: a
+    // booster batch flips between 4 and 5 vertices with boost state, and any spawn/despawn shifts
+    // every downstream offset. The per-batch snap guard is load-bearing here, not belt-and-braces:
+    // any single vertex moving more than the teleport threshold snaps its WHOLE batch, so a
+    // mispaired quad cannot shear. Only ob[0..2] is lerped; flag/tc/cn are copied from cur verbatim.
+    // Position lerp also smooths the gGameFrameCount&3 flame size pulse (it feeds ob[] via the
+    // billboard half-extents) — a 15 Hz stair-step becomes a ramp, which is the desired look.
+    struct GdxVtxRecord {
+        uintptr_t orig;
+        uint8_t* scratch; // contiguous batch buffer (count*16 bytes)
+        uint32_t count;
+        bool snap;
+        // Anchor: the owning racer's interpolated motion, captured as the model matrix's
+        // translation at both keyframes. The batch is shifted by the anchor's tween each pass; no
+        // previous-tick vertex bytes are consulted at all.
+        float aPrev[3];
+        float aCur[3];
+    };
+    std::deque<std::vector<uint8_t>> mVtxScratch; // deque of per-batch buffers: stable addresses
+    std::vector<GdxVtxRecord> mVtxRecords;
+    size_t mVtxLerped = 0;
+    size_t mVtxSnapped = 0;
+
+    uintptr_t GdxVtxReroute(uintptr_t origPtr, uint32_t count) {
+        const size_t bytes = static_cast<size_t>(count) * 16u;
+        if (!mInterpEnabled || count == 0 || ReadableByteLimit(origPtr) < bytes) {
+            return origPtr;
+        }
+        mVtxScratch.emplace_back(bytes);
+        uint8_t* scratch = mVtxScratch.back().data();
+        std::memcpy(scratch, reinterpret_cast<const void*>(origPtr), bytes);
+
+        // ANCHORED interpolation, third design for this tier. The first (offset pairing + distance
+        // threshold) never snapped once while the owner saw teleports; the second (tc-lane identity)
+        // died to a subtler fact: stale bump-buffer bytes are STABLE, so the side-attack quads'
+        // unwritten tc lanes matched the sibling pool's identical ancient garbage and kept lerping
+        // into a red vehicle-shaped smear. Byte identity cannot name an effect, and in a bunched
+        // pack no distance threshold separates "same flame, one tick of motion" from "the next
+        // machine's flame" -- both live within tens of units.
+        //
+        // What CAN name an effect is its owner. Every effect in racer.c is computed from its
+        // racer's modelMatrix, and that same matrix (gGfxPool->unk_20308[id], world-space, built at
+        // racer.c:6070) is already rerouted with both keyframes in hand. So: find the nearest
+        // non-projection matrix record to the batch centroid, and each pass shift the whole batch
+        // by that anchor's interpolated translation delta. The flame rides its machine. Previous
+        // vertex bytes are never read, so there is nothing to mispair: the residual cost is only
+        // that per-tick shape animation (the &3 size pulse) renders at the current keyframe -- a
+        // 15 Hz stair, which is stock Issue-G behaviour.
+        //
+        // 3-vertex batches (debris shards, flying sparks) stay permanently snapped: single-tick
+        // particles, and several of them genuinely have no meaningful owner after a crash.
+        bool snap = true;
+        float aPrev[3] = { 0.0f, 0.0f, 0.0f };
+        float aCur[3] = { 0.0f, 0.0f, 0.0f };
+        if (count != 3 && !mForceCutSnap && mP1Enabled && mPrevPoolBase != 0 && mCurPoolBase != 0) {
+            float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+            const int16_t* cur = reinterpret_cast<const int16_t*>(origPtr);
+            for (uint32_t v = 0; v < count; ++v) {
+                const size_t lane = v * 8;
+                cx += cur[lane + 0];
+                cy += cur[lane + 1];
+                cz += cur[lane + 2];
+            }
+            const float inv = 1.0f / static_cast<float>(count);
+            cx *= inv; cy *= inv; cz *= inv;
+
+            // 60 world units: generous for "this machine's own effect" (boosters sit within ~20
+            // units of the model origin), tight enough that a neighbouring machine must be
+            // physically overlapping to steal an anchor -- and if machines overlap, their motions
+            // are near-identical anyway, so a stolen anchor degrades to a correct answer.
+            float bestD2 = 60.0f * 60.0f;
+            const GdxP0Record* best = nullptr;
+            for (const GdxP0Record& m : mP0Records) {
+                if (m.proj || m.snap || m.prev == 0) {
+                    continue;
+                }
+                float mf[4][4];
+                gdx_interp::MtxToF(reinterpret_cast<const void*>(m.orig), mf);
+                const float dx = mf[3][0] - cx;
+                const float dy = mf[3][1] - cy;
+                const float dz = mf[3][2] - cz;
+                const float d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 < bestD2) {
+                    bestD2 = d2;
+                    best = &m;
+                }
+            }
+            if (best != nullptr) {
+                float cf[4][4];
+                float pf[4][4];
+                gdx_interp::MtxToF(reinterpret_cast<const void*>(best->orig), cf);
+                gdx_interp::MtxToF(reinterpret_cast<const void*>(best->prev), pf);
+                for (int i = 0; i < 3; ++i) {
+                    aCur[i] = cf[3][i];
+                    aPrev[i] = pf[3][i];
+                }
+                snap = false;
+            }
+        }
+        if (snap) {
+            ++mVtxSnapped;
+        } else {
+            ++mVtxLerped;
+        }
+        mVtxRecords.push_back({ origPtr, scratch, count, snap,
+                                { aPrev[0], aPrev[1], aPrev[2] },
+                                { aCur[0], aCur[1], aCur[2] } });
+        return reinterpret_cast<uintptr_t>(scratch);
+    }
+
+    void GdxVtxRefillScratch(float t) {
+        for (const GdxVtxRecord& r : mVtxRecords) {
+            const size_t bytes = static_cast<size_t>(r.count) * 16u;
+            if (ReadableByteLimit(r.orig) < bytes) {
+                continue;
+            }
+            // Whole-batch copy keeps flag/tc/cn and the current shape; the anchor shift then moves
+            // the batch back along its owner's motion. At t=1 the shift is exactly zero, so the
+            // copy alone is byte-exact (transparency contract).
+            std::memcpy(r.scratch, reinterpret_cast<const void*>(r.orig), bytes);
+            if (r.snap || t >= 1.0f) {
+                continue;
+            }
+            float shift[3];
+            bool any = false;
+            for (int i = 0; i < 3; ++i) {
+                // lerp(prev,cur,t) - cur == (prev-cur)*(1-t)
+                shift[i] = (r.aPrev[i] - r.aCur[i]) * (1.0f - t);
+                if (shift[i] != 0.0f) {
+                    any = true;
+                }
+            }
+            if (!any) {
+                continue;
+            }
+            int16_t* out = reinterpret_cast<int16_t*>(r.scratch);
+            for (uint32_t v = 0; v < r.count; ++v) {
+                const size_t lane = v * 8;
+                for (int ax = 0; ax < 3; ++ax) {
+                    const float f = static_cast<float>(out[lane + ax]) + shift[ax];
+                    out[lane + ax] = static_cast<int16_t>(std::lround(f));
+                }
+            }
+        }
+    }
+
+    size_t GdxVpLerped() const { return mVpLerped; }
+    size_t GdxVpSnapped() const { return mVpSnapped; }
+    size_t GdxVtxLerped() const { return mVtxLerped; }
+    size_t GdxVtxSnapped() const { return mVtxSnapped; }
 
     // memcmp every scratch vs its origin; at t=1 they must match (Correction-1 transparency proof).
     size_t GdxP0TransparencyViolations() const {
@@ -3130,6 +3441,8 @@ class N64DisplayListAdapter {
         uintptr_t prev;    // sibling(PREVIOUS)-pool matrix host pointer (0 in P0 / snapped slot)
         GdxP0Mtx* scratch; // stable slot the command now points at
         bool snap;         // P1: force t=1 (absent prev keyframe or teleport) for this slot
+        bool proj;         // G_MTX_PROJECTION load: excluded from effect-anchor search (its row 3
+                           // is a view-space term, not a world position)
     };
     std::deque<GdxP0Mtx> mP0Scratch;
     std::vector<GdxP0Record> mP0Records;
@@ -4818,6 +5131,64 @@ class N64DisplayListAdapter {
                                         : reinterpret_cast<uintptr_t>(kFallbackVertices);
                         }
                     }
+                    // Tier 3: effects vertex lerp (booster flames / side-attack quads). Placed
+                    // AFTER the readability failsafe so a kFallbackVertices substitute is never
+                    // rerouted. The count cap at 20 matches racer.c's largest effect batch
+                    // (count*5); course track vertices can legally spill into the effects span in
+                    // the EK layout (course.c:4514's inexplicable bound), and their batches are the
+                    // ones this cap excludes rather than mispairing static geometry.
+                    {
+                        // [vtx-interp] Wider census: the in-pool miss log above caught NOTHING in a
+                        // full race, which contradicts course geometry existing. Log the first few
+                        // vertex operands unconditionally to see what actually flows through here.
+                        // Gated on race-active: the first census burned all its shots on title-
+                        // screen asset geometry (heap-decoded course gfx) before a single racer
+                        // effect could draw.
+                        // Census, final form. Three earlier gatings established: the first 8 vertex
+                        // operands of a session are heap-decoded ASSET geometry (n=30 course
+                        // chunks), in-race operands are the same, and gGdxRaceActive never rises in
+                        // a scripted race. The scripted race also cannot draw the effects this tier
+                        // targets at all -- racer.c's flame block is gated on racer->unk_2B3 and
+                        // scaled by boostTimer, i.e. BOOST flames, and the script never boosts.
+                        // So: log the first few POOL-INTERIOR, effect-sized batches whenever they
+                        // finally occur (a human boosting / side-attacking), which is the activation
+                        // proof for this tier.
+                        static int sGdxVtxAnyLogs = 0;
+                        const uint32_t gdxVtxSeenN = (in.w0 >> 12) & 0xFFu;
+                        if (sGdxVtxAnyLogs < 8 && mInterpEnabled && gdxVtxSeenN != 0 &&
+                            gdxVtxSeenN <= 20u && GdxP0MtxInPoolSpan(outW1)) {
+                            ++sGdxVtxAnyLogs;
+                            gdx_port_logf("[vtx-interp] pool batch: op=%p poolOff=0x%zX n=%u "
+                                          "(effects span 0x%zX..0x%zX)\n",
+                                          reinterpret_cast<void*>(outW1),
+                                          static_cast<size_t>(outW1 - static_cast<uintptr_t>(gSegments[1])),
+                                          gdxVtxSeenN, gdx_gfxpool_effects_vtx_offset(),
+                                          gdx_gfxpool_effects_vtx_offset() + gdx_gfxpool_effects_vtx_bytes());
+                        }
+                    }
+                    if (mInterpEnabled && outW1 != 0 && !isBig && !isF3DSource) {
+                        const uint32_t gdxVtxN = (in.w0 >> 12) & 0xFFu;
+                        if (gdxVtxN != 0 && gdxVtxN <= 20u &&
+                            GdxEffectsVtxInSpan(outW1, static_cast<size_t>(gdxVtxN) * 16u)) {
+                            outW1 = GdxVtxReroute(outW1, gdxVtxN);
+                        } else if (GdxP0MtxInPoolSpan(outW1)) {
+                            // [vtx-interp] Attribution for a silent no-op: a full race measured ZERO
+                            // effects-vertex reroutes while engine flames were visibly drawing, so
+                            // either the operands are not where the span test looks or the count
+                            // gate excludes them. Log the first few POOL-INTERIOR vertex operands
+                            // that fail the effects test, with the numbers needed to say which.
+                            static int sGdxVtxMissLogs = 0;
+                            if (sGdxVtxMissLogs < 6) {
+                                ++sGdxVtxMissLogs;
+                                gdx_port_logf("[vtx-interp] in-pool miss: op=%p poolOff=0x%zX n=%u "
+                                              "(effects span 0x%zX..0x%zX)\n",
+                                              reinterpret_cast<void*>(outW1),
+                                              static_cast<size_t>(outW1 - static_cast<uintptr_t>(gSegments[1])),
+                                              gdxVtxN, gdx_gfxpool_effects_vtx_offset(),
+                                              gdx_gfxpool_effects_vtx_offset() + gdx_gfxpool_effects_vtx_bytes());
+                            }
+                        }
+                    }
                     /* #16 phase 3: publish the resolved host pointer the instant this
                        command's raw low32 matches the digit quad's tagged pointer
                        (set decomp-side in racer.c right before gSPVertex(gfx++,
@@ -5029,7 +5400,7 @@ class N64DisplayListAdapter {
                     if (mInterpEnabled && outW1 != 0 && !isBig &&
                         (((in.w0 & 0x04u) == 0u) || mInterpCamera) &&
                         GdxP0MtxInPoolSpan(outW1)) {
-                        outW1 = GdxP0RerouteMtx(outW1);
+                        outW1 = GdxP0RerouteMtx(outW1, (in.w0 & 0x04u) != 0u);
                     }
                     break;
 
@@ -5039,6 +5410,12 @@ class N64DisplayListAdapter {
                     }
                     if (outW1 != 0) {
                         outW1 = NormalizeLusDirectPointer(outW1);
+                    }
+                    // Tier 2: carousel viewport lerp. Index byte 8 == G_MV_VIEWPORT; GdxVpReroute
+                    // itself rejects any pointer outside D_i5_80118FF0, so every other viewport in
+                    // the game passes through untouched.
+                    if (mInterpEnabled && outW1 != 0 && (in.w0 & 0xFFu) == 8u) {
+                        outW1 = GdxVpReroute(outW1);
                     }
                     break;
 
@@ -7204,32 +7581,112 @@ extern "C" void* gdx_ensure_asset_segment_for_symbol(unsigned int symLow32, unsi
     return reinterpret_cast<void*>(base);
 }
 
-extern "C" int gdx_load_venue_texture_segment(int venue) {
-    static const void* const kVenueSegmentSymbols[] = {
-        D_A000000_235130, // Mute City
-        D_A000000_239A80, // Port Town
-        D_A000000_23EC50, // Big Blue
-        D_A000000_243D90, // Sand Ocean
-        D_A000000_24A270, // Devil's Forest
-        D_A000000_2507F0, // White Land
-        D_A000000_255100, // Sector
-        D_A000000_259600, // Red Canyon
-        D_A000000_25F360, // Fire Field
-        D_A000000_266C20, // Silence
-        D_A000000_26D780, // Ending
+// Venue texture-bank symbols, indexed by venue id. File scope because two callers must agree on
+// this list exactly: the runtime binder below, and gdx_boot_warm_asset_segments, which decodes the
+// same banks at boot so the runtime call is a cache hit. A second copy of this table would be a
+// place for them to silently diverge.
+static const void* const kGdxVenueSegmentSymbols[] = {
+    D_A000000_235130, // Mute City
+    D_A000000_239A80, // Port Town
+    D_A000000_23EC50, // Big Blue
+    D_A000000_243D90, // Sand Ocean
+    D_A000000_24A270, // Devil's Forest
+    D_A000000_2507F0, // White Land
+    D_A000000_255100, // Sector
+    D_A000000_259600, // Red Canyon
+    D_A000000_25F360, // Fire Field
+    D_A000000_266C20, // Silence
+    D_A000000_26D780, // Ending
+};
+
+// Decode the runtime-expensive asset segments at BOOT, so first use during play is a cache hit.
+//
+// WHY: the asset stalls were attributed by measurement, killing four theories in sequence.
+// Preloading the COMPRESSED blobs changed nothing (11/11 warmed in 1.6ms; Cup Select loads
+// unmoved). Fixups and command-range registration measured 0.00-0.01ms. The ++gConvertEpoch
+// cache invalidation measured flat (xlate 0.12-0.16ms for 8 ticks after each load). And the MIO0
+// decode itself -- the last suspect standing, and the one this function was first written to
+// avoid -- turned out to cost 2.2ms for ALL TWELVE segments when run here on the host thread.
+// The runtime figures (133.95ms for course_track_gfx in one hit, 6-26ms per venue bank at first
+// Cup Select entry, each overrunning the 16.68ms tick that carried it) were dominated by
+// gdx_yield ROUND-TRIPS: the load window measured yields=2..9, and per-yield cost varies with
+// where in the host frame the yield lands (seg 8: 9 yields ~= 134ms). Which call inside
+// EnsureAssetSegmentImage yields on the game fiber remains unattributed -- moving the work here
+// makes the question moot, since the host context cannot yield at all.
+// Decoded images live in gLoadedAssetSegments, which NEVER evicts, so warming here removes those
+// stalls for the whole session.
+//
+// WHY THE SNAPSHOT/RESTORE: EnsureAssetSegmentImage claims gSegments[seg] when the slot is still 0.
+// Left alone, this loop would boot the game with segment 0x0A bound to whichever venue decoded
+// last -- a binding the game never asked for. Restoring the snapshot returns every slot to its
+// pre-warm state; the claim is re-applied harmlessly by the first runtime cache hit (the hit path
+// has the same ==0 claim), and the venue binder above re-asserts 0x0A unconditionally anyway.
+// The gConvertEpoch bumps this loop causes are left alone: nothing is converted yet at boot, so
+// there is nothing to invalidate.
+//
+// CALLED: from main.cpp, after gdx_rdram_init and the blob preloads, BEFORE bootproc -- host
+// thread only, no fibers running, so none of the seqlock/threading constraints in this file apply
+// yet. gdx_yield inside the load path is a no-op in host context (__osRunningThread == NULL).
+extern "C" void gdx_boot_warm_asset_segments(void) {
+    const void* const kWarmSymbols[] = {
+        D_8000000, // course_track_gfx (seg 8): the 133.95ms single hit
+        kGdxVenueSegmentSymbols[0], kGdxVenueSegmentSymbols[1], kGdxVenueSegmentSymbols[2],
+        kGdxVenueSegmentSymbols[3], kGdxVenueSegmentSymbols[4], kGdxVenueSegmentSymbols[5],
+        kGdxVenueSegmentSymbols[6], kGdxVenueSegmentSymbols[7], kGdxVenueSegmentSymbols[8],
+        kGdxVenueSegmentSymbols[9], kGdxVenueSegmentSymbols[10],
     };
 
-    if (venue < 0 || static_cast<size_t>(venue) >= std::size(kVenueSegmentSymbols)) {
+    unsigned long long savedSegments[16];
+    static_assert(sizeof(savedSegments) == sizeof(gSegments), "gSegments snapshot size");
+    std::memcpy(savedSegments, gSegments, sizeof(savedSegments));
+
+    const auto warmT0 = std::chrono::steady_clock::now();
+    int warmed = 0;
+    for (const void* sym : kWarmSymbols) {
+        uint32_t offset = 0;
+        if (EnsureAssetSegmentForSymbol(Low32(reinterpret_cast<uintptr_t>(sym)), &offset) != 0) {
+            ++warmed;
+        }
+    }
+
+    std::memcpy(gSegments, savedSegments, sizeof(savedSegments));
+
+    gdx_port_logf("[boot-warm] decoded %d/%zu asset segments in %.1fms (segments table restored)\n",
+                  warmed, std::size(kWarmSymbols),
+                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - warmT0).count());
+}
+
+extern "C" int gdx_load_venue_texture_segment(int venue) {
+    if (venue < 0 || static_cast<size_t>(venue) >= std::size(kGdxVenueSegmentSymbols)) {
         gdx_port_logf("[segment] invalid venue texture segment %d\n", venue);
         return 0;
     }
 
-    const uint32_t symbol = Low32(reinterpret_cast<uintptr_t>(kVenueSegmentSymbols[venue]));
+    const uint32_t symbol = Low32(reinterpret_cast<uintptr_t>(kGdxVenueSegmentSymbols[venue]));
     uint32_t offset = 0;
+    // [venueload] Attribute the Cup Select stall. This path is invisible to the existing
+    // [transition] timers, which only bracket mode-change ticks -- and Cup Select's course preview
+    // loading is NOT a mode change. It runs one course per game tick from
+    // course_model.c:35-39, so the ~350ms the owner sees is really ~6 consecutive ticks.
+    //
+    // Two candidate causes, and they need opposite fixes, which is why this measures rather than
+    // assumes: either the LOAD itself is expensive (archive read + MIO0 decode + fixups), in which
+    // case preloading the blobs at boot removes it; or the load is cheap and the cost is the
+    // ++gConvertEpoch below invalidating every cached display-list conversion, in which case
+    // preloading changes NOTHING and the fix is scoped epoch invalidation. The epoch counter is
+    // logged alongside so the following ticks' xlate can be correlated.
+    const double gdxVenueT0 = (gGdxInterpNowFn != nullptr) ? gGdxInterpNowFn() : 0.0;
+    const uint32_t gdxEpochBefore = gConvertEpoch;
     const uintptr_t base = EnsureAssetSegmentForSymbol(symbol, &offset);
     if (base == 0) {
         gdx_port_logf("[segment] failed to load venue=%d symbol=%08X\n", venue, symbol);
         return 0;
+    }
+    if (gGdxInterpNowFn != nullptr) {
+        gdx_port_logf("[venueload] venue=%d symbol=%08X load=%.2fms epoch %u->%u\n", venue, symbol,
+                      (gGdxInterpNowFn() - gdxVenueT0) * 1000.0, (unsigned) gdxEpochBefore,
+                      (unsigned) gConvertEpoch);
+        gGdxVenueWatchTicks = 8; // log the next 8 ticks' translation cost (see gdx_gfx_run)
     }
 
     // Force segment 0x0A to point at the (decompressed) venue texture image.
@@ -7440,6 +7897,37 @@ extern "C" double gdx_gfx_interp_last_t(void) {
 extern "C" double gdx_gfx_interp_presents_per_sec(void) {
     return gGdxInterpPresentsPerSec;
 }
+
+/* Tick-budget reserve exchange between the host loop and the sub-frame burst.
+ *
+ * The burst does NOT own the whole 60 Hz tick: only ~0.8 ms of the game frame runs before the gfx
+ * task is submitted, and the game continues after osSpTaskStartGo, so several more milliseconds of
+ * game work happen AFTER the burst returns -- inside the same tick. A budget guard that ignores
+ * that tail hands the loop a 15.9 ms slot that is really ~9.8 ms, and consequently never fires.
+ *
+ * The reserve must be measured as WORK, never as elapsed wall-clock: deriving it from the interval
+ * between bursts silently includes the logic pacer's sleep, which makes the estimate self-
+ * reinforcing (healthy sim -> pacer sleeps -> reserve grows -> passes dropped -> more sleep). That
+ * version converged on one pass per tick and pinned presents at 59.9/s. Only the host loop can
+ * bracket real work, so it owns the arithmetic and publishes the answer here. */
+static double gGdxInterpLastBurstSec = 0.0;
+static double gGdxInterpNonBurstReserve = 0.008; // seeded near the observed tail; host refines it
+
+extern "C" double gdx_gfx_interp_last_burst_seconds(void) {
+    return gGdxInterpLastBurstSec;
+}
+
+extern "C" void gdx_gfx_interp_set_nonburst_reserve(double seconds) {
+    // Clamp rather than trust: a mode change or breakpoint can make one tick arbitrarily long, and
+    // a poisoned reserve would suppress every burst until it decayed back out.
+    if (seconds > 0.0 && seconds < 0.100) {
+        gGdxInterpNonBurstReserve = seconds;
+    }
+}
+
+static double gdx_gfx_interp_nonburst_reserve(void) {
+    return gGdxInterpNonBurstReserve;
+}
 /* [interp-pair] Pairing-quality readout. Largest prev->cur translation delta among slots that
    actually PAIRED this tick, and how many of those exceeded a plausible per-tick motion. See
    gdx_interp.h TranslationDelta: byte-offset slot identity can pair two different objects when the
@@ -7479,6 +7967,29 @@ extern "C" int gdx_gfx_interp_last_dropped(void) {
     return gGdxInterpLastDropped;
 }
 
+// Tier 2/3 coverage counters: viewport and effects-vertex batches classified this tick. Read by
+// main.cpp's [interp-p2] line. The lerped/snapped split is the acceptance instrument for the
+// effects-vertex work in particular: its byte-offset identity churns far harder than the matrices'
+// (batch sizes flip 4<->5 with boost state, spawns shift every downstream offset), and a snapped
+// batch renders exactly like the pre-Tier-3 build — so a high snap ratio means "shipped but inert",
+// which must be visible in one glance at the log, not discovered by eyeballing flames.
+static size_t gGdxInterpLastVpLerped = 0;
+static size_t gGdxInterpLastVpSnapped = 0;
+static size_t gGdxInterpLastVtxLerped = 0;
+static size_t gGdxInterpLastVtxSnapped = 0;
+extern "C" int gdx_gfx_interp_last_vp_lerped(void) {
+    return static_cast<int>(gGdxInterpLastVpLerped);
+}
+extern "C" int gdx_gfx_interp_last_vp_snapped(void) {
+    return static_cast<int>(gGdxInterpLastVpSnapped);
+}
+extern "C" int gdx_gfx_interp_last_vtx_lerped(void) {
+    return static_cast<int>(gGdxInterpLastVtxLerped);
+}
+extern "C" int gdx_gfx_interp_last_vtx_snapped(void) {
+    return static_cast<int>(gGdxInterpLastVtxSnapped);
+}
+
 // P4 determinism gate: per-tick logic-state fingerprint. Called ONCE per rendered tick from
 // gdx_gfx_run, on BOTH the interpolation-ON and interpolation-OFF paths (gdx_gfx_run is reached
 // identically either way, and the tick counter advances only on ticks that produce a gfx task --
@@ -7515,6 +8026,31 @@ static void GdxInterpDeterminismTick() {
 }
 
 extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
+    // Time the WHOLE bridge call, so the perf summary's "logic" figure stops absorbing work that
+    // is not game logic. logic is derived as gametick - (xlate + run + mirror), and only ConvertRoot
+    // was ever timed, so every other thing this function does was being reported as decomp time.
+    //
+    // Scope guard rather than a begin/end pair: this function has several early returns (no window,
+    // no interpreter, bad display list), and a leaked open timer would silently corrupt every
+    // subsequent sample rather than fail loudly.
+    // The POST half is opened after the sub-frame burst, but this function has several exits after
+    // that point, so the guard closes it on whichever one is taken rather than requiring every
+    // return site to remember.
+    bool gdxPostTimerOpen = false;
+    struct GdxGfxRunTimer {
+        bool* postOpen;
+        explicit GdxGfxRunTimer(bool* p) : postOpen(p) {
+            gdx_perf_sub_begin(GDX_PERF_SUB_GFXRUN);
+        }
+        ~GdxGfxRunTimer() {
+            if (*postOpen) {
+                gdx_perf_sub_end(GDX_PERF_SUB_POST);
+            }
+            gdx_perf_sub_end(GDX_PERF_SUB_GFXRUN);
+        }
+    } gdxGfxRunTimer(&gdxPostTimerOpen);
+    gdx_perf_sub_begin(GDX_PERF_SUB_SETUP);
+
     // The Fast3dWindow is created once at startup and lives for the whole
     // program. Fetch it once and cache the raw pointer instead of copying the
     // Context's window shared_ptr every frame: that per-frame refcount touch
@@ -7656,6 +8192,8 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
 #ifdef _WIN32
     ResetWindowsMemoryRegionCache();
 #endif
+    gdx_perf_sub_end(GDX_PERF_SUB_SETUP);
+    const double gdxXlateT0 = (gGdxVenueWatchTicks > 0 && gGdxInterpNowFn != nullptr) ? gGdxInterpNowFn() : 0.0;
     gdx_perf_sub_begin(GDX_PERF_SUB_XLATE);
     ConversionStats stats = {};
     N64DisplayListAdapter adapter(dl, dl_size, isBigEndian, &stats);
@@ -7670,6 +8208,16 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
     // Placed on the common path so it runs identically whether interpolation is ON or OFF this tick.
     GdxInterpDeterminismTick();
     gdx_perf_sub_end(GDX_PERF_SUB_XLATE);
+    // [venueload] The discriminating measurement. If translation stays flat across these ticks the
+    // cost is the load itself and a boot-time preload fixes it. If it spikes, the ++gConvertEpoch
+    // in the load path invalidated every cached conversion and we are paying full re-translation
+    // for several consecutive ticks -- which no amount of preloading would avoid.
+    if (gGdxVenueWatchTicks > 0 && gGdxInterpNowFn != nullptr) {
+        --gGdxVenueWatchTicks;
+        gdx_port_logf("[venueload] post tick=%d xlate=%.2fms lists=%zu cmds_out=%zu epoch=%u\n",
+                      8 - gGdxVenueWatchTicks, (gGdxInterpNowFn() - gdxXlateT0) * 1000.0,
+                      stats.convertedLists, stats.commandsOut, (unsigned) gConvertEpoch);
+    }
     if (converted == nullptr) return;
 
     static bool sBridgeInitDiag = false;
@@ -7876,7 +8424,10 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
         // transition-capture contract (GdxTransitionCapturePendingThisTick block above: the mirror
         // must sample the un-interpolated tick) is preserved exactly.
         const bool degenerate = (lerpSlots == 0) || (adapter.GdxP1Lerped() == 0);
-        const int passes = count;
+        // Mutable: the budget pre-sizer below may shrink this BEFORE the loop, so the t denominator
+        // shrinks with it and the last presented pose stays t=1. See the pre-sizer comment.
+        int passes = count;
+        const int gdxPlannedPasses = count;
 
         // [interp-pace] probe: when each pass was ATTEMPTED and whether the limiter took it. Kept
         // after the pacing experiment it was built to test (see the note in the loop) because it
@@ -7904,6 +8455,159 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
             return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
         }();
         gdx_fast3d_set_subframe_present(sHonourLimiter ? 0 : 1);
+
+        // Budget guard for the loop below. Declared out here, not in the loop body, so its
+        // thread-safe-static guard variable is not re-checked on every pass.
+        //
+        // WHY THIS EXISTS. Bypassing the software limiter above removed the only mechanism in the
+        // system that could shed load: IsFrameReady used to return false and skip a present cheaply
+        // when the schedule was behind. Nothing replaced it, so the tick had to pay for all M
+        // presents no matter how long they took. That is not merely a frame-rate problem, because
+        // gdx_vi_tick advances the simulation exactly ONCE per host-loop iteration and there is no
+        // catch-up anywhere: every millisecond this loop overruns is a millisecond the 60 Hz sim
+        // never gets back. Measured consequence before this guard, at a 144 Hz target: sim rate
+        // median 57 Hz, mean 52 Hz, worst 8.6 Hz -- the game visibly in slow motion, the
+        // machine-select model spinning slow and the 3-2-1-GO countdown stretching in real seconds.
+        //
+        // THE TRADE, stated plainly: when the tick budget is gone, drop the remaining sub-frames.
+        // A frame-rate dip is a smoothness cost; a slow game clock is a correctness fault. Smoothness
+        // is the thing that yields.
+        //
+        // THE GUARD MUST PREDICT, NOT REACT. A first attempt asked "is the tick budget already
+        // spent?" before each pass, and it NEVER FIRED ONCE across 76 measured samples while ticks
+        // were overrunning by 7ms -- because the overrun happens DURING the pass that follows the
+        // check, not before it. With three ~5ms passes in a 16.68ms tick, the check at pass 2 sees
+        // ~14ms elapsed, waves it through, and the pass ends at ~21ms. Reacting to an overrun that
+        // has already happened is worthless; the pass has to be refused before it starts.
+        //
+        // So the test is "will this pass FIT?", using a measured cost rather than a guessed one:
+        // an exponential moving average of how long a pass has actually been taking. An EMA rather
+        // than the last sample because a single expensive pass (a shader compile, a texture upload)
+        // must not collapse the burst for the next tick, and rather than a fixed constant because
+        // per-pass cost varies by an order of magnitude between a menu and a 30-machine race.
+        //
+        // GDX_NO_INTERP_BUDGET=1 disables the guard for A/B without a rebuild. A suppressed guard
+        // must reproduce the slow sim to earn the claim that it is what fixed it.
+        static const bool sNoBudgetGuard = [] {
+            const char* e = getenv("GDX_NO_INTERP_BUDGET");
+            return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
+        }();
+        // PASS 0 AND THE REPLAYS ARE NOT THE SAME PRICE, and averaging them together is what kept
+        // this guard over-conservative. Pass 0 pays for the tick's real rendering work -- texture
+        // uploads, shader binds, cold caches -- while passes 1..M-1 re-execute the same command
+        // buffer with everything already resident. Measured: ticks running 1.83 passes averaged
+        // 2.98 ms/pass, while ticks running 1.02 passes averaged 6.20 ms/pass. Cost per pass
+        // appeared to DOUBLE as passes were removed, which is only possible if the first one carries
+        // most of the cost.
+        //
+        // The guard only ever decides about passes k >= 1, so it must price a REPLAY, not a blended
+        // average that is dominated by a pass it has already committed to. Blending made a replay
+        // look several times more expensive than it is and refused passes the tick could easily
+        // afford -- visible as 3.6 ms of idle sitting unused every tick.
+        //
+        // THE REPLAY SEED MUST BE OPTIMISTIC, and this is not a tuning preference -- a pessimistic
+        // seed deadlocks. The replay estimate is only ever updated by a replay that actually ran, so
+        // seeding it high makes the guard refuse every replay, which means no samples arrive, which
+        // means the seed never moves. Seeded at 7 ms it pinned the burst to ~1.1 passes while 3.9 ms
+        // of every tick sat idle, and no amount of running longer would have recovered it.
+        //
+        // Seeded low the loop self-corrects in the safe direction: it attempts a replay, measures
+        // what it really cost, and the average climbs within a few ticks if replays are expensive.
+        // The downside is bounded -- at worst a handful of early ticks overrun slightly -- whereas
+        // the pessimistic failure is permanent and silent.
+        //
+        // Pass 0 keeps the realistic seed: it is never refused, so its estimate cannot deadlock, and
+        // it is tracked separately only because blending it into the replay price is what made
+        // replays look several times more expensive than they are.
+        static double gdxPass0CostEma = 0.007;
+        static double gdxReplayCostEma = 0.0005;
+        // THE BURST DOES NOT OWN THE WHOLE TICK, and assuming it did is why the first two versions of
+        // this guard never fired. Only ~0.8ms of the game frame runs BEFORE the gfx task is
+        // submitted; the game continues after osSpTaskStartGo, so roughly 6ms of game work still has
+        // to happen AFTER this loop returns, inside the same 16.68ms tick. Measured: window reads
+        // ~15.9ms of budget remaining while the tick actually ends up 19.5ms long.
+        //
+        // So reserve that tail. Rather than hardcode it -- it differs by scene, and a wrong constant
+        // silently mis-sizes every burst -- measure it: the interval between consecutive entries to
+        // this loop is one whole tick, and this loop's own duration is known, so the difference is
+        // everything else the tick does. An EMA of that is the reservation.
+        // The reserve must measure WORK, not elapsed time, and only the host loop can tell the
+        // difference. A first version derived it here, as (interval between loop entries) minus
+        // (this loop's duration) -- which silently included the logic pacer's SLEEP. That built a
+        // feedback loop that ate itself: a healthy sim means the pacer sleeps, sleep inflates the
+        // reserve, a bigger reserve drops more passes, fewer passes means more sleep. It converged
+        // on exactly one pass per tick, pinning presents at 59.9/s -- a perfect 60 Hz sim with
+        // interpolation contributing nothing, which is not the trade anyone asked for.
+        //
+        // So main.cpp publishes it instead: it brackets the tick's real work (tick start to the
+        // moment before gdx_host_pace_logic_until) and subtracts the burst, so idle time never
+        // enters. See gdx_gfx_interp_set_nonburst_reserve there.
+        // Reserve only the TAIL, not all non-burst work. The published figure covers everything in
+        // the tick that is not the burst, which includes the ~0.8 ms of game frame that ran BEFORE
+        // this loop was entered. That part is already spent and already reflected in the clock the
+        // guard compares against, so counting it again shrinks the budget twice and costs a whole
+        // pass: measured 3.6 ms of idle per tick sitting unused while the guard refused a 3.0 ms
+        // pass. Subtract the pre-burst offset so the reservation describes only what still has to
+        // happen after this loop returns.
+        const double gdxPreBurst = (gGdxInterpHostCfg.tickStart > 0.0 && gdxLoopStart > gGdxInterpHostCfg.tickStart)
+                                       ? (gdxLoopStart - gGdxInterpHostCfg.tickStart)
+                                       : 0.0;
+        double gdxReserve = gdx_gfx_interp_nonburst_reserve() - gdxPreBurst;
+        if (gdxReserve < 0.0) {
+            gdxReserve = 0.0;
+        }
+        // Never reserve so much that pass 0 is all the tick can ever afford -- at that point the
+        // guard would be permanently disabling interpolation rather than protecting it. Half the
+        // tick is the floor; beyond that the honest answer is that the machine cannot run this
+        // target, which the frame rate itself will report.
+        if (gGdxInterpHostCfg.tickDuration > 0.0 && gdxReserve > gGdxInterpHostCfg.tickDuration * 0.5) {
+            gdxReserve = gGdxInterpHostCfg.tickDuration * 0.5;
+        }
+        const double gdxBudgetEnd =
+            (gGdxInterpHostCfg.tickDuration > 0.0)
+                ? (gGdxInterpHostCfg.tickStart + gGdxInterpHostCfg.tickDuration - gdxReserve)
+                : 0.0;
+        int budgetDropped = 0;
+
+        // PRE-SIZE THE BURST instead of only clipping it mid-loop. The mid-loop guard decides after
+        // the t values are already fixed at (k+1)/passes, so clipping the third pass of a 3-pass
+        // tick presents t=1/3 and t=2/3 and NEVER PRESENTS t=1 -- the motion stream skips the
+        // tick's newest pose and takes a double-width step into the next tick (0.33, 0.67, then
+        // 1.33): a judder spike riding exactly on the ticks that were already struggling. Owner-
+        // visible as the "caps at 120" feel: the cadence plateau is expected quantization (all-2s
+        // x 60 Hz = 120), but the skipped terminal pose made it jarring rather than merely lower.
+        //
+        // Predicting the affordable pass count BEFORE the loop lets the t denominator shrink with
+        // it: a tick sized to 2 passes presents t=1/2 and t=1 -- evenly spaced, terminal pose
+        // correct, no skip. The mid-loop guard stays as the backstop for mispredictions (a pass
+        // that runs far over its estimate can still push the budget past the wall).
+        //
+        // Affordability arithmetic: pass 0 always runs (this loop owns presentation; see the
+        // guard's pass-0 rule), so the question is how many REPLAYS fit after it.
+        if (!sNoBudgetGuard && gdxBudgetEnd > 0.0 && gdxLoopStart > 0.0 && passes > 1 &&
+            gdxReplayCostEma > 0.0) {
+            const double room = gdxBudgetEnd - gdxLoopStart - gdxPass0CostEma;
+            int affordable = 1;
+            if (room > 0.0) {
+                const double replays = room / gdxReplayCostEma;
+                // Cap the intermediate before the int conversion: with the optimistic replay seed
+                // (0.0005s) `replays` can be in the tens of thousands, which is UB territory for a
+                // float->int cast only above INT_MAX, but clamping first costs nothing and reads
+                // as intent rather than luck.
+                affordable = 1 + static_cast<int>(std::min(replays, 64.0));
+            }
+            if (affordable < passes) {
+                budgetDropped += passes - affordable;
+                passes = affordable;
+                // DECAY ON SHRINK — the same one-sided-estimator lesson as the in-loop guard, which
+                // this pre-sizer initially failed to inherit and promptly re-proved: a spike
+                // inflated gdxReplayCostEma, the pre-sizer clamped every burst to 1 pass, no replay
+                // ever ran again to supply a cheaper sample, and presents pinned at 60/s for an
+                // entire session (passes=1 planned=3 on every pace line). Any estimator that gates
+                // the only activity that can update it MUST decay when it says no.
+                gdxReplayCostEma *= 0.94;
+            }
+        }
 
         int presented = 0;
         float lastT = 1.0f;
@@ -7937,7 +8641,9 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
         // rendering when the frame is dropped (Fast3dWindow.cpp: the IsFrameReady guard); counting
         // those as delivered made presents/s an upper bound and produced readings ABOVE the target
         // (a 153.5 sample against a 144 Hz target), which is what hid the real menu cost.
-        int dropped = 0;
+        // Seeded with the pre-sizer's drops so presented+dropped always sums to the PLANNED count:
+        // a pass shed before the loop and a pass refused inside it are the same fact to telemetry.
+        int dropped = budgetDropped;
         if (passes > 1) {
             ++gGdxIdemMultiPassTicks; // denominator for the divergence ratio
         }
@@ -7951,8 +8657,42 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
             // construction: window/passes yields 7.93ms gaps inside the tick and 8.75ms across the
             // tick boundary, averaging ~120 fps. Do not re-attempt without first explaining why
             // whole ticks are refused.
-            if (k < 8 && gGdxInterpNowFn != nullptr) {
-                gdxAttemptAt[k] = gGdxInterpNowFn();
+            // Budget guard. See the block comment on sNoBudgetGuard above the loop for why dropping
+            // sub-frames is the correct response and a slow simulation is not.
+            //
+            // Pass 0 is never dropped: this loop owns presentation for the whole tick
+            // (gGdxInterpPresentedLastTick tells the host not to present again), so skipping every
+            // pass would leave the previous frame on screen and turn a rate dip into a freeze. One
+            // present per tick is the floor, which is exactly the non-interpolated behaviour.
+            //
+            // Checked BEFORE the work rather than after, because the point is to not start a pass
+            // that cannot finish inside the tick. The remaining passes are counted as dropped so the
+            // telemetry stays honest -- presents/s must not be flattered by frames we chose to skip.
+            if (k > 0 && !sNoBudgetGuard && gdxBudgetEnd > 0.0 && gGdxInterpNowFn != nullptr) {
+                const double nowSec = gGdxInterpNowFn();
+                if (nowSec + gdxReplayCostEma > gdxBudgetEnd) {
+                    budgetDropped = passes - k;
+                    dropped += budgetDropped;
+                    // DECAY ON REFUSAL, or this estimator can never recover. It is one-sided: the
+                    // only thing that updates it is a replay that was allowed to run, so any upward
+                    // excursion is self-locking. Replays are genuinely expensive during boot and
+                    // load, the average climbs, and from then on every replay is refused -- which
+                    // means no cheap sample can ever arrive to bring it back down. Observed exactly
+                    // that: presents pinned at 59.8/s with 3 ms of every tick idle, while the
+                    // accumulator was still asking for 2-3 passes.
+                    //
+                    // Shrinking the estimate each time it causes a refusal makes the guard probe
+                    // again after a few ticks. If replays really are expensive the next sample puts
+                    // the average straight back up; if the scene got cheaper it settles at the new
+                    // cost. The sim stays protected either way, because a probe can overrun by at
+                    // most one replay.
+                    gdxReplayCostEma *= 0.94;
+                    break;
+                }
+            }
+            const double gdxPassStart = (gGdxInterpNowFn != nullptr) ? gGdxInterpNowFn() : 0.0;
+            if (k < 8) {
+                gdxAttemptAt[k] = gdxPassStart;
             }
             // Deterministic even spacing: t = (k+1)/passes. Last pass = 1.0 (newest pose, exact).
             // GDX_INTERP_FORCE_T1: diagnostic only. Pins every sub-frame to t=1 so all M passes get
@@ -7964,7 +8704,16 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
             // this is set, which is expected; it is a measurement mode, not a play mode.
             static const bool sForceT1 = [] {
                 const char* e = getenv("GDX_INTERP_FORCE_T1");
-                return e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;
+                const bool on = e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;
+                // Announced unconditionally, once, because an A/B whose arm state is not in the log
+                // is not an experiment. A FORCE_T1 play-test was run to falsify the booster
+                // afterimage mechanism and the log carried NO evidence the pin was live -- lerped=
+                // stays nonzero either way (it counts classification in ConvertRoot, not refills),
+                // and t_last reads 1.000 either way. The result was uninterpretable and the run
+                // wasted. Every A/B toggle must write its state to the log at arm time.
+                gdx_port_logf("[interp] GDX_INTERP_FORCE_T1=%s (sub-frame t %s)\n", on ? "1" : "unset/0",
+                              on ? "PINNED to 1.0 -- measurement mode, 60Hz motion expected" : "normal");
+                return on;
             }();
             float t = (degenerate || sForceT1) ? 1.0f
                                                : (static_cast<float>(k + 1) / static_cast<float>(passes));
@@ -7972,6 +8721,8 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
                 t = 1.0f;
             }
             adapter.GdxP0RefillScratch(t); // lerp(prev,cur,t) into every non-snapped scratch slot
+            adapter.GdxVpRefillScratch(t);  // Tier 2: carousel viewports, same t
+            adapter.GdxVtxRefillScratch(t); // Tier 3: effects vertices, same t
             // Re-arm the task's entry ucode variant. Replaying a display list must start from the
             // same RSP state pass 0 started from; a mid-list variant switch leaks forward otherwise.
             // See gdxTaskVariant above for the measurement this fixes.
@@ -8124,30 +8875,69 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
             if (k < 8) {
                 gdxAttemptOk[k] = delivered;
             }
+            // Feed the budget guard's cost estimate. Only DELIVERED passes count: a pass the limiter
+            // refused returns without rendering, so timing it would drag the average toward zero and
+            // the guard would then wave through passes that cannot possibly fit.
+            //
+            // 1/8 smoothing -- fast enough to follow a scene change within a few ticks, slow enough
+            // that one shader-compile stall does not suppress the next tick's whole burst.
+            if (delivered && gdxPassStart > 0.0 && gGdxInterpNowFn != nullptr) {
+                const double cost = gGdxInterpNowFn() - gdxPassStart;
+                if (cost > 0.0 && cost < 0.5) { // ignore absurd samples (breakpoint, alt-tab, resize)
+                    double& ema = (k == 0) ? gdxPass0CostEma : gdxReplayCostEma;
+                    ema += (cost - ema) * 0.125;
+                }
+            }
             lastT = t;
         }
         // Hand pacing back before leaving the burst, so the host's own taskless-VI present and
         // every non-interpolated path keep honouring the limiter exactly as they do today.
         gdx_fast3d_set_subframe_present(0);
 
+        // Publish this burst's duration so the host can subtract it from the tick's total WORK and
+        // hand back the reserve (see the block comment on gdxReserve above).
+        if (gGdxInterpNowFn != nullptr && gdxLoopStart > 0.0) {
+            gGdxInterpLastBurstSec = gGdxInterpNowFn() - gdxLoopStart;
+        }
+        gdx_perf_sub_begin(GDX_PERF_SUB_POST);
+        gdxPostTimerOpen = true;
+
         // [interp-pace] One line per 120 multi-pass ticks. gN is the wall-clock gap in ms between
         // pass N-1's attempt and pass N's; an 'X' suffix marks a pass the limiter refused. Reading:
         // even gaps with dropped=0 confirms burst-calling was the fault; even gaps with drops still
         // present kills the theory outright and says the limiter is rejecting for another reason;
         // near-zero gaps mean the wait above is not taking effect at all.
-        if (passes > 1 && gGdxInterpNowFn != nullptr) {
+        // Gate on the PLANNED count: a tick the pre-sizer shrank from 3 to 1 is precisely the tick
+        // this line exists to expose, and gating on the sized count would hide it.
+        if (gdxPlannedPasses > 1 && gGdxInterpNowFn != nullptr) {
             static size_t sPaceLogTick = 0;
             if ((++sPaceLogTick % 120u) == 0u) {
-                const double g1 = (passes > 1) ? (gdxAttemptAt[1] - gdxAttemptAt[0]) * 1000.0 : -1.0;
-                const double g2 = (passes > 2) ? (gdxAttemptAt[2] - gdxAttemptAt[1]) * 1000.0 : -1.0;
-                const double g3 = (passes > 3) ? (gdxAttemptAt[3] - gdxAttemptAt[2]) * 1000.0 : -1.0;
-                gdx_port_logf("[interp-pace] passes=%d window=%.2fms g1=%.2f%s g2=%.2f%s g3=%.2f%s "
-                              "presented=%d dropped=%d\n",
-                              passes, gdxPaceWindow * 1000.0,
+                // Gaps are only meaningful between passes that were ACTUALLY ATTEMPTED. When the
+                // budget guard breaks out, the remaining gdxAttemptAt[] slots keep their zero
+                // initialiser, and differencing those against a real timestamp printed nonsense
+                // like g1=-23547.66 -- a seconds-since-epoch value wearing a milliseconds label.
+                // -1.0 is this line's established "not applicable" marker; reuse it rather than
+                // emit a number that looks like a measurement.
+                const auto gap = [&](int i) {
+                    if (passes <= i || gdxAttemptAt[i] <= 0.0 || gdxAttemptAt[i - 1] <= 0.0) {
+                        return -1.0;
+                    }
+                    return (gdxAttemptAt[i] - gdxAttemptAt[i - 1]) * 1000.0;
+                };
+                const double g1 = gap(1);
+                const double g2 = gap(2);
+                const double g3 = gap(3);
+                // budget= is the subset of `dropped` this tick that the budget guard skipped because
+                // the tick was already spent, as distinct from presents the limiter refused. The two
+                // mean opposite things: limiter drops say presentation is ahead of schedule, budget
+                // drops say the tick could not afford the burst and the sim was about to lose time.
+                gdx_port_logf("[interp-pace] passes=%d planned=%d window=%.2fms g1=%.2f%s g2=%.2f%s g3=%.2f%s "
+                              "presented=%d dropped=%d budget=%d\n",
+                              passes, gdxPlannedPasses, gdxPaceWindow * 1000.0,
                               g1, (passes > 1 && !gdxAttemptOk[1]) ? "X" : "",
                               g2, (passes > 2 && !gdxAttemptOk[2]) ? "X" : "",
                               g3, (passes > 3 && !gdxAttemptOk[3]) ? "X" : "",
-                              presented, dropped);
+                              presented, dropped, budgetDropped);
             }
         }
 
@@ -8156,6 +8946,10 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
         gGdxInterpLastDropped = dropped;
         gGdxInterpLastT = static_cast<double>(lastT);
         gGdxInterpLastLerped = adapter.GdxP1Lerped();
+        gGdxInterpLastVpLerped = adapter.GdxVpLerped();
+        gGdxInterpLastVpSnapped = adapter.GdxVpSnapped();
+        gGdxInterpLastVtxLerped = adapter.GdxVtxLerped();
+        gGdxInterpLastVtxSnapped = adapter.GdxVtxSnapped();
         if (adapter.GdxP1PairMaxDelta() > gGdxInterpPairMaxDelta) {
             gGdxInterpPairMaxDelta = adapter.GdxP1PairMaxDelta();
         }
@@ -8214,6 +9008,8 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
         // Pass 0: refill scratch at t=1 (== current-pool matrix, byte-identical to stock). In P0
         // this also hashes/snapshots the retained command stream for cross-pass mutation counting.
         adapter.GdxP0RefillScratch(1.0f);
+        adapter.GdxVpRefillScratch(1.0f);
+        adapter.GdxVtxRefillScratch(1.0f);
         if (p0Active) {
             p0Hash0 = adapter.GdxP0HashCommands();
             adapter.GdxP0SnapshotCommands(p0Snapshot);
@@ -8231,6 +9027,8 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
         // Pass 1 preamble: refill scratch for the presented pass — t=1 in P0 (no-op replay), the
         // configured presentT in P1 (writes lerp(prev,cur,t) into every non-snapped scratch slot).
         adapter.GdxP0RefillScratch(pass1T);
+        adapter.GdxVpRefillScratch(pass1T);
+        adapter.GdxVtxRefillScratch(pass1T);
         if (p0Active) {
             // An identical hash proves the retained buffer is stable and interp->Run() did NOT
             // mutate it in place; any changed operand is counted as a P0 FINDING (not hidden).
@@ -8530,6 +9328,7 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
         stats.colorImageTargets[stats.colorImageTargetCount++] = finalColorImage;
     }
 
+    gdx_perf_sub_begin(GDX_PERF_SUB_FBMIRROR);
     for (size_t ti = 0; ti < stats.colorImageTargetCount; ti++) {
         const uintptr_t targetAddress = stats.colorImageTargets[ti];
         auto framebuffer = std::find_if(gN64Framebuffers.begin(), gN64Framebuffers.end(),
@@ -8539,14 +9338,53 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
         if (framebuffer == gN64Framebuffers.end()) {
             continue;
         }
-        const int hostFramebuffer = interp->mRendersToFb ? interp->mGameFb : 0;
-        interp->GetCurrentRenderingAPI()->ReadFramebufferToCPU(
-            hostFramebuffer, framebuffer->width, framebuffer->height,
-            reinterpret_cast<uint16_t*>(framebuffer->address));
-        framebuffer->valid = true;
+        // LAZY, not eager. This used to call ReadFramebufferToCPU here on EVERY task -- a full
+        // GPU->CPU readback, which stalls the pipeline until the GPU drains and then drags the
+        // pixels back across the bus. Measured at 7.16 ms of a 16.68 ms tick: the entire bridge
+        // overhead of the frame, and single-handedly the reason frame interpolation could not
+        // afford the sub-frames its target rate asked for (fbmirror=7.16 against bridge=7.18).
+        //
+        // It is redundant with its only consumer. gdx_read_current_framebuffer already performs
+        // this readback on demand, preferring gFrameMirrorFb -- a GPU->GPU copy maintained by
+        // GdxUpdateFrameMirror, which costs 0.00 ms because it never touches the CPU -- and falling
+        // back to a direct read; it also sets valid and gLastRenderedFramebuffer itself once the
+        // pixels are proven non-empty. Transition captures happen once per screen change, so paying
+        // a full readback on all sixty ticks per second to have one ready was the wrong trade by
+        // roughly three orders of magnitude.
+        //
+        // What still happens every task is the bookkeeping: the buffer is registered as the render
+        // target so the on-demand path knows where to read from. Only the copy is deferred.
+        //
+        // GDX_EAGER_FBMIRROR=1 restores the per-task readback for A/B without a rebuild. If a
+        // transition capture ever comes back empty, set it -- and if that fixes it, the on-demand
+        // path is missing a case rather than this deferral being wrong.
+        // CAPTURE TICKS STILL READ BACK EAGERLY. Deferring unconditionally regressed the Cup Select
+        // transition: the readback also published framebuffer->valid, and a transition capture on
+        // the FIRST visit to a screen consumes that flag before anything has set it
+        // (gdx_read_current_framebuffer only sets it once it has proven non-empty pixels, which on a
+        // first visit has not happened yet). The symptom was the historical "Cup Select squeeze",
+        // first entry only -- see the gFrameMirrorFb dimension note in that investigation.
+        //
+        // GdxTransitionCapturePendingThisTick is the right gate rather than a heuristic: the capture
+        // runs LATER IN THE SAME TICK than this loop (sys_gfx.c calls gdx_read_current_framebuffer
+        // after the task), which is the ordering that function was written to establish. So the
+        // expensive path costs one readback per screen transition instead of one per tick -- the
+        // frequency it was always worth paying at.
+        const bool gdxCaptureThisTick = GdxTransitionCapturePendingThisTick();
+        static const bool sEagerFbMirror = [] {
+            const char* e = getenv("GDX_EAGER_FBMIRROR");
+            return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
+        }();
         const size_t mirroredBytes =
             static_cast<size_t>(framebuffer->width) * framebuffer->height * sizeof(uint16_t);
-        RecordHostWrite(framebuffer->address, mirroredBytes);
+        if (sEagerFbMirror || gdxCaptureThisTick) {
+            const int hostFramebuffer = interp->mRendersToFb ? interp->mGameFb : 0;
+            interp->GetCurrentRenderingAPI()->ReadFramebufferToCPU(
+                hostFramebuffer, framebuffer->width, framebuffer->height,
+                reinterpret_cast<uint16_t*>(framebuffer->address));
+            framebuffer->valid = true;
+            RecordHostWrite(framebuffer->address, mirroredBytes);
+        }
         const bool isFinalTarget = (targetAddress == finalColorImage);
         if (isFinalTarget) {
             gLastRenderedFramebuffer = framebuffer->address;
@@ -8564,6 +9402,17 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
                           static_cast<int>(isFinalTarget));
         }
     }
+
+    // Close POST here, at the last STATEMENT, rather than leaving it to the scope guard. The guard
+    // is declared before `adapter`, so by C++ destruction order the adapter is torn down FIRST and
+    // its cost would land inside POST. Ending here excludes destructors, which makes the summary's
+    // (bridge - post) residual read as exactly the teardown cost of this function's locals -- the
+    // N64DisplayListAdapter holds the whole converted display list (an unordered_map of vectors,
+    // plus the per-matrix scratch records), and it is built and freed once per 60 Hz tick.
+    // A residual near zero exonerates teardown; a large one names it.
+    gdx_perf_sub_end(GDX_PERF_SUB_FBMIRROR);
+    gdx_perf_sub_end(GDX_PERF_SUB_POST);
+    gdxPostTimerOpen = false;
 }
 
 /* Instrumentation: log what the transition readback actually

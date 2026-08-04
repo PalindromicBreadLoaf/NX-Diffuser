@@ -67,6 +67,15 @@ void osViSetYScale(f32 scale) {
     (void) scale;
 }
 
+/* Live VI retrace divider readout for the host (main.cpp's interpolation gate). D_800CCFBC is the
+   game's own divider (sys_main.c:153): 1 = full 60 Hz, 3 = Course Edit's ~20 Hz cursor mode,
+   2 = the EAD demo. Exposed as an accessor -- same boundary idiom as gGameMode elsewhere in port/
+   -- because main.cpp deliberately avoids the decomp include tree. */
+extern s32 D_800CCFBC;
+int gdx_vi_divider(void) {
+    return (int) D_800CCFBC;
+}
+
 // --- host driver: advance the framebuffer rotation and post the VI retrace message. ---
 void gdx_vi_tick(void) {
     sCurrentFb = sNextFb;

@@ -20,6 +20,16 @@ using Clock = std::chrono::steady_clock;
 constexpr double kSpikeThresholdMs = 25.0; // ~1.5 dropped 60Hz frames — worth an immediate line
 constexpr int kSummaryWindowFrames = 600;  // ~10 s at 60 fps
 
+// libultraship/src/fast/Fast3dWindow.cpp calls gdx_perf_sub_begin/end with these IDs as bare
+// integers, because it cannot include this header (it lives outside libultraship). That duplication
+// is only safe if the numbers cannot drift, so pin them here: renumbering GdxPerfSub without
+// updating Fast3dWindow's GDX_PERF_SUB_*_ID defines is a compile error, not a silently mislabelled
+// measurement — and a mislabelled perf number is worse than none, because it gets acted on.
+static_assert(GDX_PERF_SUB_GUI == 3, "Fast3dWindow.cpp GDX_PERF_SUB_GUI_ID must match");
+static_assert(GDX_PERF_SUB_SFRAME == 4, "Fast3dWindow.cpp GDX_PERF_SUB_SFRAME_ID must match");
+static_assert(GDX_PERF_SUB_IRUN == 5, "Fast3dWindow.cpp GDX_PERF_SUB_IRUN_ID must match");
+static_assert(GDX_PERF_SUB_EFRAME == 6, "Fast3dWindow.cpp GDX_PERF_SUB_EFRAME_ID must match");
+
 const char* const kPhaseNames[PerfPhaseCount] = {
     "events", "input", "gametick", "guistart", "dispatch", "ticks", "present", "pacer",
 };
@@ -116,12 +126,25 @@ void emitSummary(PerfState& s) {
     }
     const double logicMean = subLogicMs(s.phaseAccumMs[PerfGameTick] / n, subMean);
 
+    // run[...] is the breakdown INSIDE run, not extra time on top of it: gui + sframe + irun +
+    // eframe ~= run. Read it per TICK, not per pass — each term is already summed over the M
+    // sub-frames the tick presented, which is the number that has to fit in the 16.68 ms budget.
     gdx_port_logf("[GDX perf] summary frames=%zu p50=%.2fms p95=%.2fms p99=%.2fms max=%.2fms "
                   "spikes=%d | mean: %s| sub: logic=%.2f xlate=%.2f run=%.2f mirror=%.2f "
+                  "| run[gui=%.2f sframe=%.2f irun=%.2f eframe=%.2f] "
+                  "| gfxrun=%.2f bridge=%.2f decomp=%.2f setup=%.2f post=%.2f fbmirror=%.2f "
                   "| audio p95=%.2fms max=%.2fms\n",
                   totals.size(), p50, p95, p99, mx, s.spikeCount, phases, logicMean,
                   subMean[GDX_PERF_SUB_XLATE], subMean[GDX_PERF_SUB_RUN], subMean[GDX_PERF_SUB_MIRROR],
-                  aP95, aMax);
+                  subMean[GDX_PERF_SUB_GUI], subMean[GDX_PERF_SUB_SFRAME], subMean[GDX_PERF_SUB_IRUN],
+                  subMean[GDX_PERF_SUB_EFRAME], subMean[GDX_PERF_SUB_GFXRUN],
+                  // bridge = what gdx_gfx_run spends OUTSIDE translation and the sub-frame burst.
+                  // decomp = the actual game frame: everything in gametick that is not gdx_gfx_run.
+                  // These two are what "logic" used to be lumped into, and they have different owners.
+                  subMean[GDX_PERF_SUB_GFXRUN] - subMean[GDX_PERF_SUB_XLATE] - subMean[GDX_PERF_SUB_RUN],
+                  (s.phaseAccumMs[PerfGameTick] / n) - subMean[GDX_PERF_SUB_GFXRUN],
+                  subMean[GDX_PERF_SUB_SETUP], subMean[GDX_PERF_SUB_POST],
+                  subMean[GDX_PERF_SUB_FBMIRROR], aP95, aMax);
 
     s.frameTotals.clear();
     s.spikeCount = 0;
