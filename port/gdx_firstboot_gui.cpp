@@ -373,18 +373,12 @@ class SetupScreen {
             mDropError = "Could not save the setup state next to the game.";
             return;
         }
-        // The disk row is validated and committed at dataDir/kDiskName (via
-        // CopyInputInto in Browse()/HandleDrop()); now create the SEPARATE managed backup copy
-        // under <dataDir>/media so the user's original .ndd (wherever it was picked/dropped from)
-        // becomes deletable, matching the ROM/IPL posture. Idempotent and best-effort: a failure here
-        // is logged but never blocks setup -- the row's own installed copy still boots the game.
-        std::string managedDiskPath;
-        if (!EnsureManagedDiskCopy(mDataDir, diskPath, managedDiskPath)) {
-            gdx_port_logf(
-                "[setup] WARNING: could not create the managed disk copy at %s; keep your original "
-                "Expansion Kit disk until this succeeds\n",
-                managedDiskPath.c_str());
-        }
+        // The disk row is validated and committed at dataDir/kDiskName (via CopyInputInto in
+        // Browse()/HandleDrop()). The SEPARATE media/ backup copy that used to be created here is
+        // retired (v1.0.0): it predates full .o2r support, and with fzerox-disk.o2r as the port's
+        // stable copy it was a third copy of a 64MB file whose only readers all fall back to the
+        // dataDir committed copy anyway. Existing media/ copies from older installs remain honored
+        // read-only; only creation is gone. See the matching retirement notes in gdx_firstboot.cpp.
         // Accepted Japanese ROM: the US recipe tree cannot extract it, so skip archive extraction
         // entirely and complete setup for the experimental raw-ROM boot (rom_buffer loads the ROM
         // directly; FirstBootRun's fast path recognizes the recorded JP hash on later boots).

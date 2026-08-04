@@ -709,21 +709,15 @@ FirstBootResult FirstBootRun(const char* argv0) {
                     }
                 }
             }
-            // A byte-identical managed copy of the disk lives under
-            // <dataDir>/media (dataDir == exeDir in DevLayout — see result.dataDir below), so the
-            // user's original .ndd is deletable exactly like the ROM/IPL. If a valid original was
-            // found, ensure the managed copy exists (idempotent — a no-op past the first time). If
-            // no original candidate is present at all, accept an already-valid managed copy as
-            // fulfilling the disk requirement instead of falling through to the in-window wizard.
-            if (!diskCand.empty()) {
-                fs::path managedDst;
-                if (!ensureManagedDiskCopy(exeDir, diskCand, managedDst)) {
-                    gdx_port_logf(
-                        "[firstboot] WARNING: could not create the managed disk copy at %s; keep the "
-                        "original EK disk in place until this succeeds\n",
-                        managedDst.string().c_str());
-                }
-            } else {
+            // Managed-copy CREATION is retired (v1.0.0). The media/ staging copy predates full
+            // .o2r support: it existed so the user's original .ndd was deletable before the disk
+            // archive could serve boots by itself. Today fzerox-disk.o2r IS the port's stable copy
+            // (extraction reads the original directly — resolveDiskSource in gdx_extract_launch.cpp
+            // falls back past media/ to the data/exe dirs), so staging 64MB the archive immediately
+            // makes redundant is pure waste. Existing media/ copies from older installs remain
+            // honored everywhere they were before (the accept loop below, disk_buffer.cpp's search
+            // order, the deletion-gate hash fallback) — this retires only their CREATION.
+            if (diskCand.empty()) {
                 for (const fs::path& dir : { exeDir, cwd }) {
                     fs::path managed = managedDiskPath(dir);
                     std::string managedWhy;
@@ -866,13 +860,9 @@ FirstBootResult FirstBootRun(const char* argv0) {
         }
 
         if (gameArchiveValid && romSatisfied && iplSatisfied && diskSatisfied) {
-            // Opportunistically backfill the managed copy for installs that completed setup before this
-            // feature existed (or where a prior copy attempt failed). Idempotent/no-op once the managed
-            // copy is valid, so this costs nothing on every normal subsequent boot.
-            if (!managedDiskValid && fileExists(diskInData)) {
-                fs::path backfillDst;
-                ensureManagedDiskCopy(dataDir, diskInData, backfillDst);
-            }
+            // The managed-copy backfill that lived here is retired along with managed-copy creation
+            // generally (see the DevLayout comment above): fzerox-disk.o2r is the stable copy now,
+            // and backfilling 64MB of media/ on installs the archive already serves was waste.
             result.status = FirstBootStatus::SetupComplete;
             // Point the caller at the ORIGINAL ROM only when it still exists: rom_buffer.cpp's
             // CLI-arg branch would otherwise be handed a dead path. When the original is gone the ROM
