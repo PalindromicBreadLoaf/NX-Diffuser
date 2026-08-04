@@ -404,6 +404,39 @@ grows quickly; a ten-minute session is mostly noise.
 
 ---
 
+## Reading `[interp-p2]` — the frame-interpolation health line
+
+With Frame Interpolation on, one `[interp-p2]` line prints every 120 ticks (~2 s). It is the
+line that decides whether a pacing or rendering change shipped clean, and its two most important
+fields measure different clocks — conflating them cost this project a full day once.
+
+```
+[interp-p2] ticks=9241 subframes=2 dropped=1 avg_m=2.34 sim_hz=59.9 t_last=1.000 tasks=1
+            lerped=31 snapped=0 vp=6/0 vtx=4/0 presents/s=143.8 pair_max=0 pair_susp=0/1510 idem_div=0/8968
+```
+
+| Field | Meaning | Healthy |
+| --- | --- | --- |
+| `sim_hz` | **Measured** simulation rate — the game clock. Rolling 30-tick window. | ≈ 59.9, always. Below ~59 the game is running in slow motion regardless of frame rate. This is the hard contract. |
+| `presents/s` | Real presented frames per second (rolling ~2 s meter). | Near the target (144 on a 144 Hz panel). May legitimately dip under load — the budget guard drops sub-frames to protect `sim_hz`. A dip that parks at exactly 120 is the guard's integer plateau (all-2s × 60), not a limiter. |
+| `ticks=` | Cumulative sim ticks this session. Divide its delta by wall-clock time for an independent `sim_hz` check. | monotonic |
+| `subframes=` / `dropped=` | Last tick's presented sub-frames and refused/shed passes. | drops rare outside load spikes |
+| `avg_m` | Cumulative average sub-frames per tick since boot. **Cumulative** — do not read it as a per-window value. | → target/60 (2.40 at 144 Hz) over time |
+| `lerped=` / `snapped=` | Pool **matrices** tweened vs snapped last tick. | in-race: lerped ≫ snapped. On machine select, `lerped=31` is the expected count (29 frozen cells + 1 spinning + projection). |
+| `vp=a/b` | Carousel **viewports** lerped/snapped (course select only). | `6/0` while the carousel exists |
+| `vtx=a/b` | **Effect vertex batches** (boost flames, side-attack quads) lerped/snapped. Zero during unboosted driving is normal — these are boost-gated effects. | lerped dominating while boosting |
+| `pair_max` / `pair_susp` | Worst matrix pairing delta since the last line / suspect pairings over total. | ≈ 0 |
+| `idem_div` | Sub-frame replay divergence (state leaking across replays) over multi-pass ticks. | `0/N`, always |
+
+The companion `[interp-pace]` line (every 120 multi-pass ticks) shows the burst itself:
+`passes=<sized> planned=<wanted>` with `budget=` counting passes the tick-budget guard shed. A
+`planned=3` tick sized to `passes=2` presents t=½ and t=1 — even spacing, newest pose always lands.
+
+Two A/B gates exist for this system, both rebuild-free: `GDX_NO_INTERP_BUDGET=1` disables the
+budget guard (expect slow motion under load — that is the disease the guard cures), and
+`GDX_INTERP_FORCE_T1=1` pins every sub-frame to t=1 (measurement mode; announces itself in the log
+at first arm — an A/B whose arm state is not in the log is not an experiment).
+
 ## Related
 
 - `port/gdx_dev_gates.h` — the Dev Tools page policy (which gates are safe to expose and why), and

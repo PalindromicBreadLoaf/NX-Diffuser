@@ -47,9 +47,33 @@ Two things routinely trip people up on Windows:
 
 ## Checking your change
 
-Build the game, then build and run the console tests. They need no ROM, no window and no assets,
-and each one exits **0** on success. They catch the failure modes specific to this port — pointer
-truncation, byte order, DSP maths.
+### 1. Prove the binary actually contains it
+
+A build that exits 0 is not evidence that your change was compiled. This project has been bitten by
+exactly this — twice in one day: an exe timestamped 34 seconds after an 8,000-line file was saved
+(the file was never recompiled), and a `build && copy` chain that deployed a **stale** binary because
+the copy ran even though the build had failed.
+
+The discipline that came out of it:
+
+```sh
+# Never this — the copy runs even when the build fails:
+cmake --build build/x64 --config Release && cp .../G-Diffuser.exe <testdir>/
+
+# This: build, VERIFY the artifact, then copy.
+cmake --build build/x64 --config Release --parallel
+python -c "import sys; d=open(r'build/x64/port/Release/G-Diffuser.exe','rb').read(); \
+sys.exit(0 if b'SOME_STRING_YOUR_CHANGE_ADDED' in d else 1)" \
+  && cp build/x64/port/Release/G-Diffuser.exe <testdir>/
+```
+
+If your change adds no new string literal, add one on purpose — a log line, an env-gate name. A
+change you cannot find in the binary is a change you cannot prove you tested.
+
+### 2. Run the console tests
+
+They need no ROM, no window and no assets, and each one exits **0** on success. They catch the
+failure modes specific to this port — pointer truncation, byte order, DSP maths.
 
 ```sh
 # Windows (Visual Studio generator)
@@ -74,8 +98,41 @@ builds the whole set along with everything else.
 
 Executables land beside `G-Diffuser` — on the Visual Studio generator, `build/x64/port/Release/`.
 
-**If you touched an asset recipe under `decomp/assets/yaml/`,** also run the asset-binding lint. It
-reads the recipes, reports colliding symbols, and writes nothing:
+### 3. Run a scripted regression if you touched timing, pacing, or rendering
+
+The port can drive itself: set `GDX_INPUT_SCRIPT=<file>` and it replays scripted pad input at the
+game's own poll cadence — menus, race, quit — with no human at the controls. Two maintained scripts
+live in [`tools/autotest/`](tools/autotest/):
+
+| Script | Route | What its telemetry proves |
+| --- | --- | --- |
+| `interp-perf.txt` | title → menus → machine select (15 s) → GP race (60 s) | frame pacing and the sim-rate contract under race load |
+| `cupsel-probe.txt` | title → straight into Cup Select, **cold** | asset-load stalls (the venue banks load once per process — a warm run proves nothing) |
+
+Run one against your test install (an install that has completed first-boot setup), then read the
+log:
+
+```sh
+GDX_PERF=1 GDX_INPUT_SCRIPT=tools/autotest/interp-perf.txt ./G-Diffuser
+grep "interp-p2" gdiffuser-run.log | tail
+```
+
+The one **hard contract**: in the `[interp-p2]` lines, `sim_hz` must hold ≈ 59.9 — that is the
+simulation clock, and a change that drags it below ~59 has broken game speed no matter what the
+frame counter says. `presents/s` may legitimately vary with load; `sim_hz` may not. The full field
+glossary is in [`docs/DIAGNOSTICS.md`](docs/DIAGNOSTICS.md).
+
+The script format (`WAIT` / `PRESS` / `WAITMODE` / `SHOT` / `QUIT` …) is documented at the top of
+`port/gdx_input_script.c`. If your change needs a route these scripts don't drive, write a new
+script and include it in the PR — it becomes the regression test for the next person.
+
+Two facilities worth knowing while you're here: `GDX_CAPTURE_WINDOW=<start>:<count>` dumps real
+presented frames to BMP for pixel-diffing, and `gdxwin-modes.txt` records which game mode was live
+at which present index so you can aim the window.
+
+### 4. If you touched an asset recipe under `decomp/assets/yaml/`
+
+Run the asset-binding lint. It reads the recipes, reports colliding symbols, and writes nothing:
 
 ```sh
 python tools/gen_asset_bindings.py --lint-only
@@ -165,12 +222,20 @@ GDX_LOG=1 GDX_TRACE=1 GDX_DIAG_VERBOSE=1 ./G-Diffuser
 
 There is also an **always-on crash sink**: a crash writes `gdiffuser-crash.txt` beside the
 executable with no environment variable set, on both Windows and Linux. Attach it if you have one.
+Crash addresses are module-relative (`rva=`); the build also emits `G-Diffuser.map`, so an RVA
+resolves to a symbol with nothing but the map file — parse the `Preferred load address`, subtract,
+and bisect.
 
 The full gate table is `port/gdx_dev_gates.c`, each row with its own description, and it is
 surfaced in-game under **F1 → Dev Tools**. For what each switch reveals — and, importantly, which
-ones *change* what is rendered rather than merely observing it — read the diagnostics document
-(`DIAGNOSTICS.md`, under `docs/`). Do not file a log captured with a behaviour-altering gate on
-without saying so.
+ones *change* what is rendered rather than merely observing it — read
+[`docs/DIAGNOSTICS.md`](docs/DIAGNOSTICS.md). Do not file a log captured with a behaviour-altering
+gate on without saying so.
+
+One convention to keep when you add a diagnostic of your own: **every A/B toggle must write its arm
+state to the log.** This project once burned a full play-test on an experiment whose toggle left no
+trace in the log — the result was uninterpretable and the run was wasted. If the gate isn't in the
+log, the experiment didn't happen.
 
 ### 4. An intermittent bug here is often an order-dependent bug
 
@@ -204,6 +269,9 @@ carry their own `.clang-format`; `port/` does not.
 - **Explain the non-obvious in a comment.** This codebase leans heavily on comments that record
   *why* — measured values, rejected alternatives, hardware quirks. `port/CMakeLists.txt` is the
   model. If you worked something out the hard way, write it down where the next person will trip.
+  One caution that comes with the style: a comment that asserts a mechanism is a claim of evidence.
+  Write the mechanism down **after** a measurement confirms it, not before — this tree has had to
+  correct comments that confidently explained the wrong cause.
 
 ## Where to look
 
@@ -211,37 +279,52 @@ carry their own `.clang-format`; `port/` does not.
 | --- | --- |
 | Build it, run it, report a bug | [`README.md`](README.md) |
 | Find which file owns a subsystem | [`port/README.md`](port/README.md) |
-| Turn on logging, or find the switch that shows your bug | the diagnostics document, under `docs/` |
+| Turn on logging, or find the switch that shows your bug | [`docs/DIAGNOSTICS.md`](docs/DIAGNOSTICS.md) |
+| Understand the architecture | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
 
-`docs/` also holds a large body of working notes accumulated during development. Read anything there
-as **evidence with a date on it**, not as current truth: most files describe the tree as it was the
-day they were written, and the analysis usually outlives the status. `docs/` is not tracked in git
-and is not part of a release.
+`docs/` is tracked and maintained — read it as current. Where a document records a measurement, it
+carries the date and the numbers, so stale claims are checkable rather than quietly trusted.
 
----
+## The repository is four repos
+
+Changes usually span more than one, and they publish in a fixed order:
+
+| Repo | Branch | What lives there |
+| --- | --- | --- |
+| this repo | `main` | `port/`, tools, assets, docs — the port itself |
+| `decomp/` (submodule) | `g-diffuser` | the matching decompilation + `#ifdef PORT` changes |
+| `libultraship/` (submodule) | `g-diffuser` | the Fast3D/engine fork |
+| `torch/` (submodule) | `g-diffuser` | the asset extraction tool |
+
+The submodules' `main`/upstream branches track their upstreams — **never** target those with port
+work. A PR that changes a submodule needs a PR against that submodule's `g-diffuser` branch, and
+the parent-repo PR then bumps the submodule pointer. Submodule PRs merge first; the parent pointer
+bump lands last.
 
 ## Submitting a change
 
-> **⚠️ PLACEHOLDER — TO BE COMPLETED BY THE PROJECT OWNER (@Zorkats).**
->
-> The following are project policy, not technical facts, and have not been decided or recorded
-> anywhere in this repository. They are deliberately left blank rather than guessed at, because a
-> confidently wrong contribution policy is worse than an obviously blank one.
->
-> - **Are outside pull requests accepted at all?** (And if so, from what point — now, or after the
->   first public release?)
-> - **Branch naming** — is there a required prefix or format?
-> - **Commit message convention** — the existing history uses a
->   `type(scope): summary` style (`fix(port):`, `feat(menu):`, `chore:`), but this has never been
->   written down as a rule. Confirm or replace.
-> - **Which branch to target**, and whether to rebase or merge.
-> - **Review expectations** — who reviews, what gets asked for, expected turnaround.
-> - **Community / discussion venue** — is there a Discord or other channel? *Do not assume one
->   exists; none is referenced anywhere in this repository.*
->
-> Until this section is filled in, the reliable route is to **open an issue first** at
-> [github.com/Zorkats/G-Diffuser/issues](https://github.com/Zorkats/G-Diffuser/issues) and ask
-> before writing code.
+**Outside pull requests are welcome.** The practical route:
+
+1. **For anything non-trivial, open an issue first** at
+   [github.com/Zorkats/G-Diffuser/issues](https://github.com/Zorkats/G-Diffuser/issues) and say what
+   you intend to change. This is a port with sharp invariants (matching, byte order, the
+   `PORT`-pairing rule) — two paragraphs of intent can save you a rewritten branch. Typo-level fixes
+   can skip straight to a PR.
+2. **Target `main`.** PRs are **squash-merged**: your branch history collapses into one commit on
+   `main`, so commit locally however you like — the PR title and description are what survive.
+3. **Branch naming is free.** Name it something you can find again.
+4. **Commit / PR title convention:** `type(scope): summary`, matching the history —
+   `feat(interp): …`, `fix(audio): …`, `refactor(firstboot): …`, `chore: …`. Keep the summary in
+   the imperative and put the *why* in the body. Read `git log` for the house voice: bodies here
+   state the measured problem and the mechanism of the fix, not a list of files touched.
+5. **Say how you verified it.** Which tests ran, which script route, what the telemetry showed —
+   and if you could not verify something, say that plainly. An honest "untested on Linux" costs
+   nothing; a silent one costs the maintainer an evening.
+6. **Review** is by the maintainer ([@Zorkats](https://github.com/Zorkats)). This is a one-person
+   project reviewed in spare time — expect days, not hours, and expect questions about evidence
+   rather than style.
+
+**Discussion venue:** GitHub Issues, for now. There is no Discord or forum yet.
 
 ## Reporting a bug
 
