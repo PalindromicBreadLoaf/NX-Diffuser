@@ -271,6 +271,21 @@ size_t gdx_gfxpool_sizeof(void) {
     return sizeof(GfxPool);
 }
 
+/* Ground truth for the effects vertex buffer's position inside the pool, for the same reason as
+   gdx_gfxpool_sizeof above: the struct-comment offset (0x2A308) is the N64 layout, and sizeof(Gfx)
+   doubling under PORT shifts every member after gfxBuffer by 0x1A008 on the host. The bridge's
+   effects-vertex interpolation must test "is this gSPVertex operand inside effectsVtxBuffer", and a
+   hand-copied N64 constant would silently aim that test 0x1A008 bytes low — inside courseVtxBuffer,
+   lerping static track geometry against a differently-ordered previous tick. offsetof from the real
+   type cannot drift. */
+size_t gdx_gfxpool_effects_vtx_offset(void) {
+    return offsetof(GfxPool, effectsVtxBuffer);
+}
+
+size_t gdx_gfxpool_effects_vtx_bytes(void) {
+    return sizeof(((GfxPool*) 0)->effectsVtxBuffer);
+}
+
 void* gdx_rdram_alloc_raw(size_t size, size_t align) {
     size_t base = (gdx_rdram_bump + (align - 1u)) & ~(align - 1u);
     if (base + size > gdx_rdram_persist_top) {
