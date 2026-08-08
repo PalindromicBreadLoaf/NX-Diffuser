@@ -44,36 +44,33 @@ constexpr const char* kRomName = "baserom.us.rev0.z64";
 constexpr const char* kDiskName = "baserom.translated.ek.ndd";
 constexpr const char* kIplName = "N64DDIPLROM.n64";
 constexpr const char* kGameArchiveName = "fzerox.o2r";
-// The dedicated IPL archive (port/gdx_extract_launch.cpp's kIplArchiveName / main.cpp's mount
-// group). Only the literal is needed here (a presence probe for the missing-input diagnostic), so this
-// stays a local constant rather than a cross-TU export.
+// The dedicated IPL archive (gdx_extract_launch.cpp's kIplArchiveName / main.cpp's mount group).
+// Only a presence probe for the missing-input diagnostic needs it, so it stays local rather than
+// becoming a cross-TU export.
 constexpr const char* kIplArchiveName = "n64ddipl.o2r";
-// The dedicated EK disk archive (port/gdx_extract_launch.cpp's kDiskArchiveName /
-// main.cpp's mount group). A valid fzerox-disk.o2r satisfies the disk requirement exactly like the
-// managed copy does (gdx_disk_load is archive-first once it is mounted), so the raw .ndd AND the
-// managed copy can be deleted once a boot has reconstructed + verified from it.
+// The dedicated EK disk archive (gdx_extract_launch.cpp's kDiskArchiveName / main.cpp's mount group).
+// A valid fzerox-disk.o2r satisfies the disk requirement exactly like the managed copy does
+// (gdx_disk_load is archive-first once it is mounted), so the raw .ndd AND the managed copy become
+// deletable once a boot has reconstructed and verified from it.
 constexpr const char* kDiskArchiveName = "fzerox-disk.o2r";
 // The dev-tree default output name (tools/gen_f3d_o2r.py / Torch's default), still used unrenamed by
-// the in-tree development archive at assets/extracted/generic.o2r (see developmentTreeProvidesArchive
-// above). GdxFirstBootDescribeMissing accepts either name as satisfying the game-archive input.
+// the in-tree archive at assets/extracted/generic.o2r. GdxFirstBootDescribeMissing accepts either
+// name as satisfying the game-archive input.
 constexpr const char* kGameArchiveDevName = "generic.o2r";
 
 // ── Known-good SHA-1 identity tables (region/dump recognition) ──────────────────────────────────────
-// Named tables so the future JP build can reuse the exact same sets (a JP build would simply accept
-// kRomSha1JpRev0 as VerifiedKnown and reject the US hash with the mirror message). All lowercase hex.
-//   * The US-rev0 ROM's accepted hash (5f658e88ffa9de23cba6986a8fd3d3a90d7b4340) is NOT duplicated
-//     here: it lives in decomp-recipes/config.yml (recipes = single source of truth) and is read at
-//     runtime via GdxExtractExpectedRomSha1 — the ROM accept decision uses that, not a local constant.
+// Named tables so the future JP build can reuse the same sets (it would accept kRomSha1JpRev0 as
+// VerifiedKnown and reject the US hash with the mirror message). All lowercase hex. The US-rev0 ROM's
+// accepted hash is deliberately NOT duplicated here: it lives in decomp-recipes/config.yml (recipes
+// are the single source of truth) and is read at runtime via GdxExtractExpectedRomSha1.
 constexpr const char* kRomSha1JpRev0 = "a418b0151521b76691fa03f8658c8b567c69498b"; // F-Zero X (Japan)
-// Alternate canonical filenames for the Japanese dumps: the wizard
-// accepts these names directly so a JP test folder needs no renaming. The JP ROM boots RAW
-// (experimental; the US recipe tree cannot extract it, so no archives are built for it) — see the
-// jpRom handling in GdxRecognizeInput and the raw-boot branch in FirstBootRun's fast path.
+// Alternate canonical filenames for the Japanese dumps, accepted directly so a JP test folder needs
+// no renaming. The JP ROM boots RAW (experimental; the US recipe tree cannot extract it, so no
+// archives exist for it) — see GdxRecognizeInput's jpRom handling and FirstBootRun's raw-boot branch.
 constexpr const char* kRomNameJp = "baserom.jp.rev0.z64";
 constexpr const char* kDiskNameJp = "baserom.jp.ek.ndd";
 // Accepted alternate filename for the US prototype IPL dump, so a folder holding it under its
-// original dump name needs no renaming — see
-// kIplNameUsProto below and SetupIplFileNameUsProto()'s doc comment in gdx_firstboot.h.
+// original dump name needs no renaming — see SetupIplFileNameUsProto() in gdx_firstboot.h.
 constexpr const char* kIplNameUsProto = "64DD_IPL_US_MJR.n64";
 struct KnownDiskDump {
     const char* sha1;
@@ -84,9 +81,8 @@ constexpr KnownDiskDump kKnownDiskDumps[] = {
     { "fde9fa6f29a52be0144bda74caf8583c036c20ce", "translated Expansion Kit disk", false },
     { "7e8badf857f1fce8aa59307c0fd318128c44418b", "retail Japanese Expansion Kit disk", true },
 };
-// Known-good 64DD IPL dumps (mirrors KnownDiskDump's structure/purpose). The US prototype dump is
-// recognized alongside the JP retail one, each labelled
-// distinctly so the two are never confused in the setup UI.
+// Known-good 64DD IPL dumps (mirrors KnownDiskDump). The US prototype and JP retail dumps are
+// labelled distinctly so the setup UI never confuses the two.
 struct KnownIplDump {
     const char* sha1;
     const char* label; // shown as the OK row header: "OK (<label>)"
@@ -109,9 +105,8 @@ constexpr KnownIplDump kKnownIplDumps[] = {
 // JP alternate filenames (kRomNameJp/kDiskNameJp, still probed by the wizard) — precisely so the
 // refusal can say "this is the Japanese release" instead of "unrecognised file".
 //
-// Written as a constexpr bool rather than #ifdef-ing each call site so BOTH paths keep compiling in
-// both configurations (the JP path cannot bit-rot behind the gate) and the compiler folds away
-// whichever branch is dead.
+// A constexpr bool rather than an #ifdef at each call site, so both paths keep compiling in both
+// configurations (the JP path cannot bit-rot behind the gate) and the compiler folds the dead branch.
 #ifdef GDX_ALLOW_JP_INPUTS
 constexpr bool kAllowJapaneseInputs = true;
 #else
@@ -129,9 +124,9 @@ constexpr const char* kJpRefusedDiskMessage =
     "this build of G-Diffuser — it is planned for a later release.\n"
     "Please use the English (translated) Expansion Kit disk image.";
 
-// Subdirectory of dataDir holding the permanent managed disk copy, kept under the same
-// canonical leaf name so it satisfies gdx_disk_load's search AND preserves the existing .gdd save key
-// (which derives from the leaf name only — see gdx_firstboot.h's ManagedDiskPath doc comment).
+// Subdirectory of dataDir holding the managed disk copy, under the same canonical leaf name so it
+// satisfies gdx_disk_load's search AND preserves the existing .gdd save key, which derives from the
+// leaf name only (see ManagedDiskPath in gdx_firstboot.h).
 constexpr const char* kManagedMediaSubdir = "media";
 
 // ROM candidate names probed for DEV-layout detection (mirrors rom_buffer.cpp's next-to-exe list).
@@ -166,8 +161,8 @@ fs::path executableDir(const char* argv0) {
     return fs::current_path(ec);
 }
 
-// NOTE: G-Diffuser is always portable — no per-user data directory exists. The game folder is the
-// data directory on every platform; AppData/XDG are never touched.
+// G-Diffuser is always portable: the game folder is the data directory on every platform, and
+// AppData/XDG are never touched.
 
 bool fileExists(const fs::path& p) {
     std::error_code ec;
@@ -238,10 +233,10 @@ char romHeaderCountryCode(const fs::path& p) {
     return static_cast<char>(hdr[0x3E]);
 }
 
-// True when `p` is a Japanese-region cartridge image AND this build does not accept Japanese
-// inputs. Catches EVERY Japanese dump — including ones whose SHA-1 this build has never seen —
-// which is what makes the header check worth having alongside the exact-hash check in
-// GdxRecognizeInput. Cheap enough (one 64-byte read) to sit on the dev-tree boot path.
+// True when `p` is a Japanese-region cartridge image AND this build does not accept Japanese inputs.
+// This catches every Japanese dump, including ones whose SHA-1 this build has never seen, which is
+// why it is worth having alongside GdxRecognizeInput's exact-hash check. One 64-byte read, cheap
+// enough for the dev-tree boot path.
 bool romIsRefusedJapanese(const fs::path& p) {
     return !kAllowJapaneseInputs && romHeaderCountryCode(p) == 'J';
 }
@@ -275,7 +270,6 @@ bool validateIpl(const fs::path& p, std::string& why) {
     return true;
 }
 
-// Copy src -> dstDir/dstName, overwriting. Returns true on success.
 bool copyInto(const fs::path& src, const fs::path& dstDir, const char* dstName) {
     std::error_code ec;
     fs::path dst = dstDir / dstName;
@@ -293,11 +287,9 @@ fs::path managedDiskPath(const fs::path& dataDir) {
     return dataDir / kManagedMediaSubdir / kDiskName;
 }
 
-// Ensure a valid managed copy of the disk exists at managedDiskPath(dataDir), copying it from
-// `validatedSrc` if needed. `validatedSrc` MUST already be a valid disk image (validateDisk passed).
-// Idempotent: a managed copy already present and correctly sized is left untouched — never re-copied,
-// never overwritten (this feature is strictly additive; a later "ensure" call on a warm boot must
-// never touch a good copy). Returns true iff a valid managed copy exists at `outDst` on return.
+// `validatedSrc` MUST already have passed validateDisk. Idempotent: a managed copy already present
+// and correctly sized is left untouched, never re-copied or overwritten, so an "ensure" call on a
+// warm boot cannot damage a good copy. True iff a valid managed copy exists at `outDst` on return.
 bool ensureManagedDiskCopy(const fs::path& dataDir, const fs::path& validatedSrc, fs::path& outDst) {
     std::error_code ec;
     fs::path mediaDir = dataDir / kManagedMediaSubdir;
@@ -369,10 +361,9 @@ bool ensureManagedDiskCopy(const fs::path& dataDir, const fs::path& validatedSrc
     gdx_port_logf("[firstboot] managed disk copy created: %s (%llu bytes)\n", outDst.string().c_str(),
                   static_cast<unsigned long long>(kDiskExactBytes));
 
-    // Best-effort: record the copy's identity in the extraction sidecar.
-    // Diagnostic bookkeeping only -- the file on disk is always the source of truth, and a failure
-    // here never fails the copy itself. GdxExtractFileSha256 streams the hash (no full-file load
-    // beyond a 64 KiB buffer), so this is a one-time ~150 ms cost paid only at copy-creation time.
+    // Diagnostic bookkeeping only: the file on disk is always the source of truth, and a failure here
+    // never fails the copy. GdxExtractFileSha256 streams the hash, so this is a one-time ~150 ms cost
+    // paid only at copy-creation time.
     std::string sha = GdxExtractFileSha256(outDst.string().c_str());
     if (!sha.empty()) {
         GdxExtractRecordManagedDisk(dataDir.string().c_str(), sha.c_str(),
@@ -419,7 +410,6 @@ SetupState loadState(const fs::path& dataDir) {
     char line[4096];
     while (fgets(line, sizeof(line), f) != nullptr) {
         std::string s(line);
-        // Strip trailing newline/CR.
         while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) {
             s.pop_back();
         }
@@ -473,7 +463,6 @@ bool saveState(const fs::path& dataDir, const SetupState& st) {
 // ── Native pickers / dialogs (Win32; graceful no-op elsewhere) ───────────────────────────────────
 
 #ifdef _WIN32
-// Opens a file picker. Returns the selected path, or empty if cancelled.
 fs::path pickFile(const wchar_t* title, const wchar_t* filter) {
     wchar_t fileName[MAX_PATH] = {};
     OPENFILENAMEW ofn = {};
@@ -491,10 +480,10 @@ fs::path pickFile(const wchar_t* title, const wchar_t* filter) {
 }
 #endif
 
-// Record the acquire-time SHA-256 of the IPL ROM into the extraction sidecar so
-// one file documents every verified input. Best-effort/diagnostic — a hash failure never fails setup.
-// The dedicated IPL extraction step later refreshes ipl_sha256 to the byte-order-normalized identity;
-// for the common native (z64) dump the two are equal. Idempotent, so calling it on every boot is fine.
+// Records the acquire-time SHA-256 of the IPL ROM into the extraction sidecar so one file documents
+// every verified input. Diagnostic only — a hash failure never fails setup. The dedicated IPL
+// extraction step later refreshes ipl_sha256 to the byte-order-normalized identity; for the common
+// native (z64) dump the two are equal. Idempotent, so calling it on every boot is fine.
 void recordIplIdentity(const fs::path& dataDir, const fs::path& iplPath) {
     if (iplPath.empty() || !fileExists(iplPath)) {
         return;
@@ -506,11 +495,11 @@ void recordIplIdentity(const fs::path& dataDir, const fs::path& iplPath) {
 }
 
 // True when a valid disk archive (fzerox-disk.o2r) is installed under `dataDir`. When the completion
-// sidecar recorded a disk_archive_sha256 (this build authored the archive), the file must hash to it
-// before it is accepted — a container swapped for a stale/foreign one is rejected and the disk falls
-// back to the managed copy / original. When no hash was recorded (sidecar absent or older), acceptance
-// degrades to presence, matching the prior behavior. The (few-hundred-ms) hash runs only on the
-// archive-only disk path (both the original .ndd and the managed media/ copy already gone).
+// sidecar recorded a disk_archive_sha256, the file must hash to it before it is accepted, so a
+// container swapped for a stale/foreign one is rejected and the disk falls back to the managed copy /
+// original. With no recorded hash (sidecar absent or older) acceptance degrades to presence. The
+// few-hundred-ms hash runs only on the archive-only disk path, where the original .ndd and the
+// managed media/ copy are both already gone.
 bool diskArchiveSatisfies(const fs::path& dataDir) {
     fs::path diskArchive = dataDir / kDiskArchiveName;
     if (!fileExists(diskArchive)) {
@@ -532,17 +521,16 @@ bool diskArchiveSatisfies(const fs::path& dataDir) {
         return false;
     }
     if (actual == recorded) {
-        // Passing hash check this boot -- latch so ensureDiskArchive's own warm-boot check (run later
-        // this same boot, from GdxExtractEnsureArchive) does not re-hash the same file (Fix 2).
+        // Latch so ensureDiskArchive's warm-boot check, run later this same boot from
+        // GdxExtractEnsureArchive, does not re-hash the same file.
         GdxExtractMarkArchiveValidated(GdxExtractArchiveKind::Disk);
         return true;
     }
-    // Mirrors gameArchiveSatisfies/iplArchiveSatisfies: a mismatched container must be quarantined so
-    // main.cpp's presence-based mount list (findArchivePaths) can never pick up the corrupt file --
-    // otherwise the disk stayed mounted (archive-first) while the wizard nagged about "setup" on top of
-    // an already-half-working boot. Recovery is stated source-agnostically: ensureDiskArchive rebuilds
-    // automatically from any disk source resolveDiskSource accepts (translated/JP .ndd or the
-    // managed copy); with none present, setup re-runs.
+    // A mismatched container must be quarantined so main.cpp's presence-based mount list
+    // (findArchivePaths) cannot pick it up; otherwise the disk stays mounted archive-first while the
+    // wizard nags about setup on top of an already-half-working boot. ensureDiskArchive rebuilds
+    // automatically from any source resolveDiskSource accepts (translated/JP .ndd, or the managed
+    // copy); with none present, setup re-runs.
     gdx_port_logf(
         "[firstboot] %s failed verification (does not match the recorded disk_archive_sha256); "
         "quarantining it — it is rebuilt automatically when a disk image is available, otherwise "
@@ -552,13 +540,12 @@ bool diskArchiveSatisfies(const fs::path& dataDir) {
     return false;
 }
 
-// True when a valid cart archive (fzerox.o2r) is installed under `dataDir`. Mirrors diskArchiveSatisfies:
-// when the sidecar recorded an archive_sha256 (this build authored the archive), the file must hash to
-// it before it is accepted; a container swapped for a stale/foreign/corrupt one is REJECTED and
-// quarantined (renamed <name>.bad) so the setup wizard re-runs and rebuilds it from the original ROM.
-// When no hash was recorded (sidecar absent or older), acceptance degrades to presence (legacy
-// fallback). The cost is one ~15 MiB hash on the archive-only boot path — acceptable (the disk already
-// hashes ~30 MB every boot).
+// True when a valid cart archive (fzerox.o2r) is installed under `dataDir`. Mirrors
+// diskArchiveSatisfies: against a recorded archive_sha256 the file must hash to it, and a container
+// swapped for a stale/foreign/corrupt one is rejected and quarantined (renamed <name>.bad) so the
+// wizard re-runs and rebuilds it from the original ROM. With no recorded hash, acceptance degrades to
+// presence. Costs one ~15 MiB hash on the archive-only boot path, next to the ~30 MB the disk already
+// hashes every boot.
 bool gameArchiveSatisfies(const fs::path& dataDir) {
     fs::path archive = dataDir / kGameArchiveName;
     if (!fileExists(archive)) {
@@ -578,8 +565,8 @@ bool gameArchiveSatisfies(const fs::path& dataDir) {
         return false;
     }
     if (actual == recorded) {
-        // Passing hash check this boot -- latch so ensureCartArchive's own warm-boot check (run later
-        // this same boot, from GdxExtractEnsureArchive) does not re-hash the same file (Fix 2).
+        // Latch so ensureCartArchive's warm-boot check, run later this same boot from
+        // GdxExtractEnsureArchive, does not re-hash the same file.
         GdxExtractMarkArchiveValidated(GdxExtractArchiveKind::Cart);
         return true;
     }
@@ -610,8 +597,8 @@ bool iplArchiveSatisfies(const fs::path& dataDir) {
         return false;
     }
     if (actual == recorded) {
-        // Passing hash check this boot -- latch so ensureIplArchive's own warm-boot check (run later
-        // this same boot, from GdxExtractEnsureArchive) does not re-hash the same file (Fix 2).
+        // Latch so ensureIplArchive's warm-boot check, run later this same boot from
+        // GdxExtractEnsureArchive, does not re-hash the same file.
         GdxExtractMarkArchiveValidated(GdxExtractArchiveKind::Ipl);
         return true;
     }
@@ -642,8 +629,8 @@ FirstBootResult FirstBootRun(const char* argv0) {
     if (ec) {
         ec.clear();
     }
-    // Record the executable directory on every return path (dev, warm, wizard, abort). The runtime
-    // O2R extractor reads its packaged gdx-extract child + decomp-recipes from here.
+    // Recorded on every return path (dev, warm, wizard, abort): the runtime O2R extractor reads its
+    // packaged gdx-extract child + decomp-recipes from here.
     result.exeDir = exeDir.string();
 
     // A ROM beside the executable is normal for a portable release and must not bypass first-time
@@ -663,11 +650,10 @@ FirstBootResult FirstBootRun(const char* argv0) {
                 break;
             }
         }
-        // Japanese-region gate: the dev fast path hashes nothing (it validates by size + z64 magic
-        // only), so a Japanese cartridge dump sitting under any of kRomDevCandidates' US filenames
-        // would otherwise boot HEADLESSLY here — past the wizard, past every message. Refuse it by
-        // ROM-header country code before anything else in this branch runs. Falling through to the
-        // in-window wizard is deliberate: it is the surface that can actually explain the refusal.
+        // The dev fast path hashes nothing (size + z64 magic only), so a Japanese dump sitting under
+        // any of kRomDevCandidates' US filenames would boot HEADLESSLY here, past the wizard and past
+        // every message. Refuse it by ROM-header country code before anything else in this branch
+        // runs, and fall through to the in-window wizard — that is the surface that can explain why.
         if (!romCand.empty() && romIsRefusedJapanese(romCand)) {
             gdx_port_logf(
                 "[firstboot] development tree ROM %s is the JAPANESE release; Japanese-region "
@@ -678,10 +664,10 @@ FirstBootResult FirstBootRun(const char* argv0) {
         }
         if (!romCand.empty()) {
             // G-Diffuser is Expansion-Kit-MANDATORY: the game is built EK-only and crashes/degrades
-            // without the 64DD disk, so the dev fast path must not bypass the wizard unless a valid
-            // EK disk AND IPL are ALSO present. Search the same direct locations the ROM candidate
-            // search above uses (exeDir, cwd — no parent walk; only developmentTreeProvidesArchive's
-            // generic.o2r probe walks parents) for the canonical disk/IPL names the wizard uses.
+            // without the 64DD disk, so the dev fast path may not bypass the wizard unless a valid EK
+            // disk AND IPL are also present. Same direct locations as the ROM candidate search above
+            // (exeDir, cwd — no parent walk; only developmentTreeProvidesArchive's generic.o2r probe
+            // walks parents).
             fs::path diskCand, iplCand;
             std::string diskWhy, iplWhy;
             bool diskFound = false, iplFound = false;
@@ -696,9 +682,8 @@ FirstBootResult FirstBootRun(const char* argv0) {
                     }
                 }
                 if (iplCand.empty()) {
-                    // Probes the canonical name, then the accepted US-prototype alt name
-                    // -- see GdxFindIplSourceInDir's doc comment in
-                    // gdx_firstboot.h; shared with ensureIplArchive and the wizard's Recheck().
+                    // Canonical name, then the accepted US-prototype alt name; shared with
+                    // ensureIplArchive and the wizard's Recheck() (see gdx_firstboot.h).
                     std::string found = GdxFindIplSourceInDir(dir.string());
                     if (!found.empty()) {
                         fs::path i(found);
@@ -709,14 +694,11 @@ FirstBootResult FirstBootRun(const char* argv0) {
                     }
                 }
             }
-            // Managed-copy CREATION is retired (v1.0.0). The media/ staging copy predates full
-            // .o2r support: it existed so the user's original .ndd was deletable before the disk
-            // archive could serve boots by itself. Today fzerox-disk.o2r IS the port's stable copy
-            // (extraction reads the original directly — resolveDiskSource in gdx_extract_launch.cpp
-            // falls back past media/ to the data/exe dirs), so staging 64MB the archive immediately
-            // makes redundant is pure waste. Existing media/ copies from older installs remain
-            // honored everywhere they were before (the accept loop below, disk_buffer.cpp's search
-            // order, the deletion-gate hash fallback) — this retires only their CREATION.
+            // Nothing here CREATES a managed media/ copy: fzerox-disk.o2r is the port's stable copy,
+            // and extraction reads the original directly (resolveDiskSource falls back past media/ to
+            // the data/exe dirs), so staging 64MB the archive immediately makes redundant is waste.
+            // media/ copies from older installs stay honored everywhere they already were — the
+            // accept loop below, disk_buffer.cpp's search order, the deletion-gate hash fallback.
             if (diskCand.empty()) {
                 for (const fs::path& dir : { exeDir, cwd }) {
                     fs::path managed = managedDiskPath(dir);
@@ -744,9 +726,8 @@ FirstBootResult FirstBootRun(const char* argv0) {
                               result.romPath.c_str(), result.diskPath.c_str(), result.iplPath.c_str());
                 return result;
             }
-            // Surface WHY each validator failed (wrong size, too small, etc.) rather than the
-            // generic "missing or invalid", so a tester with a present-but-corrupt disk/IPL can
-            // tell that apart from a genuinely missing file without re-deriving it from the code.
+            // Say WHY each validator failed (wrong size, too small) rather than "missing or invalid",
+            // so a present-but-corrupt disk/IPL is distinguishable from an absent one.
             std::string reasonSuffix;
             if (diskCand.empty()) {
                 reasonSuffix += " disk: ";
@@ -765,10 +746,9 @@ FirstBootResult FirstBootRun(const char* argv0) {
     }
 
     // ── Wizard mode: always portable ─────────────────────────────────────────────────────────────
-    // G-Diffuser never writes to a per-user directory (AppData / XDG data): the game folder is the
-    // data directory, period. Everything the port creates — the extracted fzerox.o2r, saves/,
-    // ghosts/, config, and explicitly requested diagnostics — lives beside the executable, so the
-    // whole installation is one folder that can be moved, backed up, or deleted as a unit.
+    // The port never writes to a per-user directory (AppData / XDG data). Everything it creates — the
+    // extracted fzerox.o2r, saves/, ghosts/, config, requested diagnostics — lives beside the
+    // executable, so the whole installation is one folder that moves, backs up, or deletes as a unit.
     fs::path dataDir = exeDir;
     fs::create_directories(dataDir, ec);
     ec.clear();
@@ -788,32 +768,28 @@ FirstBootResult FirstBootRun(const char* argv0) {
 
     SetupState st = loadState(dataDir);
 
-    // Fast path: setup was previously completed AND every input is still satisfied. Each of the three
-    // canonical inputs is satisfied by the ACCEPTANCE CHAIN — in order: its validated installed
-    // ARCHIVE (so the ORIGINAL is deletable; the game boots archive-only exactly as rom_buffer.cpp /
-    // disk_buffer.cpp already do), else the managed media/ copy (disk only), else the original file.
-    // Demanding the ORIGINAL ROM and IPL files here would drag the wizard back after a fully-
-    // installed setup whose originals were deleted, even though the archives cover them.
+    // Fast path: setup previously completed AND every input is still satisfied. Each canonical input
+    // runs an ACCEPTANCE CHAIN, in order: its validated installed ARCHIVE (so the ORIGINAL is
+    // deletable and the game boots archive-only, as rom_buffer.cpp / disk_buffer.cpp already do), else
+    // the managed media/ copy (disk only), else the original file. Demanding the original ROM and IPL
+    // here would drag the wizard back on a fully-installed setup whose originals were deleted.
     fs::path romInData = dataDir / kRomName;
     fs::path diskInData = dataDir / kDiskName;
     if (st.complete) {
         std::string why;
-        // Resolve the canonical name OR the accepted US-prototype alt name, never just the
-        // canonical one -- this is also where a stale
-        // st.iplPath/Game.DdIplPath sidecar entry (recorded path no longer on disk) is naturally
-        // recovered: this probe re-derives the path fresh from the data dir on every boot instead of
-        // trusting the recorded value. Shared with ensureIplArchive/Recheck() via GdxFindIplSourceInDir.
+        // Canonical name OR the accepted US-prototype alt name, never just the canonical one. This is
+        // also what recovers a stale st.iplPath/Game.DdIplPath entry: the probe re-derives the path
+        // from the data dir every boot instead of trusting the recorded value.
         std::string iplFoundPath = GdxFindIplSourceInDir(dataDir.string());
         fs::path iplCheck = iplFoundPath.empty() ? (dataDir / kIplName) : fs::path(iplFoundPath);
         fs::path managedDisk = managedDiskPath(dataDir);
         bool managedDiskValid = fileExists(managedDisk) && fileSize(managedDisk) == kDiskExactBytes;
 
-        // The game asset archive is still an independent gate: an interrupted/failed extraction (marker
-        // written but fzerox.o2r never produced/validated) must stay in the setup flow rather than
-        // silently boot the raw fallback forever. Because it is required anyway, it is also the ROM
-        // input's archive satisfier — a present-AND-VERIFIED fzerox.o2r means the ROM boots archive-only.
-        // gameArchiveSatisfies re-hashes it against the recorded archive_sha256 (quarantining a corrupt
-        // one) so a bit-rotted/swapped container triggers the wizard instead of a half-boot.
+        // The game asset archive is an independent gate: an interrupted extraction (marker written but
+        // fzerox.o2r never produced/validated) must stay in the setup flow rather than boot the raw
+        // fallback forever. Being required anyway, it doubles as the ROM input's archive satisfier — a
+        // present-AND-VERIFIED fzerox.o2r means the ROM boots archive-only. The re-hash against the
+        // recorded archive_sha256 is what makes a bit-rotted/swapped container trigger the wizard.
         bool gameArchiveValid = gameArchiveSatisfies(dataDir);
 
         // ROM: verified fzerox.o2r (archive-only boot) OR the original US-rev0 ROM.
@@ -825,18 +801,17 @@ FirstBootResult FirstBootRun(const char* argv0) {
         // disk_archive_sha256 where available (falls back to presence when the sidecar has no hash).
         bool diskSatisfied = fileExists(diskInData) || managedDiskValid || diskArchiveSatisfies(dataDir);
 
-        // Japanese-ROM raw-boot install (experimental): setup completed with the JP dump, for which
-        // no fzerox.o2r can exist (US recipes cannot extract it). Requirements are the recorded JP
-        // ROM itself (re-hashed every boot so a swapped file cannot ride the recorded acceptance),
-        // plus the same IPL/disk chains as the US path. This branch cannot be reached by an
-        // interrupted US extraction: those record the US hash (or none), never kRomSha1JpRev0.
+        // Japanese-ROM raw-boot install (experimental): setup completed with the JP dump, for which no
+        // fzerox.o2r can exist. It requires the recorded JP ROM itself, re-hashed every boot so a
+        // swapped file cannot ride the recorded acceptance, plus the same IPL/disk chains as the US
+        // path. An interrupted US extraction cannot reach this branch: those record the US hash or
+        // none, never kRomSha1JpRev0.
         //
-        // Japanese-region gate: when this build does not accept Japanese inputs the recorded-JP-hash
-        // fast path is DISABLED — otherwise a gdx_firstboot.cfg written by a JP-enabled (dev) build,
-        // or carried over in a copied game folder, would keep booting the Japanese ROM raw in a
-        // release binary with no wizard and no message. Refusing here drops through to the
-        // "input unsatisfied" branch below, which re-runs setup; the wizard's ROM row then states
-        // the actual reason (GdxRecognizeInput refuses the JP hash with kJpRefusedRomMessage).
+        // With Japanese inputs disabled the recorded-JP-hash fast path is off, or a gdx_firstboot.cfg
+        // written by a JP-enabled dev build (or carried over in a copied game folder) would keep
+        // booting the Japanese ROM raw in a release binary with no wizard and no message. Refusing
+        // drops through to the "input unsatisfied" branch below and the wizard's ROM row states the
+        // real reason.
         bool jpRawBootSatisfied = false;
         if (!gameArchiveValid && st.romSha1 == kRomSha1JpRev0 && !st.romPath.empty() &&
             fileExists(fs::path(st.romPath)) && iplSatisfied && diskSatisfied) {
@@ -860,9 +835,6 @@ FirstBootResult FirstBootRun(const char* argv0) {
         }
 
         if (gameArchiveValid && romSatisfied && iplSatisfied && diskSatisfied) {
-            // The managed-copy backfill that lived here is retired along with managed-copy creation
-            // generally (see the DevLayout comment above): fzerox-disk.o2r is the stable copy now,
-            // and backfilling 64MB of media/ on installs the archive already serves was waste.
             result.status = FirstBootStatus::SetupComplete;
             // Point the caller at the ORIGINAL ROM only when it still exists: rom_buffer.cpp's
             // CLI-arg branch would otherwise be handed a dead path. When the original is gone the ROM
@@ -872,9 +844,9 @@ FirstBootResult FirstBootRun(const char* argv0) {
             if (fileExists(iplCheck)) {
                 recordIplIdentity(dataDir, iplCheck); // keep the acquire-time IPL identity fresh
             }
-            // Annotate the disk source disk_buffer.cpp will actually use: it is ARCHIVE-FIRST (a
-            // mounted fzerox-disk.o2r reconstructs the image before the managed-copy/original search),
-            // so a present disk archive is reported as "archive" even when the managed copy also exists.
+            // disk_buffer.cpp is ARCHIVE-FIRST — a mounted fzerox-disk.o2r reconstructs the image
+            // before the managed-copy/original search — so report "archive" whenever one is present,
+            // even if the managed copy also exists.
             const char* diskSource = fileExists(dataDir / kDiskArchiveName) ? "archive"
                                      : (managedDiskValid ? "managed copy" : "original");
             if (result.romPath.empty()) {
@@ -894,12 +866,10 @@ FirstBootResult FirstBootRun(const char* argv0) {
     }
 
     // ── Needs setup ────────────────────────────────────────────────────────────────────────────────
-    // The dev fast-path and the completed fast-path both missed: the required inputs are absent or
-    // invalid. The old blocking Win32-dialog wizard is gone — acquisition now happens IN-WINDOW after
-    // libultraship + the Gui + the FileDropMgr exist. Resolve nothing further here; return NeedsSetup
-    // so main() proceeds through Context/window init without a ROM, then runs the ImGui setup flow
-    // (port/gdx_firstboot_gui.{h,cpp}), which reuses the exported validators/copy/state helpers below.
-    // result.romPath stays empty (the GUI fills the caller's ROM path once the user installs one).
+    // Both fast paths missed: the required inputs are absent or invalid. Acquisition happens IN-WINDOW,
+    // so resolve nothing further here — main() proceeds through Context/window init without a ROM and
+    // then runs the ImGui setup flow (port/gdx_firstboot_gui.{h,cpp}), which reuses the exported
+    // validators/copy/state helpers below. result.romPath stays empty until the GUI installs a ROM.
     result.status = FirstBootStatus::NeedsSetup;
     gdx_port_logf("[firstboot] required inputs missing; deferring to the in-window setup flow (%s)\n",
                   dataDir.string().c_str());
@@ -996,16 +966,15 @@ GdxInputRecognition GdxRecognizeInput(const std::string& canonicalName, const st
             r.message = "SHA-1 verified: " + r.sha1;
         } else if (r.sha1 == kRomSha1JpRev0) {
             if (!kAllowJapaneseInputs) {
-                // Japanese-region gate (see kAllowJapaneseInputs). The dump is RECOGNIZED — that is
-                // the whole point of keeping kRomSha1JpRev0 — so the row can name it precisely
-                // instead of falling through to the generic "SHA-1 mismatch" text below.
+                // The dump is RECOGNIZED — the whole point of keeping kRomSha1JpRev0 — so the row
+                // names it precisely instead of falling through to the generic mismatch text below.
                 r.verdict = GdxInputVerdict::Rejected;
                 r.message = kJpRefusedRomMessage;
                 return r;
             }
-            // Accept the Japanese dump. It boots RAW — the US recipe
-            // tree cannot extract it, so setup skips archive extraction entirely for this ROM and
-            // the boot uses the raw-ROM path (no fzerox.o2r, no archive-only mode, no deletable ROM).
+            // Accepted, but it boots RAW: the US recipe tree cannot extract it, so setup skips
+            // archive extraction for this ROM entirely — no fzerox.o2r, no archive-only mode, and the
+            // ROM file is not deletable.
             r.verdict = GdxInputVerdict::AcceptedUnknownWarn;
             r.jpRom = true;
             r.okHeaderOverride = "OK (F-Zero X (Japan) — experimental)";
@@ -1013,9 +982,9 @@ GdxInputRecognition GdxRecognizeInput(const std::string& canonicalName, const st
                         "the ROM; asset extraction and archive features are unavailable for the "
                         "Japanese version, so keep this ROM file in place.";
         } else if (romIsRefusedJapanese(fs::path(path))) {
-            // A Japanese dump this build has no hash for (alternate dump, trimmed/overdumped image,
-            // a revision we have not catalogued). The header country code still identifies it, so
-            // say WHY it is refused rather than "this is not the US cartridge".
+            // A Japanese dump this build has no hash for (alternate dump, trimmed/overdumped image, an
+            // uncatalogued revision). The header country code still identifies it, so say WHY it is
+            // refused rather than "this is not the US cartridge".
             r.verdict = GdxInputVerdict::Rejected;
             r.message = std::string(kJpRefusedRomMessage) + "\n(identified from the ROM header "
                         "country code; SHA-1 " + r.sha1 + ")";
@@ -1049,8 +1018,8 @@ GdxInputRecognition GdxRecognizeInput(const std::string& canonicalName, const st
         for (const KnownDiskDump& d : kKnownDiskDumps) {
             if (r.sha1 == d.sha1) {
                 if (d.japanese && !kAllowJapaneseInputs) {
-                    // Japanese-region gate (see kAllowJapaneseInputs). Recognized, then refused, so
-                    // the row names the disk rather than reporting an unknown image.
+                    // Recognized, then refused, so the row names the disk rather than reporting an
+                    // unknown image.
                     r.verdict = GdxInputVerdict::Rejected;
                     r.message = kJpRefusedDiskMessage;
                     return r;
@@ -1061,12 +1030,11 @@ GdxInputRecognition GdxRecognizeInput(const std::string& canonicalName, const st
                 return r;
             }
         }
-        // NOTE: an UNRECOGNIZED but correctly-sized image is still accepted-with-warning, in both
-        // gate states. There is no cheap region marker on a 64DD image the way there is on a
-        // cartridge header (the fan-translated disk is itself a modified Japanese disk, so any
-        // region field it carries still reads as Japan), so "unknown" cannot be narrowed to
-        // "Japanese" here without guessing. Refusing every unknown dump would break legitimate
-        // re-dumps; the identity gate stays exact-hash only.
+        // An UNRECOGNIZED but correctly-sized image stays accepted-with-warning in both gate states.
+        // A 64DD image carries no usable region marker (the fan-translated disk is itself a modified
+        // Japanese disk, so any region field still reads as Japan), so "unknown" cannot be narrowed to
+        // "Japanese" without guessing, and refusing every unknown dump would break legitimate
+        // re-dumps. The identity gate stays exact-hash only.
         r.verdict = GdxInputVerdict::AcceptedUnknownWarn;
         r.message = "Unrecognized Expansion Kit disk (SHA-1 " + r.sha1 +
                     ") — proceeding, but this dump is untested.";
@@ -1097,11 +1065,10 @@ bool WriteSetupComplete(const std::string& dataDir, const std::string& romPath,
     st.romPath = romPath;
     st.diskPath = diskPath;
     st.iplPath = iplPath;
-    // Recorded so the completed-setup fast path can recognize a Japanese-ROM raw-boot install
-    // (no fzerox.o2r ever exists for it) without weakening the US game-archive gate.
+    // Lets the completed-setup fast path recognize a Japanese-ROM raw-boot install (no fzerox.o2r ever
+    // exists for one) without weakening the US game-archive gate.
     st.romSha1 = GdxExtractFileSha1(romPath.c_str());
-    // Record the acquire-time IPL identity as setup finalizes (best-effort; the dedicated IPL
-    // extraction step refreshes it to the normalized identity once it runs).
+    // Best-effort; the dedicated IPL extraction step refreshes it to the normalized identity later.
     recordIplIdentity(fs::path(dataDir), fs::path(iplPath));
     return saveState(fs::path(dataDir), st);
 }
@@ -1115,7 +1082,6 @@ std::string GdxFirstBootDescribeMissing(const std::string& dataDirIn) {
     std::vector<std::string> lines;
     std::string why;
 
-    // ROM.
     fs::path romPath = dataDir / kRomName;
     if (!fileExists(romPath)) {
         lines.push_back(std::string(kRomName) + " (F-Zero X ROM): missing.");
@@ -1123,8 +1089,8 @@ std::string GdxFirstBootDescribeMissing(const std::string& dataDirIn) {
         lines.push_back(std::string(kRomName) + " (F-Zero X ROM): invalid -- " + why);
     }
 
-    // 64DD IPL ROM: the raw file OR the dedicated archive satisfies this input (
-    // gdx_ddipl_load is archive-first once n64ddipl.o2r is mounted).
+    // The raw file OR the dedicated archive satisfies this input: gdx_ddipl_load is archive-first once
+    // n64ddipl.o2r is mounted.
     fs::path iplPath = dataDir / kIplName;
     bool iplArchivePresent = fileExists(dataDir / kIplArchiveName);
     if (fileExists(iplPath)) {
@@ -1136,9 +1102,8 @@ std::string GdxFirstBootDescribeMissing(const std::string& dataDirIn) {
                         kIplArchiveName + " archive found either.");
     }
 
-    // Expansion Kit disk: the original OR the managed copy under media/ OR the dedicated disk archive
-    // satisfies this input (managed copy + archive-first; gdx_disk_load resolves
-    // archive → managed copy → original).
+    // The original OR the managed copy under media/ OR the dedicated disk archive satisfies this
+    // input; gdx_disk_load resolves archive → managed copy → original.
     fs::path diskPath = dataDir / kDiskName;
     fs::path managedDisk = managedDiskPath(dataDir);
     bool managedDiskOk = fileExists(managedDisk) && fileSize(managedDisk) == kDiskExactBytes;

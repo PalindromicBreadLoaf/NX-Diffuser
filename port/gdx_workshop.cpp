@@ -34,8 +34,8 @@
 #include <unordered_set>
 #include <vector>
 
-// stb single-header PNG writer, vendored beside this file (port/gdx_stb_image_write.h). The
-// implementation is compiled exactly once, here, so it never leaks across the torch tree.
+// stb single-header PNG writer, vendored beside this file (port/gdx_stb_image_write.h). This is the
+// one TU that defines STB_IMAGE_WRITE_IMPLEMENTATION, so it never leaks across the torch tree.
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #define STBI_WRITE_NO_STDIO_DEPRECATION
 #include "gdx_stb_image_write.h"
@@ -61,12 +61,11 @@ std::mutex gDumpMutex;
 std::unordered_set<std::string> gDumpSeen;
 
 // ── contact-sheet regen debounce ──────────────────────────────────────────────────────────────────
-// Regenerating dump/index.html on every dumped texture turns a level-load burst of ~1000 first-seen
-// textures into ~1000 synchronous full-HTML rewrites. Instead the dump path marks the sheet dirty and
-// regenerates at most once per throttle window; the menu status path (gdx_workshop_dump_count, polled
-// each frame the dump section is open) force-flushes any pending dirty state so a modder alt-tabbing to
-// index.html always sees the complete first-seen set. Guarded by its own mutex so file IO never runs
-// under gDumpMutex.
+// Regenerating dump/index.html per dumped texture turns a level-load burst of ~1000 first-seen
+// textures into ~1000 synchronous full-HTML rewrites, so the dump path only marks the sheet dirty and
+// regenerates once per throttle window. gdx_workshop_dump_count (polled per frame while the dump
+// section is open) force-flushes the pending state, so index.html is complete whenever a modder looks
+// at it. Its own mutex, so file IO never runs under gDumpMutex.
 std::mutex gSheetMutex;
 bool gSheetDirty = false;
 std::chrono::steady_clock::time_point gSheetLastWrite;  // default-constructed = epoch => first dump writes immediately
@@ -197,11 +196,10 @@ std::string htmlEscape(const std::string& s) {
     return out;
 }
 
-// Regenerate dump/index.html — a self-contained contact sheet listing every dumped texture as a
-// thumbnail (via <img> of the sibling PNGs) with its key, dimensions and N64 format. Cheap and
-// modder-facing: it lets a modder find the texture they saw on screen and copy its exact key. Rebuilt
-// from manifest.tsv on every new dump so it always reflects the full first-seen set (including PNGs
-// carried over from previous sessions). Best-effort: any failure is silently ignored (debug-only path).
+// Regenerate dump/index.html — a self-contained contact sheet of every dumped texture (thumbnail of
+// the sibling PNG, key, dimensions, N64 format) so a modder can find the texture they saw on screen
+// and copy its exact key. Rebuilt from manifest.tsv, which spans sessions, so it always covers the
+// full first-seen set. Best-effort: any failure is silently ignored.
 void writeContactSheet(const std::filesystem::path& dumpDir) {
     std::filesystem::path tsv = dumpDir / "manifest.tsv";
     FILE* in = std::fopen(tsv.string().c_str(), "rb");
@@ -299,9 +297,8 @@ void writeContactSheet(const std::filesystem::path& dumpDir) {
     }
 }
 
-// Regenerate the contact sheet only when dirty and either forced or the throttle window has elapsed
-// since the last write. Called with force=false from the dump hot path (coalesces bursts) and
-// force=true from the menu status path (guarantees a fresh sheet whenever a modder is looking).
+// force=false from the dump hot path (coalesces bursts); force=true from the menu status path, which
+// must not show a stale sheet.
 void regenContactSheetIfDue(const std::filesystem::path& dumpDir, bool force) {
     std::lock_guard<std::mutex> lock(gSheetMutex);
     if (!gSheetDirty) {
@@ -346,9 +343,7 @@ std::string jsonField(const std::string& json, const char* key) {
 
 } // namespace
 
-// ──────────────────────────────────────────────────────────────────────────────────────────────────
-// Tier-B override shim
-// ──────────────────────────────────────────────────────────────────────────────────────────────────
+// ── Tier-B override shim ──────────────────────────────────────────────────────────────────────────
 extern "C" int gdx_workshop_texture_packs_enabled(void) {
     return CVarGetInteger("gEnhancements.Workshop.TexturePacks", 0) != 0;
 }
@@ -373,17 +368,14 @@ extern "C" const char* GdxWorkshopLookupOverridePath(const char* key) {
     return ins.first->second.empty() ? nullptr : ins.first->second.c_str();
 }
 
-// ──────────────────────────────────────────────────────────────────────────────────────────────────
-// Texture dump
-// ──────────────────────────────────────────────────────────────────────────────────────────────────
+// ── Texture dump ──────────────────────────────────────────────────────────────────────────────────
 extern "C" int gdx_workshop_texture_dump_enabled(void) {
     return CVarGetInteger("gEnhancements.Workshop.TextureDump", 0) != 0;
 }
 
 extern "C" int gdx_workshop_dump_count(void) {
-    // The menu polls this each frame the dump section is open. Piggyback a force-flush of any pending
-    // contact-sheet dirty state here so a modder viewing dump/ always sees the complete first-seen set
-    // even if the last dumps landed inside the debounce throttle window. Cheap no-op when not dirty.
+    // The menu polls this every frame the dump section is open, which makes it the flush point for a
+    // contact sheet still dirty inside the debounce window. No-op when clean.
     regenContactSheetIfDue(resolveDir("dump", false), /*force=*/true);
     std::lock_guard<std::mutex> lock(gDumpMutex);
     return static_cast<int>(gDumpSeen.size());
@@ -498,18 +490,13 @@ extern "C" void gdx_workshop_dump_texture(const void* origSrcAddr, size_t origSr
         }
         std::fprintf(f, "%s\t%d\t%d\t%s\n", key.c_str(), width, height, n64FormatName(n64Fmt, n64Siz));
         std::fclose(f);
-        // Refresh the human-facing contact sheet so it always reflects the full dumped set. Debounced:
-        // mark dirty and regenerate at most once per throttle window so a level-load burst of hundreds
-        // of first-seen textures no longer triggers hundreds of synchronous HTML rewrites. The menu
-        // status path force-flushes any pending dirty state (see gdx_workshop_dump_count).
+        // Debounced regen; a pending dirty state is force-flushed by gdx_workshop_dump_count.
         markContactSheetDirty();
         regenContactSheetIfDue(dumpDir, /*force=*/false);
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────────────────────────
-// Hot reload
-// ──────────────────────────────────────────────────────────────────────────────────────────────────
+// ── Hot reload ────────────────────────────────────────────────────────────────────────────────────
 extern "C" void GdxWorkshopReload(char* outStatus, size_t outStatusLen) {
     auto setStatus = [&](const std::string& s) {
         if (outStatus != nullptr && outStatusLen > 0) {
@@ -525,16 +512,14 @@ extern "C" void GdxWorkshopReload(char* outStatus, size_t outStatusLen) {
         return;
     }
 
-    // 1) Evict cached pack resources.
     rm->DirtyResources("textures/pack/*");
 
-    // 1b) Quiesce the resource thread pool before touching the ArchiveManager. DirtyResources
-    // queues an async worker that iterates the archive manager's file table; remounting
-    // archives under it was a use-after-free (worker crash in ListFiles). The ArchiveManager
-    // now also carries its own lock, but the swap should still happen against an idle pool.
+    // Quiesce the resource thread pool before touching the ArchiveManager: DirtyResources queues an
+    // async worker that iterates the archive manager's file table, and remounting archives under it
+    // is a use-after-free (worker crash in ListFiles). The ArchiveManager carries its own lock now,
+    // but the swap still belongs against an idle pool.
     rm->WaitForAsyncTasks();
 
-    // 2) Remove currently-mounted mods archives, then re-add the on-disk enabled set.
     std::filesystem::path modsDir = resolveDir("mods", false);
     std::string modsKey = toLower(modsDir.string());
     auto archives = am->GetArchives();
@@ -581,10 +566,9 @@ extern "C" void GdxWorkshopReload(char* outStatus, size_t outStatusLen) {
     // AddArchive/RemoveArchive rebuild the virtual file system internally, so no explicit
     // ResetVirtualFileSystem call is needed here (and the method is protected anyway).
 
-    // 3) Clear interpreter texture cache so GPU uploads refresh.
     gfx_texture_cache_clear();
 
-    // 4) Bump the pack epoch (invalidate the override cache).
+    // Bump the pack epoch to invalidate the override cache.
     {
         std::lock_guard<std::mutex> lock(gCacheMutex);
         gPackEpoch++;
@@ -598,9 +582,7 @@ extern "C" void GdxWorkshopReload(char* outStatus, size_t outStatusLen) {
     gdx_port_logf("[workshop] reload: %d pack(s), %d override(s)\n", mounted, overrides);
 }
 
-// ──────────────────────────────────────────────────────────────────────────────────────────────────
-// Menu-facing helpers (C++)
-// ──────────────────────────────────────────────────────────────────────────────────────────────────
+// ── Menu-facing helpers (C++) ─────────────────────────────────────────────────────────────────────
 int GdxWorkshopOverrideCount() {
     auto am = archiveManager();
     if (am == nullptr) {
@@ -626,11 +608,11 @@ std::vector<GdxWorkshopPackInfo> GdxWorkshopListPacks() {
         return out;
     }
 
-    // Best-effort manifest from the mounted VFS (highest-priority pack wins on path collision).
-    // Read once and applied to every row for the mismatch banner.
-    // Packs now carry "workshop.json": "manifest.json" is libultraship's RESERVED archive
-    // manifest with a numeric game_version schema, and our string game_version made LUS's
-    // parser throw on every mount. Old packs are still read via the fallback name.
+    // Best-effort manifest from the mounted VFS (highest-priority pack wins on path collision), read
+    // once and applied to every row for the mismatch banner. Packs use "workshop.json" because
+    // "manifest.json" is libultraship's reserved archive manifest, whose numeric game_version schema
+    // makes LUS's parser throw on our string game_version at every mount; the reserved name stays in
+    // the probe list only to keep pre-rename packs readable.
     std::string manifestJson;
     if (auto am = archiveManager()) {
         for (const char* manifestName : { "workshop.json", "manifest.json" }) {

@@ -38,8 +38,8 @@ ImFont* LoadFontWithIcons(const std::string& path, float size) {
 } // namespace
 
 void GdxFast3dGui::ImGuiWMInit() {
-    // The platform backend is initialized first. The renderer backend is initialized after this
-    // virtual returns, so fonts added here are included in its first font-atlas upload.
+    // The renderer backend is initialized after this virtual returns, so fonts added here land in
+    // its first font-atlas upload.
     Fast::Fast3dGui::ImGuiWMInit();
 
     const std::string fontRoot = Ship::Context::GetPathRelativeToAppDirectory("fonts/");
@@ -47,8 +47,8 @@ void GdxFast3dGui::ImGuiWMInit() {
     sFontLarge = LoadFontWithIcons(fontRoot + "Montserrat-Regular.ttf", 22.0f);
     sFontMono = LoadFontWithIcons(fontRoot + "Inconsolata-Regular.ttf", 17.0f);
 
-    // Missing loose assets must never prevent the port from booting. The normal ImGui default font
-    // already includes Font Awesome through LibUltraShip, so it is a complete fallback.
+    // Missing loose assets must never block boot. ImGui's default font already includes Font
+    // Awesome through libultraship, so it is a complete fallback.
     ImFont* fallback = ImGui::GetIO().Fonts->Fonts.empty() ? nullptr : ImGui::GetIO().Fonts->Fonts[0];
     if (sFontStandard == nullptr) {
         sFontStandard = fallback;

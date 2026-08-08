@@ -18,51 +18,14 @@
 #include <unistd.h>
 #endif
 
-// gdx_ck()/gdx_cki()/gdx_ckp()/gdx_seg_log()/gdx_addr_log() (see n64_sched.c) are per-frame,
-// unconditional trace breadcrumbs sprinkled through the decomp sources: sys_gfx.c's func_80067D64
-// + func_800690FC alone emit ~14 per VI frame, and a game-mode transition adds another half dozen
-// from game.c's GMI_* checkpoints. Each call reaches gdx_port_write_log(), which does
-// OutputDebugStringA + a synchronous WriteFile + fputs/fflush on stderr -- three OS calls per line,
-// paid on the GAME thread, spiking hardest on the same tick that does the segment loads. They are
-// therefore gated behind GDX_TRACE=1: silent by default, re-enabled on demand, with no edit to any
-// decomp call site. Lower-frequency one-time/startup gdx_port_logf() calls (ROM/disk load, sched
-// init, crash handler, [transition] timing) call gdx_port_logf() directly and are unaffected.
-/* Default: Debug builds trace ON (developer workflow), Release builds trace
-   OFF (end-user performance). GDX_TRACE overrides in BOTH directions:
-   GDX_TRACE=1 on a Release build enables full diagnostics for an end-user
-   bug report; GDX_TRACE=0 on a Debug build silences the trace for profiling.
-   Error-class logging (crash handler, [transition] timings, boot/ROM/disk
-   one-shots) calls gdx_port_logf directly and is always on in both configs. */
-/* GDX_DIAG_VERBOSE gate: the high-frequency per-frame diagnostic log families
-   are silenced by default in BOTH Debug and Release and re-enabled with
-   GDX_DIAG_VERBOSE=1 (any non-"0" value). Defined in n64_sched.c and cached
-   there; declared here (and in global.h for decomp sources) so the gate is
-   callable from both the C++ bridge and decomp C.
-
-   Family -> gate mapping (a tester sets GDX_DIAG_VERBOSE=1 to reveal the
-   "verbose" families for a bug report; error/one-shot families are always on):
-
-   Gated behind GDX_DIAG_VERBOSE=1 (silent by default):
-     n64_sched.c    : [gfxdiag] [game] [seg] [sched] [phasegeom] [bigtri]
-     n64_gfx_bridge : [geodiag] [gpustate] [gfxfail] (per-frame aggregate)
-                      [datafail] [tex-census] [ci-dump] [dl-census]
-                      [seg-dl] (successful repoint) [seg-dl-race] [seed] (quad probe)
-
-   Always on (bounded and/or error/one-shot, high signal for bug reports):
-     [bridge-init]  one-shot boot state
-     [segment]      mode-transition cadence (venue segment loads)
-     [stub-miss]    bounded to 24 unique SETTIMG module pointers
-     [gdl-miss]     error family, per-phase budget: race 400 / non-race 40
-     [gdl-bad]      error family, per-phase budget: race 400 / non-race 40
-     [gfxfail] ROOT rejected  bounded to 16 (frame-skip crash failsafe)
-     [seg-dl] moveword FAILED bounded to 24 (untranslatable repoint = garbage)
-     [seed] boot-logo config  one-shot launch/env state
-     [transition]/[gdxcap]/[dump]/[vifallback] boot/capture one-shots
-
-   Not modified here (already env-gated or tightly bounded, did not flood):
-     [setupdl] (GDX_DIAG_SETUPDL + cap 40), [trect] (cap 8),
-     [vtx-*]/[mtx-*]/[texdiag]/[resolve-fail]/[signext] (small per-cause caps),
-     [transition-cap] (cap 8), GDX_DIAG_SETTIMG race trace (env-gated). */
+/* The per-frame trace breadcrumbs sprinkled through the decomp sources (gdx_ck(), gdx_seg_log(),
+   ...) each cost three OS calls per line on the GAME thread, so GDX_TRACE gates them without
+   touching any decomp call site. Debug traces ON, Release OFF; GDX_TRACE overrides both ways.
+   Error-class logging (crash handler, boot one-shots) calls gdx_port_logf directly and is
+   always on. */
+/* GDX_DIAG_VERBOSE gates the high-frequency per-frame diagnostic families, silent by default in
+   both configs. Defined and cached in n64_sched.c; declared here AND in global.h so both the C++
+   bridge and decomp C can call it. */
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -71,46 +34,25 @@ int gdx_diag_verbose(void);
 }
 #endif
 
-// The four logging gates below are Bucket D of the Dev Tools gate policy (see gdx_dev_gates.h):
-// the CVar is the PERSISTED preference and is adopted at startup by gdx_dev_gates_boot_seed(),
-// right after Ship::Context::InitConsoleVariables() and therefore ahead of essentially all boot
-// logging; an exported env var overrides it for that run only and is never written back; and a
-// runtime toggle affects output from that point forward (it cannot retroactively emit lines for
-// events that already happened — the Dev Tools page says so on the control).
-//
-// Quoted include: resolved relative to THIS header's directory, so the decomp translation units
-// that reach port_log.h through a relative path still find it.
+// The logging gates below follow the Bucket D policy in gdx_dev_gates.h: CVar is the persisted
+// preference, adopted at startup ahead of essentially all boot logging; an env var overrides for
+// that run only and is never written back.
 #include "gdx_dev_gates.h"
 
 static inline int gdx_trace_enabled(void) {
     return gdx_dev_gate(GDX_GATE_TRACE);
 }
 
-// Opt-in gate for the persistent gdiffuser-run.log file sink. File logging is
-// OFF by default (a normal play session must not silently create/append a log
-// at the process CWD, which for shortcuts/packaged installs may be write-
-// protected). It is enabled when any diagnostic mode is requested, either by
-// its env var or by its persisted CVar (Dev Tools > Logging):
-//   GDX_LOG          / gDevTools.Log.FileSink -- dedicated file-log opt-in
-//   GDX_TRACE        / gDevTools.Log.Trace    -- high-frequency trace mode
-//   GDX_DIAG_VERBOSE / gDevTools.Log.Verbose  -- verbose diagnostic families
-//   GDX_DIAG_UNLOCK  / gDevTools.Log.Unlock   -- unlock-code/audio path only
-// Read LIVE (four inline int loads from the gate cache) rather than latched, which is what makes
-// "tick the box now and the log starts" work: gdx_port_write_log below opens the file the first
-// time this returns non-zero, so enabling any of the four gates mid-session starts writing from
-// the next log line onward. Lines already emitted this session are gone — restart with the CVar
-// persisted (or with the env var exported) to capture boot. The always-on stderr /
-// OutputDebugStringA sinks are unaffected by this gate.
+// OFF by default: a normal play session must not silently create a log file. Read LIVE rather
+// than latched, so ticking the box mid-session starts the log; gdx_port_write_log opens the file
+// the first time this returns non-zero, and lines already emitted are gone.
 static inline int gdx_log_file_enabled(void) {
     return gdx_dev_gate(GDX_GATE_LOG_FILE) || gdx_dev_gate(GDX_GATE_TRACE) ||
            gdx_dev_gate(GDX_GATE_DIAG_VERBOSE) || gdx_dev_gate(GDX_GATE_DIAG_UNLOCK);
 }
 
-// Resolve "<exe dir>/<fileName>" into outPath (the exe-relative saves convention
-// sram_buffer.cpp already uses). Falls back to the bare CWD-relative filename if
-// the exe path is unavailable or does not fit. Shared by gdx_log_file_path (opt-in
-// run log) and gdx_crash_report_path (always-on crash report) so both sinks agree
-// on where "next to the executable" means. Returns outPath.
+// Exe-relative, matching the saves convention in sram_buffer.cpp; falls back to a CWD-relative
+// bare filename. Shared by both sinks below so they cannot disagree on where the files land.
 static inline const char* gdx_exe_relative_path(char* outPath, size_t outCap, const char* fileName) {
 #ifdef _WIN32
     {
@@ -148,20 +90,17 @@ static inline const char* gdx_exe_relative_path(char* outPath, size_t outCap, co
     return outPath;
 }
 
-// Resolve "<exe dir>/gdiffuser-run.log" into outPath. See gdx_exe_relative_path.
 static inline const char* gdx_log_file_path(char* outPath, size_t outCap) {
     return gdx_exe_relative_path(outPath, outCap, "gdiffuser-run.log");
 }
 
-// Resolve "<exe dir>/gdiffuser-crash.txt" into outPath. See gdx_exe_relative_path.
 static inline const char* gdx_crash_report_path(char* outPath, size_t outCap) {
     return gdx_exe_relative_path(outPath, outCap, "gdiffuser-crash.txt");
 }
 
-// Safe logging that works from any thread/fiber context.
-// Avoids fopen/fclose per-call which causes heap corruption in Debug CRT
-// when called from the GFX fiber (the CRT's internal dynamic buffer
-// deallocates on a stack frame that the fiber scheduler may have switched out).
+// Holds the file handle open instead of fopen/fclose per call: the Debug CRT's internal dynamic
+// buffer deallocates on a stack frame the fiber scheduler may have switched out, which corrupts
+// the heap when this is called from the GFX fiber.
 static inline void gdx_port_write_log(const char* message) {
     if (message == NULL) {
         return;
@@ -173,9 +112,8 @@ static inline void gdx_port_write_log(const char* message) {
 
 #ifdef _WIN32
     OutputDebugStringA(message);
-    // GUI-subsystem builds have no console. Keep a lightweight file sink so boot
-    // diagnostics remain available without reopening the file on every log call
-    // -- but only when opt-in diagnostics are requested (see gdx_log_file_enabled).
+    // GUI-subsystem builds have no console, so the file sink is the only way to get boot
+    // diagnostics off a user's machine.
     if (gdx_log_file_enabled()) {
         static HANDLE sLogFile = INVALID_HANDLE_VALUE;
         static int sTriedOpen = 0;
@@ -191,11 +129,9 @@ static inline void gdx_port_write_log(const char* message) {
             WriteFile(sLogFile, message, (DWORD)lstrlenA(message), &written, NULL);
         }
     }
-    // Also write to stderr when launched from an existing console.
     fputs(message, stderr);
     fflush(stderr);
 #else
-    // Opt-in persistent file sink (mirrors the Windows path; stderr is always on).
     if (gdx_log_file_enabled()) {
         static FILE* sLogFile = NULL;
         static int sTriedOpen = 0;
@@ -217,20 +153,10 @@ static inline void gdx_port_write_log(const char* message) {
 #endif
 }
 
-// Always-on crash-report sink: writes straight to "<exe dir>/gdiffuser-crash.txt",
-// bypassing gdx_log_file_enabled() entirely. Field testers running a plain double-
-// clicked build set none of GDX_LOG/GDX_TRACE/GDX_DIAG_VERBOSE/GDX_DIAG_UNLOCK, so
-// the opt-in run-log sink above never opens -- a crash would otherwise leave zero
-// artifacts on disk. This is called ONLY from the crash handler (n64_sched.c), a
-// rare/exceptional path, so opening+closing the handle per call (rather than
-// caching a handle for the process lifetime like gdx_port_write_log does) is fine
-// and keeps the file free to inspect immediately after a crash without waiting on
-// process exit to flush/close it.
-//
-// Same CRT-FILE* avoidance as gdx_port_write_log above: the crash handler can run
-// on the GFX/audio fiber, whose stack may be mid-switch from the scheduler's point
-// of view, so no fopen/FILE* buffering here -- raw CreateFileA/WriteFile (Windows)
-// or open/write (POSIX) only.
+// Deliberately bypasses gdx_log_file_enabled(): field testers set no diagnostic gates, so without
+// this a crash leaves zero artifacts on disk. Called only from the crash handler (n64_sched.c),
+// which can run on a fiber whose stack is mid-switch — raw CreateFileA/WriteFile (or open/write)
+// only, same CRT-FILE* hazard as gdx_port_write_log.
 static inline void gdx_crash_report_write(const char* message) {
     if (message == NULL || message[0] == '\0') {
         return;
@@ -268,8 +194,7 @@ static inline void gdx_port_vlogf(const char* fmt, va_list args) {
     char buffer[2048];
     size_t prefixLen = 0;
 #ifdef _WIN32
-    /* Wall-clock prefix with millisecond precision so log lines can be
-       correlated with frame timing and external events. */
+    /* Millisecond wall clock so lines can be correlated with frame timing and external events. */
     {
         SYSTEMTIME st;
         GetLocalTime(&st);

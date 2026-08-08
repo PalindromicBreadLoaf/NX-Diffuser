@@ -1,7 +1,7 @@
 // G-Diffuser — asset loader.
 // Bridges the generated AssetBindings (C) to libultraship's ResourceManager: given an o2r
-// resource key "category/symbol", load it and return the raw data pointer the game expects.
-// C linkage so the generated C binding table can call it.
+// resource key of the form "category/symbol", load it and return the raw data pointer the
+// game expects. C linkage, because the generated C binding table calls in here.
 
 #include "ship/Context.h"
 #include "ship/resource/ResourceManager.h"
@@ -32,7 +32,6 @@ extern "C" void* GDiffuser_LoadAsset(const char* key) {
     if (rm == nullptr) {
         return nullptr;
     }
-    // Ensure the resource is parsed/cached, then hand back its raw data pointer.
     if (rm->LoadResource(key) == nullptr) {
         return nullptr; // not present, or no factory registered for this resource type
     }
@@ -59,13 +58,11 @@ extern "C" int GDiffuser_LoadAssetBytes(const char* key, void* out, size_t outSi
         return 0;
     }
 
-    /* LUS resource factories
-     * consume the 64-byte OTR header (ResourceLoader.cpp BufferOffset) and
-     * the per-type sub-header BEFORE the resource is handed back --
-     * GetRawPointer()/GetPointerSize() are already payload-only (e.g.
-     * TextureFactory sets ImageData = buffer + 0x50). Never re-strip here:
-     * an earlier "OTEX strip" at this spot operated on a disproven model and
-     * was a latent truncation hazard for payloads with coincidental magic. */
+    /* LUS resource factories consume the 64-byte OTR header (ResourceLoader.cpp
+     * BufferOffset) and the per-type sub-header before the resource is handed back, so
+     * GetRawPointer()/GetPointerSize() are already payload-only (TextureFactory, for
+     * instance, sets ImageData = buffer + 0x50). Never re-strip a header here: it
+     * truncates any payload whose first bytes coincidentally look like a magic word. */
     const unsigned char* raw = static_cast<const unsigned char*>(resource->GetRawPointer());
     const size_t rawSize = resource->GetPointerSize();
     if ((raw == nullptr) || (rawSize == 0) || (rawSize > outSize)) {
@@ -97,25 +94,22 @@ extern "C" int GDiffuser_LoadArchiveFileBytes(const char* key, void* out, size_t
         return 0;
     }
 
-    /* Raw archive-file bytes, bypassing resource-factory deserialization.
-     * Staff-ghost records are stored in the o2r as Torch "GhostRecord" resources,
-     * for which the port registers NO libultraship factory yet (see the TODO in
-     * port/resource/ResourceFactories.cpp). GDiffuser_LoadAssetBytes therefore cannot
-     * serve them -- LoadResource() returns nullptr without a factory. LoadFileProcess
-     * hands back the untouched file buffer (64-byte OTR/Torch header followed by the
-     * Torch-serialized payload) so the caller can parse it directly.
+    /* Raw archive-file bytes, bypassing resource-factory deserialization. Staff-ghost
+     * records are stored in the o2r as Torch "GhostRecord" resources, for which the port
+     * registers no libultraship factory yet (see the TODO in
+     * port/resource/ResourceFactories.cpp), and LoadResource() returns nullptr without one.
+     * LoadFileProcess hands back the untouched file buffer -- 64-byte OTR/Torch header then
+     * the Torch-serialized payload -- for the caller to parse directly.
      *
-     * Copies min(fileSize, outSize) bytes -- a partial read is intentional: a ghost
-     * entry carries ~16 KB of trailing replay data, and a caller that only needs the
-     * leading record header passes a small buffer instead of an oversized one.
+     * The partial read is intentional: a ghost entry carries ~16 KB of trailing replay data,
+     * and a caller that only needs the leading record header passes a small buffer.
      *
-     * fileSize note: archive backends (O2rArchive/FolderArchive/OtrArchive) over-allocate
-     * File::Buffer by a fixed +4096 guard region, so Buffer->size() is NOT the real entry
-     * size and would silently zero-pad truncated reads instead of surfacing a short read to
-     * exact-size integrity gates downstream. File::TrueSize carries the real entry byte
-     * count and is preferred here; Buffer->size() is kept only as a defensive fallback for
-     * File instances where TrueSize is unset (0), and as a hard clamp so the copy can never
-     * run past the allocated buffer regardless of what TrueSize reports. */
+     * Archive backends (O2rArchive/FolderArchive/OtrArchive) over-allocate File::Buffer by a
+     * fixed +4096 guard region, so Buffer->size() is NOT the real entry size and using it
+     * would zero-pad truncated reads instead of surfacing a short read to the exact-size
+     * integrity gates downstream. File::TrueSize is the real byte count; Buffer->size()
+     * survives only as a fallback when TrueSize is unset, and as a hard clamp so the copy
+     * can never run past the allocation regardless of what TrueSize reports. */
     auto file = rm->LoadFileProcess(std::string(key));
     if ((file == nullptr) || (file->Buffer == nullptr)) {
         return 0;

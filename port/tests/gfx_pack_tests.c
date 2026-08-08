@@ -3,19 +3,8 @@
  * word.  Standalone console exe: no libultraship, no game objects, no bridge object.
  *
  * It compiles the REAL decomp gbi.h with the exact defines the game build uses
- * (PORT, F3DEX_GBI_2, _LANGUAGE_C, VERSION_US) so the gSP and gDP macros under
- * test are the same ones the game emits at runtime.  It then verifies:
- *
- *   1. sizeof(Gfx) == 16 and the wide layout places w0 at byte 0 and the pointer
- *      word w1 at byte 8 (matching the bridge's kHostBuiltGfxStride == 16 read).
- *   2. gSPVertex / gSPDisplayList / gSPMatrix / gDPSetTextureImage / gSPBranchList
- *      each pack a FULL 64-bit host pointer into w1 with zero truncation, and a
- *      bridge-style reader (w0 @0, w1 @8) recovers the exact pointer.
- *   3. Segmented addresses (e.g. 0x02000000) round-trip unchanged and keep their
- *      high 32 bits zero -- the signal the bridge uses to route them through the
- *      segment table instead of treating them as host pointers.
- *   4. A mixed synthetic display list walks correctly: right command count and a
- *      terminating ENDDL, with each command's opcode read from w0[31:24].
+ * (PORT, F3DEX_GBI_2, _LANGUAGE_C, VERSION_US), so the gSP and gDP macros under
+ * test are the same ones the game emits at runtime.
  *
  * Returns 0 iff every check passes; non-zero (and prints [FAIL]) otherwise.
  */
@@ -23,21 +12,18 @@
 /* mbi.h supplies _SHIFTL / G_MAXZ and then includes <PR/gbi.h>, exactly as the
  * game build reaches gbi.h. */
 #include <PR/mbi.h>
-/* sptask.h: the OSTask whose t.data_ptr carries the ROOT display list to the
- * bridge. The soak-fix relies on this field being a full-width u64* (never a
- * truncated low32), so assert its type/width here in the standalone harness. */
+/* OSTask::t.data_ptr carries the ROOT display list to the bridge and must stay a full-width u64*,
+ * never a truncated low32 -- asserted below. */
 #include <PR/sptask.h>
-/* R4300.h supplies K0_TO_PHYS. Campaign-soak-fix-4 proves the PORT branch passes
- * the FULL host pointer width through (not (u32)-truncated), so the classic
- * gSPMatrix(gfx, K0_TO_PHYS(&mtx), ...) idiom packs a real >4GB host pointer. */
+/* K0_TO_PHYS, for the gSPMatrix(gfx, K0_TO_PHYS(&mtx), ...) idiom. */
 #include <PR/R4300.h>
 
 #include <stdio.h>
 #include <string.h>
 
-/* Match the bridge's wide read exactly: host-built packets are 16 bytes, w0 is a
- * 32-bit little-endian word at byte 0, and the pointer word is a full-width value
- * at byte 8.  See port/n64_gfx_bridge.cpp (kHostBuiltGfxStride / sourceIsWide). */
+/* Must match the bridge's wide read: host-built packets are 16 bytes, w0 a 32-bit little-endian
+ * word at byte 0, the pointer word full-width at byte 8. See port/n64_gfx_bridge.cpp
+ * (kHostBuiltGfxStride / sourceIsWide). */
 #define HOST_GFX_STRIDE 16u
 
 typedef unsigned long long u64_t;
@@ -63,10 +49,8 @@ static void check_sz(const char* name, size_t got, size_t want) {
     }
 }
 
-/* Bridge-style raw reader: pull the opcode and the full pointer word straight out
- * of the packet bytes, using the wide 16-byte stride and byte offset 8 for w1.
- * This deliberately does NOT read the typed struct field -- it proves the on-wire
- * layout the bridge relies on is what the macros actually produce. */
+/* Deliberately does NOT read the typed struct field: reading the raw packet bytes is what proves
+ * the on-wire layout the bridge relies on is what the macros actually produce. */
 static u64_t read_w1_full(const void* base, size_t index) {
     u64_t w1 = 0;
     memcpy(&w1, (const unsigned char*)base + index * HOST_GFX_STRIDE + 8, sizeof(w1));
@@ -84,7 +68,6 @@ static unsigned int read_opcode(const void* base, size_t index) {
 int main(void) {
     printf("=== Phase G1 wide-Gfx packing tests ===\n");
 
-    /* 1. Layout invariants. */
     check_sz("sizeof(Gfx)", sizeof(Gfx), 16);
     check_sz("sizeof(Gwords)", sizeof(Gwords), 16);
     {
@@ -96,15 +79,14 @@ int main(void) {
         check_u64("w1 @ byte 8 (full pointer word)", read_w1_full(&probe, 0), 0x1122334455667788ULL);
     }
 
-    /* A fabricated high host address (bit 46 set) proves all 64 bits survive; the
-     * old (unsigned int) cast would have truncated this to 0xABCD1234. */
+    /* Bit 46 set, so all 64 bits have to survive: an (unsigned int) cast anywhere in the macro
+     * chain would truncate this to 0xABCD1234. */
     void* const kHostPtr = (void*)(u64_t)0x00007FF6ABCD1234ULL;
     void* const kDlPtr   = (void*)(u64_t)0x00007FFEDEADBEEFULL;
     void* const kTexPtr  = (void*)(u64_t)0x0000023400001000ULL;
     Mtx   dummyMtx;
     Vtx   dummyVtx[4];
 
-    /* 2. Each pointer-family macro packs the full pointer into w1. */
     {
         Gfx cmd;
         memset(&cmd, 0, sizeof(cmd));
@@ -140,7 +122,7 @@ int main(void) {
         check_u64("gDPSetTextureImage w1 == host ptr", read_w1_full(&cmd, 0), (u64_t)kTexPtr);
     }
 
-    /* Real object addresses (not just fabricated ones) also survive intact. */
+    /* Real object addresses, not just fabricated ones. */
     {
         Gfx cmd;
         memset(&cmd, 0, sizeof(cmd));
@@ -150,11 +132,10 @@ int main(void) {
         check_u64("gSPMatrix real &Mtx", read_w1_full(&cmd, 0), (u64_t)(void*)&dummyMtx);
     }
 
-    /* Campaign-soak-fix-4: the K0_TO_PHYS(...) matrix idiom (course_model.c /
-     * course_gadgets.c) must pack the FULL host pointer, not a high32=0 truncation.
-     * The pre-fix `(u32)(uintptr_t)` PORT macro dropped the high 32 bits, so the
-     * bridge saw high32==0, ran the guessing resolver, hit fallback_buffer, and the
-     * matrix loaded garbage -> invisible 3D models (832 [datafail] op=DA/frame). */
+    /* The K0_TO_PHYS(...) matrix idiom (course_model.c / course_gadgets.c) must pack the FULL
+     * host pointer. A `(u32)(uintptr_t)` PORT macro drops the high 32 bits, the bridge then sees
+     * high32==0, runs the guessing resolver, hits fallback_buffer, and the matrix loads garbage
+     * -> invisible 3D models (832 [datafail] op=DA/frame). */
     {
         Gfx cmd;
         memset(&cmd, 0, sizeof(cmd));
@@ -169,7 +150,8 @@ int main(void) {
         check_u64("gSPMatrix K0_TO_PHYS real &Mtx", read_w1_full(&cmd, 0), (u64_t)(void*)&dummyMtx);
     }
 
-    /* 3. Segmented address round-trip: a 32-bit value stays 32-bit, high half zero. */
+    /* Segmented address round-trip: a 32-bit value stays 32-bit, high half zero -- the signal the
+     * bridge uses to route it through the segment table rather than as a host pointer. */
     {
         Gfx cmd;
         const unsigned int kSeg = 0x02000000u; /* segment 2, offset 0 */
@@ -187,8 +169,6 @@ int main(void) {
         check_u64("segmented TIMG high32 == 0", read_w1_full(&cmd, 0) >> 32, 0);
     }
 
-    /* 4. Mixed synthetic display list walk: build, then walk via the bridge-style
-     *    reader counting commands until ENDDL. */
     {
         Gfx dl[8];
         Gfx* p = dl;
@@ -210,24 +190,19 @@ int main(void) {
         }
         check_sz("mixed DL walked to ENDDL", walked, 5);
         check_u64("mixed DL ENDDL seen", (u64_t)sawEnd, 1);
-        /* Spot-check pointer fidelity mid-list after the walk. */
         check_u64("walk: cmd0 (MTX) ptr", read_w1_full(dl, 0), (u64_t)kHostPtr);
         check_u64("walk: cmd3 (DL) ptr", read_w1_full(dl, 3), (u64_t)kDlPtr);
     }
 
-    /* 5. ROOT display-list pointer carry (campaign soak fix).
-     *    Gfx_SetTask assigns `task->t.data_ptr = (u64*) gGfxPool->gfxBuffer;`
-     *    and osSpTaskStartGo feeds tp->t.data_ptr straight to the bridge. That
-     *    field MUST carry the full 64-bit host pointer -- if it were ever
-     *    narrowed to 32 bits, the root DL would fall to the module-window guess
-     *    (the first-frame crash). Prove the field is pointer-width and a
-     *    fabricated >4GB pool pointer survives a store/load round-trip. */
+    /* ROOT display-list pointer carry. Gfx_SetTask assigns
+     * `task->t.data_ptr = (u64*) gGfxPool->gfxBuffer;` and osSpTaskStartGo feeds tp->t.data_ptr
+     * straight to the bridge, so narrowing that field to 32 bits drops the root DL to the
+     * module-window guess -- the first-frame crash. */
     {
         OSTask task;
         memset(&task, 0, sizeof(task));
         check_sz("OSTask_t.data_ptr is pointer-width", sizeof(task.t.data_ptr), sizeof(void*));
         check_sz("host pointer is 64-bit", sizeof(void*), 8);
-        /* Simulate Gfx_SetTask's assignment with a high (>4GB) pool address. */
         task.t.data_ptr = (u64*)kHostPtr;
         check_u64("root data_ptr carries full 64-bit ptr",
                   (u64_t)(size_t)task.t.data_ptr, (u64_t)kHostPtr);
@@ -235,15 +210,12 @@ int main(void) {
                   (u64_t)((size_t)task.t.data_ptr >> 32), (u64_t)kHostPtr >> 32);
     }
 
-    /* 6. gSPSegment wide round-trip (campaign soak fix #2).
-     *    Under F3DEX_GBI_2 gSPSegment(seg, base) expands to
-     *      gMoveWd(G_MW_SEGMENT, seg*4, base) -> gDma1p(G_MOVEWORD, base, seg*4, G_MW_SEGMENT)
-     *    so the segment BASE is packed through the SAME widened gDma1p / _GFXW1_PTR
-     *    path as gSPVertex above -- the full 64-bit host pointer, NOT a truncated
-     *    low32. The segment table is the central base for ALL segmented addressing;
-     *    a truncated base cascades into missing textures and garbage geometry.
-     *    Verify BOTH the on-wire pointer fidelity AND the exact w0 field layout the
-     *    bridge parses (index @ w0[23:16] == G_MW_SEGMENT, seg*4 @ w0[15:0]). */
+    /* gSPSegment wide round-trip. Under F3DEX_GBI_2 gSPSegment(seg, base) expands to
+     *   gMoveWd(G_MW_SEGMENT, seg*4, base) -> gDma1p(G_MOVEWORD, base, seg*4, G_MW_SEGMENT)
+     * so the segment BASE goes through the SAME widened gDma1p / _GFXW1_PTR path as gSPVertex
+     * above. The segment table is the central base for ALL segmented addressing, so a truncated
+     * base cascades into missing textures and garbage geometry. The w0 field checks pin the exact
+     * layout the bridge parses (index @ w0[23:16] == G_MW_SEGMENT, seg*4 @ w0[15:0]). */
     {
         Gfx cmd;
         const unsigned int kSegNo = 8u; /* segment 8: course_track_gfx base */
@@ -261,9 +233,6 @@ int main(void) {
                   read_w1_full(&cmd, 0) >> 32, (u64_t)kHostPtr >> 32);
     }
     {
-        /* A 32-bit segmented/physical base (e.g. RDRAM offset) keeps high32 == 0,
-         * the exact signal the bridge uses to route it through the resolver/segment
-         * path instead of treating it as an already-resolved host pointer. */
         Gfx cmd;
         const unsigned int kPhysBase = 0x80200000u; /* KSEG0 physical base */
         memset(&cmd, 0, sizeof(cmd));

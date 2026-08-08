@@ -1,8 +1,7 @@
-// port/n64_gfx_bridge.cpp — S3: C/C++ boundary for GFX task submission.
-// Called from port/n64_sched.c (C) via extern "C" linkage.
-// Uses GetInterpreterWeak() (public) + Interpreter::Run() directly — NOT
-// DrawAndRunGraphicsCommands, which would double-wrap StartFrame/EndFrame.
-// Build placement: G-Diffuser executable target only (NOT gdiffuser_game OBJECT library).
+// C/C++ boundary for GFX task submission, called from port/n64_sched.c via extern "C".
+// Uses GetInterpreterWeak() + Interpreter::Run() directly, NOT DrawAndRunGraphicsCommands,
+// which would double-wrap StartFrame/EndFrame.
+// Must build into the G-Diffuser executable target only, never the gdiffuser_game OBJECT library.
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -13,9 +12,8 @@
 #endif
 #include <windows.h>
 #else
-/* POSIX memory-probe backend (see the /proc/self/maps snapshot helpers and the
- * #else branches of GetMainModuleRange / ReadableByteLimit / ReadableCommandLimit
- * / IsReadableAddress further down). */
+/* POSIX memory-probe backend: /proc/self/maps snapshot helpers plus the #else branches of
+ * GetMainModuleRange / ReadableByteLimit / ReadableCommandLimit / IsReadableAddress. */
 #include <atomic>
 #include <dlfcn.h>
 #include <unistd.h>
@@ -24,16 +22,17 @@
 #include "ship/Context.h"
 #include "fast/Fast3dWindow.h"
 #include "fast/lus_gbi.h"
-#include "gdx_perf.h" // GDX_PERF sub-phase seams (xlate/run/mirror); no-op when disabled
-#include "gdx_dev_gates.h" // Dev Tools gate layer: every GDX_DIAG_* / behavior switch below
+#include "gdx_perf.h" // no-op when GDX_PERF is disabled
+#include "gdx_dev_gates.h" // gates every GDX_DIAG_* / behavior switch below
 #include "port_log.h"
 #include "rom_buffer.h"
-#include "gdx_segment_source.h" // single byte-source shim (GdxSegmentSourceRead / span)
+#include "gdx_segment_source.h"
 #include "n64_rdram.h"
 #include "n64_gfx_bridge.h"
 #include "n64_gfx_convert.h"
 #include "gdx_vi_convert.h"
-#include "gdx_interp.h" // matrix frame-interpolation math + per-tick snap state (default-OFF)
+#include "gdx_interp.h"
+#include "gdx_camera_pose.h"
 extern "C" {
 #include "mio0.h"
 }
@@ -41,45 +40,35 @@ extern "C" {
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 
 extern "C" int gGdxRaceActive;
-/* Forward decl (also declared lower in this file) so the
-   mode-gated Create Machine SETTIMG census can read GET_MODE(gGameMode)==0x10. */
 extern "C" int gGameMode;
 
 // ---------------------------------------------------------------------------------------------
-// Segment-reload epoch (Create Machine / mode-transition TOCTOU guard).
+// Segment-reload seqlock (mode-transition TOCTOU guard).
 //
-// Mode transitions reload asset segments on the GAME thread: decomp_port.c's
-// gdx_load_mode_segments() DMAs/MIO0-decodes fresh bytes into the segment-4/7/9
-// carves, rewrites them in place (gdx_fixup_asset_segment_image), and swaps the
-// gSegments[] bases (Segment_SetAddress). The GRAPHICS thread concurrently reads
-// gSegments[] and the segment buffer CONTENTS while translating display lists,
-// with no synchronization. Reading a half-rewritten command word can hand the
-// interpreter a torn opcode/pointer -- e.g. a byte that lands as an OTR-filepath
-// opcode (0x25) paired with a bare 32-bit token where a host string pointer is
-// expected, which then faults inside strlen on the LUS side.
+// Mode transitions reload asset segments on the GAME thread: gdx_load_mode_segments() decodes
+// fresh bytes into the segment-4/7/9 carves, rewrites them in place, and swaps the gSegments[]
+// bases. The GRAPHICS thread reads gSegments[] and the buffer CONTENTS concurrently with no
+// other synchronization, so a torn read can hand the interpreter a bogus opcode/pointer pair
+// -- e.g. an OTR-filepath opcode (0x25) with a bare 32-bit token where a host string pointer
+// is expected, which faults inside strlen on the LUS side.
 //
-// This is a seqlock generation counter. The game thread brackets every segment
-// mutation with gdx_segment_epoch_begin()/gdx_segment_epoch_end(); the value is
-// ODD while a mutation is in flight. The graphics thread snapshots it before a
-// segment-backed resolution and, via GdxSegmentEpochStable(), rejects the result
-// if the snapshot was odd (mutation in progress) or changed across the resolution
-// (a mutation started/finished mid-read -- possibly torn). The graphics thread
-// NEVER blocks: on an unstable snapshot it takes the same graceful hard-skip as a
-// failed resolution, dropping that one texture for the single reload frame (an
-// invisible cost during a mode transition). Wait-free by construction -- only
-// atomic loads, no locks, no ret/spins on the render thread.
+// The game thread brackets every segment mutation with begin()/end(); the counter is ODD while
+// a mutation is in flight. The graphics thread snapshots before a segment-backed resolution and
+// GdxSegmentEpochStable() rejects the result on an odd or changed snapshot. The graphics thread
+// must NEVER block here: an unstable snapshot takes the same graceful hard-skip as a failed
+// resolution, dropping one texture for one reload frame. Only atomic loads, no locks, no spins.
 static std::atomic<uint32_t> gGdxSegmentEpoch{0};
 
-// Game-thread mutation brackets. acq_rel keeps each increment from being
-// reordered past the segment writes it fences: begin()'s odd publish stays
-// BEFORE the buffer/base writes, end()'s even publish stays AFTER them, so a
-// graphics-thread acquire-load that sees an even, unchanged epoch is guaranteed
-// to have observed a fully-settled segment state.
+// acq_rel keeps each increment from being reordered past the segment writes it fences:
+// begin()'s odd publish stays BEFORE the buffer/base writes, end()'s even publish AFTER them,
+// so a graphics-thread acquire-load seeing an even, unchanged epoch has observed fully-settled
+// segment state.
 extern "C" void gdx_segment_epoch_begin(void) {
     gGdxSegmentEpoch.fetch_add(1u, std::memory_order_acq_rel);
 }
@@ -91,30 +80,21 @@ extern "C" void gdx_segment_epoch_end(void) {
 static inline uint32_t GdxSegmentEpochSnapshot() {
     return gGdxSegmentEpoch.load(std::memory_order_acquire);
 }
-// True iff `snap` was taken outside any mutation window AND no mutation has begun
-// since: even snapshot and unchanged now. The acquire fence orders the caller's
-// segment reads (which happened after taking `snap`) before this second load, so
-// a mutation that raced the reads is reliably detected as a changed epoch.
+// The acquire fence orders the caller's segment reads (taken after `snap`) before this second
+// load, so a mutation that raced those reads is reliably detected as a changed epoch.
 static inline bool GdxSegmentEpochStable(uint32_t snap) {
     std::atomic_thread_fence(std::memory_order_acquire);
     const uint32_t now = gGdxSegmentEpoch.load(std::memory_order_acquire);
     return ((snap & 1u) == 0u) && (snap == now);
 }
-// #16 investigation aid: decomp sets this to 1 (racer.c, right where it already
-// logs "[countdown] draw emitted") the instant the countdown draw code runs, so
-// the bridge's raw vtx/mtx trace only has to cover the interesting few frames
-// instead of the whole race -- gGdxRaceActive alone stays 1 for the entire race
-// and made a fixed-size trace file fill up long before the countdown appeared.
+// Diagnostic, strip later. racer.c raises this when the countdown draw runs so the raw vtx/mtx
+// trace covers a few frames instead of the whole race (gGdxRaceActive stays 1 all race and
+// overflowed the fixed-size trace before the countdown appeared).
 extern "C" int gGdxCountdownProbeArm = 0;
-// The coarse arm above stays 1 for the rest of the process once
-// the countdown first runs, so an edge-trigger on it alone catches whatever
-// triangle the interpreter happens to reach first afterward -- not necessarily
-// the countdown digit quad. decomp (racer.c) tags the digit quad's own vertex
-// pointer here (still a raw N64-style low32 at translate time, so it can be
-// compared directly against in.w1 below) right before drawing it; once this
-// bridge sees a G_VTX command whose raw pointer matches, it publishes the
-// RESOLVED host pointer so interpreter.cpp's GfxSpVertex can recognize that
-// exact draw and tighten the render-state probe to it.
+// Diagnostic, strip later. The coarse arm above latches for the rest of the process, so racer.c
+// also tags the digit quad's own vertex pointer here -- still a raw N64 low32 at translate time,
+// directly comparable against in.w1 below. On a matching G_VTX the bridge publishes the RESOLVED
+// host pointer so interpreter.cpp's GfxSpVertex can narrow the render-state probe to that draw.
 extern "C" unsigned int gGdxCountdownProbeVtxLow32 = 0;
 extern "C" uintptr_t gGdxCountdownProbeResolvedVtx = 0;
 #include <cstdio>
@@ -150,12 +130,14 @@ extern "C" uint8_t D_3000590[];
 extern "C" uint8_t D_30005D8[];
 extern "C" uint8_t D_3000688[];
 extern "C" uint8_t D_30006D0[];
-/* The two course material setup DLs (segment 8 +0x14040 / +0x14078), read by the
-   GDX_DIAG_SETUPDL probe in ProcessList. */
+/* Course material setup DLs (segment 8 +0x14040 / +0x14078), read by the GDX_DIAG_SETUPDL probe. */
 extern "C" uint8_t D_8014040[];
 extern "C" uint8_t D_8014078[];
-/* course_track_gfx base (segment 8). Referenced by gdx_boot_warm_asset_segments: its MIO0 decode
-   measured 133.95ms in a single hit on the boot path -- the largest asset stall in the port. */
+/* Tall-building texture window (segment 8 +0x14A20), overwritten per venue by
+   gdx_load_venue_building_texture. */
+extern "C" uint16_t D_8014A20[];
+/* course_track_gfx base (segment 8). Warmed at boot because its MIO0 decode measured 133.95ms
+   in a single hit -- the largest asset stall in the port. */
 extern "C" uint8_t D_8000000[];
 extern "C" uint8_t aVpFullScreen[];
 extern "C" uint16_t D_A000000_235130[];
@@ -172,15 +154,13 @@ extern "C" uint16_t D_A000000_26D780[];
 extern "C" uint8_t D_2000000[];
 extern "C" uint8_t D_80225800[];
 extern "C" uint8_t D_1000000[];
-/* The two live GfxPools (decomp: GfxPool D_8024DCE0[2], unk_gfx_segment.c:194),
-   addressed as raw bytes here exactly like gdx_interp.cpp:250 does. Needed by
-   IsGfxPoolHostRange() so the persistent texture-copy cache knows this
-   registered host range is REWRITTEN EVERY FRAME instead of ROM-stable. */
+/* The two live GfxPools (decomp: GfxPool D_8024DCE0[2], unk_gfx_segment.c:194), addressed as
+   raw bytes. IsGfxPoolHostRange() needs this so the persistent texture-copy cache knows the
+   range is REWRITTEN EVERY FRAME rather than ROM-stable. */
 extern "C" uint8_t D_8024DCE0[];
-/* Unsuffixed venue texture bank symbols (segment 0x0A, 0x1000-byte banks).
-   course.c's road material table references them directly (ROAD_1..WALLED_ROAD),
-   but they are 1-byte LinkStubs — the per-venue data loads via the suffixed
-   symbols (D_A000000_235130 etc.) into gSegments[0x0A]. */
+/* Unsuffixed venue texture bank symbols (segment 0x0A, 0x1000-byte banks). course.c's road
+   material table references them directly (ROAD_1..WALLED_ROAD), but they are 1-byte LinkStubs
+   — per-venue data loads via the suffixed symbols (D_A000000_235130 etc.) into gSegments[0x0A]. */
 extern "C" uint8_t D_A000000[];
 extern "C" uint8_t D_A001000[];
 extern "C" uint8_t D_A002000[];
@@ -190,26 +170,17 @@ extern "C" uint8_t D_A005000[];
 extern "C" uint8_t D_A006000[];
 extern "C" uint8_t D_A007000[];
 extern "C" uint8_t D_A008000[];
-// E4 (A3 follow-up): banks 9-11, declared in decomp's fzx_segmentA.h:15-17.
-// Banks 9-10 have no current reference but are registered for symmetry with
-// the rest of the table (see tools/gen_link_stubs.py's EXTRA_DATA_SYMS for why
-// they needed an explicit, always-linked LinkStubs.c stub -- nothing currently
-// references them so a normal log-driven regen could never add them).
+// Banks 9-10 (decomp fzx_segmentA.h:15-17) have no current reference, so a log-driven regen of
+// LinkStubs.c could never add them; they are listed in gen_link_stubs.py's EXTRA_DATA_SYMS to
+// force an always-linked stub and keep the bank table symmetric.
 extern "C" uint8_t D_A009000[];
 extern "C" uint8_t D_A00A000[];
 #ifdef EXPANSION_KIT
-// D_A00B000..D_A00BD80 are live -- gRoadTypeMenuItems/gHRoadTypeMenuItems/
-// gTRoadTypeMenuItems (decomp/src/overlays/expansion_kit/A3AE0.c:533-568)
-// reference them directly as the Road-Type panel's per-venue "type 1" preview
-// icons -- but that overlay directory is EXCLUDED from non-EK builds
-// (port/CMakeLists.txt), and their only stubs live in the EK-only
-// port/gen/EkLinkStubs.c, so these symbols do not exist to link against
-// outside an EXPANSION_KIT build. Every base-game venue texture yaml
-// (decomp/assets/yaml/*/rev0/*_textures.yaml) confirms these are real,
-// RGBA16 24x12 icons at segment 0x0A offsets 0xB000/0xB240/0xB480/0xB6C0/
-// 0xB900/0xBB40/0xBD80, immediately past the 11 main 0x1000-byte texture
-// banks (D_A000000..D_A00A000) -- each venue ships its own icon set matching
-// its visual theme, loaded as part of the same venue segment image.
+// D_A00B000..D_A00BD80 are the Road-Type panel's per-venue preview icons (RGBA16 24x12 at
+// segment 0x0A +0xB000..+0xBD80, immediately past the 11 main banks), referenced by
+// expansion_kit/A3AE0.c:533-568. That overlay directory is excluded from non-EK builds and the
+// stubs live only in port/gen/EkLinkStubs.c, so the symbols do not exist to link against
+// outside an EXPANSION_KIT build.
 extern "C" uint8_t D_A00B000[];
 extern "C" uint8_t D_A00B240[];
 extern "C" uint8_t D_A00B480[];
@@ -218,11 +189,6 @@ extern "C" uint8_t D_A00B900[];
 extern "C" uint8_t D_A00BB40[];
 extern "C" uint8_t D_A00BD80[];
 #endif  // EXPANSION_KIT
-// E3: the hand-listed 23-symbol kEkNamedAssetStubs table (and its externs) that
-// used to live here was replaced by a generic registration hook -- see
-// gdx_register_host_pointer_stub / ResolveHostPointerStub below, populated from
-// gdx_ek_assets_fill()'s full ~773-entry sEkAssetFills[] table instead of a
-// hand-maintained subset. No named externs are needed here any more.
 extern "C" uint8_t gspF3DEX2_fifoTextStart[];
 extern "C" uint8_t gspF3DFLX2_Rej_fifoTextStart[];
 extern "C" uint8_t gspF3DLX2_Rej_fifoTextStart[];
@@ -251,19 +217,15 @@ extern "C" void gdx_register_asset_segment_command_ranges(unsigned char segment,
                                                             unsigned int size);
 extern "C" int gdx_resolve_mode_segment9(unsigned int raw, size_t requiredBytes,
                                            uintptr_t* outAddress);
-// E2: true when segment `seg` (4, 7, or 9) is currently owned by a live mode
-// carve (port/decomp_port.c's sGdxSeg4Resident/sGdxSeg7Resident/sGdxSeg9Active).
-// Any other segment always returns false.
+// True when segment `seg` (4, 7 or 9) is currently owned by a live mode carve; false otherwise.
 extern "C" int gdx_mode_owns_segment(unsigned int seg);
-// True when `rom_base` matches the ROM family CURRENTLY resident/active for
-// mode-owned segment `seg` (see the comment above the definition in
-// decomp_port.c). Used to gate the live-carve redirect below so a stale-family
-// AssetBindings.c row (e.g. a different content sharing the same segment
-// number) is not served the wrong carve's bytes.
+// True when `rom_base` matches the ROM family currently resident for mode-owned segment `seg`.
+// Gates the live-carve redirect below so a stale-family AssetBindings.c row -- different content
+// sharing the same segment number -- is not served the wrong carve's bytes.
 extern "C" int gdx_mode_segment_content_matches(unsigned int seg, unsigned int rom_base);
 extern "C" const char* GDiffuser_LookupLoadedAssetKey(const void* buffer, size_t minSize, int requireUnmodified);
 extern "C" const char* gdx_lookup_asset_segment_o2r_key(unsigned int sym_low32);
-// Workshop texture packs (port/gdx_workshop.cpp): Tier-B override shim.
+// Workshop texture packs (port/gdx_workshop.cpp).
 extern "C" int gdx_workshop_texture_packs_enabled(void);
 extern "C" const char* GdxWorkshopLookupOverridePath(const char* key);
 
@@ -323,12 +285,11 @@ static inline bool IsLikelyBigEndianDisplayList(const N64Gfx* source, size_t rea
     uint8_t opB = w0 & 0xFF;
     if (opL == 0 && opB != 0) return true;
     if ((opB >= 0xB0 || opB == 0x01 || opB == 0x04) && opL < 0x20) return true;
-    /* The first word alone is ambiguous when the BE command carries nonzero
-       operand bytes (e.g. gSPGeometryMode D9 FD FF FF reads as LE 0xFFFFFDD9,
-       whose top byte 0xFF is also a plausible opcode — this made every EK
-       disk-filled UI display list classify as LE and get rejected). Walk the
-       list as big-endian: a genuine BE list produces a valid opcode chain
-       that reaches G_ENDDL within the readable window. */
+    /* The first word alone is ambiguous when the BE command carries nonzero operand bytes:
+       gSPGeometryMode D9 FD FF FF reads as LE 0xFFFFFDD9 whose top byte 0xFF is also a
+       plausible opcode, which classified every EK disk-filled UI list as LE. Walk the list as
+       big-endian instead: a genuine BE list yields a valid opcode chain reaching G_ENDDL
+       inside the readable window. */
     {
         const size_t scan = (readableLimit < 64) ? readableLimit : 64;
         for (size_t i = 0; i < scan; i++) {
@@ -346,11 +307,8 @@ constexpr size_t kMaxUnboundedDisplayListCommands = 1 << 20;
 
 constexpr uint8_t kOpVtx = 0x01;
 constexpr uint8_t kOpBranchZ = 0x04;
-// G_BRANCH_Z in the original F3D microcode (used by F-Zero X race DLs).
-// In F3D: G_IMMFIRST=0xE5, so G_BRANCH_Z = 0xE5-15 = 0xD6.
-// In F3DEX2: G_BRANCH_Z = 0x04 (kOpBranchZ above).
-// Legacy F3D assets still omit this optimization; host-built F3DEX2 lists retain
-// opcode 0x04 and evaluate it against the interpreter's transformed vertex state.
+// G_BRANCH_Z in original F3D (used by F-Zero X race DLs): G_IMMFIRST=0xE5, so 0xE5-15 = 0xD6.
+// F3DEX2 encodes the same command as 0x04 (kOpBranchZ above).
 constexpr uint8_t kOpBranchZF3D = 0xD6;
 constexpr uint8_t kOpEndDl = 0xDF;
 constexpr uint8_t kOpDl = 0xDE;
@@ -377,10 +335,6 @@ constexpr uint32_t kTextureImageFrac = 2;
 constexpr uintptr_t kSetupGfxRomOffset = 0x17B1E0;
 constexpr size_t kSetupGfxSize = 0x778;
 
-// Use G_IM_FMT_* / G_IM_SIZ_* macros from lus_gbi.h (included above).
-// G_IM_FMT_RGBA=0  G_IM_FMT_YUV=1  G_IM_FMT_CI=2  G_IM_FMT_IA=3  G_IM_FMT_I=4
-// G_IM_SIZ_4b=0  G_IM_SIZ_8b=1  G_IM_SIZ_16b=2  G_IM_SIZ_32b=3
-
 uint8_t Opcode(uint32_t w0) {
     return static_cast<uint8_t>(w0 >> 24);
 }
@@ -392,7 +346,7 @@ uint8_t WordParam(uint32_t w0) {
 bool IsLikelyDisplayListOpcode(uint8_t op) {
     if (op <= 0x09) return true;
     if ((op >= 0x20) && (op <= 0x49)) return true;
-    if ((op >= 0xB0) && (op <= 0xBF)) return true;  // F3D opcodes: G_TRI1, G_ENDDL, G_TEXTURE, etc.
+    if ((op >= 0xB0) && (op <= 0xBF)) return true;  // F3D range: G_TRI1, G_ENDDL, G_TEXTURE, ...
     if ((op >= 0xC8) && (op <= 0xCF)) return true;
     if ((op >= 0xD3) && (op <= 0xE3)) return true;
     if ((op >= 0xE4) && (op <= 0xFF)) return true;
@@ -413,11 +367,7 @@ struct ResolvedAddress {
     bool segmented = false;
 };
 
-// [venueload] Countdown of ticks whose translation cost should be logged after a venue segment
-// load. Set by gdx_load_venue_texture_segment, consumed in gdx_gfx_run. Declared up here because
-// both of those live far below and on opposite sides of the file. Exists to test whether the Cup
-// Select stall is the LOAD itself or the conversion-cache invalidation that follows it -- see the
-// block comment at the [venueload] emit site.
+// [venueload] diagnostic, strip later: ticks still owed a post-venue-load translation-cost line.
 static int gGdxVenueWatchTicks = 0;
 
 // Scheduler yield counter (n64_sched.c). Each yield returns to the host fiber, which pumps a whole
@@ -432,10 +382,9 @@ struct ConversionStats {
     size_t fallbackDataCommands = 0;
     size_t skippedDataCommands = 0;
     size_t skippedTextures = 0;
-    /* Commands whose segment-backed pointer resolution was rejected because a
-       game-thread segment reload (gGdxSegmentEpoch, top of file) raced it. Kept
-       separate from skippedTextures/skippedDataCommands so a mode-transition
-       reload storm is distinguishable from genuine resolution failures. */
+    /* Resolutions rejected because a game-thread segment reload (gGdxSegmentEpoch) raced them.
+       Separate from skippedTextures/skippedDataCommands so a mode-transition reload storm stays
+       distinguishable from genuine resolution failures. */
     size_t skippedEpochRetries = 0;
     size_t textureCopies = 0;
     size_t textureCopyBytes = 0;
@@ -444,10 +393,9 @@ struct ConversionStats {
     size_t ucodeSwitches = 0;
     size_t unknownUcodeSwitches = 0;
     uint32_t firstUnknownUcodeRaw = 0;
-    /* Deliberate L3DEX2 (line ucode) section skips, counted SEPARATELY from
-       unknownUcodeSwitches: the old shared counter made the benign per-menu-frame
-       L3DEX2 skip (raw = low32 of gspL3DEX2_fifoTextStart) indistinguishable from
-       a genuinely unmatched G_LOAD_UCODE in the [gfxdiag] line. */
+    /* Deliberate L3DEX2 (line ucode) skips, counted separately from unknownUcodeSwitches so the
+       benign per-menu-frame skip stays distinguishable from a genuinely unmatched G_LOAD_UCODE
+       in the [gfxdiag] line. */
     size_t l3dexUcodeSkips = 0;
     uint32_t firstL3dexUcodeRaw = 0;
     uint8_t firstFallbackDataOp = 0;
@@ -483,15 +431,11 @@ struct ConversionStats {
     uint8_t firstBadDlFailureOpcode = 0;
     uint8_t firstBadDlFailureReason = 0; // 1=zero limit, 2=invalid opcode, 3=no terminator
 
-    /* Every distinct resolved G_SETCOLORIMAGE host address seen while converting
-       this task's display list (deduped, capped). A single task frequently
-       redirects CIMG to an offscreen N64 framebuffer mid-task (the SETCIMG
-       "canvas" idiom in texture_utils.c's func_8007AB88/func_8007ABA4 and the
-       OBJECT_FRAMEBUFFER object type) and then restores it before the task
-       ends. The end-of-task mirror only ever inspected the FINAL color image,
-       so any framebuffer that was only a mid-task target never got mirrored to
-       CPU memory and stayed permanently invalid. Track every target here so
-       gdx_gfx_run can mirror all of them, not just the last one. */
+    /* Every distinct resolved G_SETCOLORIMAGE host address in this task's list (deduped,
+       capped). A task frequently redirects CIMG to an offscreen framebuffer mid-task (the
+       SETCIMG "canvas" idiom in texture_utils.c's func_8007AB88/func_8007ABA4, and
+       OBJECT_FRAMEBUFFER) and restores it before the task ends, so mirroring only the FINAL
+       color image leaves every mid-task-only target permanently invalid. */
     std::array<uintptr_t, 8> colorImageTargets{};
     size_t colorImageTargetCount = 0;
 };
@@ -526,16 +470,11 @@ std::vector<HostRange> gRawN64Ranges;
 std::vector<HostRange> gHostN64CommandRanges;
 std::vector<HostRange> gHostWideCommandRanges;
 std::vector<N64AddressRange> gN64AddressRanges;
-// E3/A1/A2: host-pointer identity registration for compiled-in host arrays that
-// SETTIMG can carry the address of directly (EK disk assets from
-// port/gen/EkAssetBindings.c's sEkAssetFills, plus base-game arrays like the
-// ending fireworks sprites / sCourseMinimapPalette registered from
-// port/decomp_port.c), populated via gdx_register_host_pointer_stub. Reused
-// HostRange (begin = the array's own host address, size = its byte length)
-// since the match ResolveHostPointerStub performs is identical in shape to the
-// other host-range tables here -- an interior delta<size match keyed on a host
-// pointer, not an N64 address. Replaces the old hand-maintained
-// kEkNamedAssetStubs table.
+// Host-pointer identity registration for compiled-in host arrays whose address SETTIMG can
+// carry directly (EK disk assets from EkAssetBindings.c, plus base-game arrays registered from
+// decomp_port.c). HostRange is reused with begin = the array's own HOST address, not an N64
+// address; ResolveHostPointerStub's interior delta<size match is otherwise identical in shape
+// to the other host-range tables here.
 std::vector<HostRange> gHostPointerStubs;
 std::vector<HostRange> gF3DAssetRanges;
 std::vector<HostRange> gNativeRgba16Ranges;
@@ -543,27 +482,20 @@ std::vector<uintptr_t> gPendingNativeRgba16RangeClears;
 std::vector<uint8_t> gSetupGfxSegment;
 std::vector<PersistentRawTextureCopy> gRawTextureCopies;
 std::vector<uintptr_t> gPendingTextureCacheDeletes;
-std::vector<std::unique_ptr<uint8_t[]>> gPersistentAllocations; // Fixed undefined mPersistentAllocations
+std::vector<std::unique_ptr<uint8_t[]>> gPersistentAllocations;
 std::vector<N64FramebufferInfo> gN64Framebuffers;
 uintptr_t gViCurrentFramebuffer = 0;
 uintptr_t gViNextFramebuffer = 0;
 uintptr_t gLastRenderedFramebuffer = 0;
 
-/* Title->menu wipe-band diagnostic scope. Transition_SetBackgroundBuffer
- * records the just-captured/registered transition background buffer here (via the
- * extern-C gdx_diag_note_transition_capture below). The SETTIMG host-pointer path
- * then logs, once per unique source inside this span, whether the byteswap-applying
- * native-RGBA16 range covers it. Zero size = no active transition capture, so the
- * probe costs nothing during normal rendering and can never affect a non-transition
- * texture. */
+/* Title->menu wipe-band probe, strip later. Zero size means no active transition capture, so
+ * the probe cannot fire outside a transition. */
 uintptr_t gDiagTransitionCaptureBegin = 0;
 size_t gDiagTransitionCaptureSize = 0;
 
-// Coarse asset epoch: bumped whenever an asset/ROM-backed segment image
-// is (re)decoded (EnsureAssetSegmentImage). Declared here -- ahead of that
-// function -- so it can invalidate converted lists built against an old image.
-// The rest of the converter state lives further down (needs the resolver
-// helpers forward-declared below).
+// Bumped whenever an asset/ROM-backed segment image is (re)decoded, to invalidate converted
+// lists built against the old image. Declared ahead of EnsureAssetSegmentImage; the rest of the
+// converter state lives below, after the resolver helpers it needs.
 uint32_t gConvertEpoch = 1;
 
 // Set by gdx_gfx_run() whenever a real GFX task renders into the current host
@@ -572,20 +504,13 @@ uint32_t gConvertEpoch = 1;
 // other CPU-drawn screen) and the fallback must scan out the VI framebuffer.
 bool gHostFrameGfxTaskRan = false;
 
-// Once a real GFX task has ever presented, a taskless host frame must HOLD the
-// last GPU image (like the N64 VI re-scanning the already-rendered RDRAM
-// buffer) instead of blitting the CPU-side VI framebuffer — which is empty for
-// GPU-rendered screens and produced full-screen black flashes whenever the
-// game briefly dropped below present rate (Cup Select's cup slide-up rendered
-// 1 of every 3 presents; the other 2 flashed black).
+// Once a real GFX task has ever presented, a taskless host frame must HOLD the last GPU image
+// (as the N64 VI re-scans the already-rendered RDRAM buffer) rather than blit the CPU-side VI
+// framebuffer, which is empty for GPU-rendered screens: Cup Select's slide-up rendered 1 present
+// in 3 and the other 2 flashed full-screen black.
 static bool sGpuContentLive = false;
-// Set true at the tail of every real-task tick (gdx_gfx_run) to mark that the
-// persistent frame mirror just got fresh content. gdx_vi_present_fallback's
-// hold path used to gate a CPU readback on this flag; it now composites the
-// mirror with a GPU->GPU copy every hold tick regardless (see the "40fps on
-// menus" comment there), so this flag is read-and-cleared purely as a diag
-// signal (GdxDiagHoldTick) for whether content actually changed since the
-// previous hold tick — it no longer controls what gets drawn.
+// Diagnostic only (GdxDiagHoldTick): whether the frame mirror got fresh content since the last
+// hold tick. It does NOT gate drawing — the hold path composites every tick regardless.
 static bool sGpuHoldPixelsStale = true;
 
 struct AssetSegmentLookup {
@@ -605,40 +530,24 @@ struct LoadedAssetSegment {
 
 std::vector<LoadedAssetSegment> gLoadedAssetSegments;
 
-/* Hybrid segment-tag table: static asset segments have a KNOWN display-list
- * dialect, so DLs inside their decompressed images never need the per-DL
- * opcode-scan heuristics (which misclassify, e.g., F3DEX2 setup DLs whose
- * byte stream happens to contain 0xB8 before 0xDF).
- *   segment 0x08 — course_track_gfx: F3DEX2 (setup DLs use 0xD9 geometry
- *                  mode, 0xDF G_ENDDL, and 0x06 as G_TRI2)
- *   segment 0x0A — venue textures: data only, no display lists
- * Segments not listed keep the existing heuristic path.
+/* Segments whose display-list dialect is KNOWN, so DLs inside their decompressed images can
+ * skip the per-DL opcode scan (which misclassifies F3DEX2 setup DLs whose byte stream happens
+ * to contain 0xB8 before 0xDF). Unlisted segments keep the heuristic path.
  *
- * segment 0x03 (machine_custom_gfx) is INTENTIONALLY absent: it is not a
- * single dialect. ROM ground truth (baserom.us.rev0.z64, decompressed
- * segment-3 image, offset 0x6D0) shows a genuine F3DEX2 sub-list —
- * G_VTX(0x01)+3xG_TRI2(0x06) terminated by G_ENDDL=0xDF — sitting a few
- * bytes before named legacy-F3D machine-part DLs in the same segment
- * (e.g. D_3000780). A prior blanket "segment 0x03 = F3D" tag forced every
- * G_TRI2 in that F3DEX2 sub-list through the F3D-only "0x06 = G_DL"
- * remap (see the isF3DSource-gated case 0x06 below), sending vertex-index
- * pairs (raw=0x00000406/0x00080A0C/0x000A0E0C, etc.) into
- * TranslateDisplayListPointer as if they were sub-DL pointers — the
- * dominant new [gdl-bad] classes after the resolver-window fix, and the
- * likely source of the custom-machine-body garbage wedges (race
- * decorations/booster glow, machine-select preview). Falling through to
- * the per-DL heuristic below (DisplayListUsesF3D) restores correct
- * per-list detection via the real 0xB8/0xDF terminator, the same path
- * every other unlisted segment already relies on. */
+ * Segment 0x03 (machine_custom_gfx) must stay absent: it is not a single dialect. ROM ground
+ * truth (baserom.us.rev0.z64, decompressed segment-3 image, offset 0x6D0) has a genuine F3DEX2
+ * sub-list — G_VTX(0x01) + 3x G_TRI2(0x06) terminated by 0xDF — a few bytes before named
+ * legacy-F3D machine-part DLs (e.g. D_3000780). Tagging the whole segment F3D pushes every
+ * G_TRI2 there through the F3D-only "0x06 = G_DL" remap (the isF3DSource-gated case 0x06
+ * below), feeding vertex-index pairs to TranslateDisplayListPointer as sub-DL pointers and
+ * producing garbage wedges on custom machine bodies. */
 enum class GdxSegmentUcode : uint8_t { Unknown = 0, F3D, F3DEX2 };
 
 static GdxSegmentUcode GdxSegmentDialect(uint8_t segment) {
-    /* RULED OUT -- "the decoration DLs are F3D": a word-level re-decode of the
-     * decoration DLs (D_80172A0: 0xD7 G_TEXTURE, 0x01 G_VTX, 0x05 G_TRI1 runs,
-     * 0xDF terminator) proves they are F3DEX2 -- the blanket below is CORRECT.
-     * The earlier "they are F3D" identification was a dual-dialect pattern-matching
-     * error. The decorations' real defect is the fixup-region
-     * vertex-block swap (see sAssetFixups split, AssetBindings.c). */
+    /* Segment 0x08 (course_track_gfx) is F3DEX2 by word-level decode of D_80172A0: 0xD7
+     * G_TEXTURE, 0x01 G_VTX, 0x05 G_TRI1 runs, 0xDF terminator. Do not re-tag it F3D — the
+     * decoration artifacts that suggest F3D come from the fixup-region vertex-block swap
+     * instead (see the sAssetFixups split in AssetBindings.c). */
     switch (segment) {
         case 0x08:
             return GdxSegmentUcode::F3DEX2;
@@ -741,13 +650,10 @@ bool IsNativeRgba16Range(uintptr_t source, size_t size) {
     return false;
 }
 
-// Bytes from `source` to the end of the native-RGBA16 range that contains it
-// (0 if `source` is not inside any native range). Used to keep a texture copy's
-// byte-swap treatment aligned to the exact registered extent: a load-size
-// estimate that rounds up past the registered image (e.g. the WIPE transition's
-// single wide LOADBLOCK, whose block-rounded estimate exceeds WIDTH*HEIGHT*2 by
-// one row) must not be allowed to disable the swap for the whole copy — clamp
-// the copy to this remaining extent so CopyRawTextureBytes still swaps it.
+// Bytes from `source` to the end of the native-RGBA16 range containing it, 0 if none. A load-size
+// estimate that rounds up past the registered image (the WIPE transition's single wide LOADBLOCK
+// overshoots WIDTH*HEIGHT*2 by a row) would otherwise disable the byte swap for the whole copy;
+// clamping to this extent keeps CopyRawTextureBytes swapping.
 size_t NativeRgba16RangeRemaining(uintptr_t source) {
     size_t best = 0;
     for (const HostRange& range : gNativeRgba16Ranges) {
@@ -796,30 +702,22 @@ void CopyRawTextureBytes(uint8_t* destination, uintptr_t source, size_t size) {
 // ---------------------------------------------------------------------------
 // Quarantine for the pointer-GUESSING resolver branches.
 //
-// Game-emitted display lists carry real 64-bit host pointers, and the narrow->wide converter
-// resolves every binary N64 list ONCE with deterministic pointer resolution (segment table +
-// RDRAM-arena physical strip only -- never a low32-window match or a high-32 reconstruction).
-// Together those mean the guessing machinery below -- ResolveRegisteredHostPointer's low32-window
-// match, the KSEG0 high-32 reconstruction, the physical/source-window high-32 reconstructions, the
-// ambiguous cross-segment fallback, and the raw-buffer/last-resort substitutions -- should only
-// ever fire for STRAGGLERS: narrow lists reached with GDX_G2_CONVERT=0, a conversion miss, or a
-// legacy F3D asset path the converter does not touch.
+// Game-emitted lists carry real 64-bit host pointers and the narrow->wide converter resolves
+// every binary N64 list once deterministically (segment table + RDRAM-arena physical strip
+// only), so the branches below -- low32-window match, KSEG0/physical/source-window high-32
+// reconstruction, ambiguous cross-segment fallback, raw-buffer substitutions -- should only fire
+// for stragglers: GDX_G2_CONVERT=0, a conversion miss, or a legacy F3D path the converter skips.
 //
-// The branches are gated rather than deleted so the safety net survives, and instrumented so a run
-// quantifies what still relies on guessing: a per-branch hit counter, a capped "[legacy-resolve]
-// branch=<name> hits=<n> raw=%08X op=%02X" line for the first 8 hits of each branch, and a one-time
-// "[legacy-resolve] SUMMARY" the instant any branch fires.
+// The gate DEFAULTS OFF; a full boot->race->close session recorded zero hits on every branch.
+// GDX_LEGACY_RESOLVE (or gDevTools.Behavior.LegacyResolve) restores it without a rebuild. The
+// per-branch counters and capped [legacy-resolve] lines exist to keep that claim falsifiable.
 //
-// The gate DEFAULTS OFF -- the guessing machinery is INACTIVE in a stock build, because a full
-// boot->race->close session recorded zero hits on every branch. GDX_LEGACY_RESOLVE (or the
-// gDevTools.Behavior.LegacyResolve CVar) restores it without a rebuild.
-//
-// If these are ever deleted, do NOT delete with them: segment-table lookups (explicit-segment and
-// encodedSegment paths), ResolvePortBssAlias / ResolveVenueBankAlias / ResolveGeneratedAssetStub /
-// ResolveSetupGfxStub (exact known-symbol matches, not guesses), the D_1000000 special case, the EK
-// gN64AddressRanges reverse scan, texture/framebuffer image op handling (SETTIMG/SETCIMG/SETZIMG),
-// BRANCH_Z/DMA_IO/RDPHALF_1, or the converter/cache/GDX_G2_CONVERT switch. The deterministic
-// raw & 0x1FFFFFFF RDRAM strip inside the KSEG0 branch is also NOT a guess.
+// If these are ever deleted, do NOT delete with them: segment-table lookups (explicit-segment
+// and encodedSegment paths), ResolvePortBssAlias / ResolveVenueBankAlias /
+// ResolveGeneratedAssetStub / ResolveSetupGfxStub (exact symbol matches, not guesses), the
+// D_1000000 special case, the EK gN64AddressRanges reverse scan, SETTIMG/SETCIMG/SETZIMG image
+// op handling, BRANCH_Z/DMA_IO/RDPHALF_1, or the converter/cache/GDX_G2_CONVERT switch. The
+// raw & 0x1FFFFFFF RDRAM strip inside the KSEG0 branch is deterministic, not a guess.
 // ---------------------------------------------------------------------------
 constexpr bool kGdxLegacyResolveDefaultEnabled = false;
 enum class LegacyResolveBranch : uint8_t {
@@ -855,30 +753,21 @@ inline uint64_t (&LegacyResolveHitCounters())[static_cast<size_t>(LegacyResolveB
     return hits;
 }
 
-// Set by ProcessList before each command is handled, so both member (TryResolveAddress)
-// and free-function (ResolveRegisteredHostPointer, FallbackDataPointer) guessing
-// branches can tag their [legacy-resolve] log lines with the opcode that triggered
-// them, without threading a new parameter through every call site. 0xFF = unknown
-// (a guess fired outside the per-command loop, e.g. from ResolveDisplayListSource).
+// Set by ProcessList before each command so both member and free-function guessing branches can
+// tag their [legacy-resolve] lines with the triggering opcode without threading a parameter
+// through every call site. 0xFF = a guess fired outside the per-command loop.
 uint8_t gLegacyResolveCurrentOp = 0xFFu;
 
-// Runtime switch: with kGdxLegacyResolveDefaultEnabled false, GDX_LEGACY_RESOLVE —
-// or Dev Tools > Behavior overrides > "Legacy address guessing" — restores the old guessing
-// machinery for the current process without a rebuild. Every branch below behaves as if it never
-// matched while this is off, which is the shipping default.
-//
-// The gate is normalized so 0 == stock (guessing OFF), because the Dev Tools layer compiles Bucket
-// B gates out of a Release build by hard-wiring them to 0. NOTE: if the compile-time default is
-// ever flipped back to true, this accessor short-circuits and the gate can no longer turn guessing
-// OFF — revisit it together with that flip.
+// The gate is normalized so 0 == stock (guessing OFF), because Dev Tools compiles Bucket B gates
+// out of a Release build by hard-wiring them to 0. If kGdxLegacyResolveDefaultEnabled is ever
+// flipped back to true this short-circuits and the gate can no longer turn guessing OFF —
+// revisit it together with that flip.
 inline bool LegacyResolveEnabled() {
     return kGdxLegacyResolveDefaultEnabled || gdx_dev_gate(GDX_GATE_LEGACY_RESOLVE) != 0;
 }
 
-// Always-on bookkeeping: increments the branch counter and prints the capped
-// diagnostic lines described above. Called only from the success path of a
-// guessing branch (i.e. "this guess actually produced a resolution"), so a
-// branch with hits==0 across a full run genuinely never contributed anything.
+// Called only from a guessing branch's SUCCESS path, so a branch with hits==0 across a full run
+// genuinely never contributed a resolution.
 inline void RecordLegacyResolveHit(LegacyResolveBranch branch, uint32_t raw, uint8_t op) {
     static bool sAnySeen = false;
     uint64_t& hits = LegacyResolveHitCounters()[static_cast<size_t>(branch)];
@@ -908,29 +797,21 @@ alignas(8) const int16_t kFallbackViewport[8] = {
     640, 480, 0, 0,
 };
 
-/* Zeroed, fully-readable stand-in substituted for an unreadable vertex
- * pointer (see the G_VTX crash failsafe in ProcessList). It MUST be at least
- * as large as the largest vertex load the interpreter can be asked to perform
- * from a single G_VTX command, because the failsafe only swaps the POINTER --
- * it does NOT reduce the vertex COUNT the interpreter re-reads from the command
- * word (C0(12,8) for F3DEX2). F3DEX2 encodes that count in 8 bits, so up to 255
- * vertices * sizeof(F3DVtx)(16B) can be read. A garbage/desynced command with
- * count=0xF0 (=240, 3840B) previously overran the old 64-entry (1024B) buffer
- * and faulted deep inside Fast::Interpreter::GfxSpVertex:
- * the fix-1 failsafe fired but handed the interpreter a buffer far smaller than
- * the count it still walked. Size for the full 8-bit range (256 entries). */
+/* Zeroed stand-in substituted for an unreadable vertex pointer (G_VTX crash failsafe in
+ * ProcessList). It MUST stay sized for the full 8-bit F3DEX2 vertex count: the failsafe swaps
+ * only the POINTER, not the COUNT the interpreter re-reads from the command word (C0(12,8)),
+ * so a desynced command with count=0xF0 walks 3840 bytes and faults inside GfxSpVertex if this
+ * buffer is smaller. 256 entries * sizeof(F3DVtx)(16B). */
 alignas(8) const uint8_t kFallbackVertices[256 * 16] = {};
 
 uint32_t Low32(uintptr_t value) {
     return static_cast<uint32_t>(value);
 }
 
-/* PE preferred image base (map header: "Preferred load address is
-   0000000140000000"). The runtime module base is ASLR-randomized every launch,
-   so a logged runtime pointer/low32 cannot be resolved against G-Diffuser.map
-   directly. Emitting (kPreferredImageBaseVA + moduleOffset) turns any diagnostic
-   pointer into a deterministic map lookup regardless of the run's base. Kept as
-   uint64_t so the arithmetic is valid on a 32-bit host build too. */
+/* PE preferred image base. ASLR randomizes the runtime module base every launch, so a logged
+   runtime pointer cannot be looked up in G-Diffuser.map directly; emitting
+   (kPreferredImageBaseVA + moduleOffset) makes any diagnostic pointer map-resolvable regardless
+   of the run's base. uint64_t so the arithmetic stays valid on a 32-bit host build. */
 constexpr uint64_t kPreferredImageBaseVA = 0x140000000ULL;
 
 uint32_t ReadBE32(const uint8_t* src) {
@@ -960,15 +841,12 @@ bool LookupAssetSegment(uint32_t raw, AssetSegmentLookup& out) {
     return true;
 }
 
-/* True when a pointer's low32 is a generated ASSET PLACEHOLDER symbol (an
- * exact or interior match in the asset-segment map). These 1-byte BSS stub
- * symbols (e.g. setup_gfx's D_3000050, referenced by gSPDisplayList/gSPVertex)
- * stand in for data that is loaded into a runtime segment; their real DL/vertex
- * bytes live in the loaded segment image, NOT at the stub's own address. Such a
- * pointer must be resolved through the segment/asset path (TryResolveAddress ->
- * ResolveGeneratedAssetStub), never used verbatim. Used by ProcessList to keep
- * a wide packet carrying a placeholder from being mistaken for a real host
- * pointer just because its high32 is set. */
+/* True when a pointer's low32 is a generated ASSET PLACEHOLDER symbol. These 1-byte BSS stubs
+ * (e.g. setup_gfx's D_3000050) stand in for data loaded into a runtime segment; the real
+ * DL/vertex bytes live in the loaded segment image, NOT at the stub's own address, so such a
+ * pointer must go through TryResolveAddress -> ResolveGeneratedAssetStub and never be used
+ * verbatim. ProcessList uses this so a wide packet carrying a placeholder is not mistaken for a
+ * real host pointer just because its high32 is set. */
 bool IsAssetPlaceholderPointer(uint32_t low32) {
     AssetSegmentLookup scratch = {};
     return LookupAssetSegment(low32, scratch);
@@ -980,32 +858,20 @@ uintptr_t EnsureAssetSegmentImage(const AssetSegmentLookup& lookup) {
             (loaded.romBase == lookup.romBase) &&
             (loaded.compressed == lookup.compressed) &&
             !loaded.bytes.empty()) {
-            /* Claim the segment slot only when it is unowned, mirroring the
-               fresh-load path below. Reassigning on every cache hit lets any
-               stray pointer that matches another venue's texture symbol hijack
-               segment 0x0A mid-race — the road then renders with a different
-               venue's texture. gdx_load_venue_texture_segment remains the
-               authority for slot 0x0A and assigns it unconditionally.
+            /* Claim the slot only when unowned. Reassigning on every cache hit lets a stray
+               pointer matching another venue's texture symbol hijack segment 0x0A mid-race, and
+               the road then renders with the wrong venue's texture; gdx_load_venue_texture_segment
+               stays the authority for 0x0A and assigns it unconditionally.
 
-               THREAD/SEQLOCK CONSTRAINT (deliberate non-bracket):
-               EnsureAssetSegmentImage is reachable from BOTH the game thread
-               (loaders) AND the graphics thread (TryResolveAddress at the
-               segment-0x0A path, ResolveSetupGfxStub, and gdx_gfx_run's
-               EnsureSetupGfxSegment/aVpFullScreen pre-pass). gdx_segment_epoch_
-               begin/end is a SINGLE-WRITER seqlock owned by the game thread; a
-               graphics-thread begin/end would race the fetch_add and corrupt the
-               odd/even parity, defeating the guard for every reader. So this
-               first-claim store is intentionally NOT epoch-bracketed. It is
-               benign unbracketed because it only ever transitions the slot
-               0 -> a valid, immutable host pointer (guarded by the ==0 test,
-               never valid -> different), the store is a single aligned uintptr_t
-               (atomic on the targets, no torn pointer), and the buffer it names
-               was fully built before this store. A racing graphics reader either
-               sees 0 (treats the segment as unresolved -> graceful hard-skip,
-               epoch-independent) or the fully-published pointer -- there is no
-               valid->valid' transition here that the seqlock would need to
-               protect. The seqlock still guards the game thread's AUTHORITATIVE
-               0x0A rewrite in gdx_load_venue_texture_segment, which IS bracketed. */
+               Deliberately NOT epoch-bracketed. EnsureAssetSegmentImage runs on BOTH the game
+               thread and the graphics thread, but gdx_segment_epoch_begin/end is a SINGLE-WRITER
+               seqlock owned by the game thread -- a graphics-thread bracket would race the
+               fetch_add and corrupt the odd/even parity for every reader. Safe unbracketed
+               because the ==0 test makes this a one-way 0 -> valid immutable pointer transition,
+               the store is a single aligned uintptr_t, and the buffer was fully built first: a
+               racing reader sees either 0 (unresolved -> graceful hard-skip) or the published
+               pointer. The authoritative 0x0A rewrite in gdx_load_venue_texture_segment IS
+               bracketed. */
             if (gSegments[lookup.segment] == 0) {
                 gSegments[lookup.segment] = reinterpret_cast<uintptr_t>(loaded.bytes.data());
             }
@@ -1013,17 +879,11 @@ uintptr_t EnsureAssetSegmentImage(const AssetSegmentLookup& lookup) {
         }
     }
 
-    // The byte SOURCE is the single shim (GdxSegmentSourceRead), never a
-    // direct gdx_rom_buffer content read. The gdx_rom_buffer/gdx_rom_size uses in
-    // this function are bounds arithmetic ONLY (not content reads).
-    //
-    // Archive-only fix (found by deleting the ROM after setup): the old gate here
-    // returned 0 whenever gdx_rom_buffer was NULL -- BEFORE the shim ever ran --
-    // which killed every asset segment (all venue textures, setup_gfx, viewports)
-    // on an archive-only boot even though the segment blobs fully cover them. The
-    // ROM is only genuinely required when NO archive blob contains this family:
-    // with a containing blob, the shim serves every read and the blob span bounds
-    // the sizing arithmetic below in place of gdx_rom_size.
+    // Byte content comes from the shim only; gdx_rom_buffer/gdx_rom_size appear in this function
+    // for bounds arithmetic, never as a content read. Gating on gdx_rom_buffer != NULL before the
+    // shim runs would kill every asset segment on an archive-only boot (verified by deleting the
+    // ROM after setup) even though the segment blobs fully cover them: the ROM is required only
+    // when NO archive blob contains this family.
     uint32_t blobSpan = 0;
     const bool haveBlobSpan = GdxSegmentSourceContainingSpan(lookup.romBase, &blobSpan) != 0;
     const bool romUsable = (gdx_rom_buffer != nullptr) && (lookup.romBase < gdx_rom_size);
@@ -1036,34 +896,21 @@ uintptr_t EnsureAssetSegmentImage(const AssetSegmentLookup& lookup) {
     loaded.romBase = lookup.romBase;
     loaded.compressed = lookup.compressed;
 
-    // Peek the family's leading bytes through the shim: MIO0_HEADER_LENGTH bytes
-    // cover both the magic sniff and the BE32 decoded-size field. A short read (a
-    // family with fewer than 16 ROM bytes, or the ROM absent) leaves havePeek
-    // false, which the plain path below then handles identically to the old
-    // `gdx_rom_size >= romBase + MIO0_HEADER_LENGTH` guard.
+    // MIO0_HEADER_LENGTH covers both the magic sniff and the BE32 decoded-size field. A short
+    // read (family with fewer than 16 source bytes, or no source) leaves havePeek false and the
+    // plain path below handles it.
     uint8_t peek[MIO0_HEADER_LENGTH];
     const bool havePeek = GdxSegmentSourceRead(lookup.romBase, MIO0_HEADER_LENGTH, peek) != 0;
     const bool isMio0 = havePeek && (std::memcmp(peek, "MIO0", 4) == 0);
 
-    // Stage a whole MIO0 stream through the shim, then decode from the STAGED copy
-    // (byte-identical to the old `mio0_decode(gdx_rom_buffer + romBase, ...)`). The
-    // compressed length is not carried in the header, so size the stage to the
-    // family's archive-blob span (keeps the read archive-first / fully contained);
-    // with no blob, bound the stage by the MIO0 header (the uncompressed-section
-    // end is the last input the decoder reads) capped to the ROM image. The stage
-    // is a transient per-call heap buffer: this code runs only on a cache MISS (the
-    // gLoadedAssetSegments hit loop above returns first), so it is one-time-per-
-    // family and inherently thread-safe -- no shared static staging buffer to race
-    // between the game and graphics threads, both of which reach this function.
-    // [venueload] Entry stamp for the read/decode half. Boot-preloading the archive blob made the
-    // source read free and moved the measured venue-load cost NOT AT ALL, and the fixup/range half
-    // separately measured under 1 ms, so by elimination the expense lives between here and the
-    // fixup timer below. This stamp closes the last gap.
+    // Stage the whole MIO0 stream through the shim, then decode from the staged copy. The
+    // compressed length is not in the header, so size the stage to the family's archive-blob span;
+    // with no blob, bound it by the MIO0 header (the uncompressed-section end is the last input
+    // the decoder reads) capped to the ROM image. The stage must stay a per-call heap buffer, not
+    // a shared static: this function runs on both the game and graphics threads.
+    // [venueload] diagnostic, strip later: read/decode window, sampled alongside the scheduler
+    // yield counter so a full ~16.7ms-per-yield stall is not misread as decode cost.
     const auto gdxDecodeT0 = std::chrono::steady_clock::now();
-    // Sample the scheduler's yield counter across the same window. A yield returns to the host
-    // fiber, which pumps a whole frame before re-dispatching, so each one costs a full ~16.7ms tick
-    // no matter how little work the load is doing. If yields > 0 correlates with the slow loads,
-    // the decode is not expensive and "decode earlier" would be the wrong fix.
     const unsigned long gdxYieldsBefore = gdx_yield_count;
 
     auto stageAndDecodeMio0 = [&]() -> bool {
@@ -1101,35 +948,28 @@ uintptr_t EnsureAssetSegmentImage(const AssetSegmentLookup& lookup) {
     };
 
     if (lookup.compressed) {
-        // Declared-compressed: unchanged gate -- require the MIO0 magic, else fail
-        // exactly as before (return 0).
         if (!isMio0 || !stageAndDecodeMio0()) {
             return 0;
         }
     } else if (isMio0) {
         gdx_port_logf("[segload] MIO0-autodetect seg=%u romBase=%08X (binding said uncompressed)\n",
                       lookup.segment, lookup.romBase);
-        // Some segments (notably the per-venue texture segments, e.g. Mute City's
-        // D_A000000_235130) are MIO0-compressed in ROM but the asset bindings mark
-        // them uncompressed. Copying the raw MIO0 bytes as texture data renders the
-        // compressed stream directly — that is the "track stripes". Detect the MIO0
-        // magic here and decompress regardless of the (wrong) compressed flag.
-        // Keep loaded.compressed = lookup.compressed so the segment cache key still
-        // matches future lookups (the cached bytes are already decompressed).
+        // Some segments (notably per-venue texture segments like Mute City's D_A000000_235130)
+        // are MIO0-compressed in ROM while the asset bindings mark them uncompressed; copying the
+        // raw stream as texture data is what renders the "track stripes". Trust the magic over the
+        // flag. loaded.compressed keeps lookup.compressed so the cache key still matches future
+        // lookups — the cached bytes are already decompressed.
         if (!stageAndDecodeMio0()) {
             return 0;
         }
     } else {
-        // Sizing bound: the ROM tail when a ROM is present (pre-shim behavior,
-        // byte-identical), else the containing blob's span (archive-only boot --
-        // the gate above guarantees at least one of the two exists).
+        // Sizing bound: the ROM tail when a ROM is present, else the containing blob's span. The
+        // gate above guarantees at least one of the two exists.
         const size_t available = romUsable ? (gdx_rom_size - lookup.romBase)
                                            : static_cast<size_t>(blobSpan);
-        // Structural invariant watchdog: the generator guarantees every blob
-        // covers its segments' declared image sizes, but nothing at runtime enforced it. A
-        // short blob would under-allocate below lookup.imageSize while downstream consumers
-        // trust imageSize as the logical extent -- log loudly if a regenerated table ever
-        // breaks the invariant (behavior otherwise unchanged: min() below already bounds).
+        // The generator guarantees every blob covers its segments' declared image sizes, but
+        // nothing at runtime enforces it, and downstream consumers trust imageSize as the logical
+        // extent. Log loudly if a regenerated table breaks that; min() below still bounds.
         if (!romUsable && lookup.imageSize != 0 && available < lookup.imageSize) {
             gdx_port_logf("[segload] WARNING: blob span 0x%zX < declared imageSize 0x%zX for "
                           "seg=%u romBase=%08X (archive-only) -- generated blob table may be "
@@ -1146,19 +986,15 @@ uintptr_t EnsureAssetSegmentImage(const AssetSegmentLookup& lookup) {
 
         loaded.bytes.resize(allocSize);
         std::memset(loaded.bytes.data(), 0, loaded.bytes.size());
-        // Plain (uncompressed) families read straight into the destination via the
-        // shim -- no staging needed. On an impossible read (shim returns 0) fail
-        // exactly as the old bounds gate did.
+        // Uncompressed families read straight into the destination; no staging needed.
         if (!GdxSegmentSourceRead(lookup.romBase, static_cast<uint32_t>(allocSize),
                                   loaded.bytes.data())) {
             return 0;
         }
     }
 
-    // [venueload] Split the post-read half of the load. Boot-preloading the archive blobs made the
-    // source read free and moved the measured cost NOT AT ALL (venue loads stayed 20-26 ms), so the
-    // expense is somewhere below this line. The two candidates do very different amounts of work
-    // per byte and need different fixes, so time them apart rather than reason about it.
+    // [venueload] diagnostic, strip later: fixup and range-registration timed apart, since
+    // boot-preloading the archive blobs left venue loads at 20-26 ms and the cost is below here.
     const auto gdxFixT0 = std::chrono::steady_clock::now();
     double gdxFixupMs = 0.0;
     double gdxRangesMs = 0.0;
@@ -1185,20 +1021,17 @@ uintptr_t EnsureAssetSegmentImage(const AssetSegmentLookup& lookup) {
     }
 
     const uintptr_t base = reinterpret_cast<uintptr_t>(loaded.bytes.data());
-    /* First-claim store, intentionally NOT epoch-bracketed -- same graphics/game
-       dual-reachability and 0 -> valid-immutable-pointer tolerance argument as the
-       cache-hit claim above (see that comment). Bracketing here would corrupt the
-       game-thread-only seqlock parity when the graphics thread reaches this. */
+    /* First-claim store, deliberately NOT epoch-bracketed -- same argument as the cache-hit
+       claim above: bracketing here would corrupt the game-thread-only seqlock parity when the
+       graphics thread reaches it. */
     if (gSegments[lookup.segment] == 0) {
         gSegments[lookup.segment] = base;
     }
     gHostRanges.push_back({ base, loaded.bytes.size() });
     gRawN64Ranges.push_back({ base, loaded.bytes.size() });
     gLoadedAssetSegments.emplace_back(std::move(loaded));
-    // Converter invalidation chokepoint: a freshly decoded asset image may rebind
-    // a segment or change the pointer targets converted lists resolved against.
-    // Bump the epoch so any cached wide conversion in the asset/ROM stamp space
-    // is rebuilt on next draw-time encounter.
+    // A freshly decoded image may rebind a segment or move the targets converted lists resolved
+    // against, so every cached wide conversion in the asset/ROM stamp space must be rebuilt.
     ++gConvertEpoch;
     return base;
 }
@@ -1221,11 +1054,8 @@ uintptr_t EnsureAssetSegmentForSymbol(uint32_t symbolLow32, uint32_t* outOffset 
 }
 
 uintptr_t FallbackDataPointer(uint8_t op, uint32_t raw = 0) {
-    // Guessing branch (resolution-of-last-resort): substitutes a static
-    // identity matrix / default viewport / zeroed vertex buffer when nothing
-    // resolved at all. Quarantined behind GDX_LEGACY_RESOLVE like every other
-    // guess in TryResolveAddress -- see the quarantine block above
-    // kFallbackIdentityMtx for the post-soak deletion checklist.
+    // Last-resort guess: static identity matrix / default viewport / zeroed vertices when nothing
+    // resolved. Quarantined behind GDX_LEGACY_RESOLVE like every other guess.
     if (!LegacyResolveEnabled()) {
         return 0;
     }
@@ -1282,25 +1112,17 @@ bool IsRdramHostPointer(uintptr_t full_addr) {
     return (full_addr >= base) && (full_addr < base + GDX_RDRAM_SIZE);
 }
 
-/* True when a pointer's low32 falls on a PORT BSS ALIAS object: a dummy host
- * definition that stands in for N64 storage whose LIVE bytes are elsewhere.
- * These are the two known aliases:
- *  - D_1000000 (GfxPool dummy defined in decomp_port.c): game code WRITES
- *    matrices through gGfxPool-> (the live, double-buffered pool the segment-1
- *    table points at) but emits DL references as &D_1000000.member (racer.c
- *    gSPMatrix modelviews, camera.c:3415 the PROJECTION matrix). Pre-wide,
- *    the truncated low32 resolved through TryResolveAddress's D_1000000
- *    host-range special case to gSegments[1]+offset. A wide packet carries the
- *    dummy's REAL host address, so the w1IsHostPointer fast path read the
- *    never-written dummy instead: zero projection/modelview matrices ==> every
- *    3D triangle collapses while the matrix-free 2D texrect pipeline survives
- *    (the "2D works / 3D fully dead" blackout).
- *  - D_2000000 (segment-2 BSS base, 1-byte LinkStubs token): live storage is
- *    D_80225800 via ResolvePortBssAlias. Taken verbatim it is also misaligned
- *    ((low32 & 7) != 0), so kOpMtx zeroed it and every frame fell back to the
- *    identity matrix ([datafail] op=DA raw=AAA694AC).
- * Route these back through the low32 resolver exactly like the asset
- * placeholders in IsAssetPlaceholderPointer. */
+/* True when a pointer's low32 falls on a PORT BSS ALIAS: a dummy host definition standing in for
+ * N64 storage whose LIVE bytes are elsewhere. Two exist:
+ *  - D_1000000 (GfxPool dummy in decomp_port.c). Game code WRITES matrices through gGfxPool->
+ *    (the live double-buffered pool segment 1 points at) but emits DL references as
+ *    &D_1000000.member (racer.c gSPMatrix modelviews, camera.c:3415 projection). A wide packet
+ *    carries the dummy's real host address, so taking it verbatim reads the never-written dummy:
+ *    zero projection/modelview, every 3D triangle collapses while 2D texrects survive.
+ *  - D_2000000 (segment-2 BSS base, 1-byte LinkStubs token). Live storage is D_80225800 via
+ *    ResolvePortBssAlias; verbatim it is also misaligned, so kOpMtx zeroed it and every frame
+ *    fell back to the identity matrix.
+ * Both must go back through the low32 resolver, like the asset placeholders above. */
 bool IsPortBssAliasPointer(uint32_t low32) {
     if (low32 == Low32(reinterpret_cast<uintptr_t>(D_2000000))) {
         return true;
@@ -1317,10 +1139,9 @@ bool IsPortBssAliasPointer(uint32_t low32) {
     return false;
 }
 
-/* These containment scans run for nearly every translated command/pointer,
-   over hundreds of registered ranges. Iterate via data()/size() — MSVC Debug
-   iterator checking on range-for made these loops a measurable per-frame
-   cost once menus/gameplay started resolving EK asset pointers. */
+/* Runs for nearly every translated pointer over hundreds of ranges. Iterate via data()/size():
+   MSVC Debug iterator checking on range-for made this a measurable per-frame cost once
+   menus/gameplay started resolving EK asset pointers. */
 static inline bool HostRangeListContains(const std::vector<HostRange>& list, uintptr_t full_addr) {
     const HostRange* r = list.data();
     const size_t n = list.size();
@@ -1378,9 +1199,7 @@ bool DisplayListUsesF3D(const N64Gfx* source, size_t limit, size_t stride, bool 
     return false;
 }
 
-// Forward-declared: defined later in this file, needed here for the
-// requiredBytes readability check added to ResolveRegisteredHostPointer.
-size_t ReadableByteLimit(uintptr_t address);
+size_t ReadableByteLimit(uintptr_t address); // defined below
 
 bool ResolveRdramLow32(uint32_t raw, size_t requiredBytes, uintptr_t* outHost) {
     if (gdx_rdram == nullptr || outHost == nullptr) {
@@ -1404,11 +1223,8 @@ bool ResolveRdramLow32(uint32_t raw, size_t requiredBytes, uintptr_t* outHost) {
 }
 
 bool ResolveRegisteredHostPointer(uint32_t raw, ResolvedAddress& out, size_t requiredBytes = 1) {
-    // GDX_LEGACY_RESOLVE quarantine (see the block above kFallbackIdentityMtx):
-    // this is the "registered-host low32-window match" guess the converter explicitly does
-    // NOT reproduce (G2ResolvePhysical only does the deterministic RDRAM-arena
-    // subset). Disabling the flag makes this branch behave as if it never
-    // matched, same as if it were deleted.
+    // The registered-host low32-window guess, which the converter deliberately does not reproduce
+    // (G2ResolvePhysical does only the deterministic RDRAM-arena subset).
     if (!LegacyResolveEnabled()) {
         return false;
     }
@@ -1419,16 +1235,11 @@ bool ResolveRegisteredHostPointer(uint32_t raw, ResolvedAddress& out, size_t req
 
         const uint32_t baseLow = Low32(range.begin);
         const uint32_t offset = raw - baseLow;
-        /* requiredBytes: this previously accepted any range whose
-           low32 window merely CONTAINED the start byte, with no check that
-           requiredBytes fit before the range's end, and no page-level
-           readability confirmation -- and it committed to the FIRST matching
-           range in registration order even when that match was coincidental.
-           gHostRanges can have low32 windows that overlap by chance for an
-           unrelated raw value, so validate both the declared size and the real
-           mapped pages, and keep scanning on failure instead of trusting the
-           first hit. This is one of the "wrong-but-readable" resolution gaps
-           suspected as the remaining cause of vertex/matrix garbage loads. */
+        /* gHostRanges low32 windows can overlap by chance for an unrelated raw value, so a match
+           on the start byte alone is not enough: validate the declared size AND the real mapped
+           pages, and keep scanning on failure rather than committing to the first hit in
+           registration order. Accepting the first containing range produced wrong-but-readable
+           resolutions and garbage vertex/matrix loads. */
         if (offset < range.size && requiredBytes <= range.size - offset) {
             const uintptr_t full = range.begin + offset;
             if (ReadableByteLimit(full) >= requiredBytes) {
@@ -1445,39 +1256,28 @@ bool ResolveRegisteredHostPointer(uint32_t raw, ResolvedAddress& out, size_t req
 // ---------------------------------------------------------------------------
 // Binary N64 (8-byte) -> wide 16-byte boundary converter + cache.
 //
-// A narrow N64-format list (EK disk asset, ROM blob, or RDRAM-decoded segment)
-// is converted ONCE to the wide layout the fast path consumes and
-// cached across frames. The per-frame path then reads a wide source (stride 16,
-// resolver-free) instead of re-parsing the narrow list and guessing pointers.
+// A narrow N64-format list (EK disk asset, ROM blob, or RDRAM-decoded segment) is converted ONCE
+// to the wide layout the fast path consumes and cached across frames, so the per-frame path reads
+// a resolver-free stride-16 source instead of re-parsing and guessing pointers.
 //
-// Wiring is LAZY: the redirect lives in EnqueueList, so every narrow list the
-// draw-time walk reaches -- root or sub-DL -- is converted+cached on first
-// encounter, and sub-DL recursion falls out of the existing walk (each sub-DL is
-// itself an EnqueueList that hits the same hook). See n64_gfx_convert.{h,cpp}.
+// Wiring is LAZY: the redirect lives in EnqueueList, so every narrow list the draw-time walk
+// reaches is converted on first encounter and sub-DL recursion falls out of the existing walk --
+// each sub-DL is itself an EnqueueList hitting the same hook. See n64_gfx_convert.{h,cpp}.
 // ---------------------------------------------------------------------------
 gdx::GfxWideCache gWideCache;
-// (gConvertEpoch is defined earlier, near the framebuffer globals.)
-// Runtime kill switch (GDX_G2_CONVERT=0 disables the converter and restores the
-// pure narrow path). Default ON. Lets the next runtime-verification session flip
-// the boundary off instantly without a rebuild if a regression appears.
+// Runtime kill switch: GDX_G2_CONVERT=0 restores the pure narrow path without a rebuild.
 bool gG2ConvertEnabled = true;
 bool gG2ConvertInit = false;
-// Dialect (F3D vs F3DEX2) of each converted wide buffer, keyed by its exact data
-// pointer. ProcessList consults this instead of re-deriving the dialect from the
-// wide stream: the converted buffer loses its source segment's dialect tag, and
-// the opcode-scan fallback can misclassify F3DEX2 setup DLs whose bytes contain
-// 0xB8 before 0xDF (the exact case the segment-tag table guards -- see comment
-// above GdxSegmentDialect). Recorded before enqueue, so the value for a live
-// buffer is always current at read time.
+// Dialect of each converted wide buffer, keyed by its exact data pointer. The converted buffer
+// loses its source segment's dialect tag and the opcode-scan fallback misclassifies F3DEX2 setup
+// DLs containing 0xB8 before 0xDF, so ProcessList must consult this rather than re-derive from
+// the wide stream. Recorded before enqueue, so a live buffer's value is always current.
 std::unordered_map<const void*, bool> gConvertedWideIsF3d;
 
-/* Segment-9 fallback probe, G2ResolvePhysical variant (see GdxSeg9FallbackDiag
- * further down for the full rationale -- this is the same scope-exit idea
- * adapted to G2ResolvePhysical's `uintptr_t* out_host` signature instead of
- * TryResolveAddress's ResolvedAddress&). Diagnosis only; env-gated on
- * GDX_LOG; bounded to the first 24 misses per process. Declared here (ahead
- * of N64DisplayListAdapter) so it is visible at G2ResolvePhysical's call
- * site, which runs before that class is defined in this translation unit. */
+/* Segment-9 fallback probe, strip later: G2ResolvePhysical variant of GdxSeg9FallbackDiag below,
+ * adapted to its `uintptr_t* out_host` signature. GDX_LOG-gated, first 24 misses per process.
+ * Declared here so it is visible at G2ResolvePhysical's call site, which precedes
+ * N64DisplayListAdapter in this translation unit. */
 class GdxSeg9FallbackDiagRaw {
   public:
     GdxSeg9FallbackDiagRaw(bool armed, uint32_t raw, size_t requiredBytes, const uintptr_t* outHost)
@@ -1511,13 +1311,11 @@ class GdxSeg9FallbackDiagRaw {
 };
 
 bool G2ResolvePhysical(void* /*user*/, uint32_t raw, size_t required_bytes, uintptr_t* out_host) {
-    /* Resolve exact, registered N64 overlay tokens before treating KSEG values
-       as RDRAM. Expansion Kit display lists use original overlay VRAM addresses
-       such as 0x80137528 for light structures; interpreting those as physical
-       RDRAM silently feeds zeroed memory to the renderer. These registrations
-       are authoritative token-to-host mappings, not low32 reconstruction
-       guesses. Match TryResolveAddress's precedence, then fall through to the
-       deterministic RDRAM paths used previously. */
+    /* Registered overlay tokens must resolve BEFORE KSEG values are treated as RDRAM: EK display
+       lists use original overlay VRAM addresses (0x80137528 for light structures), and reading
+       those as physical RDRAM silently feeds zeroed memory to the renderer. These are
+       authoritative token-to-host mappings, not low32 guesses, and the order matches
+       TryResolveAddress's precedence. */
     {
         uintptr_t modeAddress = 0;
         if (gdx_resolve_mode_segment9(raw, required_bytes, &modeAddress) != 0 &&
@@ -1527,14 +1325,9 @@ bool G2ResolvePhysical(void* /*user*/, uint32_t raw, size_t required_bytes, uint
         }
     }
 
-    // Task 3 diag (Course Edit node-info panel scatter): see GdxSeg9FallbackDiagRaw
-    // above. Armed only for genuine segment-9 tokens that just missed the
-    // authoritative mode resolver; its destructor fires on whichever return
-    // below actually serves (or fails to serve) this token. E5: also armed by
-    // GDX_DIAG_NODEINFO, a dedicated opt-in for the [nodeinfo] investigation that
-    // does not require enabling the broader GDX_LOG file-log sink.
-    // Live gate reads (two inline int loads, no `static` latch) so arming the probe from
-    // Dev Tools applies on the next resolution instead of requiring a restart.
+    // Armed only for segment-9 tokens that just missed the authoritative mode resolver; the
+    // destructor fires on whichever return below serves (or fails to serve) the token. Gates are
+    // read live, not latched in a static, so arming from Dev Tools takes effect without a restart.
     const bool seg9DiagEnabled = gdx_dev_gate(GDX_GATE_LOG_FILE) || gdx_dev_gate(GDX_GATE_DIAG_NODEINFO);
     GdxSeg9FallbackDiagRaw seg9Diag(seg9DiagEnabled && (raw >> 24) == 9u, raw, required_bytes, out_host);
 
@@ -1587,22 +1380,13 @@ void EnsureG2ConvertInit() {
         return;
     }
     gG2ConvertInit = true;
-    // Read ONCE here (not per frame): the converter's cache/context are wired at this point and
-    // flipping the switch afterwards would leave already-converted lists behind. Dev Tools labels
-    // the control "applies on restart" for exactly this reason.
+    // Read ONCE: the converter's cache/context are wired here, so flipping the switch afterwards
+    // would leave already-converted lists behind. Dev Tools labels the control "applies on
+    // restart" for that reason.
     gG2ConvertEnabled = !gdx_dev_gate(GDX_GATE_NO_G2_CONVERT);
-    // GDX_DIAG_NO_G2_CONVERT: plain-getenv diagnostic override of the same switch.
-    //
-    // GDX_GATE_NO_G2_CONVERT is Bucket B, so it is hard-wired to 0 in a Release build and the kill
-    // switch is unreachable in exactly the binary the owner tests. This override exists because the
-    // converter is the prime suspect for the interpolation flicker: display lists are converted to
-    // the wide layout and CACHED LAZILY on first encounter (see the block comment above
-    // gWideCache), which is a first-execution-only side effect -- and measurement shows the FIRST
-    // sub-frame pass renders differently from every later one, while passes 1 and 2 are
-    // byte-identical to each other. Turning the converter off makes every pass take the same narrow
-    // path, so if the flicker disappears the lazy conversion is the cause.
-    //
-    // Diagnostic, not a shipping control: it forces the slower narrow path for the whole session.
+    // Plain-getenv override of the same switch, needed because GDX_GATE_NO_G2_CONVERT is Bucket B
+    // and hard-wired to 0 in a Release build -- the binary where the interpolation flicker is
+    // reproduced. Diagnostic only: it forces the slower narrow path for the whole session.
     if (const char* e = getenv("GDX_DIAG_NO_G2_CONVERT")) {
         if (e[0] != 0 && strcmp(e, "0") != 0) {
             gG2ConvertEnabled = false;
@@ -1616,11 +1400,10 @@ void EnsureG2ConvertInit() {
 }
 
 uint64_t G2StampFor(const N64Gfx* src) {
-    // Two disjoint stamp namespaces so an RDRAM DMA never collides with an asset
-    // epoch. RDRAM-backed lists are mutable (course loads overwrite the arena):
-    // key them on the DMA generation so any write rebuilds them. Asset/ROM lists
-    // are immutable once decoded (a reload takes a fresh heap address = new key):
-    // key them on the coarse asset epoch, high bit set to separate the spaces.
+    // Two disjoint stamp namespaces so a DMA generation never collides with an asset epoch.
+    // RDRAM-backed lists are mutable (course loads overwrite the arena), so key them on the DMA
+    // generation; asset/ROM lists are immutable once decoded (a reload lands at a fresh heap
+    // address = new key), so key them on the asset epoch with the high bit set.
     if (IsRdramHostPointer(reinterpret_cast<uintptr_t>(src))) {
         return gDmaGeneration;
     }
@@ -1633,59 +1416,29 @@ bool ResolveGeneratedAssetStub(uint32_t raw, ResolvedAddress& out, size_t requir
         return false;
     }
 
-    /* E1 (editor resolver diagnosis): the interior match above originally had no
-     * requiredBytes validation at all, so when a caller over-estimated the needed
-     * byte count (e.g. EstimateRawTextureCopyBytes), an interior hit that did not
-     * actually have that many bytes left in its declared image was accepted
-     * anyway. That let this function steal seg-9/seg-7 tokens away from the
-     * correct-but-stricter callers (gdx_resolve_mode_segment9, the mode-owned
-     * carve) and hand back wrong-source bytes -- seg-9 tokens landing in the
-     * machine_models ROM table (the nodeinfo scatter) and seg-7 EK tokens landing
-     * in the cartridge expansion_kit_textures_beta blob (blank tooltips).
-     *
-     * F3 update: reject ONLY when the offset itself is out of bounds
-     * (lookup.offset >= lookup.imageSize). A valid offset whose requiredBytes
-     * estimate overshoots the declared image size is now ACCEPTED rather than
-     * hard-rejected: block-rounded copy-size estimates can legitimately overshoot
-     * the real image by one row (see NativeRgba16RangeRemaining's comment above
-     * and the WIPE-transition LOADBLOCK case it documents), and the downstream
-     * copy path already clamps the actual copy to what is readable
-     * (`required = std::min(required, readable)` in TranslateTexturePointer), so
-     * an inflated requiredBytes here can never cause an over-read. The original
-     * goal of this check -- rejecting matches where an inflated estimate proves
-     * the token really belongs to a mode-owned/other source -- is now covered by
-     * the separate gdx_mode_owns_segment gate below (E2), so clamping instead of
-     * hard-rejecting here is safe. */
+    /* Reject ONLY on an out-of-bounds offset, deliberately NOT on requiredBytes overshooting the
+     * declared image: block-rounded copy estimates legitimately overshoot by a row (see
+     * NativeRgba16RangeRemaining and its WIPE-transition LOADBLOCK case) and TranslateTexturePointer
+     * clamps the actual copy to what is readable, so an inflated estimate cannot over-read. The
+     * case a stricter check was meant to catch -- a token that really belongs to another source --
+     * is covered by the gdx_mode_owns_segment gate below. */
     if (lookup.offset >= lookup.imageSize) {
         return false;
     }
 
-    /* A mode-owned segment's live carve (gdx_load_seg4_if_needed /
-     * gdx_load_seg7_if_needed / gdx_resolve_mode_segment9) is authoritative for
-     * that segment; a ROM-backed AssetBindings.c row for the SAME segment number
-     * is stale context that must not win over it BY DEFAULT. The original fix
-     * hard-rejected every such row with no fallback, which was correct for the
-     * editor's seg-9 scatter (a stale machine_models row while Course Edit's
-     * course_edit_textures was active) but wrong for races: hud_gfx and
-     * machine_global_gfx are mode-owned for the ENTIRE race (not just a
-     * transition frame), so EVERY compiled-symbol reference into segments 4/7
-     * (HUD digits/flag/energy bar, racer display lists) was starved for the
-     * whole race. Segment 0x0A's live-carve redirect below
-     * shows the correct shape: redirect into the live carve instead of
-     * rejecting, when the carve is actually readable there. Generalized to any
-     * mode-owned segment (4/7/9), gated on gdx_mode_segment_content_matches so a
-     * row from a ROM family that is NOT the one currently resident in the carve
-     * (e.g. that same stale machine_models-during-Course-Edit case, or the
-     * never-port-loaded seg-4 course_edit_textures_beta family) still falls
-     * through to a genuine reject -- keeping the original editor fix intact.
-     * Bound check is ReadableByteLimit only, matching the proven 0x0A pattern
-     * exactly: no clean per-segment active-size accessor exists for segments
-     * 4/7, and segment 9's sGdxSeg9ActiveSize is already a stricter gate applied
-     * by gdx_resolve_mode_segment9 with first refusal in TryResolveAddress, so
-     * this is only reached as a permissive fallback net after that stricter
-     * check has already failed. Segment 9 tokens get that first refusal before
-     * this function ever runs, but ResolveWideAssetStubPointer's wide-pointer
-     * path reaches this function directly, so the check must live here too. */
+    /* A mode-owned segment's live carve is authoritative; a ROM-backed AssetBindings.c row for the
+     * same segment number is stale context. Redirect into the carve rather than reject: hud_gfx
+     * and machine_global_gfx stay mode-owned for the ENTIRE race, so hard-rejecting starves every
+     * compiled-symbol reference into segments 4/7 (HUD digits, flag, energy bar, racer DLs) for
+     * the whole race. The gdx_mode_segment_content_matches gate keeps a row from a ROM family
+     * that is NOT the resident one (stale machine_models during Course Edit; the never-loaded
+     * seg-4 course_edit_textures_beta) falling through to a genuine reject.
+     *
+     * ReadableByteLimit is the only bound check, matching the 0x0A pattern below: segments 4/7
+     * have no per-segment active-size accessor, and segment 9's stricter sGdxSeg9ActiveSize gate
+     * already ran in gdx_resolve_mode_segment9 with first refusal in TryResolveAddress -- this is
+     * only the permissive net behind it. ResolveWideAssetStubPointer reaches this function
+     * directly, so the check has to live here too. */
     if (gdx_mode_owns_segment(lookup.segment) != 0) {
         const uintptr_t live = gSegments[lookup.segment];
         if (live != 0 && gdx_mode_segment_content_matches(lookup.segment, lookup.romBase) != 0 &&
@@ -1707,24 +1460,19 @@ bool ResolveGeneratedAssetStub(uint32_t raw, ResolvedAddress& out, size_t requir
         return false;
     }
 
-    /* Live-carve preference, segment 0x0A ONLY (early-race floor
-     * root cause): interior venue-bank pointers low32-match whichever venue's
-     * suffixed stub range happens to contain them (the stubs alias in low32),
-     * so the per-symbol heap image can be a DIFFERENT venue's texture bank --
-     * the frames 1-43 wrong-venue floor. The slot-0x0A carve is rotated by
-     * gdx_load_venue_texture_segment (the authority) and every venue shares
-     * the same bank*0x1000 layout, so resolving live is venue-correct by
-     * construction. Deliberately NOT generalized to other segments: routing
-     * seg-4/7 placeholder textures to the rdram carve strips their o2r
-     * delivery eligibility (the SETTIMG path's !IsRdramHostPointer gate) and
-     * puts them on the raw-copy path with per-frame dma-generation staleness
-     * refreshes -- a regression run showed the whole HUD + vehicles
-     * garbled, unplayable FPS). The rank digits gain nothing from the live
-     * carve either: [digit-carve] proved gSegments[4]+0x13DE0 is zero at race
-     * time (the console's runtime fill has no port equivalent yet). This
-     * segment is never mode-owned (gdx_mode_owns_segment has no 0x0A case), so
-     * it is handled here as its own case rather than folded into the
-     * mode-owned block above. */
+    /* Live-carve preference, segment 0x0A ONLY. Interior venue-bank pointers low32-match whichever
+     * venue's suffixed stub range happens to contain them (the stubs alias in low32), so the
+     * per-symbol heap image can be a DIFFERENT venue's texture bank -- the wrong-venue floor on
+     * the first frames of a race. The 0x0A carve is rotated by gdx_load_venue_texture_segment and
+     * every venue shares the same bank*0x1000 layout, so resolving live is venue-correct by
+     * construction.
+     *
+     * Do NOT generalize to other segments: routing seg-4/7 placeholder textures to the rdram
+     * carve strips their o2r eligibility (the SETTIMG path's !IsRdramHostPointer gate) and puts
+     * them on the raw-copy path with per-frame staleness refreshes -- a regression run garbled
+     * the whole HUD and vehicles at unplayable FPS. The rank digits gain nothing either:
+     * gSegments[4]+0x13DE0 is zero at race time, since the console's runtime fill has no port
+     * equivalent yet. 0x0A is never mode-owned, hence its own case here. */
     if (lookup.segment == 0x0Au) {
         const uintptr_t live = gSegments[0x0A];
         if (live != 0 && ReadableByteLimit(live + lookup.offset) >= 1) {
@@ -1767,55 +1515,21 @@ bool ResolvePortBssAlias(uint32_t raw, ResolvedAddress& out) {
     return true;
 }
 
-/* course.c's road material table (ROAD_1..WALLED_ROAD) stores the unsuffixed
- * venue bank symbols D_A000000..D_A008000 directly, so road-pass SETTIMGs carry
- * those stubs' truncated addresses. The stubs are 1-byte placeholders with no
- * binding; without this alias they false-match zero-filled memory and the road
- * samples an all-black texture. The real data is the per-venue segment image
- * gdx_load_venue_texture_segment puts in gSegments[0x0A]; bank N sits at
- * N * 0x1000 (the suffixed per-venue symbols confirm the stride). Exact-base
- * match only: the stubs are packed 1 byte apart, so interior spans would
- * collide with the next symbol. */
-/* Wide-DL regression fix: game-BUILT wide DLs carry the REAL
-   host addresses of generated 1-byte asset stubs (port/gen/LinkStubs.c)
-   whenever a compile-time table stores asset symbols — course.c's road/wall
-   material table (course.c:101-112) stores the venue banks D_A000000..
-   D_A008000 directly. The wide host-pointer fast path took those addresses
-   verbatim (the EXE module is a registered host range), so the track floor,
-   walls and tunnel sampled EXE data-section bytes: black where the stub
-   neighborhood is zeroed, striped garbage otherwise, changing per BUILD with
-   the module layout. The low32 resolver already knows these identities
-   (ResolveVenueBankAlias / ResolveGeneratedAssetStub) but wide pointers never
-   reach it. Exact full-address membership inside the module range only — a
-   genuine data pointer cannot false-match because the stub's address IS the
-   full address being compared. Returns 0 when `full` is not a known stub. */
-/* E3 (replaces the old hand-listed 23-symbol kEkNamedAssetStubs table, Fix A1's
- * original "module->asset shim gap" fix), generalized by A1/A2 (fireworks /
- * sCourseMinimapPalette) beyond its original Expansion-Kit-only scope: any REAL,
- * full-size host array whose own address SETTIMG can carry directly -- not a
- * generated 1-byte LinkStubs placeholder -- can be registered here so
- * ResolveWideAssetStubPointer RECOGNIZES it instead of miscounting it as an
- * unbound stub. Originally populated only from gdx_ek_assets_fill()'s loop (EK
- * disk assets, port/gen/EkAssetBindings.c / tools/gen_ek_assets.py, covering the
- * full ~773-entry sEkAssetFills[] table instead of a hand-maintained subset);
- * now also populated once at init from port/decomp_port.c for base-game compiled
- * -in arrays with the same "unbound stub" false positive (the ending fireworks
- * sprites D_i7_8014ADA8/AE30/AEB8 and sCourseMinimapPalette). The resolved
- * pointer is unchanged either way (delta added back onto the array's own
- * address) -- this table only affects RECOGNITION, never the delivered bytes;
- * pair it with gdx_set_native_rgba16_texture_range when the array's compiled
- * bytes also need the host-endian byteswap (see the fireworks registration).
+/* Registry of REAL, full-size host arrays whose own address SETTIMG can carry directly -- as
+ * opposed to a generated 1-byte LinkStubs placeholder -- so ResolveWideAssetStubPointer
+ * RECOGNIZES them instead of miscounting them as unbound stubs. Populated from
+ * gdx_ek_assets_fill()'s sEkAssetFills[] table and, at init, from decomp_port.c for base-game
+ * compiled-in arrays with the same false positive (ending fireworks sprites,
+ * sCourseMinimapPalette). This table affects RECOGNITION only: the resolved pointer is the delta
+ * added back onto the array's own address, never different bytes. Pair a registration with
+ * gdx_set_native_rgba16_texture_range when the compiled bytes also need the host-endian byteswap.
  *
- * Interior-offset support (course_edit/191080.c's node-info number strip
- * indexes aCourseEditNumberSheetTex at +0x120/+0x240 for later digit-glyph
- * bands): same delta<size unsigned-wraparound match gdx_lookup_asset_segment_
- * interior uses for the ROM-backed table (AssetBindings.c), not an exact-only
- * comparison.
+ * The match is delta<size with unsigned wraparound, not exact-base, because interior offsets are
+ * real: course_edit/191080.c's node-info number strip indexes aCourseEditNumberSheetTex at
+ * +0x120/+0x240 for later digit-glyph bands. Same rule gdx_lookup_asset_segment_interior uses.
  *
- * gdx_register_host_pointer_stub itself is defined further down, alongside the
- * other gdx_register_* host-range functions, OUTSIDE this anonymous namespace
- * (matching this file's own convention for extern "C" definitions -- see
- * gdx_record_dma_load's "temporarily close to define extern "C"" split above). */
+ * gdx_register_host_pointer_stub is defined further down, outside this anonymous namespace,
+ * with the other extern "C" gdx_register_* functions. */
 bool ResolveHostPointerStub(uint32_t raw, ResolvedAddress& out) {
     for (const HostRange& entry : gHostPointerStubs) {
         const uint32_t base = Low32(entry.begin);
@@ -1832,20 +1546,28 @@ bool ResolveHostPointerStub(uint32_t raw, ResolvedAddress& out) {
 }
 
 bool ResolveVenueBankAlias(uint32_t raw, ResolvedAddress& out); // fwd decl (defined below)
+/* Game-BUILT wide DLs carry the REAL host address of a generated 1-byte asset stub whenever a
+   compile-time table stores asset symbols -- course.c:101-112 stores the venue banks
+   D_A000000..D_A008000 directly. Taken verbatim by the wide host-pointer fast path (the EXE
+   module is a registered host range) the track floor, walls and tunnel sample EXE data-section
+   bytes: black where the stub neighborhood is zeroed, striped garbage otherwise, and different
+   per BUILD as the module layout moves. The low32 resolvers already know these identities but
+   wide pointers never reach them, hence this hop.
+
+   Matching on low32 is sound here rather than a guess: within one process each stub symbol has
+   exactly one host address, so low32 -> address is injective over the stub set, and the value
+   being compared IS that address truncated -- a genuine data pointer cannot false-match a stub
+   it does not equal. Returns 0 when `full` is not a known stub. */
 uintptr_t ResolveWideAssetStubPointer(uintptr_t full, uintptr_t moduleBegin, uintptr_t moduleEnd,
                                        size_t requiredBytes = 1) {
     if (full == 0) {
         return 0;
     }
-    /* Exact-symbol matchers run FIRST, before the coarse module-range gate below.
-       They compare `full`'s low32 against the KNOWN addresses of specific stub
-       symbols, so a hit is unambiguous and needs no range pre-filter. This order
-       is load-bearing: on Linux PIE, GetMainModuleRange under-covers the anonymous
-       .bss tail where the venue-bank stubs (D_A000000..D_A008000) live, so gating
-       exact matching behind the range check dropped every venue bank and the track
-       floor/walls/pipes sampled the raw zero stub byte (solid black). Exact
-       resolution is safe regardless of the range: the stub's own address is what
-       matched. */
+    /* Exact-symbol matchers MUST run before the module-range gate below. On Linux PIE,
+       GetMainModuleRange under-covers the anonymous .bss tail holding the venue-bank stubs, so
+       gating exact matching behind the range check drops every venue bank and the track
+       floor/walls/pipes sample the raw zero stub byte (solid black). Exact resolution is safe
+       outside the range because the stub's own address is what matched. */
     const uint32_t low = Low32(full);
     ResolvedAddress out = {};
     if (ResolveVenueBankAlias(low, out)) {
@@ -1854,30 +1576,30 @@ uintptr_t ResolveWideAssetStubPointer(uintptr_t full, uintptr_t moduleBegin, uin
     if (ResolveGeneratedAssetStub(low, out, requiredBytes)) {
         return out.full;
     }
-    // A1/A2 generalized this beyond EXPANSION_KIT (see ResolveHostPointerStub's
-    // comment): base-game arrays register here too, so this check always runs.
     if (ResolveHostPointerStub(low, out)) {
         return out.full;
     }
-    /* Coarse module-range gate: preserved to guard any range-scoped resolution
-       that follows the exact matchers. A `full` outside the EXE module is not a
-       generated stub and must not be reinterpreted. Nothing range-scoped exists
-       below yet, so a miss falls through to 0 either way. */
+    /* Kept to guard any future range-scoped resolution: a `full` outside the EXE module is not a
+       generated stub and must not be reinterpreted. Nothing range-scoped exists below yet. */
     if (moduleBegin == 0 || full < moduleBegin || full >= moduleEnd) {
         return 0;
     }
     return 0;
 }
 
+/* course.c's road material table (ROAD_1..WALLED_ROAD) stores the unsuffixed venue bank symbols
+ * D_A000000..D_A008000 directly, so road-pass SETTIMGs carry those stubs' truncated addresses.
+ * The stubs are 1-byte placeholders with no binding; without this alias they false-match
+ * zero-filled memory and the road samples an all-black texture. The real data is the per-venue
+ * image gdx_load_venue_texture_segment puts in gSegments[0x0A]. Exact-base match only: the stubs
+ * are packed 1 byte apart, so an interior span would collide with the next symbol. */
 bool ResolveVenueBankAlias(uint32_t raw, ResolvedAddress& out) {
     if (gSegments[0x0A] == 0) {
         return false;
     }
-    // {stub symbol, byte offset within the venue segment image}. The first 11
-    // banks are the uniform 0x1000-byte texture banks; the EK Road-Type panel
-    // icons that follow are NOT bank-aligned (576-byte RGBA16 24x12 icons, see
-    // the D_A00B000.. extern declarations above), so offsets are listed
-    // explicitly rather than derived by multiplying an index.
+    // {stub symbol, byte offset within the venue segment image}. Offsets are listed rather than
+    // derived from an index because only the first 11 are the uniform 0x1000-byte banks; the EK
+    // Road-Type icons after them are 576-byte and not bank-aligned.
     struct BankEntry {
         uint32_t low32;
         uint32_t offset;
@@ -1892,15 +1614,9 @@ bool ResolveVenueBankAlias(uint32_t raw, ResolvedAddress& out) {
         { Low32(reinterpret_cast<uintptr_t>(D_A006000)), 0x6000u },
         { Low32(reinterpret_cast<uintptr_t>(D_A007000)), 0x7000u },
         { Low32(reinterpret_cast<uintptr_t>(D_A008000)), 0x8000u },
-        // E4: banks 9-10 (no current reference, registered for symmetry -- see the
-        // extern declarations above).
         { Low32(reinterpret_cast<uintptr_t>(D_A009000)), 0x9000u },
         { Low32(reinterpret_cast<uintptr_t>(D_A00A000)), 0xA000u },
 #ifdef EXPANSION_KIT
-        // Road-Type panel icons (gRoadTypeMenuItems/gHRoadTypeMenuItems/
-        // gTRoadTypeMenuItems, decomp/src/overlays/expansion_kit/A3AE0.c) --
-        // EK-only, real per-venue RGBA16 24x12 icons confirmed against every
-        // base-game venue texture yaml (see the extern declarations above).
         { Low32(reinterpret_cast<uintptr_t>(D_A00B000)), 0xB000u },
         { Low32(reinterpret_cast<uintptr_t>(D_A00B240)), 0xB240u },
         { Low32(reinterpret_cast<uintptr_t>(D_A00B480)), 0xB480u },
@@ -1933,9 +1649,9 @@ uintptr_t EnsureSetupGfxSegment() {
         return reinterpret_cast<uintptr_t>(gSetupGfxSegment.data());
     }
 
-    // Archive-only fix: same shim-aware gate as EnsureAssetSegmentImage -- the ROM
-    // is only required when no archive blob contains this range (the shim read
-    // below fails cleanly either way; this just avoids a pointless allocation).
+    // Same shim-aware gate as EnsureAssetSegmentImage: the ROM is required only when no archive
+    // blob contains this range. The shim read below fails cleanly either way; this only avoids a
+    // pointless allocation.
     uint32_t setupSpan = 0;
     if (GdxSegmentSourceContainingSpan(static_cast<uint32_t>(kSetupGfxRomOffset), &setupSpan) == 0 &&
         ((gdx_rom_buffer == nullptr) || (gdx_rom_size < kSetupGfxRomOffset + kSetupGfxSize))) {
@@ -1943,12 +1659,9 @@ uintptr_t EnsureSetupGfxSegment() {
     }
 
     gSetupGfxSegment.resize(kSetupGfxSize);
-    // This hardcoded 0x17B1E0/0x778 fallback exists ONLY for a
-    // missing-binding regression -- D_3000000 is present in sAssetSegmentMap, so
-    // the EnsureAssetSegmentForSymbol primary path above always resolves and this
-    // is dead in normal operation. Route the raw byte read through the single
-    // byte-source shim anyway; the per-word BE32 host-endian swap below is preserved
-    // byte-for-byte.
+    // Hardcoded 0x17B1E0/0x778 fallback for a missing-binding regression only: D_3000000 is in
+    // sAssetSegmentMap, so the primary path above always resolves and this is dead in normal
+    // operation.
     std::vector<uint8_t> raw(kSetupGfxSize);
     if (!GdxSegmentSourceRead(static_cast<uint32_t>(kSetupGfxRomOffset),
                               static_cast<uint32_t>(kSetupGfxSize), raw.data())) {
@@ -1961,8 +1674,8 @@ uintptr_t EnsureSetupGfxSegment() {
 
     {
         const uintptr_t segBase = reinterpret_cast<uintptr_t>(gSetupGfxSegment.data());
-        // Register so RegisteredHostRemaining() treats this as ROM-backed, and so
-        // G_MOVEWORD can't overwrite gSegments[3] with a garbage arena-buffer address.
+        // Registered so RegisteredHostRemaining() treats this as ROM-backed and G_MOVEWORD cannot
+        // overwrite gSegments[3] with a garbage arena-buffer address.
         gHostRanges.push_back({ segBase, gSetupGfxSegment.size() });
         gHostN64CommandRanges.push_back({ segBase, gSetupGfxSegment.size() });
         if (gSegments[3] == 0) {
@@ -2089,17 +1802,14 @@ static void ResetWindowsMemoryRegionCache() {
 // ---------------------------------------------------------------------------------------------
 // POSIX memory-probe backend: a snapshot of /proc/self/maps with miss-triggered refresh.
 //
-// The Windows probes (VirtualQuery) answer "is this address readable, and how far does the
-// containing region extend?" per call. On Linux the equivalent is /proc/self/maps. Re-reading and
-// parsing that file on every probe (this bridge calls ReadableByteLimit thousands of times per
-// frame) would be far too slow, so we snapshot it once and re-parse only on a MISS -- an address
-// not found in the snapshot triggers exactly one re-parse then re-query. That handles regions
-// mmap'd after boot (the RDRAM calloc, fiber stacks, late texture arenas) without a watcher
-// thread. Readable regions are coalesced at parse time so a "rest of the block" answer comes out
+// VirtualQuery answers "readable, and how far does the region extend?" per call; /proc/self/maps
+// is the Linux equivalent but this bridge probes thousands of times per frame, so re-parsing per
+// call is out. Snapshot once, re-parse exactly once on a miss, then re-query -- that covers
+// regions mmap'd after boot (RDRAM calloc, fiber stacks, late texture arenas) without a watcher
+// thread. Readable regions are coalesced at parse time so a "rest of the block" answer is
 // comparable to VirtualQuery's region-spanning result.
 //
-// Threading: these probes run only on the single graphics thread. The atomic generation counter
-// is belt-and-suspenders for the re-parse and is otherwise unused.
+// These probes run only on the graphics thread; the atomic generation counter is otherwise unused.
 // ---------------------------------------------------------------------------------------------
 struct MapsRegion {
     uintptr_t begin;
@@ -2147,7 +1857,6 @@ static void ParseProcMaps() {
     sMapsGeneration.fetch_add(1, std::memory_order_relaxed);
 }
 
-// Binary-search the snapshot for the region containing `addr`.
 static const MapsRegion* FindMapsRegion(uintptr_t addr) {
     size_t lo = 0;
     size_t hi = sMaps.size();
@@ -2164,8 +1873,7 @@ static const MapsRegion* FindMapsRegion(uintptr_t addr) {
     return nullptr;
 }
 
-// Look up `addr`, re-parsing once on a miss (late mmap). Copies the region out by value so the
-// result stays valid even though a subsequent probe may re-parse and reallocate sMaps.
+// Copies the region out by value: a subsequent probe can re-parse and reallocate sMaps.
 static bool PosixRegionFor(uintptr_t addr, MapsRegion& out) {
     if (sMaps.empty()) {
         ParseProcMaps();
@@ -2357,15 +2065,11 @@ uintptr_t MakePersistentVtxCopy(uintptr_t source, size_t count) {
     }
     size_t requiredBytes = count * 16;
 
-    /* Defense in depth for the machine vertex-spike bug (#3): callers are now
-       expected to have validated `requiredBytes` bytes are readable at `source`
-       via TranslateDataPointer(..., requiredBytes) before reaching here, but an
-       under-validated resolution (e.g. only 1 byte proven readable) previously
-       let this loop walk past the end of the real vertex buffer into unrelated
-       host memory -- one garbage vertex is a visible "spike" (stretched
-       polygon). Clamp defensively and zero the tail so a residual gap can never
-       turn into an out-of-bounds host read again, and log it so the true
-       source of any remaining spikes is still visible. */
+    /* Defense in depth: callers are expected to have validated requiredBytes at `source` via
+       TranslateDataPointer, but an under-validated resolution (only 1 byte proven readable) lets
+       this loop walk past the vertex buffer into unrelated host memory, and one garbage vertex is
+       a visible stretched-polygon spike. Clamp and zero the tail; log so a remaining spike still
+       has a visible cause. */
     const size_t readable = ReadableByteLimit(source);
     size_t safeCount = count;
     if (readable < requiredBytes) {
@@ -2413,18 +2117,11 @@ uintptr_t MakePersistentMtxCopy(uintptr_t source) {
     std::memset(out, 0, 64);
     gPersistentAllocations.push_back(std::move(alloc));
 
-    /* Defense in depth, same idiom as MakePersistentVtxCopy's
-       [vtx-clamp] above: callers are expected to have validated 64 bytes readable
-       at `source` before reaching here (see kOpMtx's CRASH FAILSAFE, hoisted to
-       run pre-copy), but clamp internally too so ANY caller -- present or future,
-       including the second MakePersistentMtxCopy call site in the kOpVtx
-       F3D-remapped-to-Mtx branch -- cannot turn an under-validated resolution
-       into an out-of-bounds host read. The buffer is zeroed above, so a clamped
-       tail reads as benign zero words rather than garbage; a fully-unreadable
-       `source` (readable == 0) therefore yields a fully-zeroed, degenerate 64-byte
-       matrix rather than a null return -- a deliberate divergence from the primary
-       kOpMtx call site, which drops the whole command (outW1 = 0, never reaching
-       this function) on the same under-validated condition. */
+    /* Same clamp idiom as MakePersistentVtxCopy, applied internally so ANY caller -- including
+       the kOpVtx F3D-remapped-to-Mtx branch -- cannot turn an under-validated resolution into an
+       out-of-bounds read. The buffer is zeroed above, so a fully-unreadable `source` yields a
+       degenerate all-zero matrix rather than a null return. That deliberately differs from the
+       primary kOpMtx call site, which drops the whole command on the same condition. */
     const size_t readable = ReadableByteLimit(source);
     const size_t safeWords = std::min<size_t>(16, readable / 4);
     if (readable < 64) {
@@ -2444,54 +2141,26 @@ uintptr_t MakePersistentMtxCopy(uintptr_t source) {
     return reinterpret_cast<uintptr_t>(out);
 }
 
-/* True when a texture/TLUT source address lands inside the two live GfxPools
- * (D_8024DCE0[2]).
+/* True when a texture/TLUT source lands inside the two live GfxPools (D_8024DCE0[2]).
  *
- * WHY THIS EXISTS -- the "Silence moon is bright pink after racing Mute City 2"
- * defect (venue background sprite palettes):
+ * MakePersistentRawTextureCopy treats any registered host range as IMMUTABLE and skips the
+ * memcmp. That holds for asset carves, the ROM buffer and the audio heap, but the GfxPools are
+ * registered too (decomp_port.c:116) and are RAM scratch the game rewrites EVERY FRAME, so the
+ * first copy minted at a pool address would be served for the rest of the process.
  *
- * MakePersistentRawTextureCopy below classifies a source as IMMUTABLE when it
- * belongs to any registered host range ("ROM-backed textures are stable after
- * the segment is loaded; skip memcmp"). That is correct for every asset-segment
- * carve, the ROM buffer and the audio heap -- but the GfxPools are registered
- * too (port/decomp_port.c:116, gdx_register_host_range(D_8024DCE0, ...)), and
- * they are RAM scratch that game logic rewrites EVERY FRAME. Classifying them
- * as immutable means the very first persistent copy taken at a given pool
- * address is served for the rest of the process, no matter how the game
- * rewrites those bytes afterwards.
+ * Night-course background sprites are where that shows: their CI4 TLUTs are staged into the pool
+ * each frame (background.c:1376) and bound from it via the segment-1 alias (background.c:1438),
+ * with slot indices assigned from 0 in first-seen order per course (background.c:1278-1306). So
+ * every night course reuses the same two host addresses, and racing Mute City 2 before Silence
+ * leaves Silence's moon decoding the skyline's palette -- bright pink. Cold-booting into Silence
+ * looks correct, which is the tell.
  *
- * The nighttime background sprites are the case where that is visible. Their
- * CI4 TLUTs are staged into the live pool each frame
- * (decomp/src/overlays/ovl_i3/background.c:1376,
- * gGfxPool->unk_2C528[i][j] = spritePaletteReplacement->palette[j]) and the
- * display list binds them from the pool through the segment-1 alias
- * (background.c:1438, gDPLoadTLUT_pal16(gfx++, 0, D_1000000.unk_2C528[idx]),
- * rerouted to gSegments[1] + offset by IsPortBssAliasPointer/TryResolveAddress).
- * Slot index is per-course and assigned from 0 upward in first-seen order
- * (background.c:1278-1306), so EVERY night course reuses slots 0..N-1 at the
- * SAME two host addresses (one per pool parity).
+ * Excluding the pools puts them back on the `changed` path, which re-copies AND queues a
+ * TextureCacheDelete so LUS re-imports the same frame. Cost is trivial: pool-backed texture
+ * sources are only ever 32-byte TLUTs; pool vertices and matrices go through
+ * MakePersistentVtxCopy/MakePersistentMtxCopy instead.
  *
- * Consequence: race Mute City 2 (slot 0 = night-city skyline 1's palette
- * D_F238C10) and the 32-byte copy for that address is minted holding the
- * skyline palette. Enter Silence: the moon's staged palette D_F242210 is
- * written into the same pool slot, but the copy is treated as immutable and
- * never refreshed, so the interpreter's LOADTLUT reads the skyline palette and
- * the moon's (correct) CI4 indices decode bright pink -- exactly the palette
- * the reconstruction identified. Slot 1 does the same to the Moon Base station.
- * Cold-booting straight into Silence is CORRECT because then the first copy
- * ever minted at those addresses is Silence's own palette.
- *
- * The refresh path (the `changed` branch below) is already the right mechanism:
- * it re-copies in place AND queues the buffer for TextureCacheDelete, so LUS
- * re-imports from the updated bytes on the frame that produced them. It simply
- * never ran for pool-backed sources. Excluding the pools from the immutable
- * fast path restores it. The comparison cost is trivial: a pool-backed texture
- * source is only ever one of these 16-entry TLUTs (32 bytes), never a bulk
- * texture -- the pool's other display-list-referenced members are vertices and
- * matrices, which use MakePersistentVtxCopy/MakePersistentMtxCopy instead.
- *
- * Deliberately NOT extended to D_1000000: that object is the never-written BSS
- * alias (a translate-time stand-in only, port/decomp_port.c:1324), so a memcmp
+ * Deliberately NOT extended to D_1000000: that is the never-written BSS alias, so a memcmp
  * against it could never observe a change. */
 extern "C" size_t gdx_gfxpool_sizeof(void);
 bool IsGfxPoolHostRange(uintptr_t source) {
@@ -2502,6 +2171,20 @@ bool IsGfxPoolHostRange(uintptr_t source) {
     const uintptr_t base = reinterpret_cast<uintptr_t>(&D_8024DCE0[0]);
     const size_t span = poolSize * 2; // GfxPool D_8024DCE0[2]
     return (source >= base) && (source < base + span);
+}
+
+/* The 0x800-byte window at segment 8 + 0x14A20 (D_8014A20, tall-building texture) is the one
+ * region of a decoded asset-segment image the game REWRITES: func_800747EC DMAs a per-venue slice
+ * of super_textures over it at every course load. Decoded images are registered host ranges, so
+ * without this carve-out the immutable fast path serves whichever venue's bytes were minted first
+ * — the same stale-copy class as the GfxPool TLUTs above. Written once by
+ * gdx_load_venue_building_texture and never changes after, since gLoadedAssetSegments never
+ * evicts. */
+static std::atomic<uintptr_t> sVenueBuildingTexBase{ 0 };
+
+static bool IsVenueBuildingTextureRange(uintptr_t source) {
+    const uintptr_t base = sVenueBuildingTexBase.load(std::memory_order_relaxed);
+    return (base != 0) && (source >= base) && (source < base + 0x800);
 }
 
 uintptr_t MakePersistentRawTextureCopy(uintptr_t source, size_t requiredBytes, bool* outRefreshed) {
@@ -2543,18 +2226,17 @@ uintptr_t MakePersistentRawTextureCopy(uintptr_t source, size_t requiredBytes, b
                 // ROM-backed textures are stable after the segment is loaded; skip memcmp.
                 // The GfxPools are registered host ranges too but are per-frame RAM scratch,
                 // so they must stay on the compare path -- see IsGfxPoolHostRange above.
-                const bool stableSource = RegisteredHostRemaining(source) > 0 && !IsGfxPoolHostRange(source);
+                // Likewise the venue building-texture window, rewritten per course load.
+                const bool stableSource = RegisteredHostRemaining(source) > 0 && !IsGfxPoolHostRange(source) &&
+                                          !IsVenueBuildingTextureRange(source);
                 if (!stableSource) {
                     changed = (std::memcmp(copy.bytes.get(), reinterpret_cast<const void*>(source), copyBytes) != 0);
                 }
             }
         }
 
-        /* Verification aid for the background-sprite TLUT fix (default OFF).
-           GDX_DIAG_POOL_TEX=1 logs the first 8 bytes of every pool-backed
-           texture/TLUT source and whether this frame's compare saw a change.
-           Entering a night course, the first line for a given source must show
-           chg=1 -- that is the previously-missing refresh actually happening. */
+        /* GDX_DIAG_POOL_TEX=1: dumps pool-backed TLUT sources and whether the compare saw a
+           change. Entering a night course, the first line for a source must show chg=1. */
         static const bool sDiagPoolTex = std::getenv("GDX_DIAG_POOL_TEX") != nullptr;
         if (sDiagPoolTex && copyBytes >= 8 && IsGfxPoolHostRange(source)) {
             static int sPoolTexLogs = 0;
@@ -2608,53 +2290,48 @@ uintptr_t MakePersistentRawTextureCopy(uintptr_t source, size_t requiredBytes, b
 }
 
 // =============================================================================================
-// P0 — Matrix-interpolation retention + scratch-slot indirection (DEBUG-ONLY, default-OFF)
+// Matrix-interpolation retention + scratch-slot indirection (default-OFF, GDX_INTERP_P0)
 // =============================================================================================
-// Ships nothing user-visible. Env-gated by GDX_INTERP_P0 (read once); every hook is a strict
-// no-op with zero allocation on the normal path.
+// Every hook is a strict no-op with zero allocation on the normal path.
 //
-// RETENTION INVARIANT: the resolved command buffer (the adapter's per-list `commands` vectors) and
-// every input the interpreter dereferences stay valid and re-executable within one tick. Those
-// inputs are: `converted` (owned by the local N64DisplayListAdapter, valid until gdx_gfx_run
-// returns); interp->mSegmentPointers[0..15] (a gSegments snapshot taken just before ConvertRoot);
-// the bytes those commands point at -- GfxPool matrices in segment-1 RDRAM, persistent copies in
-// gPersistentAllocations (freed only AFTER Run, so a replay must happen BEFORE that free), vertex
-// staging, and texture sources; and the latched ucode/F3dex2 variant.
+// RETENTION INVARIANT: the resolved command buffer and every input the interpreter dereferences
+// must stay valid and re-executable within one tick. Those inputs are `converted` (owned by the
+// local N64DisplayListAdapter, valid until gdx_gfx_run returns); interp->mSegmentPointers[0..15]
+// (a gSegments snapshot taken just before ConvertRoot); the bytes those commands point at --
+// GfxPool matrices in segment-1 RDRAM, persistent copies in gPersistentAllocations (freed only
+// AFTER Run, so a replay must happen BEFORE that free), vertex staging, texture sources; and the
+// latched ucode variant.
 //
 // SCRATCH-SLOT TRANSPARENCY: at G_MTX translation, pool-span matrices are copied into a stable
-// per-tick scratch slot and the resolved command's pointer is rewritten to it, recording
-// (origPtr, scratchPtr). At t=1 the scratch IS a byte copy of the pool matrix, so interpreter
-// output is identical (checked by memcmp -- GdxP0TransparencyViolations()). Non-pool matrices
-// (static/persistent, isBig -> MakePersistentMtxCopy) resolve outside the pool span and pass
-// through untouched.
+// per-tick scratch slot and the command's pointer rewritten to it, recording (origPtr,
+// scratchPtr). At t=1 the scratch is a byte copy of the pool matrix, so interpreter output is
+// identical -- checked by memcmp via GdxP0TransparencyViolations(). Non-pool matrices resolve
+// outside the pool span and pass through untouched.
 //
-// EVIDENCE (no GPU readback): an FNV-1a over the resolved command words is logged before each
-// pass. Byte-identical hashes across passes are what prove the retained buffer is stable and that
-// the interpreter does not mutate it in place; any per-command operand mutation is counted and
-// reported rather than hidden. A differing cmdhash would mean P2 replay must snapshot/restore the
-// buffer per pass.
+// The FNV-1a cmdhash logged before each pass is the evidence that the retained buffer is stable
+// and the interpreter does not mutate it in place; a differing cmdhash would mean replay has to
+// snapshot/restore the buffer per pass.
 //
-// A genuine second interp->Run() replays the SAME retained buffer at t=1. That is safe on the
-// shipping DX11 backend because Run() clears+draws+MSAA-resolves but does NOT present (present is
-// interp->EndFrame()/SwapBuffers, host-called once). See the block in gdx_gfx_run.
+// A second interp->Run() replaying the same buffer is safe on the DX11 backend because Run()
+// clears+draws+MSAA-resolves but does NOT present -- present is interp->EndFrame()/SwapBuffers,
+// called once by the host.
 
 struct GdxP0Mtx {
     uint64_t w[8];
 }; // 64 bytes; alignof 8 satisfies the interpreter's (ptr & 7) == 0 matrix-alignment check.
 static_assert(sizeof(GdxP0Mtx) == 64, "N64 Mtx is 64 bytes");
 
-// P0 activation. Everything downstream is a no-op when this is false. Bucket B (it changes what is
-// rendered), so in a build without GDX_DEV_TOOLS the gate is a compile-time 0 and the whole P0 path
-// is dead. The value is sampled once per gfx task (see mP0Enabled in the caller), not per command,
-// so a mid-task flip cannot desync the two-pass scratch bookkeeping.
+// Bucket B (it changes what is rendered), so without GDX_DEV_TOOLS the gate is a compile-time 0
+// and the whole path is dead. Sample once per gfx task (mP0Enabled in the caller), never per
+// command: a mid-task flip would desync the two-pass scratch bookkeeping.
 static bool GdxInterpP0Enabled() {
     return gdx_dev_gate(GDX_GATE_INTERP_P0) != 0;
 }
 
 // ===== Host-driven decoupled-loop configuration (set by port/main.cpp per iteration) =====
-// The host configures each tick's sub-frame schedule BEFORE gdx_dispatch; gdx_gfx_run (which runs
-// inside dispatch) consumes it. Single-threaded (graphics/main thread only) — no locking. All of
-// this is inert unless gdx_interp::P2HostActive() and the host set active=1 for the tick.
+// The host configures each tick's sub-frame schedule BEFORE gdx_dispatch; gdx_gfx_run consumes it
+// from inside dispatch. Graphics/main thread only, hence no locking. Inert unless
+// gdx_interp::P2HostActive() and the host set active=1 for the tick.
 namespace {
 struct GdxInterpHostCfg {
     bool active = false;       // host enabled the decoupled present loop for this tick
@@ -2667,12 +2344,10 @@ GdxInterpNowFn gGdxInterpNowFn = nullptr;
 bool gGdxInterpPresentedLastTick = false;
 int gGdxInterpLastSubframes = 0;
 double gGdxInterpLastT = 1.0;
-// Real-FPS visibility: last-tick lerp/snap counts surfaced by the Stats page
-// and the [interp-p2] line, plus a rolling presented-frames-per-second meter. The meter counts
-// EVERY sub-frame present in the decoupled loop over a ~0.5 s window (wall clock via the host
-// now-fn) so the menu can show true presents/sec ("144 fps (sim 60 Hz)") rather than logic ticks.
-/* [interp-idem] see the sub-frame loop: cumulative count of ticks whose replays bound DIFFERENT
-   textures than pass 0, i.e. ticks where re-executing the display list was NOT idempotent. */
+// The presents/sec meter counts EVERY sub-frame present over a ~0.5 s wall-clock window, so the
+// menu shows true presents/sec rather than logic ticks.
+/* [interp-idem] cumulative ticks whose replays bound DIFFERENT textures than pass 0, i.e. ticks
+   where re-executing the display list was NOT idempotent. */
 extern "C" void gdx_gfx_texbind_hash_reset(void);
 extern "C" unsigned long long gdx_gfx_texbind_hash(void);
 static unsigned long long sGdxIdemPass0Hash = 0;
@@ -2687,24 +2362,21 @@ size_t gGdxIdemDivergentTicks = 0;
 size_t gGdxIdemMultiPassTicks = 0;
 
 size_t gGdxInterpLastLerped = 0;
-/* [interp-pair] These ACCUMULATE across ticks. The telemetry line prints one tick in every 120,
-   so a per-tick snapshot made a low-rate mispairing statistically invisible -- the first version of
-   this probe reported 2 hits in 34 samples, which proved nothing either way. Totals plus a
-   window max are what make the reading decisive. */
+/* [interp-pair] These ACCUMULATE across ticks: the telemetry line prints one tick in 120, so a
+   per-tick snapshot makes a low-rate mispairing statistically invisible. Totals plus a window max
+   are what make the reading decisive. */
 float gGdxInterpPairMaxDelta = 0.0f;   // max delta since the last read (reader resets)
 size_t gGdxInterpPairSuspect = 0;      // cumulative suspicious pairings since boot
 size_t gGdxInterpPairLerped = 0;       // cumulative paired slots -- the denominator
 size_t gGdxInterpLastSnapped = 0;
-// Sub-frames the swapchain limiter refused this tick. These used to be counted as presented, so
-// every rate reading was an upper bound and a heavy tick looked healthy in the log while dropping
-// frames on screen. A non-zero value here means the tick did not fit its budget.
+// Sub-frames the swapchain limiter refused this tick. Counted apart from presented ones, or a
+// heavy tick reads as healthy in the log while dropping frames on screen.
 int gGdxInterpLastDropped = 0;
 double gGdxInterpPresentsPerSec = 0.0;
 int gGdxInterpPresentWindowCount = 0;
 double gGdxInterpPresentWindowStart = -1.0;
-// Snapshot read by the adapter ctor: keeps the per-tick "is P2 host mode on" decision consistent
-// with the branch main.cpp already committed to for this tick (main.cpp set gGdxInterpHostCfg.active
-// via gdx_gfx_interp_tick_config before dispatch), rather than re-reading the CVar mid-tick.
+// Read by the adapter ctor instead of re-reading the CVar mid-tick, so the "is P2 host mode on"
+// decision matches the branch main.cpp already committed to before dispatch.
 inline bool GdxP2HostConfigured() { return gGdxInterpHostCfg.active; }
 
 // Tick-boundary latch for the referenced-offset set.
@@ -2728,20 +2400,18 @@ inline bool GdxP2HostConfigured() { return gGdxInterpHostCfg.active; }
 bool gGdxInterpNewTick = false;
 int gGdxInterpTasksThisTick = 0;
 int gGdxInterpLastTasks = 0;
-// The cut epoch latched for the WHOLE tick. CutPendingForThisTick() is a consume-once "changed
-// since the last call" edge, so calling it per task meant the tick's first task ate the cut and
-// every later task saw false -- half a frame snapped and the other half lerped straight across the
-// cut, which is precisely the whole-frame semantic the cut exists to provide. Latched once at the
-// tick boundary and read by every task in that tick.
+// The cut epoch latched for the WHOLE tick. CutPendingForThisTick() is a consume-once edge, so
+// calling it per task lets the first task eat the cut and every later task see false -- half the
+// frame snaps and the other half lerps straight across the cut, destroying the whole-frame
+// semantic the cut exists for. Latch once at the tick boundary; every task in the tick reads this.
 bool gGdxInterpCutThisTick = false;
 } // namespace
 
-// P3: the in-race pause flag (decomp/src/game/game.c). The bridge reads it directly — the
-// same way it already reads gSegments/D_800DCCFC/D_8024DCE0 — so pause handling stays on the
-// interpolation branch: a paused tick forces a single crisp t=1 present here while the host's
-// logic-deadline pacer still holds 60 Hz. Routing pause through main.cpp's default path instead
-// would hand pacing to gdx_frame_pacer_tick(), which is a strict no-op while FrameInterpolation is
-// on (mutual exclusion), and would free-run the present on a VSync-off panel. Read-only.
+// In-race pause flag (game.c), read directly the same way gSegments/D_8024DCE0 are. Pause must be
+// handled on the interpolation branch: a paused tick forces one crisp t=1 present here while the
+// host's logic-deadline pacer holds 60 Hz. Routing it through main.cpp's default path hands pacing
+// to gdx_frame_pacer_tick(), a no-op while FrameInterpolation is on, and free-runs the present on
+// a VSync-off panel. Read-only.
 extern "C" { extern signed char gGamePaused; }
 
 // Implemented in libultraship/src/fast/Fast3dWindow.cpp. Overrides the DXGI software rate limiter's
@@ -2749,29 +2419,25 @@ extern "C" { extern signed char gGamePaused; }
 // object provides the actual pacing. See the block comment at the definition.
 extern "C" void gdx_fast3d_set_subframe_present(int on);
 
-// P4: detect a pending transition background-capture THIS tick, so the capture
-// reads a CANONICAL t=1 frame and never a tween. The decomp's `Transition sTransition`
-// (ovl_i2/transition.h; external linkage) has TRANSITION_FLAG_SET_BACKGROUND_BUFFER set in
-// Transition_Update (sys_gfx.c frame-pump step func_800690FC, sys_gfx.c:204) and cleared only inside
-// Transition_SetBackgroundBuffer (transition.c:802) — which reads our frame mirror via
-// gdx_read_current_framebuffer at sys_gfx.c:219, LATER in the SAME tick than this gdx_gfx_run.
+// A pending transition background-capture must read a CANONICAL t=1 frame, never a tween.
+// TRANSITION_FLAG_SET_BACKGROUND_BUFFER is set in Transition_Update (sys_gfx.c:204) and cleared
+// only inside Transition_SetBackgroundBuffer (transition.c:802), which reads our frame mirror at
+// sys_gfx.c:219 -- later in the SAME tick than this gdx_gfx_run.
 //
-// ORDERING PROOF (sys_gfx.c:202-219, transition.c:518-535, n64_sched.c:915, main.cpp:873-883): the
-// whole game frame runs inside one gdx_vi_tick. In program order:
-//   func_800690FC (Transition_Update: SETS the flag)  ->  func_80069698 (Transition_Draw: builds DL)
-//   -> Gfx_FullSync (posts GFX_TASK_SET) -> the game fiber blocks on osRecvMesg(&D_800DCAC8),
-//      which is where the port SYNCHRONOUSLY runs osSpTaskStartGo -> gdx_gfx_run for THIS tick
-//      (GdxInterpBeginTick reads the flag HERE — still set) -> the sub-frame loop presents and
-//      GdxUpdateFrameMirror refreshes the mirror -> DP-done wakes the fiber
-//   -> Transition_SetBackgroundBuffer (CLEARS the flag; reads the just-refreshed mirror).
-// So flag-set happens-before BeginTick, and BeginTick's mirror refresh happens-before the capture.
-// OR-ing this into mForceCutSnap makes every scratch slot snap to cur (t=1); the P2 sub-frame loop
-// then goes degenerate (GdxP1Lerped()==0) and renders every pass at t=1 (pass COUNT stays at M for
-// a constant present cadence — see the degenerate block) — so the mirror the capture samples is
-// the un-interpolated tick, as the capture requires. Read-only, direct-global idiom
-// (same as gGamePaused / D_8024DCE0 / gSegments): no new decomp shim. Flag bit == (1<<0);
-// `flags` is a u16 at struct offset 0x12 (activeType s32, queuedType s32, state s32, timer s16,
-// argument s16, appearType u16, flags u16 — natural alignment, verified against transition.h:34-45).
+// The ordering that makes the read safe (sys_gfx.c:202-219, n64_sched.c:915): the whole game frame
+// runs inside one gdx_vi_tick, in program order Transition_Update (SETS flag) -> Transition_Draw
+// -> Gfx_FullSync -> the fiber blocks on osRecvMesg(&D_800DCAC8), where the port synchronously
+// runs osSpTaskStartGo -> gdx_gfx_run (GdxInterpBeginTick reads the flag here, still set) -> the
+// sub-frame loop presents and refreshes the mirror -> DP-done wakes the fiber ->
+// Transition_SetBackgroundBuffer clears the flag and reads the just-refreshed mirror.
+//
+// OR-ing this into mForceCutSnap snaps every scratch slot to t=1, so the sub-frame loop goes
+// degenerate and renders every pass at t=1 while pass COUNT stays at M for a constant present
+// cadence -- the mirror the capture samples is then the un-interpolated tick.
+//
+// Layout: flag bit is (1<<0); `flags` is a u16 at struct offset 0x12 (activeType s32, queuedType
+// s32, state s32, timer s16, argument s16, appearType u16, flags u16 at natural alignment, per
+// transition.h:34-45).
 extern "C" { extern unsigned char sTransition[]; }
 static inline bool GdxTransitionCapturePendingThisTick() {
     const unsigned short flags =
@@ -2779,12 +2445,11 @@ static inline bool GdxTransitionCapturePendingThisTick() {
     return (flags & 0x1u /* TRANSITION_FLAG_SET_BACKGROUND_BUFFER */) != 0;
 }
 
-// P4: determinism-gate canary globals. The game's two LCG RNG states
-// (decomp/src/sys/math.c:185-188, external linkage) are advanced ONLY by game logic (physics, AI,
-// effects, Math_Rand1/2) and NEVER by the render path — interpolation reads GfxPools and writes only
-// scratch (prime directive). So the per-tick RNG fingerprint is identical with interpolation ON and
-// OFF given identical input, and the FIRST tick whose fingerprint differs localizes any leak of a
-// sub-frame value back into logic. Read-only. See GdxInterpDeterminismTick below.
+// Determinism canary. The game's two LCG states (math.c:185-188) are advanced ONLY by game logic,
+// never by the render path -- interpolation reads GfxPools and writes only scratch. So the
+// per-tick RNG fingerprint must be identical with interpolation ON and OFF given identical input,
+// and the first tick whose fingerprint differs localizes a sub-frame value leaking back into
+// logic. Read-only; see GdxInterpDeterminismTick below.
 extern "C" {
 extern int gRandSeed1;
 extern unsigned int gRandMask1;
@@ -2792,17 +2457,15 @@ extern int gRandSeed2;
 extern unsigned int gRandMask2;
 }
 
-// GfxPool span from the segment-1 base. sys_gfx.c's Gfx_InitBuffer does
-// Segment_SetPhysicalAddress(1, gGfxPool) every frame, so gSegments[1] holds the CURRENT pool's
-// host base; a pool matrix resolves to gSegments[1] + member-offset.
+// GfxPool span from the segment-1 base. Gfx_InitBuffer does Segment_SetPhysicalAddress(1, gGfxPool)
+// every frame, so gSegments[1] holds the CURRENT pool's host base and a pool matrix resolves to
+// gSegments[1] + member-offset.
 //
-// The span MUST be the real host sizeof(GfxPool), NOT the N64
-// struct-comment size 0x36730. On the 64-bit host sizeof(Gfx) doubles (pointer-width w1), inflating
-// gfxBuffer[13313] by 0x1A008, so the real pool is 0x50738 and — critically — the game's modelview
-// matrices live in the UPPER region (past 0x36730). With the old 0x36730 bound, GdxP0MtxInPoolSpan
-// rejected essentially every real modelview matrix, so NOTHING was rerouted (measured: [interp-p1]
-// lerped/snapped all 0) and interpolation had nothing to tween. gdx_gfxpool_sizeof() (port/
-// decomp_port.c, compiled with the real GfxPool type) is ground truth for the host size.
+// The span MUST come from gdx_gfxpool_sizeof() (decomp_port.c, the TU with the real GfxPool type),
+// never the N64 struct-comment size 0x36730. sizeof(Gfx) doubles on a 64-bit host, inflating
+// gfxBuffer[13313] by 0x1A008 to a real pool of 0x50738, and the modelview matrices live past
+// 0x36730 — with the stale bound GdxP0MtxInPoolSpan rejects essentially every modelview matrix and
+// interpolation has nothing to tween.
 extern "C" size_t gdx_gfxpool_sizeof(void);
 static inline bool GdxP0MtxInPoolSpan(uintptr_t p) {
     static const size_t kGdxP0GfxPoolSpanBytes = gdx_gfxpool_sizeof();
@@ -2810,12 +2473,303 @@ static inline bool GdxP0MtxInPoolSpan(uintptr_t p) {
     return base != 0 && p >= base && p < base + kGdxP0GfxPoolSpanBytes;
 }
 
-// Effects-vertex span test, same ground-truth discipline as the pool span above and for the same
-// reason: offsetof from decomp_port.c (the TU with the real GfxPool type), never the N64
-// struct-comment constant 0x2A308 — the host offset is 0x1A008 higher because sizeof(Gfx) doubles,
-// and the stale constant would aim this test into courseVtxBuffer.
+// Same ground-truth rule as the pool span: offsetof from decomp_port.c, never the N64
+// struct-comment constant 0x2A308. The host offset is 0x1A008 higher because sizeof(Gfx) doubles,
+// and the stale constant aims this test into courseVtxBuffer.
 extern "C" size_t gdx_gfxpool_effects_vtx_offset(void);
 extern "C" size_t gdx_gfxpool_effects_vtx_bytes(void);
+
+// Per-racer matrix layout (ground truth from decomp_port.c). Lets a rerouted pool offset be mapped
+// back to (which of the three per-racer matrix arrays, which racer id) -- see GdxRacerMtxClassify.
+extern "C" void gdx_gfxpool_racer_mtx_layout(size_t* outBody, size_t* outSecond, size_t* outHighlight,
+                                             size_t* outStride, size_t* outCount);
+
+// --- Camera projection*view rebuild -----------------------------------------------------------
+// The one pool matrix that must NOT be lerped element-wise. GfxPool::unk_20208 is the COMBINED
+// projection*view (camera.c:1278) and its translation row is -eye*R -- the eye already rotated by
+// R, not a position. Lerping it lerps a product of two quantities that both change across the
+// tick, so the implied camera position bows off the straight line between the two true eye
+// positions by roughly (delta-rotation x |eye|). eye is a raw world coordinate thousands of units
+// out, so that lever arm turns a small rotation error into a large mid-tick WORLD translation:
+// the scene shifts and snaps back every tick boundary. Interpolate the camera's INPUTS and re-run
+// the game's own build instead. Derivation in gdx_interp.h CameraInterpActive; rebuild contract
+// in port/gdx_camera_pose.h.
+extern "C" void gdx_gfxpool_camera_mtx_layout(size_t* outProjView, size_t* outStride, size_t* outCount);
+
+// One-shot offsetof caching, same as the racer layout below: the N64 struct-comment offsets are
+// 0x1A008 low on the host because sizeof(Gfx) doubles under PORT.
+struct GdxCameraMtxLayout {
+    size_t projView = 0;
+    size_t stride = 0;
+    size_t count = 0;
+    GdxCameraMtxLayout() {
+        gdx_gfxpool_camera_mtx_layout(&projView, &stride, &count);
+    }
+};
+
+static const GdxCameraMtxLayout& GdxCameraMtxLayoutRef() {
+    static const GdxCameraMtxLayout k;
+    return k;
+}
+
+// Pool slot index for a camera projection*view matrix, or -1 for any other pool offset.
+static int GdxCameraMtxSlot(uint32_t poolOffset) {
+    const GdxCameraMtxLayout& k = GdxCameraMtxLayoutRef();
+    if (k.stride == 0 || k.count == 0) {
+        return -1;
+    }
+    if (poolOffset < k.projView || poolOffset >= k.projView + (k.stride * k.count)) {
+        return -1;
+    }
+    const size_t rel = poolOffset - k.projView;
+    if ((rel % k.stride) != 0) {
+        return -1;
+    }
+    return static_cast<int>(rel / k.stride);
+}
+
+// File scope, NOT adapter members: the adapter is constructed once per GFX TASK and the game
+// submits several per 60 Hz tick, so an adapter-owned history would reset mid-tick and never hold
+// a previous keyframe. Rolled once per tick from GdxInterpBeginTick's new-tick block.
+static GdxCameraPose gGdxCamPoseCur[GDX_CAMERA_POSE_MAX] = {};
+static GdxCameraPose gGdxCamPosePrev[GDX_CAMERA_POSE_MAX] = {};
+// Per-slot verdict from the t=1 identity check: a pose is usable as an interpolation endpoint ONLY
+// if rebuilding from it reproduced the game's own pool matrix byte-for-byte on its capture tick.
+// That check is what covers every case where a gCameras snapshot does not describe the matrix
+// actually in the pool -- photo mode restores camera->eye/at/fov after the build
+// (camera.c:1279-1288), func_i3_8012EE90 clobbers unk_20008/unk_20108 mid-frame (C2160.c:15-18) --
+// so a misread surfaces as a mismatch instead of a wrong camera on screen.
+static bool gGdxCamPoseCurOk[GDX_CAMERA_POSE_MAX] = {};
+static bool gGdxCamPosePrevOk[GDX_CAMERA_POSE_MAX] = {};
+static size_t gGdxCamRebuilds = 0;   // per-tick rebuild calls that produced a matrix
+static size_t gGdxCamRejects = 0;    // per-tick slots the t=1 identity check refused
+// Why a camera slot was NOT rebuilt. Every refusal reason needs its own counter: gGdxCamRejects
+// alone counts the memcmp mismatch, which left a third of ticks silently on the element-wise lerp
+// while the telemetry read clean.
+enum GdxCamWhy {
+    kCamWhyPoseRead = 0, // gdx_camera_pose_read refused, or layout/pool base unavailable
+    kCamWhyId,           // camera->id disagreed with the slot index
+    kCamWhyUnreadable,   // the pool matrix for this slot was not readable
+    kCamWhyBuild,        // gdx_camera_build_projview refused (degenerate lookat input)
+    kCamWhyMismatch,     // built fine, but did not reproduce the pool matrix at t=1
+    kCamWhyPrevPose,     // this tick verified, but the PREVIOUS tick's pose had not
+    kCamWhySnap,         // slot already snapping (cut/pause/absent keyframe)
+    kCamWhyCount
+};
+static size_t gGdxCamWhy[kCamWhyCount] = {};
+static float gGdxCamMaxEyeDelta = 0.0f; // largest per-tick |eye_cur - eye_prev| among usable pairs
+
+// Camera cut detection must run in POSE space, not matrix space.
+//
+// A projection matrix's row 3 is P*(-eye*R), a VIEW-SPACE term rather than a world position
+// (camera.c:968-973), and eye is a raw world coordinate thousands of units out -- the game's own
+// EK branch gates on ABS(projectionViewMtx.m[3][1]) > 30000.0f (camera.c:1260-1262). One degree of
+// per-tick yaw moves row 3 by roughly |eye| * dTheta, about 525 units at |eye| ~= 20000, which
+// clears kTeleportThreshold (300) and snaps the WHOLE CAMERA to t=1 while model matrices keep
+// lerping: new camera, old model poses, the machine sliding across a frozen world and popping back
+// at the tick boundary. Steering-correlated, because steering is what rotates the camera.
+//
+// The EYE POSITION is a world position, so the 300-unit scale means what it says there. Returns
+// false for an unverified pair, leaving the slot on the element-wise lerp.
+static bool GdxCameraPoseTeleport(uint32_t poolOffset) {
+    const int slot = GdxCameraMtxSlot(poolOffset);
+    if (slot < 0 || slot >= GDX_CAMERA_POSE_MAX) {
+        return false; // not a camera matrix; caller uses the world-space test
+    }
+    if (!gGdxCamPoseCurOk[slot] || !gGdxCamPosePrevOk[slot]) {
+        return false;
+    }
+    const GdxCameraPose& c = gGdxCamPoseCur[slot];
+    const GdxCameraPose& p = gGdxCamPosePrev[slot];
+    const float dx = c.eyeX - p.eyeX;
+    const float dy = c.eyeY - p.eyeY;
+    const float dz = c.eyeZ - p.eyeZ;
+    return ((dx * dx) + (dy * dy) + (dz * dz)) >
+           (gdx_interp::kTeleportThreshold * gdx_interp::kTeleportThreshold);
+}
+
+// Process-lifetime gate for the rebuild path, cached like the other env gates here since an env
+// override is a test hook and must not be re-read per call.
+//
+// Default ON. [screen-probe] projected the player's machine per sub-frame against the
+// un-interpolated 60 Hz trajectory; cornering reverses the machine's screen direction ~30% of
+// ticks by itself, so what matters is how many reversals interpolation ADDS:
+//
+//     element-wise lerp   sx reversals 57.9% vs 31.8% natural  ->  +26.1 points
+//     pose rebuild        sx reversals 29.3% vs 28.2% natural  ->   +1.1 points
+//
+// World position is linear across the same ticks (0 reversals in ~2000, step ratio 1.00), so the
+// excess came from the camera. Set to "0" to force the element-wise path back for comparison.
+static bool GdxCameraRebuildConfigured() {
+    static const bool on = [] {
+        const char* v = std::getenv("GDX_INTERP_CAMERA_POSE");
+        if (v == nullptr || v[0] == '\0') {
+            return true;
+        }
+        return !(v[0] == '0' && v[1] == '\0');
+    }();
+    return on;
+}
+
+// Every field is a plain scalar in world/degree space, so a linear blend is correct for all of
+// them -- including up, because Matrix_SetLookAt re-derives a true orthonormal basis from
+// (eye, at, up) via side = up x forward then trueUp = forward x side (math.c:1022-1048), so a
+// blended up that is no longer perpendicular is corrected by the builder. No quaternion slerp
+// needed. numPlayers/id come from the CURRENT pose: they gate control flow, not geometry, and the
+// caller already refuses a pair that disagrees on them.
+static void GdxCameraPoseLerp(const GdxCameraPose& a, const GdxCameraPose& b, float t, GdxCameraPose* out) {
+    const float u = 1.0f - t;
+    out->eyeX = (a.eyeX * u) + (b.eyeX * t);
+    out->eyeY = (a.eyeY * u) + (b.eyeY * t);
+    out->eyeZ = (a.eyeZ * u) + (b.eyeZ * t);
+    out->atX = (a.atX * u) + (b.atX * t);
+    out->atY = (a.atY * u) + (b.atY * t);
+    out->atZ = (a.atZ * u) + (b.atZ * t);
+    out->upX = (a.upX * u) + (b.upX * t);
+    out->upY = (a.upY * u) + (b.upY * t);
+    out->upZ = (a.upZ * u) + (b.upZ * t);
+    out->fov = (a.fov * u) + (b.fov * t);
+    out->nearZ = (a.nearZ * u) + (b.nearZ * t);
+    out->farZ = (a.farZ * u) + (b.farZ * t);
+    out->fovScaleX = (a.fovScaleX * u) + (b.fovScaleX * t);
+    out->fovScaleY = (a.fovScaleY * u) + (b.fovScaleY * t);
+    out->frustrumCenterX = (a.frustrumCenterX * u) + (b.frustrumCenterX * t);
+    out->frustrumCenterY = (a.frustrumCenterY * u) + (b.frustrumCenterY * t);
+    // Interpolate the RESOLVED fov, not the raw one, and keep the resolved flag set so the builder
+    // skips the threshold. Both endpoints were resolved at their own tick, so the value moves
+    // smoothly across the tick instead of the branch snapping on and off inside it.
+    out->resolvedFov = (a.resolvedFov * u) + (b.resolvedFov * t);
+    out->fovIsResolved = (a.fovIsResolved != 0 && b.fovIsResolved != 0) ? 1 : 0;
+    out->numPlayers = b.numPlayers;
+    out->id = b.id;
+    out->valid = 1;
+}
+
+// --- Side-attack model-basis discontinuity ----------------------------------------------------
+// racer.c:4556 hard-assigns modelBasis.x = trueBasis.x for the duration of a SIDE attack,
+// racer.c:4621-4638 re-derives the rest of the basis from it, racer.c:5985 builds the body matrix.
+// So the body matrix's ROTATION jumps in one tick, twice per attack, and lerping across that jump
+// draws the machine at an orientation it never held -- the side-attack afterimage. Spin attacks
+// enter and leave continuously (COS(0)=1, SIN(0)=0) and have no jump, matching the side-yes/spin-no
+// split seen in play. Predicate: gdx_racer_side_attack_active in decomp_port.c.
+extern "C" int gdx_racer_side_attack_count(void);
+extern "C" int gdx_racer_side_attack_active(int index);
+
+static constexpr uint32_t kGdxSideAttackSlots = 30; // == kGdxRacerMtxSlots (TOTAL_RACER_COUNT)
+static uint8_t gGdxSideAttackCur[kGdxSideAttackSlots] = {};
+static uint8_t gGdxSideAttackPrev[kGdxSideAttackSlots] = {};
+// Set when the predicate went 1 -> 0 last tick. The EXIT discontinuity is off by one: on the final
+// attack tick racer.c:4555 still sees unk_27C != 0 and performs the hard assignment, and only
+// afterwards does racer.c:4569-4574 clear unk_27C/attackState -- so the snapshot reads 0 on a tick
+// whose matrix is still the attacked one, and the basis reverts on the FOLLOWING tick. Entry has
+// no such skew, which is why only this direction is deferred.
+static uint8_t gGdxSideAttackExitPending[kGdxSideAttackSlots] = {};
+// This tick's verdict: the racer's model basis is discontinuous between the previous pool's matrix
+// and the current one, so the previous keyframe's ROTATION is meaningless for it.
+static uint8_t gGdxSideAttackJump[kGdxSideAttackSlots] = {};
+static size_t gGdxBasisJumpFixed = 0;
+// [basis-probe] ticks still to report after an attack ends, so the deferred exit jump is captured.
+static int gGdxBasisProbeTail = 0;
+
+// Restore rigidity to an element-wise-lerped per-racer model matrix.
+//
+// lerp(R0, R1, t) is not a rotation: the lerp of two unit vectors is SHORTER than unit, so basis
+// rows collapse mid-tick and recover at t=1 -- up to an 18% shrink with 18% row divergence at
+// t=0.5, against 0.00000 spread at t=1. The machine squashes for a sub-frame and pops back,
+// invisible at the model origin and growing across the silhouette.
+//
+// Rescale each lerped row to the interpolation of the two endpoint row LENGTHS, not to unit, so
+// genuine per-tick scale animation (attack highlight growth, machineLod switches) survives.
+// Cross-product re-derivation would also fix the residual shear, but the shrink is the dominant
+// term and this keeps the operation to what the measurement justifies.
+static void GdxRenormalizeLerpedBasis(const void* prevMtx, const void* curMtx, float t, GdxP0Mtx* scratch) {
+    float prv[4][4];
+    float cur[4][4];
+    float out[4][4];
+    gdx_interp::MtxToF(prevMtx, prv);
+    gdx_interp::MtxToF(curMtx, cur);
+    gdx_interp::MtxToF(scratch, out);
+    for (int r = 0; r < 3; ++r) {
+        const float lp = std::sqrt((prv[r][0] * prv[r][0]) + (prv[r][1] * prv[r][1]) + (prv[r][2] * prv[r][2]));
+        const float lc = std::sqrt((cur[r][0] * cur[r][0]) + (cur[r][1] * cur[r][1]) + (cur[r][2] * cur[r][2]));
+        const float have = std::sqrt((out[r][0] * out[r][0]) + (out[r][1] * out[r][1]) + (out[r][2] * out[r][2]));
+        if (have <= 1e-6f) {
+            continue; // degenerate row; leave it rather than divide by ~0
+        }
+        const float want = (lp * (1.0f - t)) + (lc * t);
+        const float k = want / have;
+        out[r][0] *= k;
+        out[r][1] *= k;
+        out[r][2] *= k;
+    }
+    gdx_interp::MtxFromF(out, scratch);
+}
+
+// Read the A/B gate for deciding the EK fov threshold once per tick. Default ON (the 20px vertical
+// snap it removes was measured before and after), but switchable so a regression can be attributed.
+static bool GdxFovResolveConfigured() {
+    static const bool on = [] {
+        const char* v = std::getenv("GDX_INTERP_FOV_RESOLVE");
+        if (v == nullptr || v[0] == '\0') {
+            return true;
+        }
+        return !(v[0] == '0' && v[1] == '\0');
+    }();
+    return on;
+}
+
+// A/B gates for the lerped-basis renormalisation and the basis-jump fixup. Resolved in
+// gdx_interp.cpp (RigidBasisActive/BasisJumpFixActive) where CVarGetInteger links: the env var is
+// a force-on pin, the registered CVar carries the shipping default. Reading getenv alone here
+// would make both fixes unreachable to users.
+static bool GdxRotFixConfigured() {
+    return gdx_interp::RigidBasisActive();
+}
+
+static bool GdxBasisJumpFixConfigured() {
+    return gdx_interp::BasisJumpFixActive();
+}
+
+// Which per-racer matrix a pool offset belongs to. kNone for anything else in the pool (camera,
+// course, HUD, menu matrices) -- those are not per-racer and have no co-moving sibling.
+enum class GdxRacerMtxField { kNone, kBody, kSecond, kHighlight };
+
+struct GdxRacerMtxId {
+    GdxRacerMtxField field = GdxRacerMtxField::kNone;
+    uint32_t racer = 0;
+};
+
+static GdxRacerMtxId GdxRacerMtxClassify(uint32_t poolOffset) {
+    struct Layout {
+        size_t body, second, highlight, stride, count;
+        Layout() {
+            gdx_gfxpool_racer_mtx_layout(&body, &second, &highlight, &stride, &count);
+        }
+    };
+    static const Layout k;
+    GdxRacerMtxId out;
+    if (k.stride == 0) {
+        return out;
+    }
+    const size_t span = k.stride * k.count;
+    const struct {
+        size_t base;
+        GdxRacerMtxField field;
+    } arrays[] = { { k.body, GdxRacerMtxField::kBody },
+                   { k.second, GdxRacerMtxField::kSecond },
+                   { k.highlight, GdxRacerMtxField::kHighlight } };
+    for (const auto& a : arrays) {
+        if (poolOffset >= a.base && poolOffset < a.base + span) {
+            const size_t rel = poolOffset - a.base;
+            if ((rel % k.stride) == 0) {
+                out.field = a.field;
+                out.racer = static_cast<uint32_t>(rel / k.stride);
+            }
+            return out;
+        }
+    }
+    return out;
+}
 static inline bool GdxEffectsVtxInSpan(uintptr_t p, size_t bytes) {
     static const size_t kOffset = gdx_gfxpool_effects_vtx_offset();
     static const size_t kBytes = gdx_gfxpool_effects_vtx_bytes();
@@ -2828,46 +2782,23 @@ static inline bool GdxEffectsVtxInSpan(uintptr_t p, size_t bytes) {
 }
 
 // Course-select carousel viewports (course_view.c: Vp D_i5_80118FF0[2][6], first index is the
-// D_800DCCFC parity). Referenced directly — the D_xk3_80138930 extern in gdx_ek_disk_overrides.c
-// is the precedent for naming an overlay symbol from port code; overlays are statically linked.
-// Declared as raw s16 lanes rather than the decomp Vp union so this TU stays free of the decomp
-// include tree; sizeof(Vp)==16 and the layout is vscale[4] then vtrans[4], asserted below.
+// D_800DCCFC parity). Overlays are statically linked, so naming the symbol directly is fine.
+// Declared as raw s16 lanes rather than the decomp Vp union to keep this TU out of the decomp
+// include tree; sizeof(Vp)==16, layout vscale[4] then vtrans[4], asserted below.
 extern "C" int16_t D_i5_80118FF0[2][6][8];
 static_assert(sizeof(D_i5_80118FF0) == 2 * 6 * 16, "carousel viewport array shape");
 
-// FNV-1a accumulation over 64-bit command words.
 static inline void GdxP0FnvAccum(uint64_t& h, uint64_t word) {
     h ^= word;
     h *= 0x100000001B3ull;
 }
 
-/* Segment-9 fallback probe (Course Edit node-info panel scatter, diagnosis only).
- *
- * TryResolveAddress and G2ResolvePhysical both try gdx_resolve_mode_segment9()
- * first for every raw token -- the single authoritative source for the
- * currently-active segment 9 content (machine_models vs the Course Edit disk
- * image, see gdx_load_segment9_for_mode in decomp_port.c). When that misses,
- * execution falls through the function's remaining ~10 generic resolver
- * branches (EK address-range table, port/venue alias tables, D_1000000,
- * explicit segment table, RDRAM low32, registered host pointers, KSEG0/1...),
- * any of which could serve a genuinely seg9-tagged token (top byte == 9) by
- * accident. Three nearby seg-9 addresses resolving to three different host
- * buffers -- the reported [nodeinfo] scatter -- is exactly the signature of
- * that: different tokens missing the authoritative path and landing in
- * different fallback branches.
- *
- * Rather than adding a log line before every one of those returns (an
- * invasive touch to a hot-path function with many branches, several shared by
- * every texture/vertex/matrix pointer in the game, not just seg9), this is a
- * scope-exit probe: declared once, right after the seg9-mode miss, it reads
- * whatever `out` ends up holding when TryResolveAddress returns by ANY of its
- * exit paths (guaranteed by C++ destructor semantics) and logs the final
- * host address/segment/offset -- direct evidence of the scatter without
- * touching the resolver branches themselves. No behavioral change: purely
- * observes state that already exists when the function returns.
- *
- * Env-gated on GDX_LOG (see port_log.h); bounded to the first 24 misses per
- * process so a long soak/replay session cannot flood the log. */
+/* Segment-9 fallback probe, strip later. A seg9 token that misses the authoritative
+ * gdx_resolve_mode_segment9 falls through ~10 generic resolver branches, any of which can serve it
+ * by accident -- nearby seg-9 addresses landing in different host buffers is the [nodeinfo]
+ * scatter. Declared once after the mode miss, this reads whatever `out` holds on ANY exit path via
+ * the destructor, so no log line has to be added to a hot-path branch. GDX_LOG-gated, first 24
+ * misses per process. */
 class GdxSeg9FallbackDiag {
   public:
     GdxSeg9FallbackDiag(bool armed, uint32_t raw, size_t requiredBytes, const ResolvedAddress* out)
@@ -2923,10 +2854,8 @@ class N64DisplayListAdapter {
     }
 
     uintptr_t EnqueueList(const N64Gfx* source, size_t explicitLimit) {
-        // Lazy conversion boundary: if `source` is a narrow N64-format list, convert
-        // it to the wide layout once (cached) and enqueue the wide buffer instead,
-        // so ProcessList takes the resolver-free fast path. No-op for sources that
-        // are already wide (game-emitted or previously converted).
+        // Lazy conversion boundary: a narrow N64-format source becomes a cached wide buffer so
+        // ProcessList takes the resolver-free fast path. No-op for already-wide sources.
         source = GetOrBuildConvertedWide(source, explicitLimit);
 
         auto cached = mLists.find(source);
@@ -2982,20 +2911,30 @@ class N64DisplayListAdapter {
         mCaptureSnapThisTick = false;
 
         // ---- PER-TICK work, performed by the tick's FIRST task ----
-        // Runs before the mP1Enabled bail-out so the cut epoch is consumed exactly once per tick
-        // even on a tick where lerping is inactive -- otherwise an epoch bump landing on a
-        // non-interp tick would be double-counted against the next interp tick. Roll the
-        // referenced-offset set here too: commit BEFORE clearing promotes the whole previous tick's
-        // accumulated set to "previous", then starts this tick empty. Committing at the start of
-        // the next tick rather than after the final task means nothing has to identify which task
-        // IS the final one; every task in the tick accumulates into one set and tests against a
-        // complete previous tick. See gGdxInterpNewTick above for what per-task rolling did.
+        // Must run BEFORE the mP1Enabled bail-out so the cut epoch is consumed exactly once per
+        // tick even when lerping is inactive; otherwise an epoch bump on a non-interp tick is
+        // double-counted against the next interp tick. The referenced-offset set rolls here for a
+        // related reason: committing at the START of the next tick (rather than after the final
+        // task) means nothing has to identify which task is last -- every task accumulates into one
+        // set and tests against a complete previous tick.
         ++gGdxInterpTasksThisTick;
+        // Latched because the camera pose roll below needs "is this the tick's first task?" AFTER
+        // the pool bases exist, and the flag itself is consumed here.
+        bool newTick = false;
         if (gGdxInterpNewTick) {
+            newTick = true;
             gGdxInterpNewTick = false;
             gdx_interp::CommitTick();
             gdx_interp::BeginTick();
             gGdxInterpCutThisTick = gdx_interp::CutPendingForThisTick();
+        }
+
+        // Also before the mP1Enabled bail-out: this history is an edge detector and must advance
+        // exactly once per tick whether or not lerping is active. Rolling it after the early return
+        // burns `newTick` without advancing, leaving prev/cur comparing non-adjacent ticks and
+        // silently dropping transitions. Reads only gRacers, never the pool, so it is safe here.
+        if (newTick) {
+            GdxSideAttackRoll();
         }
 
         if (!mP1Enabled) {
@@ -3003,23 +2942,402 @@ class N64DisplayListAdapter {
         }
         mCurPoolBase = static_cast<uintptr_t>(gSegments[1]);
         mPrevPoolBase = gdx_interp::PrevPoolBase(mCurPoolBase); // 0 if pool layout mismatch
-        // P3 + P4: consume the cut epoch EXACTLY once per tick,
-        // OR-in the pause flag, and OR-in a pending transition background-capture. Any of the three
-        // makes the previous keyframe meaningless for the WHOLE frame this tick, so force every slot
-        // to snap (t=1): the whole-frame cut semantic (a cut invalidates all prev keyframes),
-        // the pause freeze (nothing new to tween; show the newest pose crisp), and the transition
-        // capture (the mirror this tick feeds Transition_SetBackgroundBuffer must be un-interpolated,
-        // see GdxTransitionCapturePendingThisTick's ordering proof).
+        // A cut, a pause, or a pending transition capture each makes the previous keyframe
+        // meaningless for the WHOLE frame, so any of them forces every slot to snap to t=1: a cut
+        // invalidates all prev keyframes, a pause has nothing new to tween, and the capture's
+        // mirror must be un-interpolated (see GdxTransitionCapturePendingThisTick's ordering).
         mCaptureSnapThisTick = GdxTransitionCapturePendingThisTick();
         mForceCutSnap = gGdxInterpCutThisTick || (gGamePaused != 0) || mCaptureSnapThisTick;
+        if (newTick) {
+            GdxCameraPoseRoll();
+        }
     }
 
-    // Copy a fully-resolved 64-byte pool matrix into a stable per-tick scratch slot; record
-    // (prevPoolPtr, curPoolPtr, scratchPtr, snap); return the scratch address so the caller
-    // rewrites the resolved command's w1. The deque never invalidates element addresses on
-    // push_back, so a scratch pointer baked into an earlier command stays valid as more matrices
-    // are rerouted. In P0 this records (0, cur, scratch, false) and refill is an identity copy;
-    // in P1 it derives the sibling-pool prev pointer and computes the per-slot snap decision.
+    // Roll the side-attack predicate one tick and decide, per racer, whether the model basis is
+    // discontinuous across THIS pool pair. Runs once per tick from the tick's first task.
+    //
+    // Entry and exit are not symmetric. On the first attack tick the predicate and the hard
+    // assignment turn on together, so a 0 -> 1 edge marks the jump directly. On the LAST attack
+    // tick the assignment still runs (racer.c:4555 sees unk_27C != 0) and racer.c:4569-4574 clears
+    // the state only afterwards, so the 1 -> 0 edge lands on a tick whose matrix is still the
+    // attacked one and the basis reverts on the following tick -- where the deferred flag fires.
+    //
+    // NOT gated on mBasisJumpFix: this is an edge detector AND the source of the attack flag the
+    // probes report, so it must advance every tick regardless of whether the repair is on. Gating
+    // it made [screen-probe] read atk=0 for a whole session. The repair itself stays gated, in
+    // GdxFixupBasisJumpMatrices.
+    void GdxSideAttackRoll() {
+        gGdxBasisJumpFixed = 0;
+
+        int count = gdx_racer_side_attack_count();
+        if (count > static_cast<int>(kGdxSideAttackSlots)) {
+            count = static_cast<int>(kGdxSideAttackSlots);
+        }
+        for (int i = 0; i < count; ++i) {
+            gGdxSideAttackPrev[i] = gGdxSideAttackCur[i];
+            gGdxSideAttackCur[i] = (gdx_racer_side_attack_active(i) != 0) ? 1u : 0u;
+
+            const bool entry = (gGdxSideAttackPrev[i] == 0 && gGdxSideAttackCur[i] == 1);
+            const bool exitNow = (gGdxSideAttackExitPending[i] != 0);
+            gGdxSideAttackExitPending[i] =
+                (gGdxSideAttackPrev[i] == 1 && gGdxSideAttackCur[i] == 0) ? 1u : 0u;
+            gGdxSideAttackJump[i] = (entry || exitNow) ? 1u : 0u;
+        }
+    }
+
+    // [basis-probe] GDX_DIAG_BASIS=1, strip later. Measures the player's body matrix (unk_20308[0])
+    // per tick through every side attack, BEFORE any fixup rewrites r.prev. Rotation and
+    // translation are reported separately because racer.c:4546-4548 makes modelPos depend on
+    // modelBasis.y, so the basis jump moves the machine as well as turning it, and the current
+    // fixup only addresses rotation.
+    void GdxBasisProbeTick() {
+        static const bool sBasisProbe = std::getenv("GDX_DIAG_BASIS") != nullptr;
+        if (!sBasisProbe || !mP1Enabled || mCurPoolBase == 0) {
+            return;
+        }
+        const bool active = (gGdxSideAttackCur[0] != 0);
+        const bool jump = (gGdxSideAttackJump[0] != 0);
+        if (!active && !jump && gGdxBasisProbeTail == 0) {
+            return; // quiet outside an attack and its trailing window
+        }
+        if (active || jump) {
+            gGdxBasisProbeTail = 4; // keep logging past the exit so the deferred jump is visible
+        } else {
+            --gGdxBasisProbeTail;
+        }
+
+        // Per-racer-0 matrices, indexed body / second(shadow) / highlight.
+        float rot[3] = { -1.0f, -1.0f, -1.0f };
+        float tr[3] = { -1.0f, -1.0f, -1.0f };
+        // Worst paired translation delta anywhere in the pool this tick. The machine travels ~33
+        // units per tick, so anything far above that is a slot whose two keyframes are not the same
+        // object -- byte-offset identity pairing unrelated draws, which renders one object at
+        // another's previous position. The offset and classification say WHAT is ghosting.
+        float worstDelta = 0.0f;
+        uint32_t worstOffset = 0;
+        int worstField = -1;
+        uint32_t worstRacer = 0;
+
+        for (const GdxP0Record& r : mP0Records) {
+            if (r.prev == 0 || ReadableByteLimit(r.prev) < 64u || ReadableByteLimit(r.orig) < 64u) {
+                continue;
+            }
+            const uint32_t off = static_cast<uint32_t>(r.orig - mCurPoolBase);
+            float cur[4][4];
+            float prv[4][4];
+            gdx_interp::MtxToF(reinterpret_cast<const void*>(r.orig), cur);
+            gdx_interp::MtxToF(reinterpret_cast<const void*>(r.prev), prv);
+
+            const float dx = cur[3][0] - prv[3][0];
+            const float dy = cur[3][1] - prv[3][1];
+            const float dz = cur[3][2] - prv[3][2];
+            const float delta = std::sqrt((dx * dx) + (dy * dy) + (dz * dz));
+
+            const GdxRacerMtxId id = GdxRacerMtxClassify(off);
+            // Projection matrices are excluded: their row 3 is a view-space term, not a world
+            // position, so a large "delta" there means nothing. Same reason GdxP0Record carries proj.
+            if (!r.proj && delta > worstDelta) {
+                worstDelta = delta;
+                worstOffset = off;
+                worstField = static_cast<int>(id.field);
+                worstRacer = id.racer;
+            }
+
+            if (id.field == GdxRacerMtxField::kNone || id.racer != 0) {
+                continue;
+            }
+            const int col = (id.field == GdxRacerMtxField::kBody)     ? 0
+                            : (id.field == GdxRacerMtxField::kSecond) ? 1
+                                                                      : 2;
+            float rotMax = 0.0f;
+            for (int row = 0; row < 3; ++row) {
+                for (int c = 0; c < 3; ++c) {
+                    const float d = std::fabs(cur[row][c] - prv[row][c]);
+                    if (d > rotMax) {
+                        rotMax = d;
+                    }
+                }
+            }
+            rot[col] = rotMax;
+            tr[col] = delta;
+        }
+
+        // rot is the largest absolute change in any 3x3 basis element -- not an angle, a spike
+        // detector. field: 0 none, 1 body, 2 second/shadow, 3 highlight.
+        gdx_port_logf("[basis-probe] active=%d jump=%d "
+                      "body=%.4f/%.2f shadow=%.4f/%.2f hl=%.4f/%.2f "
+                      "worst=%.2f@%05X field=%d racer=%u\n",
+                      active ? 1 : 0, jump ? 1 : 0,
+                      rot[0], tr[0], rot[1], tr[1], rot[2], tr[2],
+                      worstDelta, worstOffset, worstField, worstRacer);
+    }
+
+    // [screen-probe] GDX_DIAG_SCREEN=1, strip later. Projects the player's machine through the
+    // camera once per sub-frame, in pixels. Screen position is the product of two independently
+    // interpolated things -- the body matrix and the camera's projection*view -- either of which
+    // can be smooth alone while the product is not. Across one tick's sub-frames the machine must
+    // sweep monotonically in roughly equal steps; a zig-zag or an outsized step is the artifact.
+    // Called after each sub-frame's refill, so it reads exactly the matrices about to be drawn.
+    void GdxScreenProbe(float t) {
+        static const bool sScreenProbe = std::getenv("GDX_DIAG_SCREEN") != nullptr;
+        if (!sScreenProbe || !mP1Enabled || mCurPoolBase == 0) {
+            return;
+        }
+        const GdxP0Mtx* body = nullptr;
+        const GdxP0Mtx* cam = nullptr;
+        for (const GdxP0Record& r : mP0Records) {
+            const uint32_t off = static_cast<uint32_t>(r.orig - mCurPoolBase);
+            if (body == nullptr) {
+                const GdxRacerMtxId id = GdxRacerMtxClassify(off);
+                if (id.field == GdxRacerMtxField::kBody && id.racer == 0) {
+                    body = r.scratch;
+                }
+            }
+            if (cam == nullptr && r.proj && GdxCameraMtxSlot(off) == 0) {
+                cam = r.scratch;
+            }
+            if (body != nullptr && cam != nullptr) {
+                break;
+            }
+        }
+        if (body == nullptr || cam == nullptr) {
+            return;
+        }
+        float b[4][4];
+        float pv[4][4];
+        gdx_interp::MtxToF(body, b);
+        gdx_interp::MtxToF(cam, pv);
+        // Row 3 of the modelview is the machine's world position; row-vector convention, so the
+        // clip-space point is worldPos * projectionView (same order Camera_CalculateProjectionViewMtx
+        // builds for, camera.c:949).
+        // Also project a point 100 units out along the model's own forward axis. The origin alone
+        // cannot see a ROTATION error: lerping a rotation element-wise yields a non-orthonormal
+        // matrix whose error is exactly zero at the origin and grows with distance from it. The
+        // machine's visible extent is what the player sees, so an offset point is the probe that
+        // can detect a squashed or sheared model while the centre sits perfectly still. Steering is
+        // when the model's rotation changes fastest, which is when this should light up.
+        float tipClip[4];
+        const float tipLocal[3] = { 100.0f, 0.0f, 0.0f };
+        for (int c = 0; c < 4; ++c) {
+            const float wxp = (tipLocal[0] * b[0][0]) + (tipLocal[1] * b[1][0]) + (tipLocal[2] * b[2][0]) + b[3][0];
+            const float wyp = (tipLocal[0] * b[0][1]) + (tipLocal[1] * b[1][1]) + (tipLocal[2] * b[2][1]) + b[3][1];
+            const float wzp = (tipLocal[0] * b[0][2]) + (tipLocal[1] * b[1][2]) + (tipLocal[2] * b[2][2]) + b[3][2];
+            tipClip[c] = (wxp * pv[0][c]) + (wyp * pv[1][c]) + (wzp * pv[2][c]) + pv[3][c];
+        }
+        // Orthonormality of the lerped model basis: |row| should be the model scale on every row,
+        // and equal across rows. Element-wise lerp shrinks rows mid-tick; report the spread.
+        float rowLen[3];
+        for (int r = 0; r < 3; ++r) {
+            rowLen[r] = std::sqrt((b[r][0] * b[r][0]) + (b[r][1] * b[r][1]) + (b[r][2] * b[r][2]));
+        }
+        const float lenMin = std::min(rowLen[0], std::min(rowLen[1], rowLen[2]));
+        const float lenMax = std::max(rowLen[0], std::max(rowLen[1], rowLen[2]));
+        float clip[4];
+        for (int c = 0; c < 4; ++c) {
+            clip[c] = (b[3][0] * pv[0][c]) + (b[3][1] * pv[1][c]) + (b[3][2] * pv[2][c]) + pv[3][c];
+        }
+        if (clip[3] <= 0.0001f && clip[3] >= -0.0001f) {
+            return; // behind/at the eye plane; the divide would be meaningless
+        }
+        const float sx = (clip[0] / clip[3]) * 160.0f + 160.0f; // N64 320x240 screen space
+        const float sy = (clip[1] / clip[3]) * -120.0f + 120.0f;
+        // Camera eye at this same sub-frame, from the pose history. With both the machine's world
+        // position and the camera's eye logged beside the resulting screen position, a marked
+        // instant says which of the two moved -- no inference required.
+        float ex = 0.0f, ey = 0.0f, ez = 0.0f;
+        int camOk = 0;
+        if (gGdxCamPoseCurOk[0] && gGdxCamPosePrevOk[0]) {
+            GdxCameraPose mid;
+            GdxCameraPoseLerp(gGdxCamPosePrev[0], gGdxCamPoseCur[0], t, &mid);
+            ex = mid.eyeX; ey = mid.eyeY; ez = mid.eyeZ;
+            camOk = 1;
+        }
+        float tx = -1.0f, ty = -1.0f;
+        if (tipClip[3] > 0.0001f || tipClip[3] < -0.0001f) {
+            tx = (tipClip[0] / tipClip[3]) * 160.0f + 160.0f;
+            ty = (tipClip[1] / tipClip[3]) * -120.0f + 120.0f;
+        }
+        gdx_port_logf("[screen-probe] t=%.3f sx=%.2f sy=%.2f tip=(%.2f,%.2f) "
+                      "rowlen=%.4f/%.4f world=(%.1f,%.1f,%.1f) "
+                      "eye=(%.1f,%.1f,%.1f) camok=%d atk=%d\n",
+                      static_cast<double>(t), static_cast<double>(sx), static_cast<double>(sy),
+                      static_cast<double>(tx), static_cast<double>(ty),
+                      static_cast<double>(lenMin), static_cast<double>(lenMax),
+                      static_cast<double>(b[3][0]), static_cast<double>(b[3][1]),
+                      static_cast<double>(b[3][2]),
+                      static_cast<double>(ex), static_cast<double>(ey), static_cast<double>(ez),
+                      camOk, (gGdxSideAttackCur[0] != 0) ? 1 : 0);
+    }
+
+    // Freeze the ROTATION and keep lerping the TRANSLATION for every per-racer matrix whose basis
+    // jumped this tick. Synthesise a previous keyframe that is the current matrix with the previous
+    // matrix's translation row: the machine still travels smoothly between the two tick positions,
+    // but stops sweeping through an orientation it never occupied.
+    //
+    // Deliberately NOT a snap: snapping these slots freezes the machine for a whole tick at both
+    // transitions (a visible hitch) and also catches spin attacks, which have no jump to hide.
+    // Same shape as GdxFixupSpawnedRacerMatrices, generalised from "no previous keyframe" to
+    // "previous keyframe's rotation is meaningless".
+    void GdxFixupBasisJumpMatrices() {
+        if (!mBasisJumpFix || !mP1Enabled || mCurPoolBase == 0 || mPrevPoolBase == 0 || mForceCutSnap) {
+            return;
+        }
+        for (GdxP0Record& r : mP0Records) {
+            if (r.snap || r.prev == 0) {
+                continue; // nothing paired to correct
+            }
+            const GdxRacerMtxId id = GdxRacerMtxClassify(static_cast<uint32_t>(r.orig - mCurPoolBase));
+            if (id.field == GdxRacerMtxField::kNone || id.racer >= kGdxSideAttackSlots) {
+                continue;
+            }
+            if (gGdxSideAttackJump[id.racer] == 0) {
+                continue;
+            }
+            if (ReadableByteLimit(r.orig) < 64u || ReadableByteLimit(r.prev) < 64u) {
+                continue;
+            }
+            float cur[4][4];
+            float prv[4][4];
+            gdx_interp::MtxToF(reinterpret_cast<const void*>(r.orig), cur);
+            gdx_interp::MtxToF(reinterpret_cast<const void*>(r.prev), prv);
+            // Row 3 is the translation (same convention GdxFixupSpawnedRacerMatrices relies on).
+            // Take the previous position, keep the current orientation.
+            for (int axis = 0; axis < 3; ++axis) {
+                cur[3][axis] = prv[3][axis];
+            }
+            mSynthPrev.emplace_back();
+            GdxP0Mtx* synth = &mSynthPrev.back();
+            gdx_interp::MtxFromF(cur, synth);
+            r.prev = reinterpret_cast<uintptr_t>(synth);
+            ++gGdxBasisJumpFixed;
+        }
+    }
+
+    // Roll the camera pose history one tick and re-verify the fresh poses. Runs once per tick, from
+    // the tick's first task, AFTER the pool bases are latched (the verification reads the pool).
+    //
+    // The verification is the whole safety argument. gCameras is snapshotted one step removed from
+    // Camera_UpdateProjectionViewMtx, so nothing guarantees a priori that rebuilding from the
+    // snapshot reproduces the matrix the game left in the pool. Rather than enumerate the ways it
+    // could disagree: rebuild at the captured pose and memcmp against the pool -- same inputs, same
+    // builder, same process, so a match is bit-exact and a mismatch disqualifies the slot for the
+    // tick, falling back to the element-wise lerp.
+    void GdxCameraPoseRoll() {
+        if (!mInterpCameraRebuild) {
+            return;
+        }
+        gGdxCamRebuilds = 0;
+        gGdxCamRejects = 0;
+        gGdxCamMaxEyeDelta = 0.0f;
+        for (size_t w = 0; w < kCamWhyCount; ++w) {
+            gGdxCamWhy[w] = 0;
+        }
+
+        const GdxCameraMtxLayout& layout = GdxCameraMtxLayoutRef();
+        int count = gdx_camera_pose_count();
+        if (count > GDX_CAMERA_POSE_MAX) {
+            count = GDX_CAMERA_POSE_MAX;
+        }
+        for (int i = 0; i < count; ++i) {
+            gGdxCamPosePrev[i] = gGdxCamPoseCur[i];
+            gGdxCamPosePrevOk[i] = gGdxCamPoseCurOk[i];
+            gGdxCamPoseCurOk[i] = false;
+
+            if (gdx_camera_pose_read(i, &gGdxCamPoseCur[i]) == 0 || layout.stride == 0 ||
+                mCurPoolBase == 0) {
+                ++gGdxCamWhy[kCamWhyPoseRead];
+                continue;
+            }
+            // gCameras[N].id == N is the game's own invariant (sole assignment camera.c:2177), and
+            // the id is what indexes the pool slot, so disagreement means this pose cannot be
+            // matched back to a matrix and must not be used.
+            // Resolve the EK fov threshold once per tick, before anything interpolates: from here
+            // on only the RESULT moves and the 30000 cutoff is never re-tested inside a tick.
+            // Gated so a suspected regression can be attributed.
+            if (GdxFovResolveConfigured()) {
+                gdx_camera_resolve_fov(&gGdxCamPoseCur[i]);
+            } else {
+                gGdxCamPoseCur[i].fovIsResolved = 0;
+                gGdxCamPoseCur[i].resolvedFov = gGdxCamPoseCur[i].fov;
+            }
+            const int id = gGdxCamPoseCur[i].id;
+            if (id != i || id < 0 || static_cast<size_t>(id) >= layout.count) {
+                ++gGdxCamWhy[kCamWhyId];
+                continue;
+            }
+            const uintptr_t poolPtr = mCurPoolBase + layout.projView + (static_cast<size_t>(id) * layout.stride);
+            if (ReadableByteLimit(poolPtr) < 64u) {
+                ++gGdxCamWhy[kCamWhyUnreadable];
+                continue;
+            }
+            GdxP0Mtx rebuilt = {};
+            if (gdx_camera_build_projview(&gGdxCamPoseCur[i], &rebuilt) == 0) {
+                ++gGdxCamWhy[kCamWhyBuild];
+                continue; // degenerate lookat input; the builder refused rather than half-write
+            }
+            if (std::memcmp(&rebuilt, reinterpret_cast<const void*>(poolPtr), 64) == 0) {
+                gGdxCamPoseCurOk[i] = true;
+                if (gGdxCamPosePrevOk[i]) {
+                    const float dx = gGdxCamPoseCur[i].eyeX - gGdxCamPosePrev[i].eyeX;
+                    const float dy = gGdxCamPoseCur[i].eyeY - gGdxCamPosePrev[i].eyeY;
+                    const float dz = gGdxCamPoseCur[i].eyeZ - gGdxCamPosePrev[i].eyeZ;
+                    const float delta = std::sqrt((dx * dx) + (dy * dy) + (dz * dz));
+                    if (delta > gGdxCamMaxEyeDelta) {
+                        gGdxCamMaxEyeDelta = delta;
+                    }
+                }
+            } else {
+                ++gGdxCamRejects;
+                ++gGdxCamWhy[kCamWhyMismatch];
+            }
+        }
+    }
+
+    // Rebuild one camera matrix at sub-frame time t. Returns false to fall through to the
+    // element-wise path; every refusal below is a case where the rebuild is not provably better
+    // than the lerp. Takes the record's fields rather than the record because GdxP0Record is
+    // declared further down the class and is not nameable in a member signature this early.
+    bool GdxCameraRebuildSlot(uintptr_t orig, uintptr_t recPrev, bool recSnap, GdxP0Mtx* scratch, float t) {
+        const int slot = GdxCameraMtxSlot(static_cast<uint32_t>(orig - mCurPoolBase));
+        if (slot < 0 || slot >= GDX_CAMERA_POSE_MAX) {
+            return false;
+        }
+        // Both endpoints must have passed their own tick's identity check. Interpolating from an
+        // unverified keyframe would reintroduce exactly the class of error this replaces.
+        if (!gGdxCamPoseCurOk[slot] || !gGdxCamPosePrevOk[slot]) {
+            ++gGdxCamWhy[kCamWhyPrevPose];
+            return false;
+        }
+        // A slot the existing machinery already decided to snap (cut epoch, pause, transition
+        // capture, absent keyframe) has no meaningful previous pose either.
+        if (recSnap || recPrev == 0 || mForceCutSnap) {
+            ++gGdxCamWhy[kCamWhySnap];
+            return false;
+        }
+        const GdxCameraPose& cur = gGdxCamPoseCur[slot];
+        const GdxCameraPose& prev = gGdxCamPosePrev[slot];
+        if (cur.id != slot || prev.id != slot) {
+            return false;
+        }
+        // numPlayers gates the EK fov-widening branch. A change across the pair means the two
+        // endpoints were built by different control flow, so blending them is not defined.
+        if (cur.numPlayers != prev.numPlayers) {
+            return false;
+        }
+        GdxCameraPose mid;
+        GdxCameraPoseLerp(prev, cur, t, &mid);
+        if (gdx_camera_build_projview(&mid, scratch) == 0) {
+            return false;
+        }
+        ++gGdxCamRebuilds;
+        return true;
+    }
+
+    // Copy a resolved 64-byte pool matrix into a stable per-tick scratch slot and return its
+    // address so the caller can rewrite the command's w1. The scratch arena MUST be a deque: it
+    // never invalidates element addresses on push_back, so a scratch pointer baked into an earlier
+    // command stays valid as more matrices are rerouted. P0 records (0, cur, scratch, false) and
+    // refills by identity copy; P1 derives the sibling-pool prev pointer and the snap decision.
     uintptr_t GdxP0RerouteMtx(uintptr_t origPtr, bool isProj) {
         if (!mInterpEnabled || origPtr == 0 || ReadableByteLimit(origPtr) < 64u) {
             return origPtr; // defensive: leave the pointer untouched, bit-exact stock path
@@ -3036,9 +3354,9 @@ class N64DisplayListAdapter {
             const uint32_t offset = static_cast<uint32_t>(origPtr - mCurPoolBase);
             const bool prevPresent = gdx_interp::NoteReferencedOffset(offset);
             if (mForceCutSnap) {
-                // P3: a cut/teleport epoch bump or an active pause forces every slot this tick to
-                // snap to cur (t=1), regardless of a usable prev keyframe. Still noted above so the
-                // referenced-set stays correct for the NEXT tick's spawn/despawn decision.
+                // A cut/teleport epoch bump or an active pause snaps every slot to cur regardless
+                // of a usable prev keyframe. Still noted above so the referenced-set stays correct
+                // for the NEXT tick's spawn/despawn decision.
                 snap = true;
                 ++mP1SnappedCut;
             } else if (mPrevPoolBase != 0 && mCurPoolBase != 0 && prevPresent) {
@@ -3047,24 +3365,28 @@ class N64DisplayListAdapter {
                     prevPtr = 0;
                     snap = true; // sibling not readable -> snap to cur
                     ++mP1SnappedAbsent;
-                } else if (gdx_interp::TranslationTeleport(reinterpret_cast<const void*>(prevPtr),
-                                                           reinterpret_cast<const void*>(origPtr))) {
+                } else if (isProj ? GdxCameraPoseTeleport(offset)
+                                 : gdx_interp::TranslationTeleport(reinterpret_cast<const void*>(prevPtr),
+                                                                   reinterpret_cast<const void*>(origPtr))) {
                     snap = true; // teleport/cut heuristic (belt-and-suspenders)
                     ++mP1SnappedTeleport;
                 } else {
                     ++mP1Lerped;
-                    // [interp-pair] Pairing-quality sample. See gdx_interp.h TranslationDelta for
-                    // why byte-offset identity can silently pair two different objects, and why the
-                    // 2000-unit teleport guard above cannot notice when it does.
-                    const float delta = gdx_interp::TranslationDelta(
-                        reinterpret_cast<const void*>(prevPtr), reinterpret_cast<const void*>(origPtr));
+                    // [interp-pair] Pairing-quality sample; see gdx_interp.h TranslationDelta for
+                    // why byte-offset identity can silently pair two different objects. Sample only
+                    // slots whose row 3 IS a world position: including projection matrices makes
+                    // pair_max/pair_susp report the camera's view-space terms, which reads as a fat
+                    // tail whenever the view rotates.
+                    const float delta = isProj ? 0.0f
+                                               : gdx_interp::TranslationDelta(
+                                                     reinterpret_cast<const void*>(prevPtr),
+                                                     reinterpret_cast<const void*>(origPtr));
                     if (delta > mP1PairMaxDelta) {
                         mP1PairMaxDelta = delta;
                     }
-                    // Suspicious, not wrong: real per-tick motion is "a few tens of units"
-                    // (gdx_interp.cpp:201-204), so a paired slot moving further than this is either
-                    // something genuinely fast or a mispairing. The count is what shows a fat tail
-                    // appearing exactly when the camera sweeps.
+                    // Suspicious, not wrong: real per-tick motion is a few tens of units
+                    // (gdx_interp.cpp:201-204), so a paired slot moving further is either genuinely
+                    // fast or a mispairing.
                     if (delta > 200.0f) {
                         ++mP1PairSuspect;
                     }
@@ -3079,11 +3401,107 @@ class N64DisplayListAdapter {
             }
         }
 
+        // [attack-hl] Per-racer verdict for the attack-highlight probe: unk_21208 is written only
+        // while the attack is live (racer.c:5876), so on the attack's first tick its offset was not
+        // referenced last tick and this ladder snaps it to t=1 while the body matrix lerps to t<1 --
+        // same machine, two instants.
+        if (mP1Enabled && mCurPoolBase != 0) {
+            const GdxRacerMtxId id = GdxRacerMtxClassify(static_cast<uint32_t>(origPtr - mCurPoolBase));
+            if (id.field != GdxRacerMtxField::kNone && id.racer < kGdxRacerMtxSlots) {
+                const int col = (id.field == GdxRacerMtxField::kBody)     ? 0
+                                : (id.field == GdxRacerMtxField::kSecond) ? 1
+                                                                          : 2;
+                mRacerMtxVerdict[id.racer][col] = snap ? 2 : 1; // 0 absent, 1 lerped, 2 snapped
+            }
+        }
+
         mP0Records.push_back({ origPtr, prevPtr, slot, snap, isProj });
         return reinterpret_cast<uintptr_t>(slot);
     }
 
     size_t GdxP0ScratchSlots() const { return mP0Records.size(); }
+
+    // Give a per-racer matrix that SPAWNED this tick the keyframe it lacks, borrowed from the same
+    // racer's body matrix, so it tweens in lockstep with the machine it is drawn on instead of
+    // snapping to t=1 alone.
+    //
+    // The artifact: a side attack draws a 1.075x scaled red copy of the machine from
+    // gGfxPool->unk_21208[racer->id] (racer.c:5876-5896), written ONLY while the attack is live.
+    // On the attack's first tick that slot has no previous keyframe and snaps to t=1 while the body
+    // (unk_20308, written every drawn tick) lerps to t<1. At only 7.5% larger the highlight should
+    // read as a red rim; separated by a tick of motion, the body slides out from inside it.
+    //
+    // Borrowing is sound because ownership is STRUCTURAL, not a proximity heuristic like the
+    // effects-vertex anchor: unk_20308/unk_20A88/unk_21208 are parallel Mtx[30] arrays indexed by
+    // the same racer->id. Translation only -- copying the body's rotation would be wrong since the
+    // highlight carries its own scale, and the residual rotational mismatch on hard-turning frames
+    // is orders of magnitude below the artifact.
+    void GdxFixupSpawnedRacerMatrices() {
+        if (!mP1Enabled || mCurPoolBase == 0 || mPrevPoolBase == 0 || mForceCutSnap) {
+            return;
+        }
+
+        // Index the racers whose body matrix has a usable pair this tick.
+        size_t bodyIdx[kGdxRacerMtxSlots];
+        for (uint32_t i = 0; i < kGdxRacerMtxSlots; ++i) {
+            bodyIdx[i] = SIZE_MAX;
+        }
+        for (size_t i = 0; i < mP0Records.size(); ++i) {
+            const GdxP0Record& r = mP0Records[i];
+            if (r.snap || r.prev == 0) {
+                continue;
+            }
+            const GdxRacerMtxId id = GdxRacerMtxClassify(static_cast<uint32_t>(r.orig - mCurPoolBase));
+            if (id.field == GdxRacerMtxField::kBody && id.racer < kGdxRacerMtxSlots) {
+                bodyIdx[id.racer] = i;
+            }
+        }
+        for (size_t i = 0; i < mP0Records.size(); ++i) {
+            GdxP0Record& r = mP0Records[i];
+            if (!r.snap || r.prev != 0) {
+                continue; // already paired, or snapped for a reason other than a missing keyframe
+            }
+            const GdxRacerMtxId id = GdxRacerMtxClassify(static_cast<uint32_t>(r.orig - mCurPoolBase));
+            if ((id.field != GdxRacerMtxField::kHighlight && id.field != GdxRacerMtxField::kSecond) ||
+                id.racer >= kGdxRacerMtxSlots || bodyIdx[id.racer] == SIZE_MAX) {
+                continue;
+            }
+            const GdxP0Record& body = mP0Records[bodyIdx[id.racer]];
+            if (ReadableByteLimit(body.orig) < 64u || ReadableByteLimit(body.prev) < 64u ||
+                ReadableByteLimit(r.orig) < 64u) {
+                continue;
+            }
+            float bodyCur[4][4];
+            float bodyPrev[4][4];
+            float mine[4][4];
+            gdx_interp::MtxToF(reinterpret_cast<const void*>(body.orig), bodyCur);
+            gdx_interp::MtxToF(reinterpret_cast<const void*>(body.prev), bodyPrev);
+            gdx_interp::MtxToF(reinterpret_cast<const void*>(r.orig), mine);
+            for (int axis = 0; axis < 3; ++axis) {
+                mine[3][axis] += bodyPrev[3][axis] - bodyCur[3][axis];
+            }
+            mSynthPrev.emplace_back();
+            GdxP0Mtx* synth = &mSynthPrev.back();
+            gdx_interp::MtxFromF(mine, synth);
+            r.prev = reinterpret_cast<uintptr_t>(synth);
+            r.snap = false;
+            ++mP1BorrowedKeyframes;
+            // Keep the probe's verdict table honest: this slot now lerps.
+            const int col = (id.field == GdxRacerMtxField::kHighlight) ? 2 : 1;
+            mRacerMtxVerdict[id.racer][col] = 1;
+        }
+    }
+
+    size_t GdxP1BorrowedKeyframes() const { return mP1BorrowedKeyframes; }
+
+    // [attack-hl] This tick's verdict for one per-racer matrix: 0 not referenced, 1 lerped,
+    // 2 snapped. col 0 = body (unk_20308), 1 = second (unk_20A88), 2 = attack highlight (unk_21208).
+    uint8_t GdxRacerMtxVerdict(uint32_t racer, int col) const {
+        if (racer >= kGdxRacerMtxSlots || col < 0 || col > 2) {
+            return 0;
+        }
+        return mRacerMtxVerdict[racer][col];
+    }
 
     // Refill every scratch slot for the next replay pass. P0 (and any snapped P1 slot) copies the
     // current-pool matrix verbatim (== lerp at t=1). A live P1 slot writes lerp(prev, cur, t) in
@@ -3093,29 +3511,50 @@ class N64DisplayListAdapter {
             if (ReadableByteLimit(r.orig) < 64u) {
                 continue;
             }
+            // Camera projection*view rebuilds from an interpolated pose instead of lerping the
+            // finished matrix. r.proj is tested first so slot classification costs only the handful
+            // of projection loads per tick, not every matrix in the list.
+            //
+            // t == 1 deliberately falls through to the verbatim copy below: the transparency
+            // invariant is that the last sub-frame IS a byte copy of the pool matrix, and the
+            // rebuild must not be the thing that establishes the invariant it is checked against.
+            if (r.proj && mInterpCameraRebuild && t < 1.0f && mCurPoolBase != 0 &&
+                GdxCameraRebuildSlot(r.orig, r.prev, r.snap, r.scratch, t)) {
+                continue;
+            }
             if (mP1Enabled && r.prev != 0 && !r.snap && t < 1.0f &&
                 ReadableByteLimit(r.prev) >= 64u) {
                 gdx_interp::LerpMtx(reinterpret_cast<const void*>(r.prev),
                                     reinterpret_cast<const void*>(r.orig), t, r.scratch);
+                // Restore rigidity to per-racer model matrices only. Applied to the racer arrays
+                // rather than every pool matrix because those are known to be scale-times-rotation
+                // (Matrix_ScaleFrom3DMatrix, racer.c:5985/5883); an arbitrary pool matrix carries no
+                // such guarantee and rescaling its rows would be a change, not a correction.
+                if (mRotFix && mCurPoolBase != 0) {
+                    const GdxRacerMtxId rid = GdxRacerMtxClassify(static_cast<uint32_t>(r.orig - mCurPoolBase));
+                    if (rid.field != GdxRacerMtxField::kNone) {
+                        GdxRenormalizeLerpedBasis(reinterpret_cast<const void*>(r.prev),
+                                                  reinterpret_cast<const void*>(r.orig), t, r.scratch);
+                    }
+                }
             } else {
                 std::memcpy(r.scratch, reinterpret_cast<const void*>(r.orig), 64);
             }
         }
     }
 
-    // --- Carousel viewport interpolation (Tier 2) -------------------------------------------------
+    // --- Carousel viewport interpolation ----------------------------------------------------------
     //
-    // The course-select carousel slides by rewriting viewport vtrans[0] per tick (course_select.c
-    // Object_LerpPosXToClampedTargetMaxStep, up to 192 vtrans units = 48 screen px per tick) — no
-    // matrix carries this motion, so the pool-matrix lerp cannot smooth it. The viewports live in
-    // D_i5_80118FF0[2][6], parity-indexed by the SAME D_800DCCFC toggle as the GfxPool, so the
-    // previous tick's keyframe already exists at the sibling parity row: no snapshotting needed.
+    // The course-select carousel slides by rewriting viewport vtrans[0] per tick (up to 192 vtrans
+    // units = 48 screen px), and no matrix carries that motion, so the pool-matrix lerp cannot
+    // smooth it. The viewports live in D_i5_80118FF0[2][6], parity-indexed by the SAME D_800DCCFC
+    // toggle as the GfxPool, so the previous keyframe already exists at the sibling parity row.
     //
-    // Deliberately NOT reusing the matrix machinery's parts, per the differences that would corrupt
-    // it: the array is overlay BSS (outside the pool span), the prev keyframe is orig +/- 6*16
-    // bytes (not prevPoolBase + offset), and NoteReferencedOffset's set is keyed on pool offsets a
-    // viewport pointer would collide with. The slot index i is the identity here, and it is
-    // perfectly stable — far stronger than the byte-offset identity the matrices live with.
+    // Deliberately NOT reusing the matrix machinery: the array is overlay BSS outside the pool
+    // span, the prev keyframe is orig +/- 6*16 bytes rather than prevPoolBase + offset, and
+    // NoteReferencedOffset's set is keyed on pool offsets a viewport pointer would collide with.
+    // Identity here is the slot index, which is perfectly stable -- stronger than the byte-offset
+    // identity the matrices live with.
     struct alignas(8) GdxVpSlot {
         int16_t v[8]; // vscale[4], vtrans[4] — layout of the libultra Vp_t, host-native
     };
@@ -3169,9 +3608,9 @@ class N64DisplayListAdapter {
 
     void GdxVpRefillScratch(float t) {
         for (const GdxVpRecord& r : mVpRecords) {
-            // t>=1 must be a byte-exact copy (same Correction-1 transparency contract as the
-            // matrices); the lerp rounds to nearest so the carousel cannot bias a sub-pixel toward
-            // the stale keyframe on every pass.
+            // t>=1 must be a byte-exact copy (same transparency contract as the matrices); the lerp
+            // rounds to nearest so the carousel cannot bias a sub-pixel toward the stale keyframe
+            // on every pass.
             if (r.snap || t >= 1.0f) {
                 std::memcpy(r.scratch, reinterpret_cast<const void*>(r.orig), sizeof(GdxVpSlot));
                 continue;
@@ -3186,22 +3625,14 @@ class N64DisplayListAdapter {
         }
     }
 
-    // --- Effects vertex interpolation (Tier 3: booster flames / side-attack quads) ----------------
+    // --- Effects vertex interpolation (booster flames / side-attack quads) ------------------------
     //
-    // racer.c computes the flame/effect vertex positions on the CPU per tick from racer->modelMatrix
-    // and bumps them into gGfxPool->effectsVtxBuffer — no gSPMatrix anywhere in that path, so at
-    // sub-frame t the machine body renders at the lerped pose while its flame stays baked at the
-    // tick-end pose: the owner's "afterimage". The pool is double-buffered, so the previous tick's
-    // vertices sit at prevPoolBase + the same offset, and the pool-quiescence proof (see the loop's
-    // parity latch) covers vertex bytes exactly as it covers matrices.
-    //
-    // Identity is the batch's pool byte offset — a MUCH higher-churn keyspace than matrices: a
-    // booster batch flips between 4 and 5 vertices with boost state, and any spawn/despawn shifts
-    // every downstream offset. The per-batch snap guard is load-bearing here, not belt-and-braces:
-    // any single vertex moving more than the teleport threshold snaps its WHOLE batch, so a
-    // mispaired quad cannot shear. Only ob[0..2] is lerped; flag/tc/cn are copied from cur verbatim.
-    // Position lerp also smooths the gGameFrameCount&3 flame size pulse (it feeds ob[] via the
-    // billboard half-extents) — a 15 Hz stair-step becomes a ramp, which is the desired look.
+    // racer.c computes effect vertex positions on the CPU per tick from racer->modelMatrix and bumps
+    // them into gGfxPool->effectsVtxBuffer with no gSPMatrix anywhere in that path, so at sub-frame
+    // t the body renders at the lerped pose while its flame stays baked at the tick-end pose --
+    // the afterimage. The pool is double-buffered, so the previous tick's vertices sit at
+    // prevPoolBase + the same offset and the parity latch's quiescence argument covers vertex bytes
+    // exactly as it covers matrices.
     struct GdxVtxRecord {
         uintptr_t orig;
         uint8_t* scratch; // contiguous batch buffer (count*16 bytes)
@@ -3227,25 +3658,21 @@ class N64DisplayListAdapter {
         uint8_t* scratch = mVtxScratch.back().data();
         std::memcpy(scratch, reinterpret_cast<const void*>(origPtr), bytes);
 
-        // ANCHORED interpolation, third design for this tier. The first (offset pairing + distance
-        // threshold) never snapped once while the owner saw teleports; the second (tc-lane identity)
-        // died to a subtler fact: stale bump-buffer bytes are STABLE, so the side-attack quads'
-        // unwritten tc lanes matched the sibling pool's identical ancient garbage and kept lerping
-        // into a red vehicle-shaped smear. Byte identity cannot name an effect, and in a bunched
-        // pack no distance threshold separates "same flame, one tick of motion" from "the next
-        // machine's flame" -- both live within tens of units.
+        // ANCHORED interpolation. Do not replace this with vertex-byte pairing: byte identity
+        // cannot name an effect (stale bump-buffer bytes are STABLE, so the side-attack quads'
+        // unwritten tc lanes match the sibling pool's identical ancient garbage and lerp into a red
+        // vehicle-shaped smear), and in a bunched pack no distance threshold separates "same flame,
+        // one tick of motion" from "the next machine's flame" -- both live within tens of units.
         //
-        // What CAN name an effect is its owner. Every effect in racer.c is computed from its
-        // racer's modelMatrix, and that same matrix (gGfxPool->unk_20308[id], world-space, built at
-        // racer.c:6070) is already rerouted with both keyframes in hand. So: find the nearest
-        // non-projection matrix record to the batch centroid, and each pass shift the whole batch
-        // by that anchor's interpolated translation delta. The flame rides its machine. Previous
-        // vertex bytes are never read, so there is nothing to mispair: the residual cost is only
-        // that per-tick shape animation (the &3 size pulse) renders at the current keyframe -- a
-        // 15 Hz stair, which is stock Issue-G behaviour.
+        // What CAN name an effect is its owner: every effect in racer.c is computed from its
+        // racer's modelMatrix, and that matrix (gGfxPool->unk_20308[id], racer.c:6070) is already
+        // rerouted with both keyframes in hand. Find the nearest non-projection matrix record to
+        // the batch centroid and shift the whole batch by that anchor's interpolated translation
+        // delta. Previous vertex bytes are never read, so there is nothing to mispair; the residual
+        // cost is that per-tick shape animation renders at the current keyframe.
         //
-        // 3-vertex batches (debris shards, flying sparks) stay permanently snapped: single-tick
-        // particles, and several of them genuinely have no meaningful owner after a crash.
+        // 3-vertex batches (debris shards, sparks) stay permanently snapped: single-tick particles,
+        // several of which genuinely have no owner after a crash.
         bool snap = true;
         float aPrev[3] = { 0.0f, 0.0f, 0.0f };
         float aCur[3] = { 0.0f, 0.0f, 0.0f };
@@ -3346,7 +3773,7 @@ class N64DisplayListAdapter {
     size_t GdxVtxLerped() const { return mVtxLerped; }
     size_t GdxVtxSnapped() const { return mVtxSnapped; }
 
-    // memcmp every scratch vs its origin; at t=1 they must match (Correction-1 transparency proof).
+    // memcmp every scratch vs its origin; at t=1 they must match (the transparency invariant).
     size_t GdxP0TransparencyViolations() const {
         size_t bad = 0;
         for (const GdxP0Record& r : mP0Records) {
@@ -3419,23 +3846,31 @@ class N64DisplayListAdapter {
     std::vector<QueueItem> mWorkQueue;
     std::vector<Fast::F3DGfx> mNoopList{ MakeLusGfx(static_cast<uintptr_t>(kOpEndDl) << 24, 0) };
 
-    // P0/P1 scratch-slot indirection state (only populated when mInterpEnabled). The arena is
-    // per-adapter, i.e. per gdx_gfx_run/per tick — rebuilt every tick, matching the
-    // "stable per-tick scratch slot arena". deque<> guarantees element-address stability.
-    // The host-driven decoupled loop reuses ALL of the P1 dual-pool lerp machinery, so
-    // P2 activation is simply OR-ed into the P1 enable. Declared first so mP1Enabled can read it
-    // (members initialise in declaration order). mP2Host mirrors main.cpp's per-tick decision.
+    // Scratch-slot indirection state, populated only when mInterpEnabled. The arena is per-adapter
+    // (per gdx_gfx_run, per tick) and deque<> guarantees element-address stability. The
+    // host-driven decoupled loop reuses ALL of the P1 dual-pool lerp machinery, so P2 activation is
+    // OR-ed into the P1 enable; mP2Host must be declared first because members initialise in
+    // declaration order and mP1Enabled reads it.
     const bool mP2Host = GdxP2HostConfigured();
     const bool mP0Enabled = GdxInterpP0Enabled();
     const bool mP1Enabled = gdx_interp::P1().enabled || mP2Host;
     const bool mInterpEnabled = mP0Enabled || mP1Enabled;
-    // Latched once per adapter (i.e. once per gdx_gfx_run) rather than read at the matrix command
-    // that consults it: CameraInterpActive() hashes a CVar name, and the condition below is
-    // evaluated for EVERY G_MTX in the display list. A handful of lookups per tick is free; a
-    // lookup per command is not. The Bucket B dev gate is OR-ed in so a dev build can still force
-    // camera interpolation on for A/B without touching the shipped CVar.
+    // Latched once per adapter rather than read per matrix command: CameraInterpActive() hashes a
+    // CVar name and this condition is evaluated for EVERY G_MTX in the display list. The Bucket B
+    // dev gate is OR-ed in so a dev build can force camera interpolation on for A/B without
+    // touching the shipped CVar.
     const bool mInterpCamera =
         gdx_interp::CameraInterpActive() || gdx_dev_gate(GDX_GATE_INTERP_CAMERA) != 0;
+    // Rebuild the camera's projection*view from an interpolated POSE instead of lerping the
+    // finished matrix element-wise. Requires mInterpCamera: with camera interpolation off the
+    // matrix is not rerouted at all and there is nothing to rebuild. ON by default; see
+    // GdxCameraRebuildConfigured for the measurement, and set GDX_INTERP_CAMERA_POSE=0 to A/B it.
+    const bool mInterpCameraRebuild = mInterpCamera && GdxCameraRebuildConfigured();
+    // Kill the rotation smear across a side attack's two model-basis discontinuities. Independent of
+    // the camera work: this one is a racer-matrix defect and needs no projection involvement.
+    const bool mBasisJumpFix = GdxBasisJumpFixConfigured();
+    // Rescale element-wise-lerped per-racer basis rows back to rigid. See GdxRenormalizeLerpedBasis.
+    const bool mRotFix = GdxRotFixConfigured();
     struct GdxP0Record {
         uintptr_t orig;    // resolved CURRENT-pool matrix host pointer (curPoolPtr)
         uintptr_t prev;    // sibling(PREVIOUS)-pool matrix host pointer (0 in P0 / snapped slot)
@@ -3446,6 +3881,14 @@ class N64DisplayListAdapter {
     };
     std::deque<GdxP0Mtx> mP0Scratch;
     std::vector<GdxP0Record> mP0Records;
+    // [attack-hl] Per-racer verdicts for the three per-racer matrix arrays this tick:
+    // 0 = not referenced, 1 = lerped, 2 = snapped. Columns are body / second / highlight.
+    static constexpr uint32_t kGdxRacerMtxSlots = 30;
+    uint8_t mRacerMtxVerdict[kGdxRacerMtxSlots][3] = {};
+    // Synthetic previous keyframes built by GdxFixupSpawnedRacerMatrices. deque: a record's prev
+    // pointer must stay valid as later ones are appended.
+    std::deque<GdxP0Mtx> mSynthPrev;
+    size_t mP1BorrowedKeyframes = 0;
     // Dual-pool bases (latched per tick by GdxInterpBeginTick) + snap-event counters.
     uintptr_t mCurPoolBase = 0;
     uintptr_t mPrevPoolBase = 0;
@@ -3471,11 +3914,10 @@ class N64DisplayListAdapter {
         return (IsRawN64HostPointer(ptr) || IsHostN64CommandPointer(ptr)) ? kN64GfxStride : kHostBuiltGfxStride;
     }
 
-    // Return a wide 16-byte version of `source`, converting+caching on
-    // first encounter. `ioLimit` is updated to the wide command count. Returns
-    // `source` unchanged (and leaves ioLimit alone) when conversion is disabled,
-    // the source is already wide, or its extent is unknown -- in which case the
-    // caller falls back to the original narrow machinery.
+    // Wide 16-byte version of `source`, converted and cached on first encounter; `ioLimit` becomes
+    // the wide command count. Returns `source` and leaves ioLimit alone when conversion is
+    // disabled, the source is already wide, or its extent is unknown -- the caller then falls back
+    // to the narrow machinery.
     const N64Gfx* GetOrBuildConvertedWide(const N64Gfx* source, size_t& ioLimit) {
         EnsureG2ConvertInit();
         if (!gG2ConvertEnabled || source == nullptr) {
@@ -3496,11 +3938,9 @@ class N64DisplayListAdapter {
             return source;  // unknown extent -> leave to the narrow path
         }
 
-        // Decide endianness and dialect the SAME way ProcessList would, so the
-        // converted value path is byte-identical and the pointer classification
-        // matches. The dialect decision is recorded so ProcessList reuses it
-        // rather than re-deriving it (and possibly misclassifying) from the
-        // dialect-tagless wide buffer.
+        // Endianness and dialect must be decided the SAME way ProcessList would, or the converted
+        // value path diverges and the pointer classification stops matching. The dialect is
+        // recorded so ProcessList reuses it instead of re-deriving it from the tagless wide buffer.
         const bool isBig = CommandSourceIsBigEndian(source, stride);
         const GdxSegmentUcode dialect = GdxAssetPointerDialect(reinterpret_cast<uintptr_t>(source));
         const bool isF3d =
@@ -3516,11 +3956,8 @@ class N64DisplayListAdapter {
         }
 
         const N64Gfx* wideSrc = reinterpret_cast<const N64Gfx*>(wide.data());
-        /* [dl-census]: one line per UNIQUE
-           narrow list converted by G2 across the whole session (menus included).
-           Names which asset families' display lists take the binary route --
-           the pause-menu/decoration suspects -- with an ASLR-stable identity
-           where the source is module-resident. */
+        /* [dl-census] diagnostic, strip later: one line per unique narrow list converted this
+           session, with an ASLR-stable identity when the source is module-resident. */
         {
             static uintptr_t sDlCensusSeen[48] = {};
             static int sDlCensusCount = 0;
@@ -3548,10 +3985,9 @@ class N64DisplayListAdapter {
                               isBig ? 1 : 0, isF3d ? 1 : 0);
             }
         }
-        // The dialect map is re-recorded here before any ProcessList read of this
-        // exact buffer, so clearing it when it grows large is always safe (a stale
-        // rebuilt buffer's old address is never read again). Bounds lifetime
-        // growth from in-place rebuilds that relocate a cached list's storage.
+        // Clearing is safe because the dialect is re-recorded below before any ProcessList read of
+        // this exact buffer, and a rebuilt buffer's old address is never read again. Bounds the
+        // map's growth from in-place rebuilds that relocate a cached list's storage.
         if (gConvertedWideIsF3d.size() > 8192) {
             gConvertedWideIsF3d.clear();
         }
@@ -3650,29 +4086,19 @@ class N64DisplayListAdapter {
             }
         }
 
-        // Task 3 diag (Course Edit node-info panel scatter): see GdxSeg9FallbackDiag
-        // above N64DisplayListAdapter. Armed only for genuine segment-9 tokens that
-        // just missed the authoritative mode resolver; its destructor fires on
-        // whichever return below actually serves (or fails to serve) this token. E5:
-        // also armed by GDX_DIAG_NODEINFO, a dedicated opt-in for the [nodeinfo]
-        // investigation that does not require enabling the broader GDX_LOG sink.
-        // Live gate reads — see the matching comment on the raw-resolver twin above.
+        // Armed only for segment-9 tokens that just missed the authoritative mode resolver; the
+        // destructor fires on whichever return below serves (or fails to serve) the token. Gates
+        // read live, as on the raw-resolver twin above.
         const bool seg9DiagEnabled =
             gdx_dev_gate(GDX_GATE_LOG_FILE) || gdx_dev_gate(GDX_GATE_DIAG_NODEINFO);
         GdxSeg9FallbackDiag seg9Diag(seg9DiagEnabled && (raw >> 24) == 9u, raw, requiredBytes, &out);
 
-        /*
-         * Disk-resident EK overlays retain their original N64 virtual or
-         * segmented pointers inside display lists. Their payloads live in
-         * generated host arrays, so resolve those explicit token ranges before
-         * the generic KSEG/segment heuristics. Reverse order lets the most
-         * recently registered overlay win if original overlay VRAM ranges
-         * overlap.
-         */
-        /* Raw-pointer reverse iteration: this runs per translated data pointer
-           over ~600 registered EK ranges; MSVC Debug checked iterators made it
-           a real per-frame cost (reverse order preserved: most recently
-           registered overlay wins on overlap). */
+        /* Disk-resident EK overlays keep their original N64 virtual/segmented pointers inside
+           display lists while their payloads live in generated host arrays, so these explicit
+           token ranges must resolve before the generic KSEG/segment heuristics. Reverse order lets
+           the most recently registered overlay win when original overlay VRAM ranges overlap.
+           Raw-pointer iteration: this runs per translated data pointer over ~600 EK ranges and
+           MSVC Debug checked iterators made it a real per-frame cost. */
         {
             const N64AddressRange* ranges = gN64AddressRanges.data();
             for (size_t ri = gN64AddressRanges.size(); ri > 0; ri--) {
@@ -3701,8 +4127,8 @@ class N64DisplayListAdapter {
             return true;
         }
 
-        // E1: thread requiredBytes through so a caller-side over-estimate cannot
-        // accept an interior match that overruns the row's declared image size.
+        // requiredBytes is threaded through so a caller-side over-estimate cannot accept an
+        // interior match that overruns the row's declared image size.
         if (ResolveGeneratedAssetStub(raw, out, requiredBytes)) {
             return true;
         }
@@ -3714,17 +4140,10 @@ class N64DisplayListAdapter {
         const uint32_t d1000000_low = Low32(reinterpret_cast<uintptr_t>(D_1000000));
         for (const HostRange& range : gHostRanges) {
             if (range.begin == reinterpret_cast<uintptr_t>(D_1000000)) {
-                /* requiredBytes: this only proved the START of
-                   the candidate offset was inside D_1000000's range, never that
-                   requiredBytes actually fit before the end of the buffer -- the
-                   same short-read hazard already fixed for the other candidate
-                   paths in this function, but missed here. D_1000000 is the huge
-                   static data blob that also backs per-player/machine structures
-                   (e.g. &D_1000000.unk_21988[playerIndex], the G_MTX source
-                   confirmed in the countdown-face investigation), so a matrix or
-                   vertex load landing near the tail of this buffer could silently
-                   walk past it into unrelated memory -- a plausible source of the
-                   still-visible machine vertex spikes. */
+                /* requiredBytes must fit before the END of the range, not just contain its start.
+                   D_1000000 also backs per-player/machine structures (e.g.
+                   &D_1000000.unk_21988[playerIndex] as a G_MTX source), so a matrix or vertex load
+                   near the tail would otherwise walk into unrelated memory. */
                 const size_t offset = static_cast<size_t>(raw - d1000000_low);
                 if (raw >= d1000000_low && offset <= range.size && requiredBytes <= range.size - offset) {
                     out.full = static_cast<uintptr_t>(gSegments[1]) + offset;
@@ -3735,27 +4154,23 @@ class N64DisplayListAdapter {
             }
         }
 
-        /* Explicit N64 segment addresses (top byte = segment index 1..15, e.g.
-           the course/venue texture pointers 0x08xxxxxx / 0x0Axxxxxx emitted by
-           F3D asset display lists) must resolve through the segment table, which
-           now points at the decompressed venue image. Do this BEFORE the low-32
-           host-range heuristic: that heuristic can false-match a segment address
-           against an unrelated host allocation whose low 32 bits happen to cover
-           it, which is what left the track textures reading raw/garbage bytes. */
+        /* Explicit N64 segment addresses (top byte = segment index 1..15, e.g. the 0x08xxxxxx /
+           0x0Axxxxxx course/venue texture pointers) resolve through the segment table. This must
+           run BEFORE the low-32 host-range heuristic, which can false-match a segment address
+           against an unrelated host allocation whose low 32 bits happen to cover it -- that is
+           what left the track textures reading garbage. */
         {
             const uint8_t seg = static_cast<uint8_t>(raw >> 24);
             const uint32_t segOffset = raw & 0x00FFFFFFu;
             if (seg >= 1 && seg < kGfxSegmentCount && gSegments[seg] != 0 &&
                 segOffset < kSegmentOffsetLimit) {
                 const uintptr_t full = gSegments[seg] + segOffset;
-                /* A segment match is only authoritative when the result is
-                   actually readable. K0_TO_PHYS truncates module data pointers
-                   to 29 bits, so e.g. 0x7FF702142C10 & 0x1FFFFFFF = 0x02142C10
-                   masquerades as a segment-2 offset far past the real segment-2
-                   buffer. Accepting it blindly yields an unreadable pointer that
-                   TranslateDataPointer nulls — the texture silently vanishes.
-                   Fall through so the physical-window paths can reconstruct the
-                   original module pointer instead. */
+                /* A segment match is authoritative only when the result is actually readable.
+                   K0_TO_PHYS truncates module data pointers to 29 bits, so e.g.
+                   0x7FF702142C10 & 0x1FFFFFFF = 0x02142C10 masquerades as a segment-2 offset far
+                   past the real segment-2 buffer; accepting it yields an unreadable pointer that
+                   TranslateDataPointer nulls and the texture silently vanishes. Fall through so
+                   the physical-window paths can reconstruct the original module pointer. */
                 if (ReadableByteLimit(full) >= requiredBytes) {
                     out.full = full;
                     out.segment = seg;
@@ -3766,12 +4181,11 @@ class N64DisplayListAdapter {
             }
         }
 
-        /* Host-built PORT commands still have N64-sized pointer words, so a
-           pointer to the emulated RDRAM arena may arrive as its low 32 bits.
-           Unlike the quarantined registered-range reconstruction below, this
-           is one exact, session-owned 8 MiB allocation and unsigned subtraction
-           also handles a low32 wrap. Keep it after explicit segment tokens so
-           0x01xxxxxx..0x0Fxxxxxx retain their N64 meaning. */
+        /* Host-built PORT commands still carry N64-sized pointer words, so a pointer into the
+           emulated RDRAM arena can arrive as its low 32 bits. Unlike the quarantined
+           registered-range reconstruction below this is one exact, session-owned 8 MiB allocation
+           and unsigned subtraction handles a low32 wrap. Must stay after explicit segment tokens
+           so 0x01xxxxxx..0x0Fxxxxxx keep their N64 meaning. */
         {
             uintptr_t rdramAddress = 0;
             if (ResolveRdramLow32(raw, requiredBytes, &rdramAddress)) {
@@ -3795,15 +4209,11 @@ class N64DisplayListAdapter {
                 out.segmented = false;
                 return true;
             }
-            /* Out-of-RDRAM KSEG0: NOT necessarily MMIO/cart — a truncated
-               64-bit host pointer whose low32 happens to fall in 0x80-0x9F
-               (e.g. 0x933AEF70 from heap 0x20A933AEF70) looks identical.
-               Try reconstructing it against known high-32 windows before
-               giving up; texture loads feed garbage into TMEM otherwise.
-               GDX_LEGACY_RESOLVE quarantine: this "high-32 reconstruction" is
-               a guess (see the quarantine block above kFallbackIdentityMtx) --
-               the deterministic RDRAM strip above already covers the
-               non-guessing case. */
+            /* Out-of-RDRAM KSEG0 is not necessarily MMIO/cart: a truncated 64-bit host pointer
+               whose low32 lands in 0x80-0x9F (e.g. 0x933AEF70 from heap 0x20A933AEF70) looks
+               identical. Reconstruct against known high-32 windows before giving up, or texture
+               loads feed garbage into TMEM. Quarantined -- this is a guess; the deterministic
+               RDRAM strip above covers the non-guessing case. */
             if (LegacyResolveEnabled()) {
                 const uintptr_t highCandidates[] = {
                     reinterpret_cast<uintptr_t>(mRootBegin) & 0xFFFFFFFF00000000ULL,
@@ -3838,12 +4248,10 @@ class N64DisplayListAdapter {
             return false; /* genuinely unresolvable KSEG0 (MMIO/cart range) */
         }
 
-        /* Some PORT paths pass bare physical RDRAM offsets through display-list
-           words after osVirtualToPhysical() truncates host pointers.  Mirror the
-           decomp-side resolver here so sub-DL/data pointers like 0x0013C700 and
-           0x0015EC00 do not become no-op display lists.  Keep a conservative
-           lower bound at the graphics-pool/arena area so tiny immediates such as
-           0x400 are not accidentally treated as real pointers. */
+        /* Some PORT paths pass bare physical RDRAM offsets through display-list words after
+           osVirtualToPhysical() truncates host pointers, so mirror the decomp-side resolver or
+           sub-DL/data pointers like 0x0013C700 become no-op display lists. The lower bound sits at
+           the graphics-pool/arena area so tiny immediates such as 0x400 are not read as pointers. */
         if ((raw >= static_cast<uint32_t>(GDX_RDRAM_GFXPOOL_OFFSET)) &&
             (raw < static_cast<uint32_t>(GDX_RDRAM_SIZE)) &&
             (gdx_rdram != nullptr)) {
@@ -3855,33 +4263,23 @@ class N64DisplayListAdapter {
         const uint8_t encodedSegment = static_cast<uint8_t>(raw >> 24);
         const uint32_t encodedOffset = raw & 0x00FFFFFE;
 
-        /* K0_TO_PHYS()/OS_K0_TO_PHYSICAL() etc. used to store only the low 29
-           bits of host-built pointers in commands such as G_MTX. On PORT those
-           macros are now full passthroughs — (u32)(uintptr_t)(x) — so raw is
-           the complete unmasked low32 of the real host pointer.
-           The window mask below must match that: reconstruct by taking the
-           high 32 bits from a known range and ORing in the full low32, the
-           same convention gdx_resolve_module_host_address() and the
-           mModuleBegin block below already use. Extract the window helper
-           early so it can run either before or after the segment table
-           depending on the caller. Bounds + readability checks prevent small
-           immediates from matching. */
+        /* On PORT, K0_TO_PHYS()/OS_K0_TO_PHYSICAL() are full passthroughs -- (u32)(uintptr_t)(x) --
+           so `raw` is the complete unmasked low32 of the real host pointer, not the low 29 bits.
+           The window mask must match: take the high 32 bits from a known range and OR in the full
+           low32, the same convention gdx_resolve_module_host_address() and the mModuleBegin block
+           below use. The helper is extracted here so it can run either before or after the segment
+           table depending on the caller; bounds and readability checks stop small immediates from
+           matching. */
         constexpr uintptr_t kPhysicalAddressMask = 0xFFFFFFFFu;
-        // GDX_LEGACY_RESOLVE quarantine: tryPhysicalWindow/tryAllPhysicalWindows
-        // reconstruct a full pointer by substituting a KNOWN range's high32 onto
-        // `raw`'s low32 -- a guess (see the quarantine block above
-        // kFallbackIdentityMtx). The gate lives in tryAllPhysicalWindows so both
-        // call sites below are covered by a single check.
+        // Quarantined guess: substituting a known range's high32 onto `raw`'s low32. The gate
+        // lives in tryAllPhysicalWindows so one check covers both call sites below.
         const auto tryPhysicalWindow = [&](uintptr_t begin, uintptr_t end) -> bool {
             if ((begin == 0) || (end <= begin)) {
                 return false;
             }
             uintptr_t full = (begin & ~kPhysicalAddressMask) | static_cast<uintptr_t>(raw);
-            /*
-             * A host range can cross a 4 GB low32 window (the full passthrough
-             * period). In that case the token may belong to the next window
-             * even though the range begins in the previous one.
-             */
+            /* A host range can straddle a 4 GB low32 window, so the token may belong to the NEXT
+               window even though the range begins in the previous one. */
             if (full < begin) {
                 constexpr uintptr_t kPhysicalAddressWindow = kPhysicalAddressMask + 1u;
                 if (full > UINTPTR_MAX - kPhysicalAddressWindow) {
@@ -3914,20 +4312,13 @@ class N64DisplayListAdapter {
             return false;
         };
 
-        /* A host-built display list and the matrices/vertices it references are
-         * almost always allocated together in the same 4 GB low32 window
-         * (the GfxPool / task DL arena). When that arena is not a
-         * registered host range, the reconstructions above miss and the pointer
-         * would fall back to an identity matrix. Reconstruct the pointer from the
-         * referencing DL's own window as a last resort, accepting it only when the
-         * result is readable AND lies within one allocation region of the source
-         * so it can never false-match unrelated memory elsewhere in the window. */
-        // GDX_LEGACY_RESOLVE quarantine: trySourceWindow is explicitly a
-        // "last resort" guess (see the quarantine block above
-        // kFallbackIdentityMtx) -- gated the same as the other branches.
+        /* Quarantined last-resort guess. A host-built display list and the matrices/vertices it
+         * references are almost always allocated in the same 4 GB low32 window (the GfxPool / task
+         * DL arena); when that arena is not a registered host range the reconstructions above miss
+         * and the pointer degrades to an identity matrix. Accept only a readable result within one
+         * allocation region of the source, so it cannot false-match unrelated memory elsewhere in
+         * the window. GDX_DIAG_NO_SRCWIN=1 disables it for bisection without a rebuild. */
         const auto trySourceWindow = [&]() -> bool {
-            // A/B escape hatch: GDX_DIAG_NO_SRCWIN=1 disables the source-window
-            // matrix reconstruction so regressions can be bisected without a rebuild.
             if (!LegacyResolveEnabled() || gdx_dev_gate(GDX_GATE_NO_SRCWIN) || (sourceHint == 0))
                 return false;
             uintptr_t full = (sourceHint & ~kPhysicalAddressMask) | static_cast<uintptr_t>(raw);
@@ -3942,11 +4333,10 @@ class N64DisplayListAdapter {
             return true;
         };
 
-        /* When the caller knows this raw value came from K0_TO_PHYS on a host
-           pointer (e.g., a G_MTX from host-built F3DEX2 code), try the full
-           low32 physical window BEFORE the segment table.  That prevents raw
-           values whose top byte matches an active segment index — e.g.,
-           0x0805DAA0 matching segment 8 — from being misrouted. */
+        /* When the caller knows `raw` came from K0_TO_PHYS on a host pointer (e.g. a G_MTX from
+           host-built F3DEX2 code), the low32 physical window must be tried BEFORE the segment
+           table, or a raw whose top byte matches an active segment index -- 0x0805DAA0 against
+           segment 8 -- gets misrouted. */
         if (preferPhysical && (tryAllPhysicalWindows() || trySourceWindow())) {
             return true;
         }
@@ -3971,25 +4361,12 @@ class N64DisplayListAdapter {
             return true;
         }
 
-        /* Ambiguous cross-segment fallback: this used to pick
-           whichever registered segment produced the numerically SMALLEST low32
-           offset for `raw`, with no readability check at all. When the raw
-           value's own top-byte segment is stale/unregistered this frame (e.g. a
-           race decoration or machine part referencing a segment that has not
-           been (re)pointed yet), a completely unrelated segment could "win" this
-           race purely by low32 coincidence -- and the winner was accepted even
-           if the resulting address was unreadable or, worse, readable-but-wrong
-           (garbage bytes from someone else's buffer). That is a plausible source
-           of the wrong-but-readable vertex/matrix loads behind the still-visible
-           spike/mesh-explosion reports even after the requiredBytes fix, which
-           only guarded against SHORT reads, not WRONG-but-long-enough ones.
-           Fix: gather every segment whose low32 offset is in range, sort by
-           offset ascending, and accept the first candidate that actually proves
-           readable for requiredBytes -- falling through to the next-closest
-           segment instead of blindly trusting the closest one.
-           GDX_LEGACY_RESOLVE quarantine: this whole block is the "ambiguous
-           cross-segment fallback" guess (see the quarantine block above
-           kFallbackIdentityMtx) -- gated as a unit. */
+        /* Quarantined ambiguous cross-segment fallback. When `raw`'s own top-byte segment is stale
+           or unregistered this frame, an unrelated segment can win purely by low32 coincidence, so
+           picking the numerically closest offset outright yields wrong-but-readable vertex/matrix
+           loads (a requiredBytes check only guards SHORT reads, not wrong-but-long-enough ones).
+           Gather every in-range segment, sort by offset ascending, and accept the first that
+           actually proves readable -- falling through instead of trusting the closest. */
         if (LegacyResolveEnabled()) {
             struct SegCandidate {
                 uint8_t segment;
@@ -4027,22 +4404,17 @@ class N64DisplayListAdapter {
             }
         }
 
-        // GDX_LEGACY_RESOLVE quarantine: mModuleBegin high-32 reconstruction guess.
+        // Quarantined mModuleBegin high-32 reconstruction guess.
         if (LegacyResolveEnabled() && (mModuleBegin != 0)) {
             uintptr_t full = (mModuleBegin & 0xFFFFFFFF00000000ULL) | static_cast<uintptr_t>(raw);
             if (full < mModuleBegin) {
                 full += 0x100000000ULL;
             }
 
-            /* Vertex-spike root cause (#3), confirmed by [vtx-spike] runtime evidence:
-               this reconstruction only checked that `full` falls inside the overall
-               module's mapped address RANGE, never that `requiredBytes` are actually
-               readable from it. A candidate landing 5 bytes from the end of a mapped
-               region (e.g. right before an unmapped/guard page) would "succeed" here
-               and then a 58-vertex (928-byte) MakePersistentVtxCopy walked hundreds of
-               bytes into unrelated/unmapped memory -- one or more garbage vertices,
-               the visible stretched-polygon "spike". Require the full payload to be
-               readable, matching the other candidate paths in this function. */
+            /* Requiring the full payload readable, not just `full` inside the module range: a
+               candidate landing a few bytes before an unmapped page otherwise "succeeds" and a
+               58-vertex (928-byte) MakePersistentVtxCopy walks into unrelated memory -- the
+               stretched-polygon vertex spike. */
             if ((full >= mModuleBegin) && (full < mModuleEnd) &&
                 (ReadableByteLimit(full) >= requiredBytes)) {
                 out.full = full;
@@ -4052,7 +4424,7 @@ class N64DisplayListAdapter {
             }
         }
 
-        // GDX_LEGACY_RESOLVE quarantine: raw>=0x10000000 highCandidates guess scan.
+        // Quarantined raw>=0x10000000 high-32 candidate scan.
         if (LegacyResolveEnabled() && (raw >= 0x10000000)) {
             const uintptr_t highCandidates[] = {
                 reinterpret_cast<uintptr_t>(mRootBegin) & 0xFFFFFFFF00000000ULL,
@@ -4080,9 +4452,8 @@ class N64DisplayListAdapter {
                     continue;
                 }
 
-                // Same vertex-spike fix as the mModuleBegin block above: a 1-byte
-                // IsReadableAddress() check let a candidate a few bytes from the end
-                // of its region "succeed" for a much larger vertex/matrix payload.
+                // Full-payload readability, same reason as the mModuleBegin block above: a 1-byte
+                // check passes a candidate sitting just before the end of its region.
                 const uintptr_t full = high | static_cast<uintptr_t>(raw);
                 if (ReadableByteLimit(full) >= requiredBytes) {
                     out.full = full;
@@ -4151,10 +4522,8 @@ class N64DisplayListAdapter {
             return IsReadableAddress(resolved.full) ? resolved.full : 0;
         }
 
-        // GDX_LEGACY_RESOLVE quarantine: treats the bare low32 as a literal host
-        // pointer -- only "works" if the host allocation happens to sit under
-        // 4 GB, which is not guaranteed on any 64-bit target. A guess like the
-        // others above (see the quarantine block above kFallbackIdentityMtx).
+        // Quarantined: treats the bare low32 as a literal host pointer, which only works if the
+        // allocation happens to sit under 4 GB -- not guaranteed on any 64-bit target.
         if (!LegacyResolveEnabled()) {
             return 0;
         }
@@ -4218,15 +4587,11 @@ class N64DisplayListAdapter {
     }
 
     size_t EstimateRawTextureCopyBytes(const N64Gfx* source, size_t index, size_t limit, size_t stride, bool isBig) const {
-        /* Wide-layout w1 fix (rank-gadget confetti root cause):
-           ReadCommand is an 8-byte reader (w1 at offset +4). A wide 16-byte
-           packet stores w1 at offset +8; offset +4 is zero padding. The main
-           ProcessList loop compensates (memcpy from +8) but this scan never
-           did, so every w1-derived load extent (LOADBLOCK lrs, LOADTILE
-           lrt/lrs, TLUT count) read as 0 on wide lists -- the estimate
-           collapsed to kMinRawTextureCopyBytes (8) and LUS decoded a full
-           tile out of an 8-byte copy (the HUD rank digits' confetti). w0 is
-           at offset 0 in both layouts and needs no correction. */
+        /* ReadCommand is an 8-byte reader (w1 at +4), but a wide 16-byte packet stores w1 at +8
+           with zero padding at +4. Without this compensation every w1-derived load extent
+           (LOADBLOCK lrs, LOADTILE lrt/lrs, TLUT count) reads as 0 on wide lists, the estimate
+           collapses to kMinRawTextureCopyBytes, and LUS decodes a full tile out of an 8-byte copy.
+           w0 sits at offset 0 in both layouts and needs no correction. */
         const bool sourceIsWide = (stride == kHostBuiltGfxStride);
         const auto readScanCommand = [&](size_t i) {
             N64Gfx command = ReadCommand(source, i, stride, isBig);
@@ -4273,10 +4638,9 @@ class N64DisplayListAdapter {
 
     uintptr_t TranslateTexturePointer(uint32_t raw, const N64Gfx* source, size_t index, size_t limit, bool isBig,
                                       size_t stride) {
-        /* Resolve with the actual upcoming load size so the readability gates in
-           TryResolveAddress can reject short false matches (e.g. a segment base
-           plus a truncated-module-pointer offset that is only readable for a few
-           bytes) instead of feeding a partial buffer to the texture copy. */
+        /* Resolve with the actual upcoming load size so TryResolveAddress's readability gates can
+           reject short false matches -- e.g. a segment base plus a truncated-module-pointer offset
+           readable for only a few bytes -- instead of feeding a partial buffer to the copy. */
         const size_t estimatedBytes = EstimateRawTextureCopyBytes(source, index, limit, stride, isBig);
         const uintptr_t translated = TranslateDataPointer(raw, std::max<size_t>(estimatedBytes, 1));
         if (translated == 0) {
@@ -4288,15 +4652,11 @@ class N64DisplayListAdapter {
             return 0;
         }
 
-        /* [digit-carve] one-shot: the rank digits
-           (aPositionDigitTexs, seg4+0x13DE0) are ZERO-FILLED in ROM -- the
-           console composes/loads them at runtime. This dump decides whether
-           the port's carve receives that runtime content (nonzero => the
-           live-carve resolver fix alone renders the gadget) or stays zero
-           (=> an EK/asset fill gap remains and the digits will be invisible
-           until that loader is found). */
-        /* Mode-gated, not gGdxRaceActive-gated: Course Edit sets that latch too, and it spent the
-           one-shot there in one session. 0x01 is GAMEMODE_GP_RACE (GET_MODE == gGameMode & 0x1F). */
+        /* [digit-carve] one-shot diagnostic, strip later: the rank digits (aPositionDigitTexs,
+           seg4+0x13DE0) are zero-filled in ROM and composed at runtime on console, so this dump
+           says whether the port's carve ever receives that content. Mode-gated rather than
+           gGdxRaceActive-gated because Course Edit sets that latch too and spends the one-shot.
+           0x01 is GAMEMODE_GP_RACE. */
         if ((gGameMode & 0x1F) == 0x01 && gSegments[4] != 0) {
             static bool sDigitCarveLogged = false;
             if (!sDigitCarveLogged) {
@@ -4308,12 +4668,9 @@ class N64DisplayListAdapter {
                               d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
             }
         }
-        // How much data can we safely read from `translated`?
-        // VirtualQuery (ReadableByteLimit) is ground truth for Windows page regions.
-        // For the 8MB RDRAM calloc the entire region is one VirtualAlloc block, so
-        // this gives us 7+ MB remaining — enough to cap cleanly at kMaxRawTextureCopyBytes.
-        // For non-RDRAM host ranges gHostRanges is the fallback.
-        // If neither gives us anything, fall back to scanning the local display list.
+        // Readable extent at `translated`. gHostRanges is consulted first because the page-level
+        // limit is coarse: the 8 MB RDRAM calloc is one VirtualAlloc block, so ReadableByteLimit
+        // would report 7+ MB remaining for a pointer anywhere inside it.
         const size_t registeredRemaining = RegisteredHostRemaining(translated);
         size_t readable = registeredRemaining;
         if (readable == 0) readable = ReadableByteLimit(translated);
@@ -4326,7 +4683,6 @@ class N64DisplayListAdapter {
                               raw, reinterpret_cast<const void*>(translated));
                 sBadTextureEstimatePrints++;
             }
-            // Fallback to min of readable or kMaxRawTextureCopyBytes
             required = std::min(readable, kMaxRawTextureCopyBytes);
         }
         
@@ -4381,20 +4737,14 @@ class N64DisplayListAdapter {
 
     uintptr_t TranslateDisplayListPointer(uint32_t raw, const N64Gfx* parentSource = nullptr, size_t parentIndex = 0,
                                           const N64Gfx* directTarget = nullptr) {
-        /*
-         * Resolve the exact token first. Generated asset symbols are one-byte
-         * host stubs and are not necessarily 8-byte aligned; masking them first
-         * can collapse several distinct symbols into an unrelated texture.
+        /* Resolve the EXACT token first: generated asset symbols are one-byte host stubs and are
+         * not necessarily 8-byte aligned, so masking first collapses distinct symbols into an
+         * unrelated texture. Genuine N64 DL addresses still get the hardware-compatible alignment
+         * fallback, but only after the exact candidate proves absent or invalid.
          *
-         * Genuine N64 DL addresses still get the hardware-compatible alignment
-         * fallback, but only when the exact candidate is absent or invalid.
-         *
-         * A wide (host-built) parent already carries the real host
-         * pointer to the sub-DL in directTarget. Use it verbatim — no low32
-         * reconstruction, no alignment guessing — but still validate it and run
-         * it through EnqueueList so the sub-list gets converted to F3DGfx (the
-         * interpreter cannot consume a raw wide-decomp Gfx list directly).
-         */
+         * A wide (host-built) parent already carries the real host pointer in directTarget; use it
+         * verbatim, but still validate it and route it through EnqueueList, since the interpreter
+         * cannot consume a raw wide-decomp Gfx list directly. */
         const N64Gfx* target = (directTarget != nullptr) ? directTarget : ResolveDisplayListSource(raw);
         const auto isValidTarget = [this](const N64Gfx* candidate) {
             if (candidate == nullptr) {
@@ -4416,15 +4766,12 @@ class N64DisplayListAdapter {
         }
 
         if (target == nullptr) {
-            /* Split the print budget by race phase: a single global budget is
-               exhausted by menu/transition frames long before a race starts, so
-               a missing race-time DL (e.g. the finish-line start arc) was never
-               logged. Same anti-pattern fixed for [bigtri]; mirror it here. */
+            /* Budget split by race phase: one global budget is exhausted by menu/transition frames
+               long before a race starts, so a missing race-time DL never gets logged. Always-on
+               error family, but bounded in both phases so it cannot flood boot menus. */
             static int sMissingDlPrintsMenu = 0;
             static int sMissingDlPrintsRace = 0;
             int& missingBudget = (gGdxRaceActive != 0) ? sMissingDlPrintsRace : sMissingDlPrintsMenu;
-            // Always-on error family, but bounded in every phase so it cannot flood boot
-            // menus: race keeps the large evidence budget, non-race is capped small (40).
             const int missingCap = (gGdxRaceActive != 0) ? 400 : 40;
             if (missingBudget < missingCap) {
                 ++missingBudget;
@@ -4473,13 +4820,10 @@ class N64DisplayListAdapter {
 
         const size_t limit = KnownCommandLimit(target);
         if ((limit == 0) || !LooksLikeDisplayList(target, limit)) {
-            /* Race-phase-split budget (see [gdl-miss] above): keep race-time bad
-               DLs visible instead of being drowned by menu frames. */
+            /* Race-phase-split budget, same reasoning as [gdl-miss] above. */
             static int sBadDlPrintsMenu = 0;
             static int sBadDlPrintsRace = 0;
             int& badBudget = (gGdxRaceActive != 0) ? sBadDlPrintsRace : sBadDlPrintsMenu;
-            // Always-on error family, bounded in every phase (see [gdl-miss] above):
-            // race keeps the large evidence budget, non-race is capped small (40).
             const int badCap = (gGdxRaceActive != 0) ? 400 : 40;
             if (badBudget < badCap) {
                 ++badBudget;
@@ -4569,16 +4913,11 @@ class N64DisplayListAdapter {
     }
 
     // --- Segment-reload seqlock guards -------------------------------------
-    // A mode transition reloads asset segments 4/7/9 on the GAME thread
-    // (decomp_port.c gdx_load_mode_segments) -- rewriting the carve bytes AND
-    // swapping the gSegments[] bases -- while this GRAPHICS thread resolves
-    // segment-backed pointers here unsynchronized. Each guard snapshots the
-    // epoch before a resolution and re-checks it after: a resolution that raced
-    // a reload (torn base or torn bytes) is reported unstable and the caller
-    // substitutes an opcode-specific fallback instead of trusting it. Wide
-    // packets carrying a real host pointer never read gSegments[], so they
-    // bypass the guard. Wait-free: exactly two acquire atomic loads per guarded
-    // command, no locks, no allocation.
+    // Each guard snapshots the epoch before a resolution and re-checks it after; a resolution that
+    // raced a mode-transition reload (torn base or torn bytes) is reported unstable and the caller
+    // substitutes an opcode-specific fallback. Wide packets carrying a real host pointer never read
+    // gSegments[], so they bypass the guard. Wait-free: two acquire loads per guarded command, no
+    // locks, no allocation.
 
     // Rate-limited skip notice shared by every guarded site.
     void NoteEpochSkip() {
@@ -4621,19 +4960,16 @@ class N64DisplayListAdapter {
                                                 reinterpret_cast<const N64Gfx*>(hostFull));
         }
         const uint32_t epoch = GdxSegmentEpochSnapshot();
-        // Pre-check: TranslateDisplayListPointer unconditionally bumps
-        // mStats->missingDisplayLists/noopDisplayLists/badDisplayLists and emits
-        // [gdl-miss]/[gdl-bad] log lines. If the snapshot is already unstable,
-        // skip the call entirely so a raced mode-transition frame doesn't pollute
-        // those counters/log budgets with a result that would be discarded anyway.
+        // Pre-check because TranslateDisplayListPointer unconditionally bumps the miss/bad counters
+        // and spends [gdl-miss]/[gdl-bad] log budget; an already-unstable snapshot would pollute
+        // both with a result that gets discarded anyway.
         if (!GdxSegmentEpochStable(epoch)) {
             NoteEpochSkip();
             return reinterpret_cast<uintptr_t>(mNoopList.data());
         }
         const uintptr_t resolved = TranslateDisplayListPointer(raw, parentSource, parentIndex, nullptr);
-        // The race can also begin during the call itself; that residual sliver
-        // still pollutes at most one call's counters -- acceptable, unlike the
-        // always-hit case the pre-check above eliminates.
+        // A race beginning during the call still pollutes at most one call's counters, unlike the
+        // always-hit case the pre-check eliminates.
         if (GdxSegmentEpochStable(epoch)) return resolved;
         NoteEpochSkip();
         return reinterpret_cast<uintptr_t>(mNoopList.data());
@@ -4643,16 +4979,12 @@ class N64DisplayListAdapter {
     Fast::F3DGfx* ConvertRoot() {
         if (mRootBegin == nullptr) return nullptr;
         const size_t rootLimit = RootCommandLimit(mRootBegin);
-        /* CRASH FAILSAFE: a ROOT display list
-           that does not validate must render NOTHING -- it must never be fed
-           to the interpreter, which would execute arbitrary host memory as GBI
-           commands (the first-frame [gfxfail] bad=1 crash). Sub-DLs are already
-           routed to mNoopList when they fail LooksLikeDisplayList (see
-           TranslateDisplayListPointer), but the ROOT is enqueued directly and
-           bypassed that guard. The N64 task DL is always terminated by
-           gSPEndDisplayList (Gfx_FullSync), so a well-formed root always
-           satisfies LooksLikeDisplayList well within the scan limit; a
-           truncated/garbage/zeroed root does not -> skip the whole frame. */
+        /* CRASH FAILSAFE: a ROOT display list that does not validate must render NOTHING. Feeding
+           it to the interpreter executes arbitrary host memory as GBI commands. Sub-DLs already
+           route to mNoopList on a LooksLikeDisplayList failure, but the ROOT is enqueued directly
+           and bypasses that guard. The N64 task DL is always terminated by gSPEndDisplayList
+           (Gfx_FullSync), so a well-formed root validates well within the scan limit; a
+           truncated/garbage/zeroed one does not, and the whole frame is skipped. */
         if (rootLimit == 0 ||
             ReadableByteLimit(reinterpret_cast<uintptr_t>(mRootBegin)) <
                 CommandStrideForSource(mRootBegin) ||
@@ -4680,11 +5012,8 @@ class N64DisplayListAdapter {
         if (mStats != nullptr) mStats->convertedLists++;
         item.listPtr->commands.reserve(item.limit);
 
-        /* Segment-4 probe: hud_gfx (countdown faces, start arc) now has real
-           backing, yet those elements still don't draw. Log every DL translated
-           from inside the segment-4 window so the next run proves whether the
-           countdown display lists are reached at all (vs. resolving elsewhere
-           or never being emitted). */
+        /* [seg4] probe, strip later: hud_gfx (countdown faces, start arc) has real backing yet
+           does not draw. Logs whether those display lists reach the bridge at all. */
         {
             static int sSeg4Probes = 0;
             const uintptr_t seg4Base = gSegments[4];
@@ -4703,12 +5032,10 @@ class N64DisplayListAdapter {
          * Use the physical location rather than a heuristic to avoid false positives. */
         const size_t stride = CommandStrideForSource(item.source);
         const bool isBig = CommandSourceIsBigEndian(item.source, stride);
-        // Prefer the segment-tag table: DLs inside a tagged asset segment have a
-        // known dialect and must never fall back to the opcode-scan heuristics.
-        // For a converted wide buffer the source segment's dialect tag
-        // is gone, so consult the dialect the converter recorded for it FIRST --
-        // re-deriving it from the wide stream would risk the exact F3DEX2/F3D
-        // misclassification the tag table exists to prevent.
+        // DLs inside a tagged asset segment have a known dialect and must never fall back to the
+        // opcode scan. A converted wide buffer has lost its source segment's tag, so the dialect
+        // the converter recorded is consulted FIRST -- re-deriving it from the wide stream risks
+        // the exact F3DEX2/F3D misclassification the tag table exists to prevent.
         const GdxSegmentUcode sourceDialect =
             GdxAssetPointerDialect(reinterpret_cast<uintptr_t>(item.source));
         const auto convertedDialect = gConvertedWideIsF3d.find(item.source);
@@ -4722,15 +5049,14 @@ class N64DisplayListAdapter {
             mStats->f3dLists++;
         }
 
-        // Diagnostic: dump how the course material setup DLs (segment 8 +0x14040 /
-        // +0x14078) are classified and converted; their SETTILEs program tiles 1-7
-        // for every track draw, so a misconversion here breaks all course tiling.
+        // [setupdl] diagnostic, strip later: how the course material setup DLs (segment 8 +0x14040
+        // / +0x14078) classify and convert. Their SETTILEs program tiles 1-7 for every track draw,
+        // so a misconversion here breaks all course tiling.
         bool diagThisList = false;
         if (gdx_dev_gate(GDX_GATE_DIAG_SETUPDL)) {
-            /* Both DLs are BSS placeholders that ResolveGeneratedAssetStub redirects into the
-               bridge's own segment-8 image, so item.source is never gSegments[8] + offset --
-               anchor on the generated asset rows instead. The image bytes outlive the vector that
-               owns them (only ever appended to), so the resolved addresses are cacheable. */
+            /* Both DLs are BSS placeholders redirected into the bridge's own segment-8 image, so
+               item.source is never gSegments[8] + offset; anchor on the generated asset rows.
+               gLoadedAssetSegments is only ever appended to, so resolved addresses are cacheable. */
             static uintptr_t sSetupDlA = 0;
             static uintptr_t sSetupDlB = 0;
             if (sSetupDlA == 0 || sSetupDlB == 0) {
@@ -4756,12 +5082,9 @@ class N64DisplayListAdapter {
             }
         }
 
-        /* Set while an unsupported microcode (e.g. L3DEX2, the line ucode Course
-           Edit loads for its track lines) is active: its SP-side commands (vertex
-           loads, G_LINE3D, matrix/DL/segment ops at op < 0xE0) have semantics the
-           F3DEX2 interpreter doesn't implement, so running them through it
-           produces garbage frames. Drop those until the display list loads a
-           supported microcode again. */
+        /* Set while an unsupported microcode is active: its SP-side commands (op < 0xE0) have
+           semantics the F3DEX2 interpreter does not implement, so running them produces garbage.
+           Drop them until the list loads a supported microcode again. */
         bool skipUnsupportedUcode = false;
         /* True while an L3DEX2 (line microcode) section is being converted: its non-line
            commands are F3DEX2-compatible and run as Standard, and each G_LINE3D (0x08) is
@@ -4769,13 +5092,11 @@ class N64DisplayListAdapter {
            Cleared by the next recognized microcode load. */
         bool l3dexLineSection = false;
 
-        // Host-built display lists carry a FULL pointer-width w1.
-        // The decomp Gfx type under PORT is { u32 w0; <pad>; uintptr_t w1; } = 16
-        // bytes, so the pointer-carrying word lives at byte offset 8, not 4.
-        // ReadCommand() only recovers 8 bytes (w0 @0, a 32-bit w1 @4 == padding
-        // on wide packets), so for wide sources we pull the real 64-bit word here
-        // and fix in.w1 to its low 32 bits (all the operand parsing below still
-        // expects the 32-bit token). Narrow N64/ROM/RDRAM lists are unchanged.
+        // Host-built lists carry a FULL pointer-width w1: the decomp Gfx type under PORT is
+        // { u32 w0; <pad>; uintptr_t w1; } = 16 bytes, so the pointer word is at offset 8, not 4.
+        // ReadCommand only recovers 8 bytes (w0 @0, padding @4 on wide packets), so wide sources
+        // pull the real 64-bit word here and set in.w1 to its low 32 bits -- the operand parsing
+        // below still expects a 32-bit token. Narrow N64/ROM/RDRAM lists are unaffected.
         const bool sourceIsWide =
             (stride == kHostBuiltGfxStride) && (kHostBuiltGfxStride > kN64GfxStride);
 
@@ -4790,45 +5111,30 @@ class N64DisplayListAdapter {
             } else {
                 w1full = in.w1;
             }
-            /* A wide packet whose pointer word has any high bits set is a REAL
-             * host pointer the game already resolved — use it verbatim and skip the
-             * low32-reconstruction guesswork. A wide packet with high bits zero holds a 32-bit VALUE or
-             * a segmented address, which still flows through the segment table /
-             * value path below exactly as before. Narrow sources never set high
-             * bits, so this is always false for them. */
+            /* A wide packet whose pointer word has any high bits set is a REAL host pointer the
+             * game already resolved: use it verbatim, no low32 reconstruction. High bits zero
+             * means a 32-bit VALUE or a segmented address, which still flows through the segment
+             * table / value path. Narrow sources never set high bits. */
             bool w1IsHostPointer =
                 sourceIsWide && ((static_cast<uint64_t>(w1full) >> 32) != 0);
-            /* EXCEPTION to the "high bits set => real host pointer" rule: the
-             * game references runtime-loaded segmented assets (setup_gfx render-
-             * mode DLs via gSPDisplayList(&D_3000050), vertex data via
-             * gSPVertex(&D_3000xxx)) through 1-byte BSS PLACEHOLDER symbols. The
-             * wide gSPDisplayList/gSPVertex pack the full host address of that
-             * placeholder, so high32 is set and it LOOKS like a real host
-             * pointer -- but the placeholder is a 1-byte object; the real DL/
-             * vertex bytes live in the loaded segment image. Taking it verbatim
-             * branches the interpreter into the 1-byte stub and reads adjacent
-             * BSS as commands: odd branch targets, a G_GEOMETRYMODE word
-             * (0xD9680800) misread as a vertex pointer, and a count=0xF0 garbage
-             * G_VTX -- the boot/title-phase crash. Route
-             * these back through the low32 resolver, which maps the placeholder
-             * to the loaded segment via ResolveGeneratedAssetStub exactly as the
-             * pre-wide build did. Only the placeholder's own low32 is affected;
-             * genuine runtime host pointers (GfxPool sub-DLs, persistent vertex
-             * copies) are never registered in the asset map and are unchanged. */
+            /* EXCEPTION to that rule: the game references runtime-loaded segmented assets
+             * (setup_gfx render-mode DLs via gSPDisplayList(&D_3000050), vertex data via
+             * gSPVertex(&D_3000xxx)) through 1-byte BSS PLACEHOLDER symbols. The wide packet
+             * carries the full host address of the placeholder, so high32 is set and it looks like
+             * a real pointer -- but the object is 1 byte and the real bytes live in the loaded
+             * segment image. Taken verbatim, the interpreter branches into the stub and reads
+             * adjacent BSS as commands (odd branch targets, a G_GEOMETRYMODE word misread as a
+             * vertex pointer, a count=0xF0 G_VTX). Route these back through the low32 resolver.
+             * Genuine runtime host pointers are never in the asset map and are unaffected. */
             if (w1IsHostPointer &&
                 (IsAssetPlaceholderPointer(in.w1) || IsPortBssAliasPointer(in.w1))) {
                 w1IsHostPointer = false;
             }
-            /* Second EXCEPTION: high32 == 0xFFFFFFFF is a SIGN-EXTENDED 32-bit value,
-             * not a host pointer -- Windows user space never has an all-ones top half
-             * (that's kernel range). Course-edit entry crash (symbolized:
-             * GfxDpLoadBlock memcpy from 0xFFFFFFFFF8694130): decomp code widened a
-             * bit31-set token through a signed cast into the wide list, the verbatim
-             * rule accepted it, and LUS copied from kernel space -- the 80%-of-entries
-             * AV. Strip to the low32 and route through the segment/low32 resolver
-             * exactly like a narrow-source command: if the token's owning range is
-             * registered the texture resolves correctly (pre-wide behavior); if not,
-             * the existing unresolved fallbacks draw nothing instead of crashing. */
+            /* Second EXCEPTION: high32 == 0xFFFFFFFF is a SIGN-EXTENDED 32-bit value, not a host
+             * pointer -- user space never has an all-ones top half. Decomp code widens a
+             * bit31-set token through a signed cast into the wide list, and taking it verbatim had
+             * LUS memcpy from kernel space (GfxDpLoadBlock from 0xFFFFFFFFF8694130 on Course Edit
+             * entry). Strip to low32 and route through the resolver like a narrow command. */
             if (w1IsHostPointer && (static_cast<uint64_t>(w1full) >> 32) == 0xFFFFFFFFull) {
                 static int sSignExtLogs = 0;
                 if (sSignExtLogs < 8) {
@@ -4840,55 +5146,30 @@ class N64DisplayListAdapter {
                 w1IsHostPointer = false;
             }
             const uint8_t op = Opcode(in.w0);
-            // GDX_LEGACY_RESOLVE instrumentation: tag any guessing branch that
-            // fires while resolving this command's pointer(s) with the opcode
-            // that triggered it (see the quarantine block above
-            // kFallbackIdentityMtx). Free functions (ResolveRegisteredHostPointer,
-            // FallbackDataPointer) read this global instead of a threaded param.
+            // Tags any guessing branch that fires while resolving this command with the opcode
+            // that triggered it; free functions read this global instead of a threaded param.
             gLegacyResolveCurrentOp = op;
-            /* Keep 0xDD (a ucode reload ends the skip), ENDDL (0xDF EX2 / 0xB8
-               F3D — dropping the terminator would leave the translated list
-               unterminated and the interpreter would run off its end), AND any
-               RDP command (op >= 0xE0: SETCIMG/SETZIMG/SETSCISSOR/SETPRIMCOLOR/
-               SETCOMBINE/FILLRECT/tile loads/...). RDP commands are executed by
-               the RDP hardware, not the active RSP microcode, so on real N64
-               hardware they run identically whether F3DEX2 or L3DEX2 is loaded;
-               dropping them left the color image / scissor / prim color / combine
-               state stale for whatever the game draws right after the L3DEX2
-               section (course_edit/191080.c reloads F3DEX2 and keeps drawing
-               HUD/gadget content into the same viewport), which is a second,
-               independent source of the reported Course Edit flicker beyond the
-               missing line geometry itself.
-               Deliberately NOT counted in skippedDataCommands: that counter
-               drives the per-frame [datafail] log line, and an intentional
-               line-ucode skip would spam it every Course Edit frame. */
+            /* Three things survive the skip. 0xDD, because a ucode reload ends it. ENDDL
+               (0xDF EX2 / 0xB8 F3D), because dropping the terminator leaves the translated list
+               unterminated and the interpreter runs off its end. And every RDP command (op >=
+               0xE0), because the RDP executes those, not the RSP microcode -- on hardware they
+               behave identically whichever ucode is loaded, so dropping them leaves color
+               image / scissor / prim color / combine stale for whatever draws right after the
+               section (course_edit/191080.c reloads F3DEX2 and keeps drawing into the same
+               viewport). Deliberately NOT counted in skippedDataCommands: that counter drives the
+               [datafail] line and an intentional skip would spam it every Course Edit frame. */
             if (skipUnsupportedUcode && op != 0xDD && op != 0xDF && op != 0xB8 && op < 0xE0) {
                 continue;
             }
             if (diagThisList && i < 24) {
                 gdx_port_logf("[setupdl]   #%02zu %08X %08X op=%02X\n", i, in.w0, in.w1, op);
             }
-            /* TEXRECT coord probe (fade dash-band investigation).
-             *
-             * Env-gated on GDX_DIAG_TRECT=1 (zero cost otherwise -- was previously
-             * unconditional). The old version used a process-lifetime `static int`
-             * capped at 8, so "only 8 strips reach the bridge" was an artifact of the
-             * cap outliving every transition instance, not evidence about actual
-             * TEXRECT delivery -- a fade emits ~74 strip texrects across its whole
-             * run, and the cap silenced all but the first 8 ever seen in the process.
-             *
-             * Fix: reset the counter whenever a NEW transition instance starts,
-             * detected the same way transition.c's sGdxDbgSig probe does --
-             * activeTransitionType changing -- but read straight from the decomp
-             * `sTransition` struct via the extern already used by
-             * GdxTransitionCapturePendingThisTick above (activeTransitionType is the
-             * struct's first s32, offset 0x0; see the offset note there). Logging is
-             * then capped PER TRANSITION instead of for the process: the first 16
-             * ops print individually, every 16th after that prints a running count,
-             * and a summary line (with the last op's coords) fires the moment the
-             * NEXT transition instance begins, giving a definitive total for the
-             * instance that just ended -- e.g. "74/74 reached the bridge" vs a
-             * lower count if commands are being dropped upstream. */
+            /* [trect] probe, strip later. GDX_DIAG_TRECT=1, zero cost otherwise. The budget resets
+             * per TRANSITION INSTANCE (activeTransitionType is sTransition's first s32) rather
+             * than per process: a fade emits ~74 strip texrects, so a process-lifetime cap
+             * silences everything after the first instance and makes "only N reach the bridge"
+             * an artifact of the cap. A summary line fires when the next instance begins, giving a
+             * definitive total for the one that just ended. */
             if (op == 0xE4 || op == 0xE5) {
                 if (gdx_dev_gate(GDX_GATE_DIAG_TRECT)) {
                     static int32_t sTRectLastType = 0; // TRANSITION_TYPE_NONE
@@ -4932,21 +5213,13 @@ class N64DisplayListAdapter {
             uintptr_t outW1 = static_cast<uintptr_t>(in.w1);
             if (mStats != nullptr) mStats->opCounts[op]++;
 
-            /* #16 unconditional raw-value trace: the count==4-gated [rect] probe
-               never matched the countdown draw's known raw pointers (captured
-               decomp-side), even though gfxdiag shows this list's vtx/mtx commands
-               being processed with no miss/bad/skip counts. Dump EVERY vtx/mtx raw
-               w0/w1 seen during the race so the exact command stream can be
-               diffed against the decomp-side low32 values without a count filter
-               that could itself be hiding the match (e.g. wrong endianness making
-               the parsed count something other than 4). */
+            /* Countdown raw-value trace, strip later: dumps every vtx/mtx w0/w1 so the command
+               stream can be diffed against decomp-side low32 values with no count filter, which
+               could itself hide the match (e.g. wrong endianness changing the parsed count). */
             {
                 const bool sDiagCountdownRaw = gdx_dev_gate(GDX_GATE_DIAG_COUNTDOWN) != 0;
-                // Gate on the arm flag (set decomp-side the instant the countdown
-                // draw code runs) instead of gGdxRaceActive: that flag stays 1 for
-                // the whole race, so a fixed-size trace filled up long before the
-                // countdown ever appeared. Keep capturing a little after arming
-                // too (car doesn't stop generating HUD each frame).
+                // Gated on the arm flag, not gGdxRaceActive: that stays 1 for the whole race and
+                // the fixed-size trace fills long before the countdown appears.
                 if (sDiagCountdownRaw && gGdxCountdownProbeArm != 0 && (op == kOpVtx || op == kOpMtx)) {
                     static int sRawTraceCount = 0;
                     static FILE* sRawTraceFile = nullptr;
@@ -4981,45 +5254,31 @@ class N64DisplayListAdapter {
                                 static_cast<uintptr_t>(encoded);
                     }
                     {
-                        /* Vertex-spike root cause: TranslateDataPointer used to be
-                           called with its default requiredBytes=1, so the resolver only
-                           proved the FIRST byte of the vertex buffer readable while
-                           MakePersistentVtxCopy below unconditionally read numVtx*16
-                           bytes. An ambiguous/near-miss resolution (segment-offset
-                           guess, physical-window reconstruction) could pass that 1-byte
-                           gate yet be wrong or short past byte 0 -- one garbage vertex
-                           is a visible stretched-polygon "spike". Require the FULL
-                           vertex payload to be readable before accepting a candidate. */
+                        /* The resolver must prove the FULL vertex payload readable, not just the
+                           first byte: MakePersistentVtxCopy reads numVtx*16 unconditionally, and an
+                           ambiguous resolution (segment-offset guess, physical-window
+                           reconstruction) can pass a 1-byte gate yet be wrong past byte 0 -- one
+                           garbage vertex is a visible stretched-polygon spike. */
                         const uint32_t vtxCount = (!isF3DSource) ? ((in.w0 >> 12) & 0xFFu) : 0u;
                         const size_t vtxRequiredBytes =
                             (vtxCount != 0) ? (static_cast<size_t>(vtxCount) * 16u) : 1u;
-                        /* Bridge asymmetry fix: the G_MTX case below passes
-                           preferPhysical=!isF3DSource and sourceHint=item.source, but this
-                           G_VTX case never did, so trySourceWindow() -- explicitly written
-                           to reconstruct "a host-built display list and the
-                           matrices/vertices it references [that] are almost always
-                           allocated together in the same 4GB low32 window" -- was never
-                           even attempted for vertex loads. Mirror the matrix call so
-                           vertex buffers get the same last-resort reconstruction. */
+                        /* Mirrors the G_MTX case's preferPhysical/sourceHint arguments so vertex
+                           buffers get trySourceWindow's last-resort reconstruction too -- it was
+                           written for exactly this case, a host-built list and the vertices it
+                           references sharing one 4 GB low32 window. */
                         if (!ResolveGuarded(in.w1, w1IsHostPointer, w1full, outW1, vtxRequiredBytes,
                                             /*preferPhysical=*/!isF3DSource,
                                             reinterpret_cast<uintptr_t>(item.source))) {
-                            /* Segment reload raced this vertex resolution: NEVER skip a
-                               vertex load silently -- later triangles index the vertex
-                               buffer and would render garbage. Substitute the same
-                               fallback the readability failsafe below uses (kFallbackVertices,
-                               or 0 for an F3D command remapped to G_MTX). This also
-                               neutralizes the possibly-torn resolved pointer before any
-                               downstream deref (census / MakePersistentVtxCopy). */
+                            /* A raced vertex resolution must NEVER be skipped silently: later
+                               triangles index the vertex buffer and would render garbage.
+                               Substitute the readability failsafe's fallback, which also
+                               neutralizes the possibly-torn pointer before any downstream deref. */
                             outW1 = isF3DSource ? 0u
                                                 : reinterpret_cast<uintptr_t>(kFallbackVertices);
                         }
-                        /* [vtx-census]: one line per UNIQUE vertex source, NOT
-                           race-gated (machine select is a primary target).
-                           Logs the resolution class and CONTENT fingerprint at
-                           +0x10 -- the failure family this verifies is
-                           readable-but-zero/aliased data, which the failsafe
-                           probes below can never see. */
+                        /* [vtx-census] diagnostic, strip later: one line per unique vertex source,
+                           with a CONTENT fingerprint at +0x10 -- the failure family it targets is
+                           readable-but-zero/aliased data, invisible to the failsafe probes below. */
                         {
                             static uint32_t sVtxCensusSeen[48] = {};
                             static int sVtxCensusCount = 0;
@@ -5030,10 +5289,8 @@ class N64DisplayListAdapter {
                                     break;
                                 }
                             }
-                            /* Retargeted: general sources burned the
-                               budget before race time twice. Segment-8 raws
-                               (the decoration family, e.g. 0x08017388) are the
-                               open investigation — census those exclusively. */
+                            /* Segment-8 raws only: general sources burn the budget before race
+                               time, and the decoration family is the open investigation. */
                             if (!vcDup && sVtxCensusCount < 48 && outW1 != 0 &&
                                 ((in.w1 >> 24) & 0xFFu) == 0x08u) {
                                 sVtxCensusSeen[sVtxCensusCount++] = in.w1;
@@ -5052,12 +5309,9 @@ class N64DisplayListAdapter {
                                               vfp[0], vfp[1], vfp[2], vfp[3], vfp[4], vfp[5], vfp[6], vfp[7]);
                             }
                         }
-                        // Always on: was gated behind GDX_DIAG_VTX, so a
-                        // user run without that env var set captured zero [vtx-spike]/
-                        // [vtx-dropped] evidence even while the visible spikes/mesh
-                        // explosions kept happening. The per-frame cost is one branch
-                        // plus (when a race is active) a capped set of log lines, so
-                        // there is no reason to require manual opt-in for this.
+                        // Deliberately always on, not env-gated: a run without the opt-in captured
+                        // zero [vtx-spike]/[vtx-dropped] evidence while the spikes kept happening.
+                        // Costs one branch plus a capped set of race-time log lines.
                         if (gGdxRaceActive != 0 && vtxCount != 0) {
                             if (outW1 != 0) {
                                 const size_t readable = ReadableByteLimit(outW1);
@@ -5069,11 +5323,9 @@ class N64DisplayListAdapter {
                                                   vtxCount, item.source);
                                 }
                             } else {
-                                /* The strict requiredBytes gate rejected every candidate.
-                                   Log what the OLD requiredBytes=1 rule would have
-                                   accepted, to show whether this DL is the source of a
-                                   spike that has now been turned into a dropped-vertex
-                                   pop instead (safer, but still worth knowing about). */
+                                /* The strict gate rejected every candidate. Log what a
+                                   requiredBytes=1 rule would have accepted, so a spike that this
+                                   turned into a dropped-vertex pop is still attributable. */
                                 const uintptr_t loose = TranslateDataPointer(in.w1, 1);
                                 static int sVtxDroppedLogs = 0;
                                 if (sVtxDroppedLogs < 40) {
@@ -5131,28 +5383,16 @@ class N64DisplayListAdapter {
                                         : reinterpret_cast<uintptr_t>(kFallbackVertices);
                         }
                     }
-                    // Tier 3: effects vertex lerp (booster flames / side-attack quads). Placed
-                    // AFTER the readability failsafe so a kFallbackVertices substitute is never
-                    // rerouted. The count cap at 20 matches racer.c's largest effect batch
-                    // (count*5); course track vertices can legally spill into the effects span in
-                    // the EK layout (course.c:4514's inexplicable bound), and their batches are the
-                    // ones this cap excludes rather than mispairing static geometry.
+                    // Effects vertex lerp (booster flames / side-attack quads). Must sit AFTER the
+                    // readability failsafe so a kFallbackVertices substitute is never rerouted. The
+                    // count cap of 20 matches racer.c's largest effect batch; course track vertices
+                    // can legally spill into the effects span in the EK layout (course.c:4514), and
+                    // the cap is what keeps their batches out rather than mispairing static geometry.
                     {
-                        // [vtx-interp] Wider census: the in-pool miss log above caught NOTHING in a
-                        // full race, which contradicts course geometry existing. Log the first few
-                        // vertex operands unconditionally to see what actually flows through here.
-                        // Gated on race-active: the first census burned all its shots on title-
-                        // screen asset geometry (heap-decoded course gfx) before a single racer
-                        // effect could draw.
-                        // Census, final form. Three earlier gatings established: the first 8 vertex
-                        // operands of a session are heap-decoded ASSET geometry (n=30 course
-                        // chunks), in-race operands are the same, and gGdxRaceActive never rises in
-                        // a scripted race. The scripted race also cannot draw the effects this tier
-                        // targets at all -- racer.c's flame block is gated on racer->unk_2B3 and
-                        // scaled by boostTimer, i.e. BOOST flames, and the script never boosts.
-                        // So: log the first few POOL-INTERIOR, effect-sized batches whenever they
-                        // finally occur (a human boosting / side-attacking), which is the activation
-                        // proof for this tier.
+                        // [vtx-interp] diagnostic, strip later: the first few pool-interior,
+                        // effect-sized batches, which is the activation proof for this tier. Not
+                        // race-gated -- a scripted race never boosts, so it cannot draw the effects
+                        // this targets at all.
                         static int sGdxVtxAnyLogs = 0;
                         const uint32_t gdxVtxSeenN = (in.w0 >> 12) & 0xFFu;
                         if (sGdxVtxAnyLogs < 8 && mInterpEnabled && gdxVtxSeenN != 0 &&
@@ -5172,11 +5412,9 @@ class N64DisplayListAdapter {
                             GdxEffectsVtxInSpan(outW1, static_cast<size_t>(gdxVtxN) * 16u)) {
                             outW1 = GdxVtxReroute(outW1, gdxVtxN);
                         } else if (GdxP0MtxInPoolSpan(outW1)) {
-                            // [vtx-interp] Attribution for a silent no-op: a full race measured ZERO
-                            // effects-vertex reroutes while engine flames were visibly drawing, so
-                            // either the operands are not where the span test looks or the count
-                            // gate excludes them. Log the first few POOL-INTERIOR vertex operands
-                            // that fail the effects test, with the numbers needed to say which.
+                            // [vtx-interp] diagnostic, strip later: pool-interior vertex operands
+                            // that fail the effects-span test, with the numbers needed to say
+                            // whether the span or the count gate is what excluded them.
                             static int sGdxVtxMissLogs = 0;
                             if (sGdxVtxMissLogs < 6) {
                                 ++sGdxVtxMissLogs;
@@ -5189,33 +5427,21 @@ class N64DisplayListAdapter {
                             }
                         }
                     }
-                    /* #16 phase 3: publish the resolved host pointer the instant this
-                       command's raw low32 matches the digit quad's tagged pointer
-                       (set decomp-side in racer.c right before gSPVertex(gfx++,
-                       D_400AA28, 4, 0)). interpreter.cpp's GfxSpVertex compares its
-                       own vertex pointer argument against this to know precisely
-                       when the digit quad itself loads, instead of the coarse
-                       arm flag matching whatever triangle happens to run first. */
+                    /* Diagnostic, strip later: publishes the resolved host pointer when this
+                       command's raw low32 matches the digit quad tagged in racer.c, so
+                       interpreter.cpp's GfxSpVertex can recognize that exact draw rather than
+                       whatever triangle the coarse arm flag catches first. */
                     if (gGdxCountdownProbeArm != 0 && gGdxCountdownProbeVtxLow32 != 0 &&
                         in.w1 == gGdxCountdownProbeVtxLow32 && outW1 != 0) {
                         gGdxCountdownProbeResolvedVtx = outW1;
                     }
-                    /* Countdown-quad probe (#16): the "3,2,1,GO" HUD quad is drawn as a
-                       4-vertex textured rect (gSPVertex(gfx++, D_400AA28, 4, 0)) built
-                       inside a 3D billboard positioned by a G_MTX load right before it.
-                       Dump ob/tc for every 4-vertex load seen while a race is active so
-                       the countdown draw's raw pointer (captured decomp-side via
-                       gdx_cki("[countdown] ...")) can be grepped out of this same log to
-                       see whether its object-space rect is sane (small ob magnitude,
-                       tc spanning the 32x32 texture) or garbage/degenerate (all-zero,
-                       NaN-adjacent, or wildly out of range). */
+                    /* [rect] probe, strip later: the "3,2,1,GO" HUD quad is a 4-vertex textured
+                       rect inside a 3D billboard. Dumps ob/tc for every 4-vertex load so the
+                       countdown's object-space rect can be checked for degeneracy. */
                     {
                         const bool sDiagCountdown = gdx_dev_gate(GDX_GATE_DIAG_COUNTDOWN) != 0;
-                        // Gated on the arm flag, not gGdxRaceActive: the blanket race
-                        // gate let ~60 unrelated 4-vertex HUD quads (portraits, other
-                        // sprites) exhaust the log cap minutes before the countdown
-                        // ever ran, so this probe never actually captured the quad it
-                        // was written for. Arming near the real event fixes that.
+                        // Gated on the arm flag, not gGdxRaceActive: a blanket race gate lets ~60
+                        // unrelated 4-vertex HUD quads exhaust the cap before the countdown runs.
                         if (sDiagCountdown && gGdxCountdownProbeArm != 0 && !isF3DSource &&
                             (((in.w0 >> 12) & 0xFFu) == 4u) && outW1 != 0) {
                             static int sRectLogs = 0;
@@ -5253,27 +5479,21 @@ class N64DisplayListAdapter {
                     if (!ResolveGuarded(in.w1, w1IsHostPointer, w1full, outW1, 64,
                                         /*preferPhysical=*/!isF3DSource,
                                         reinterpret_cast<uintptr_t>(item.source))) {
-                        /* Raced reload: drop to 0. This never reaches the interpreter as
-                           a null matrix pointer -- the shared post-switch check further
-                           down (outW1 == 0 for kOpVtx/kOpMtx/kOpMovemem/kOpSetTextureImage)
-                           always intercepts it first: under GDX_LEGACY_RESOLVE it
-                           substitutes FallbackDataPointer's result (kFallbackIdentityMtx),
-                           otherwise the whole command is dropped via `continue` before the
-                           interpreter ever sees it -- same as a genuine resolution failure. */
+                        /* Raced reload: 0 is the sentinel, never a null pointer reaching the
+                           interpreter -- the shared post-switch check further down always
+                           intercepts it, substituting FallbackDataPointer's result under
+                           GDX_LEGACY_RESOLVE or dropping the command entirely otherwise. */
                         outW1 = 0;
                     }
                     if ((outW1 & 7u) != 0) {
                         outW1 = 0;
                     }
                     {
-                        // Matrix resolution probe: unlike the vertex paths above,
-                        // this call already requires the full 64-byte Mtx to be
-                        // readable, so a dropped resolution here (rather than a
-                        // garbage read) is the expected failure mode. Log it so a
-                        // human tester can correlate dropped machine matrices with
-                        // observed z-fighting/punch-through during races.
-                        // Always on: see the [vtx-spike]/[vtx-dropped] note
-                        // above -- GDX_DIAG_VTX required manual setup the user never did.
+                        // Unlike the vertex paths, this call already requires the full 64-byte Mtx
+                        // readable, so a DROPPED resolution rather than a garbage read is the
+                        // expected failure mode -- logged so dropped machine matrices can be
+                        // correlated with observed z-fighting. Always on, same reasoning as
+                        // [vtx-spike] above.
                         if (gGdxRaceActive != 0 && outW1 == 0 && in.w1 != 0) {
                             static int sMtxDroppedLogs = 0;
                             if (sMtxDroppedLogs < 40) {
@@ -5283,22 +5503,15 @@ class N64DisplayListAdapter {
                             }
                         }
                     }
-                    /* CRASH FAILSAFE (hoisted pre-copy): the w1IsHostPointer fast
-                       path above takes w1full verbatim with no readability
-                       check, and the resolver path can return an
-                       under-validated candidate (reachable now that
-                       ResolveGeneratedAssetStub's E1 bounds check is
-                       offset-only -- a near-end-of-image interior match can
-                       return a valid-start/short-tail pointer). A matrix load
-                       dereferences 64 bytes, so drop any matrix pointer whose
-                       full 64 bytes are not readable (0 is the dropped-matrix
-                       sentinel the shared post-switch failsafe further down
-                       consumes -- see the kOpMtx resolve-failure comment above).
-                       MUST run BEFORE MakePersistentMtxCopy below: that helper
-                       always returns a fresh, fully-readable 64-byte
-                       allocation, so validating outW1 AFTER the copy (the
-                       original placement) checked the wrong pointer and never
-                       protected the copy's own raw 64-byte read. */
+                    /* CRASH FAILSAFE. The w1IsHostPointer fast path takes w1full verbatim with no
+                       readability check, and the resolver can return an under-validated candidate
+                       (ResolveGeneratedAssetStub's bounds check is offset-only, so a
+                       near-end-of-image interior match yields a valid-start/short-tail pointer).
+                       A matrix load dereferences 64 bytes, so drop any pointer whose full 64 are
+                       not readable; 0 is the sentinel the shared post-switch failsafe consumes.
+                       MUST run BEFORE MakePersistentMtxCopy: that helper always returns a fresh,
+                       fully-readable allocation, so checking after the copy validates the wrong
+                       pointer and never protects the copy's own raw 64-byte read. */
                     if (outW1 != 0 && ReadableByteLimit(outW1) < 64u) {
                         static int sMtxFailsafeLogs = 0;
                         if (sMtxFailsafeLogs < 40) {
@@ -5311,24 +5524,18 @@ class N64DisplayListAdapter {
                         outW1 = 0u;
                     }
                     if (outW1 != 0) {
-                        /* Same byte-order proxy as the G_VTX paths: matrices
-                           referenced from big-endian DLs are static asset Mtx
-                           data and need word-swapping for the interpreter's
-                           host-order reads; host-built DLs reference
-                           Matrix_ToMtx output, which is already host-order.
-                           MakePersistentMtxCopy also clamps internally now
-                           (mirrors MakePersistentVtxCopy's [vtx-clamp] idiom),
-                           so this is defense in depth, not the only guard. */
+                        /* Same byte-order proxy as the G_VTX paths: matrices referenced from
+                           big-endian DLs are static asset Mtx data needing word-swapping for the
+                           interpreter's host-order reads, while host-built DLs reference
+                           Matrix_ToMtx output, already host-order. */
                         if (isBig) {
                             outW1 = MakePersistentMtxCopy(outW1);
                         }
                         outW1 = NormalizeLusDirectPointer(outW1);
                     }
-                    // #16 countdown-matrix content probe: dump the resolved 64-byte
-                    // Mtx as raw hex words, armed on the same flag as the [rect]
-                    // probe, to sanity-check the countdown billboard's modelview
-                    // matrix for degenerate (all-zero) or wildly-out-of-range values
-                    // instead of just confirming the pointer resolved.
+                    // [mtx-content] probe, strip later: dumps the resolved 64-byte Mtx as hex
+                    // words, armed on the same flag as [rect], to check the countdown billboard's
+                    // modelview for degenerate values rather than just a resolved pointer.
                     {
                         const bool sDiagCountdownMtx = gdx_dev_gate(GDX_GATE_DIAG_COUNTDOWN) != 0;
                         if (sDiagCountdownMtx && gGdxCountdownProbeArm != 0 && outW1 != 0) {
@@ -5345,33 +5552,27 @@ class N64DisplayListAdapter {
                             }
                         }
                     }
-                    // P0/P1 (debug-only): scratch-slot indirection for pool matrices. When
-                    // GDX_INTERP_P0 or GDX_INTERP_P1 is set and this fully-resolved 64-byte matrix
-                    // lives inside the current GfxPool segment-1 span (host-built modelview loads),
-                    // copy it into a stable scratch slot and rewrite the command to point there,
-                    // recording (prev,cur,scratch,snap). At t=1 the scratch is a byte copy of the
-                    // pool matrix (Correction-1 transparency); in P1 the per-sub-frame refill writes
-                    // lerp(prev,cur,t). Static/persistent asset matrices took the isBig ->
-                    // MakePersistentMtxCopy path above and resolve OUTSIDE the pool span, so they
-                    // pass through untouched here (HUD/2D ortho draws never load segment-1
-                    // pool matrices, so they are structurally excluded from interpolation).
-                    // G_MTX_PROJECTION (0x04) loads are included whenever mInterpCamera is set,
-                    // which now ships ON. race.c:250 loads gfxPool->unk_20208[] -- camera.c's
-                    // combined projection*view camera -- with that flag, and course.c emits no
-                    // gSPMatrix at all, so excluding projection froze BOTH the camera and the whole
-                    // track at 60 Hz while racer model matrices kept interpolating: objects smoothed
-                    // against a static world, which is what tore the CPU-baked booster flames off
-                    // the machines. See gdx_interp.h CameraInterpActive for why lerping a combined
-                    // projection*view is exact rather than an approximation.
-                    // F3DEX2's `p^G_MTX_PUSH` params encoding never touches bit 0x04, so the raw
-                    // low byte can be tested without un-XOR'ing first.
-                    // [mtx-census] GDX_DIAG_MTX=1. Phase C research established by READING that the
-                    // booster flames draw under an identity matrix at segment 2 offset 0, loaded by
-                    // a G_MTX inside the aSetupBoosterDL ROM asset -- and that this load is ignored
-                    // here because it resolves OUTSIDE the pool span. Neither fact was confirmed at
-                    // runtime. This reports every distinct G_MTX operand that misses the reroute,
-                    // with the top row of the matrix it points at, so "is it identity" and "does the
-                    // bridge see it at all" are answered by measurement before any decomp change.
+                    // Scratch-slot indirection for pool matrices: a fully-resolved 64-byte matrix
+                    // inside the current GfxPool segment-1 span is copied into a stable scratch
+                    // slot and the command rewritten to point there. Static/persistent asset
+                    // matrices took the isBig -> MakePersistentMtxCopy path above and resolve
+                    // OUTSIDE the pool span, so they pass through untouched -- HUD/2D ortho draws
+                    // never load segment-1 pool matrices and are structurally excluded.
+                    //
+                    // G_MTX_PROJECTION (0x04) loads are included whenever mInterpCamera is set.
+                    // race.c:250 loads gfxPool->unk_20208[] -- the combined projection*view -- with
+                    // that flag and course.c emits no gSPMatrix at all, so excluding projection
+                    // freezes BOTH the camera and the whole track at 60 Hz while racer matrices
+                    // keep interpolating: objects smoothed against a static world, which is what
+                    // tore the CPU-baked booster flames off the machines. See gdx_interp.h
+                    // CameraInterpActive for why lerping a combined projection*view is not
+                    // sufficient. F3DEX2's `p^G_MTX_PUSH` encoding never touches bit 0x04, so the
+                    // raw low byte can be tested without un-XOR'ing.
+                    //
+                    // [mtx-census] GDX_DIAG_MTX=1, strip later: every distinct G_MTX operand that
+                    // MISSES the reroute, with the top row of the matrix it points at. Answers
+                    // whether the booster flames really draw under an identity matrix resolving
+                    // outside the pool span, by measurement rather than by reading.
                     {
                         static const bool sDiagMtx = std::getenv("GDX_DIAG_MTX") != nullptr;
                         if (sDiagMtx && mInterpEnabled && outW1 != 0 && !GdxP0MtxInPoolSpan(outW1) &&
@@ -5411,9 +5612,8 @@ class N64DisplayListAdapter {
                     if (outW1 != 0) {
                         outW1 = NormalizeLusDirectPointer(outW1);
                     }
-                    // Tier 2: carousel viewport lerp. Index byte 8 == G_MV_VIEWPORT; GdxVpReroute
-                    // itself rejects any pointer outside D_i5_80118FF0, so every other viewport in
-                    // the game passes through untouched.
+                    // Carousel viewport lerp. Index byte 8 == G_MV_VIEWPORT; GdxVpReroute rejects
+                    // any pointer outside D_i5_80118FF0, so every other viewport passes untouched.
                     if (mInterpEnabled && outW1 != 0 && (in.w0 & 0xFFu) == 8u) {
                         outW1 = GdxVpReroute(outW1);
                     }
@@ -5441,66 +5641,61 @@ class N64DisplayListAdapter {
 
                 case kOpSetTextureImage:
                     {
-                        /* TOCTOU guard (Create Machine entry, thread_id=3 AV in
-                           strlen): snapshot the segment-reload epoch BEFORE touching
-                           any segment-backed state. A mode transition on the game
-                           thread reloads segments 4/7/9 (decomp_port.c
-                           gdx_load_mode_segments) -- rewriting the carve bytes AND
-                           swapping the gSegments[] bases -- while this thread reads
-                           them unsynchronized. */
+                        /* Snapshot the segment-reload epoch BEFORE touching any segment-backed
+                           state; without it a mode transition reloading segments 4/7/9 mid-read
+                           produced an AV inside strlen on Create Machine entry. */
                         const uint32_t settimgEpoch = GdxSegmentEpochSnapshot();
                         const uintptr_t translated =
                             w1IsHostPointer ? w1full : TranslateDataPointer(in.w1);
-                        /* If a reload raced a segment-backed resolution (odd or
-                           changed epoch), the translated pointer and the bytes it
-                           addresses may be torn. Host-pointer textures never read
-                           gSegments[], so they are exempt (no behavior change).
-                           Drop the texture for this one frame -- the previous
-                           binding persists and the skip is invisible during a mode
-                           transition -- rather than sampling / stringifying
-                           half-written state. Wait-free: only atomic loads ran. */
+                        /* A raced reload can leave both the translated pointer and the bytes it
+                           addresses torn. Host-pointer textures never read gSegments[] and are
+                           exempt. Drop the texture for one frame -- the previous binding persists
+                           and the skip is invisible during a transition -- rather than sampling or
+                           stringifying half-written state. */
                         const bool segmentReloadRaced =
                             !w1IsHostPointer && !GdxSegmentEpochStable(settimgEpoch);
                         if (segmentReloadRaced) {
                             if (mStats != nullptr) mStats->skippedTextures++;
                             continue;
                         }
-                        /* A resolution is USABLE -- for the O2R/pack OTR-filepath
-                           emit and for every diagnostic that dereferences the
-                           resolved bytes as memory or a string -- only if it
-                           produced a non-null pointer. A failed/partial resolution
-                           (the [resolve-fail] path returns 0) hard-skips the entire
-                           census / pack-override / logging branch below; the normal
-                           unresolved-fallback emit (FallbackDataPointer, further
-                           down) is unchanged. */
+                        /* Gates every branch below that dereferences the resolved bytes as memory
+                           or as a string -- the O2R/pack filepath emit and the diagnostics. A
+                           failed resolution returns 0 and must hard-skip all of them; the normal
+                           unresolved-fallback emit further down is unaffected. */
                         const bool resolutionUsable = (translated != 0);
-                        // Only emit the O2R filepath opcode for BSS-stub textures (asset-segment
+                        // Emit the O2R filepath opcode ONLY for BSS-stub textures (asset-segment
                         // symbols with a 1:1 O2R resource). RDRAM-backed textures are contiguous
-                        // multi-tile buffers where the game issues many G_LOADBLOCKs with
-                        // increasing ULS offsets across the full region — the O2R resource only
-                        // covers the first tile and causes out-of-bounds reads for later bands.
-                        // Those textures must go through the raw-copy path (1MB slice of RDRAM).
-                        const char* o2rKey = (!w1IsHostPointer && resolutionUsable && !IsRdramHostPointer(translated))
+                        // multi-tile buffers the game loads with many G_LOADBLOCKs at increasing
+                        // ULS offsets; the O2R resource covers only the first tile, so later bands
+                        // read out of bounds. Those must take the raw-copy path.
+                        //
+                        // The venue building-texture window is excluded for a different reason and
+                        // MUST STAY excluded: its content is runtime-mutable and venue-dependent
+                        // (func_800747EC DMAs a per-venue slice of super_textures over it each
+                        // course load), so no build-time archive snapshot can be right --
+                        // course_track_gfx/D_8014A20 in the o2r is in fact ALL ZEROS, because on
+                        // the ROM that region is scratch. Serving it by name draws flat white slab
+                        // buildings on every course placing BUILDING_TALL (Death Race, Mute City 2,
+                        // the Ending). The raw-copy path reads the decoded image, which
+                        // gdx_load_venue_building_texture keeps venue-correct.
+                        const char* o2rKey = (!w1IsHostPointer && resolutionUsable && !IsRdramHostPointer(translated) &&
+                                              !IsVenueBuildingTextureRange(translated))
                                                  ? gdx_lookup_asset_segment_o2r_key(in.w1)
                                                  : nullptr;
                         const char* texCensusPath = "rawcopy"; /* [tex-census] delivery classification */
-                        /* Tier-B texture-pack override. `translated` is the unified host/RDRAM
-                           source pointer for BOTH delivery paths (host-pointer wide packets AND
-                           raw-copy RDRAM), so a single lookup here covers common assets (fonts,
-                           portraits, title art) regardless of which branch would otherwise take them.
-                           When packs are enabled and this buffer is a registered common asset that a
-                           mounted pack replaces, rewrite the load to the OTR-filepath opcode -- the
-                           exact same mechanism as the Tier-A o2rKey emit. The override existence check
-                           is cached per key per pack epoch, so a hit/miss costs at most one registry
-                           scan; with the CVar off this is byte-identical to before (no lookup runs). */
+                        /* Texture-pack override. `translated` is the unified source pointer for
+                           BOTH delivery paths, so one lookup here covers common assets (fonts,
+                           portraits, title art) whichever branch would otherwise take them. A pack
+                           hit rewrites the load to the OTR-filepath opcode, the same mechanism as
+                           the o2rKey emit. Existence is cached per key per pack epoch; with the
+                           CVar off no lookup runs at all. */
                         const char* packPath = nullptr;
-                        /* Same multi-tile exclusion as the Tier-A o2rKey emit above
-                           (!IsRdramHostPointer): an RDRAM-backed buffer is a contiguous
-                           multi-tile atlas sampled at many ULS offsets, and a single-OTEX
-                           override only covers the first band — replacing it garbled every
-                           later band (the title-screen text corruption with a font pack
-                           active). Atlas replacement needs per-tile keying; until then those
-                           buffers keep the raw-copy path. */
+                        /* Same multi-tile exclusion as the o2rKey emit above: an RDRAM-backed
+                           buffer is a contiguous atlas sampled at many ULS offsets and a
+                           single-OTEX override covers only the first band, which garbles every
+                           later one (title-screen text corruption with a font pack active). Atlas
+                           replacement needs per-tile keying; until then these keep the raw-copy
+                           path. */
                         if (!o2rKey && resolutionUsable && !IsRdramHostPointer(translated) &&
                             gdx_workshop_texture_packs_enabled()) {
                             const char* assetKey = GDiffuser_LookupLoadedAssetKey(
@@ -5535,17 +5730,14 @@ class N64DisplayListAdapter {
                                 w1full, mModuleBegin, mModuleEnd, std::max<size_t>(estimatedBytes, 1));
                             const uintptr_t hostTextureSource =
                                 (stubResolved != 0) ? stubResolved : w1full;
-                            // Leftover census: a module-range texture pointer that BOTH
-                            // stub resolvers miss is almost certainly an unbound stub
-                            // (LinkStubs symbol with no AssetBindings entry / venue bank
-                            // beyond the alias table) — i.e., the next visual-garbage
-                            // candidate. Enumerate them so a single soak run names every
-                            // remaining broken texture source.
+                            // [stub-miss] diagnostic, strip later: a module-range texture pointer
+                            // both stub resolvers miss is almost certainly an unbound stub
+                            // (LinkStubs symbol with no AssetBindings entry, or a venue bank past
+                            // the alias table) -- the next visual-garbage candidate.
                             if (stubResolved == 0 && w1full >= mModuleBegin && w1full < mModuleEnd) {
-                                // One line per UNIQUE address: real module-resident
-                                // arrays (e.g. sCourseMinimapPalette, sampled every
-                                // frame) are legitimate and must not drown the budget
-                                // that should be naming actual unresolved stubs.
+                                // One line per UNIQUE address: legitimate module-resident arrays
+                                // like sCourseMinimapPalette are sampled every frame and would
+                                // drown the budget.
                                 static uintptr_t sStubMissSeen[24] = {};
                                 static int sStubMissCount = 0;
                                 bool alreadySeen = false;
@@ -5557,14 +5749,9 @@ class N64DisplayListAdapter {
                                 }
                                 if (!alreadySeen && sStubMissCount < 24) {
                                     sStubMissSeen[sStubMissCount++] = w1full;
-                                    /* Emit the ASLR-stable identity too: the low32
-                                       alone is useless against the .map because the
-                                       base is randomized each run. modOff/prefVA
-                                       (imageBase + moduleOffset) resolve to the exact
-                                       symbol deterministically -- e.g. this run's
-                                       E3BAE880 -> prefVA 0x14134E880 =
-                                       sMachineWeightDigitCompTexInfos+0x420, a real
-                                       module array for which verbatim is by design. */
+                                    /* The low32 alone is useless against the .map because the base
+                                       is randomized per run; prefVA (imageBase + moduleOffset)
+                                       resolves to the exact symbol deterministically. */
                                     const uintptr_t modOff = w1full - mModuleBegin;
                                     gdx_port_logf("[stub-miss] SETTIMG module ptr %p (low32=%08X) "
                                                   "modOff=%08llX prefVA=%011llX unresolved -- taken verbatim\n",
@@ -5573,16 +5760,11 @@ class N64DisplayListAdapter {
                                                   static_cast<unsigned long long>(kPreferredImageBaseVA + modOff));
                                 }
                             }
-                            /* [transition-cap] probe (guarded): when this
-                               SETTIMG source is the recorded transition capture
-                               buffer, report whether the byteswap-applying native
-                               RGBA16 range covers it. native=1 => the host-endian
-                               (little) capture IS swapped for the big-endian
-                               RGBA5551 reader (correct, no band); native=0 => it is
-                               read raw => red/blue swap + bit-shift = the title->menu
-                               noise band. One line per unique source; the gate is
-                               zero-size outside a transition so gameplay pays nothing
-                               and no non-transition texture is ever touched. */
+                            /* [transition-cap] probe, strip later: whether the byteswap-applying
+                               native-RGBA16 range covers the transition capture buffer. native=1
+                               means the host-endian capture IS swapped for the big-endian RGBA5551
+                               reader; native=0 means it is read raw, giving the red/blue swap and
+                               bit-shift that is the title->menu noise band. */
                             if (gDiagTransitionCaptureSize != 0 &&
                                 w1full >= gDiagTransitionCaptureBegin &&
                                 w1full < gDiagTransitionCaptureBegin + gDiagTransitionCaptureSize) {
@@ -5603,39 +5785,29 @@ class N64DisplayListAdapter {
                                                   reinterpret_cast<void*>(w1full), nativeApplied ? 1 : 0);
                                 }
                             }
-                            /* CPU framebuffer readback and transition capture buffers contain
-                               host-order RGBA5551 words.  Most host pointers refer to generated
-                               texture bytes that already use the N64 byte order and therefore
-                               must remain direct, but ranges registered through
-                               gdx_set_native_rgba16_texture_range need their two bytes swapped
-                               before Fast3D's N64 texture reader consumes them.
-
-                               The narrow/raw path already applies this policy in
-                               MakePersistentRawTextureCopy.  Wide Gfx packets previously skipped
-                               that path entirely, despite the [transition-cap] diagnostic
-                               reporting native=1, so phased strips sampled little-endian words
-                               as a big-endian stream and produced the multicolour noise bands.
-                               Copy only the exact upcoming load extent and preserve the direct
-                               path for every non-native host texture. */
+                            /* CPU framebuffer readback and transition capture buffers hold
+                               HOST-order RGBA5551 words. Most host pointers refer to generated
+                               texture bytes already in N64 byte order and must stay direct, but
+                               ranges registered through gdx_set_native_rgba16_texture_range need
+                               their two bytes swapped before Fast3D's N64 texture reader consumes
+                               them. Wide Gfx packets have to apply the same policy the narrow path
+                               gets from MakePersistentRawTextureCopy, or phased strips sample
+                               little-endian words as big-endian and render as multicolour noise
+                               bands. Copy only the exact load extent; every non-native host
+                               texture keeps the direct path. */
                             if (IsNativeRgba16Range(hostTextureSource, 2)) {
-                                // estimatedBytes is already computed above (hoisted so the
-                                // ResolveWideAssetStubPointer call gets the real requiredBytes).
                                 size_t readable = RegisteredHostRemaining(hostTextureSource);
                                 if (readable == 0) {
                                     readable = ReadableByteLimit(hostTextureSource);
                                 }
-                                /* Keep the copy within the registered native-RGBA16
-                                   extent. The load-size estimate can round up past the
-                                   registered image (the WIPE transition issues one wide
-                                   LOADBLOCK whose block-rounded estimate is one row larger
-                                   than WIDTH*HEIGHT*2). If the copy size spills past the
-                                   native range, CopyRawTextureBytes' all-or-nothing
-                                   IsNativeRgba16Range check fails and the ENTIRE copy is
-                                   memcpy'd WITHOUT the byte swap, so Fast3D samples the
-                                   host-order words as big-endian and the un-revealed wipe
-                                   region renders as rainbow noise. Clamping to the native
-                                   extent guarantees the swap is applied; the estimate's
-                                   extra tail bytes lie beyond the last real load anyway. */
+                                /* Clamp the copy to the registered native-RGBA16 extent. The
+                                   load-size estimate can round up past the registered image (the
+                                   WIPE transition's single wide LOADBLOCK overshoots WIDTH*HEIGHT*2
+                                   by a row), and CopyRawTextureBytes' IsNativeRgba16Range check is
+                                   all-or-nothing: a copy spilling past the range is memcpy'd
+                                   WITHOUT the swap, so the un-revealed wipe region renders as
+                                   rainbow noise. The estimate's tail bytes lie beyond the last
+                                   real load anyway. */
                                 const size_t nativeRemaining = NativeRgba16RangeRemaining(hostTextureSource);
                                 if (nativeRemaining != 0 && nativeRemaining < readable) {
                                     readable = nativeRemaining;
@@ -5666,35 +5838,24 @@ class N64DisplayListAdapter {
                                 outW1 = NormalizeLusDirectPointer(outW1);
                             }
                         }
-                        /* Residual TOCTOU window (Create Machine entry, thread_id=3 AV
-                           in strlen): the early epoch check above passed, but the
-                           pointer resolution, the O2R/pack lookups, and (for RDRAM/
-                           native sources) MakePersistentRawTextureCopy just READ
-                           segment-backed state. Re-check the SAME snapshot now -- after
-                           all resolution and content copies, before the resolved bytes
-                           are consumed by the census/diagnostics below or handed to the
-                           interpreter. This brackets the whole content read as a seqlock:
-                           if a reload began anywhere in that window, drop the texture for
-                           this frame (previous binding persists) rather than emitting a
-                           torn copy. Wait-free: one more acquire load. */
+                        /* Close the seqlock bracket: the early check passed, but the resolution,
+                           the O2R/pack lookups and MakePersistentRawTextureCopy have all READ
+                           segment-backed state since. Re-check the SAME snapshot here -- after
+                           every content copy, before the bytes reach the census or the
+                           interpreter -- and drop the texture for this frame if a reload began
+                           anywhere in that window. */
                         if (!w1IsHostPointer && !GdxSegmentEpochStable(settimgEpoch)) {
                             if (mStats != nullptr) mStats->skippedTextures++;
                             NoteEpochSkip();
                             continue;
                         }
-                        /* [tex-census]: one line
-                           per UNIQUE SETTIMG source across the WHOLE session (NOT
-                           race-gated -- pause menu / machine select / menus are the
-                           interesting cases). Pairs every on-screen texture with its delivery
-                           path and the first bytes LUS consumes, mirroring the audio
-                           [sample-census]. Fingerprint at +0x20 to skip transparent
-                           glyph corners when the buffer is large enough. */
+                        /* [tex-census] diagnostic, strip later: one line per unique SETTIMG source
+                           for the whole session, pairing each texture with its delivery path and
+                           the first bytes LUS consumes. Fingerprint taken at +0x20 to skip
+                           transparent glyph corners when the buffer is large enough. */
                         {
-                            /* Recalibrated: 160 unique slots burned out in
-                               the first 8s of boot (all RGBA/I) and the pause-menu CI
-                               textures -- the audit's primary target -- never logged.
-                               512 general slots + a RESERVED pool for CI-format (fmt=2)
-                               sources, which always log regardless of the general cap. */
+                            /* CI-format sources get a RESERVED pool: a single shared budget burns
+                               out on RGBA/I textures during boot and the CI ones never log. */
                             static uint32_t sTexCensusSeen[512] = {};
                             static int sTexCensusCount = 0;
                             static uint32_t sTexCensusCiSeen[64] = {};
@@ -5744,12 +5905,11 @@ class N64DisplayListAdapter {
                                                   in.w1, texCensusPath, cFmt, cSiz, cWidth,
                                                   reinterpret_cast<void*>(outW1),
                                                   cfp[0], cfp[1], cfp[2], cfp[3], cfp[4], cfp[5], cfp[6], cfp[7]);
-                                    /* [ci-dump] (options/pause CI-cell investigation, scope item A):
-                                       for CI-format sources, the discriminator between "delivered
-                                       wrong" and "interpreted wrong" is the raw tile bytes at the
-                                       address LUS will consume -- 32 bytes from offset 0 (CI text
-                                       tiles are small; the +0x20 fingerprint skip would overshoot).
-                                       Compared offline against the same tile decoded from ROM. */
+                                    /* [ci-dump], strip later: for CI sources the discriminator
+                                       between "delivered wrong" and "interpreted wrong" is the raw
+                                       tile bytes LUS will consume. 32 bytes from offset 0, not the
+                                       +0x20 fingerprint -- CI text tiles are small enough that the
+                                       skip would overshoot. */
                                     if (cFmt == 2u && outW1 != 0 && ReadableByteLimit(outW1) >= 32) {
                                         const uint8_t* cd = reinterpret_cast<const uint8_t*>(outW1);
                                         gdx_port_logf("[ci-dump] raw=%08X b0=%02X%02X%02X%02X%02X%02X%02X%02X"
@@ -5765,18 +5925,11 @@ class N64DisplayListAdapter {
                                 }
                             }
                         }
-                        /* Create Machine gibberish probe:
-                           mode-gated one-shot census. The session-wide [tex-census] budget
-                           burns out during boot before Create Machine is reached, so this
-                           block logs EVERY unique SETTIMG source while GET_MODE(gGameMode)
-                           == 0x10 (GAMEMODE_CREATE_MACHINE), with the raw source, the
-                           resolved host pointer LUS consumes, fmt/siz/width, and the first
-                           16 bytes at that pointer. Compare those bytes against the known-good
-                           disk decode (0x00C8A270 bg strip, 0x00C8CE60 OK button) to prove
-                           whether the interpreter receives correct BE data or wrong bytes.
-                           Bounded to 512 unique sources: the old 64 saturated on the first frame,
-                           so parts swapped in later were never censused. Remove once #1 is
-                           root-caused. */
+                        /* [GDX-DBG cm] probe, strip later: mode-gated census for Create Machine
+                           (GET_MODE == 0x10), needed because the session-wide [tex-census] budget
+                           burns out during boot. Logs the raw source, resolved pointer, format and
+                           first 16 bytes, to compare against the known-good disk decode
+                           (0x00C8A270 bg strip, 0x00C8CE60 OK button). */
                         if ((gGameMode & 0x1F) == 0x10) {
                             static uint32_t sCmSeen[512] = {};
                             static int sCmCount = 0;
@@ -5803,13 +5956,10 @@ class N64DisplayListAdapter {
                                               cb[8], cb[9], cb[10], cb[11], cb[12], cb[13], cb[14], cb[15]);
                             }
                         }
-                        /* Create Machine untextured 3D preview probe:
-                           segment-3 (machine_custom_gfx) SETTIMG census, gated on
-                           GAMEMODE_CREATE_MACHINE. Separates the host-pointer
-                           path bypassing the placeholder redirect (isPlaceholder=0, zero
-                           bytes) from a healthy resolve. Bounded to 512 unique sources: the old 32
-                           filled in 2 ms, well before the machine was built. Remove once
-                           root-caused. */
+                        /* [cm-seg3] probe, strip later: segment-3 SETTIMG census for the untextured
+                           Create Machine preview. Separates a host-pointer path bypassing the
+                           placeholder redirect (isPlaceholder=0, zero bytes) from a healthy
+                           resolve. */
                         if ((gGameMode & 0x1F) == 0x10) {
                             static uint32_t sCmTexSeen[512] = {};
                             static int sCmTexCount = 0;
@@ -5830,17 +5980,14 @@ class N64DisplayListAdapter {
                                               cmb[0], cmb[1], cmb[2], cmb[3], cmb[4], cmb[5], cmb[6], cmb[7]);
                             }
                         }
-                        // Resolution probe. Classifies the RESOLVED SOURCE
-                        // (`translated`), not the persistent-copy output — the copy is
-                        // always an unregistered heap buffer, so classifying outW1 only
-                        // reports which delivery path ran, never whether the data is
-                        // correct. Fingerprints the bytes LUS will actually consume and
-                        // flags MIO0-compressed streams reaching the sampler (stripes).
+                        // [settimg-trace] probe, strip later. Classifies the RESOLVED SOURCE, not
+                        // the persistent-copy output: the copy is always an unregistered heap
+                        // buffer, so classifying outW1 reports only which delivery path ran, never
+                        // whether the data is correct. Flags MIO0 streams reaching the sampler.
                         if (gdx_dev_gate(GDX_GATE_DIAG_SETTIMG) && gGdxRaceActive != 0) {
                             static int sSettimgCount = 0;
-                            // Per-course budget. gGdxRaceActive is a latch that never clears, so a
-                            // process-lifetime cap could only ever describe a GP's first course;
-                            // GET_MODE moves on every race/next-course transition.
+                            // Per-course budget: gGdxRaceActive is a latch that never clears, so a
+                            // process-lifetime cap could only ever describe a GP's first course.
                             static int sSettimgMode = -1;
                             const int settimgMode = gGameMode & 0x1F;
                             if (settimgMode != sSettimgMode) {
@@ -5921,36 +6068,28 @@ class N64DisplayListAdapter {
                             }
                         }
                     }
-                    // Course-Edit node-info probe. Env-gated on GDX_DIAG_NODEINFO and, unlike the
-                    // GDX_DIAG_SETTIMG trace above, NOT race-gated, so it is live in the editor. It
-                    // fires only when this SETTIMG's raw N64 source lands in one of two windows.
+                    // [nodeinfo] probe, strip later. GDX_DIAG_NODEINFO, deliberately NOT race-gated
+                    // so it is live in the editor. Fires on two raw-source windows: the seg-9
+                    // node-info textures, and the seg-7 I4 glyph sheets (0x07009080 / 0x07009C80 /
+                    // 0x0700A880, 0xC00 each) that func_xk1_8002924C blits the info panels from.
                     //
-                    // Window 1 -- the seg-9 node-info textures: NumberSheet (0x09000C48), NumberTex
-                    // (0x09001788), InfoBackground (0x09002F88), InfoFontSheet (0x09003408). RULED
-                    // OUT for this defect: 0x7031F0 resolves to an ovl_i3 verbatim HUD array, not an
-                    // editor asset; all four symbols are present and correctly sized/addressed in
-                    // port/gen/EkAssetBindings.c; and they are RGBA16/I4, not CI8, so the two-half
-                    // CI8 cache cannot apply.
+                    // The live question is RESOLUTION, not the assets. seg-7 is also populated from
+                    // cartridge ROM (expansion_kit_textures_beta), and only TryResolveAddress
+                    // scanning gN64AddressRanges ahead of the segment table keeps the disk copy
+                    // winning; a requiredBytes over-estimate drops the range match and falls through
+                    // to that cart data, which is structureless noise. The budget is exact -- 3072
+                    // of 3072 -- with no slack to absorb one.
                     //
-                    // Window 2 -- the blank info panels. Those do NOT use the 64DD kanji glyph path or
-                    // Font_*; they go through func_xk1_8002924C (expansion_kit/A6340.c:60), which
-                    // blits 8x8 cells out of three I4 128x48 sheets at seg-7 0x07009080 / 0x07009C80 /
-                    // 0x0700A880 (0xC00 each, contiguous through 0x0700B480). Those sheets hold real,
-                    // legible glyph data on the translated disk (1625/1401/1566 nonzero bytes over the
-                    // full 3072-byte buffers), so the asset is not the defect. Note the deliberate
-                    // FULL-buffer count: all three open with a zero run for the blank space glyph at
-                    // cell 0, so a fixed-prefix checksum reads them as empty and lies.
+                    // Reading it: no lines means the draw never runs (an editor-state gate); out=NULL
+                    // or a short avail means the resolve is failing and the cart fallback is what
+                    // reaches the screen.
                     //
-                    // The live question is resolution. seg-7 is ALSO populated from cartridge ROM
-                    // (expansion_kit_textures_beta), and only the fact that TryResolveAddress scans
-                    // gN64AddressRanges ahead of the segment table keeps the disk copy winning. A
-                    // requiredBytes over-estimate would drop the range match and fall through to that
-                    // cart data, which is structureless noise -- and the budget here is exact, 3072 of
-                    // 3072, with no slack to absorb one.
-                    //
-                    // Reading the output: no lines at all means the draw never runs (an editor-state
-                    // gate); lines with out=NULL or a short avail mean the resolve is failing and the
-                    // cart fallback is what reaches the screen. Zero cost unless the env is set.
+                    // Already ruled out: 0x7031F0 is an ovl_i3 verbatim HUD array, not an editor
+                    // asset; all four seg-9 symbols are present and correctly sized in
+                    // EkAssetBindings.c and are RGBA16/I4, not CI8, so the two-half CI8 cache cannot
+                    // apply; and the glyph sheets hold legible data on the translated disk
+                    // (1625/1401/1566 nonzero bytes, counted over the FULL buffer -- all three open
+                    // with a zero run for the blank-space glyph, so a fixed-prefix checksum lies).
                     {
                         const bool inNodeInfoWindow = in.w1 >= 0x09000C48u && in.w1 < 0x09003808u;
                         const bool inSetupFontWindow = in.w1 >= 0x07009080u && in.w1 < 0x0700B480u;
@@ -5968,7 +6107,7 @@ class N64DisplayListAdapter {
                                 if (avail >= sizeof(nib)) {
                                     std::memcpy(nib, reinterpret_cast<const void*>(outW1), sizeof(nib));
                                 }
-                                // Label by the window that matched. The seg-9 ladder alone reported
+                                // Label by the window that matched: the seg-9 ladder alone reports
                                 // every seg-7 hit as NumberSheet, since 0x0700xxxx < 0x09001788.
                                 const char* asset =
                                     inSetupFontWindow
@@ -5995,24 +6134,18 @@ class N64DisplayListAdapter {
                 case kOpMoveword:
                     if (WordParam(in.w0) == kMovewordSegmentIndex) {
                         const uint8_t segIdx = static_cast<uint8_t>((in.w0 & 0xFFFF) / 4);
-                        /* gSPSegment(seg, base) packs the segment
-                           BASE through the WIDENED gDma1p macro (F3DEX_GBI_2 -> _GFXW1_PTR),
-                           so a game-emitted wide list carries the FULL host pointer in
-                           w1full. The segment table is the CENTRAL base for ALL segmented
-                           addressing; reading the truncated low32 (in.w1) and running it
-                           through the legacy resolver here (the [legacy-resolve]
-                           reghost_low32 op=DB hits in the soak log) truncated every segment
-                           base and cascaded into zero-byte texture copies (gray rects),
-                           garbage vertex/matrix bases, and noop'd DL roots. Take the real
-                           host pointer verbatim, resolver-free, exactly like the other
-                           w1IsHostPointer pointer opcodes (VTX/MTX/MOVEMEM/DL/SETTIMG). */
-                        /* Segment-table WRITE guard: a mode transition on the game
-                           thread reloads segments 4/7/9 and swaps gSegments[] bases.
-                           Snapshot the epoch before resolving; if a reload raced it,
-                           do NOT publish a base derived from a torn gSegments[]/segment
-                           image -- skip the WRITE, retain the stale base for this one
-                           frame (the DL re-emits the segment set next frame), and emit
-                           the stale base. This is a write race, worse than the reads. */
+                        /* gSPSegment(seg, base) packs the segment BASE through the widened gDma1p
+                           macro, so a game-emitted wide list carries the FULL host pointer in
+                           w1full. The segment table is the central base for ALL segmented
+                           addressing, so reading the truncated low32 and running it through the
+                           legacy resolver truncates every segment base and cascades into zero-byte
+                           texture copies, garbage vertex/matrix bases and noop'd DL roots. Take the
+                           real host pointer verbatim, like the other w1IsHostPointer opcodes.
+
+                           This is a segment-table WRITE, so the epoch guard matters more than on
+                           the read paths: if a reload raced it, do NOT publish a base derived from
+                           a torn gSegments[] -- skip the write, keep the stale base for one frame
+                           (the DL re-emits the segment set next frame) and emit that. */
                         const uint32_t mwEpoch =
                             w1IsHostPointer ? 0u : GdxSegmentEpochSnapshot();
                         uintptr_t translated;
@@ -6033,10 +6166,8 @@ class N64DisplayListAdapter {
                         }
                         if (translated != 0 && segIdx < kGfxSegmentCount) {
                             const uintptr_t normalized = NormalizeLusDirectPointer(translated);
-                            /* In-DL segment repoints were invisible in the log (only the
-                               CPU-side setters print [seg] lines), which made "element
-                               draws through an unset/stale segment" bugs undiagnosable.
-                               Log the first few repoints of EVERY segment. */
+                            /* Only the CPU-side setters print [seg] lines, so in-DL repoints were
+                               invisible and "draws through a stale segment" undiagnosable. */
                             if (gSegments[segIdx] != normalized) {
                                 static int sSegRepointLogs[kGfxSegmentCount] = {};
                                 // [seg-dl] successful repoint is informational per-draw:
@@ -6048,27 +6179,15 @@ class N64DisplayListAdapter {
                                                   reinterpret_cast<void*>(gSegments[segIdx]),
                                                   reinterpret_cast<void*>(normalized));
                                 }
-                                /* Early-race floor probe: course-select's
-                                   thumbnail carousel alone burns the 6-slot sSegRepointLogs[0x0A]
-                                   budget above (5 venue-cycle repoints + 1 boot-time repoint,
-                                   confirmed in the 21:10 soak log) before the race is ever entered,
-                                   so any repoint of the venue-bank segment (0x0A) DURING the first
-                                   race frames is invisible. That segment is what
-                                   ResolveVenueBankAlias (n64_gfx_bridge.cpp above) resolves
-                                   course.c's road/wall material stubs through, and
-                                   MakePersistentRawTextureCopy keys its cache on the resolved
-                                   `source` pointer -- if gSegments[0x0A] is transiently wrong for
-                                   the opening frames (e.g. still holding the course-select
-                                   thumbnail's RDRAM-mirror target) that would produce a
-                                   first-created cache entry from the WRONG source (garbage), and
-                                   once the segment settles to the correct venue base a NEW,
-                                   correctly-sourced cache entry takes over -- a "self heal" that
-                                   is not staleness re-detection but a different cache key. This
-                                   probe is scoped to the race window and keyed independently of
-                                   the budget above so it survives past course-select; look for
-                                   "[seg-dl-race] seg=A" lines and compare their timestamps against
-                                   the observed garbage-to-correct transition (~13s to ~22s of race
-                                   time) on the next soak run. */
+                                /* [seg-dl-race] probe, strip later. Course-select's carousel alone
+                                   burns the 6-slot budget above for segment 0x0A before a race is
+                                   entered, so an 0x0A repoint during the first race frames is
+                                   invisible -- and 0x0A is what ResolveVenueBankAlias resolves
+                                   course.c's road/wall stubs through. If it is transiently wrong
+                                   there, MakePersistentRawTextureCopy mints a cache entry from the
+                                   WRONG source and a later correct entry takes over under a
+                                   different key, which looks like self-healing but is not staleness
+                                   detection. Keyed independently so it survives course-select. */
                                 if (segIdx == 0x0A && gGdxRaceActive != 0) {
                                     static int sSegARaceRepointLogs = 0;
                                     // [seg-dl-race] informational probe: silent unless GDX_DIAG_VERBOSE=1.
@@ -6132,25 +6251,17 @@ class N64DisplayListAdapter {
                     break;
 
                 case 0xDD: {
-                    /*
-                     * Physical G_LOAD_UCODE packets encode a data size in w0 and
-                     * a truncated host symbol in w1. Convert known F-Zero X
-                     * F3DEX2-family loads into a semantic variant switch that
-                     * Libultraship can consume without treating the size as a
-                     * UcodeHandlers enum.
-                     */
-                    /* The game emits this pointer through different VA->PA
-                       transforms (identity, & 0x1FFFFFFF, - 0x80000000)
-                       depending on the call site — and the symbols' truncated
-                       host addresses move every build. Compare within the
-                       512MB physical window so recognition is layout- and
-                       transform-independent (an exact-low32 match here once
-                       broke per-build: machine select lost every model).
-                       When the packet is WIDE and carries a
-                       full host pointer (w1IsHostPointer), match the FULL
-                       pointer exactly against the stub symbol first — that is
-                       unambiguous. The low29 window stays as the only test for
-                       narrow/truncated sources. */
+                    /* Physical G_LOAD_UCODE packets encode a data size in w0 and a truncated host
+                       symbol in w1. Convert known F3DEX2-family loads into a semantic variant
+                       switch Libultraship can consume without reading the size as a UcodeHandlers
+                       enum.
+
+                       The game emits this pointer through different VA->PA transforms (identity,
+                       & 0x1FFFFFFF, - 0x80000000) depending on call site, and the symbols' truncated
+                       host addresses move every build, so recognition compares within the 512 MB
+                       physical window -- an exact-low32 match broke per build and machine select
+                       lost every model. A WIDE packet carrying a full host pointer is matched
+                       exactly instead; the low29 window is only for narrow/truncated sources. */
                     const auto matchesUcodeText = [raw = in.w1, w1IsHostPointer,
                                                    w1full](const void* symbol) {
                         const uintptr_t symbolAddr = reinterpret_cast<uintptr_t>(symbol);
@@ -6171,27 +6282,20 @@ class N64DisplayListAdapter {
                     } else if (matchesUcodeText(gspF3DLX2_Rej_fifoTextStart)) {
                         variant = Fast::F3dex2Variant::Reject;
                     } else if (matchesUcodeText(gspF3DEX2_Rej_fifoTextStart)) {
-                        /* EK menus load plain F3DEX2.Rej (distinct from
-                           F3DLX2.Rej). Same reject-box semantics for the
-                           interpreter — without this arm the load was dropped
-                           and reject screening never engaged on those screens
-                           (log signature: ucode_unknown=1 every menu frame). */
+                        /* EK menus load plain F3DEX2.Rej, distinct from F3DLX2.Rej but with the
+                           same reject-box semantics. Without this arm the load is dropped and
+                           reject screening never engages (ucode_unknown=1 every menu frame). */
                         variant = Fast::F3dex2Variant::Reject;
                     } else if (matchesUcodeText(gspF3DFLX2_Rej_fifoTextStart)) {
                         variant = Fast::F3dex2Variant::FZeroFlxReject;
                     } else if (matchesUcodeText(gspL3DEX2_fifoTextStart)) {
-                        /* L3DEX2 line microcode (Course Edit track lines, menu
-                           track previews). Fast3D has no line primitive, but the
-                           section's non-line commands (G_VTX, PipeSync, prim
-                           color, render mode) are F3DEX2-compatible: run the
-                           section as Standard and rewrite each G_LINE3D (opcode
-                           0xB5 under F3DEX_GBI_2, NOT the classic F3D 0x08)
-                           into OTR_G_LINE3D_GDX (see case 0xB5 below), which the
-                           interpreter expands into a screen-space quad. This
-                           replaces the old wholesale section skip, which avoided
-                           garbage frames but never rendered the course spline or
-                           control-point connector lines at all. The counter now
-                           counts translated sections rather than skips. */
+                        /* L3DEX2 line microcode (Course Edit track lines, menu track previews).
+                           Fast3D has no line primitive, but the section's non-line commands are
+                           F3DEX2-compatible, so run it as Standard and rewrite each G_LINE3D into
+                           OTR_G_LINE3D_GDX (case 0x08 below), which the interpreter expands into a
+                           screen-space quad. Skipping the section wholesale avoids garbage frames
+                           but never renders the course spline or control-point connectors.
+                           l3dexUcodeSkips counts translated sections, not skips. */
                         variant = Fast::F3dex2Variant::Standard;
                         l3dexLineSection = true;
                         if (mStats != nullptr) {
@@ -6201,9 +6305,8 @@ class N64DisplayListAdapter {
                             }
                         }
                     } else {
-                        /* Genuinely unrecognized load: drop only the load
-                           itself (never engage the skip — a false positive
-                           here would silently eat the rest of the frame). */
+                        /* Unrecognized load: drop only the load itself, never engage the section
+                           skip -- a false positive there silently eats the rest of the frame. */
                         if (mStats != nullptr) {
                             mStats->unknownUcodeSwitches++;
                             if (mStats->firstUnknownUcodeRaw == 0) {
@@ -6224,23 +6327,21 @@ class N64DisplayListAdapter {
                     break;
                 }
 
-                // L3DEX2 G_LINE3D: meaningful only inside a Course Edit line section.
-                // Under F3DEX_GBI_2 (this build: port CMake defines F3DEX_GBI_2=1),
-                // G_LINE3D == 0x08 -- gbi.h line 121, INSIDE the "#ifdef F3DEX_GBI_2"
-                // block that opens at line 90. The (G_IMMFIRST-10) == 0xB5 definition at
-                // line 148 belongs to the LEGACY F3D branch after the "#else" at line 122
-                // -- that #else's trailing block comment merely NAMES the condition being
-                // closed (Nintendo style), it does not open the GBI_2 block; a previous
-                // fix misread it and relabeled this case 0xB5, which let real 0x08 line
-                // commands pass through verbatim to the interpreter (owner crash log:
-                // "Unhandled OP code: 0x8, for loaded ucode: 4") and crash once 4+
-                // control points made lines draw.
-                // gSPLineW3D packs into w0 alone: w0[31:24]=0x08, w0[23:16]=v0*2,
-                // w0[15:8]=v1*2, w0[7:0]=wd, w1=0. Rewrite to the port's custom line
-                // command preserving the operand byte layout; the interpreter expands
-                // it into a screen-space quad (vertex indices arrive *2, handler /2).
-                // Outside a line section this opcode is dropped rather than misexecuted
-                // (0x08 is G_RESERVED3 in plain F3DEX2, never legitimately emitted).
+                // L3DEX2 G_LINE3D, meaningful only inside a Course Edit line section.
+                //
+                // This build defines F3DEX_GBI_2=1, where G_LINE3D == 0x08 (gbi.h:121, inside the
+                // "#ifdef F3DEX_GBI_2" block opened at line 90). The (G_IMMFIRST-10) == 0xB5
+                // definition at line 148 belongs to the LEGACY branch after the "#else" at line 122
+                // -- that #else's trailing block comment only NAMES the condition being closed,
+                // Nintendo style, and does not open the GBI_2 block. Labelling this case 0xB5 lets
+                // real 0x08 line commands reach the interpreter verbatim and crash ("Unhandled OP
+                // code: 0x8, for loaded ucode: 4") as soon as 4+ control points make lines draw.
+                //
+                // gSPLineW3D packs into w0 alone: w0[31:24]=0x08, w0[23:16]=v0*2, w0[15:8]=v1*2,
+                // w0[7:0]=wd, w1=0. The rewrite preserves that byte layout; the interpreter expands
+                // it into a screen-space quad (indices arrive *2, handler divides by 2). Outside a
+                // line section the opcode is dropped: 0x08 is G_RESERVED3 in plain F3DEX2 and never
+                // legitimately emitted.
                 case 0x08:
                     if (!l3dexLineSection) {
                         continue;
@@ -7581,6 +7682,61 @@ extern "C" void* gdx_ensure_asset_segment_for_symbol(unsigned int symLow32, unsi
     return reinterpret_cast<void*>(base);
 }
 
+/* CPU-side analogue of ResolveWideAssetStubPointer (this file, ~:1832), for
+ * Gdx_ResolvePortAddress's wide-pointer branch. A wide (>32-bit) pointer inside
+ * the EXE module range whose low32 matches an asset-segment map row IS that
+ * placeholder symbol's own address: the module spans < 2^32 bytes so low32 is a
+ * bijection within it, and every map row's low32 derives from this same
+ * module's live symbol address — a match is an identity, never a coincidence.
+ * Such a pointer must resolve to the decoded, fixed-up segment image; the stub's
+ * own storage is zero BSS by construction and nothing legitimately reads it.
+ * Runtime-confirmed victim: Camera_InitViewport's &aVp* reads came back all
+ * zero ([vpinit] vscale=0/0 vtrans=0/0, vp inside the module), zeroing
+ * camera->currentVp{Scale,Trans}{X,Y} and silently killing the 1ST/2ND/3RD
+ * position markers, the rival marker, the ending fireworks and the background
+ * stars — four symptoms, one read.
+ * The module-range gate runs FIRST (cached statics: GetMainModuleRange scans
+ * /proc/self/maps on Linux and must not run per pointer); the binary search
+ * only prices pointers that already live in the module. Known Linux caveat,
+ * inherited from ResolveWideAssetStubPointer's notes: under PIE the range can
+ * under-cover the .bss tail, which degrades to a false NEGATIVE (today's
+ * behavior) — the "wide-asset" gdx_addr_log line missing on Linux while
+ * present on Windows is the signature to watch for. */
+/* A/B kill switch for the wide-asset redirect below. Default ON; GDX_WIDE_ASSET_RESOLVE=0
+   restores the pre-fix verbatim wide-pointer return so a regression can be attributed to
+   this hook vs. the fixed image base that landed in the same build, without a rebuild. */
+extern "C" int gdx_wide_asset_resolve_enabled(void) {
+    static int sState = -1;
+    if (sState < 0) {
+        const char* v = std::getenv("GDX_WIDE_ASSET_RESOLVE");
+        sState = (v != nullptr && v[0] == '0' && v[1] == '\0') ? 0 : 1;
+    }
+    return sState;
+}
+
+extern "C" void* gdx_resolve_wide_asset_pointer(const void* full) {
+    const uintptr_t v = reinterpret_cast<uintptr_t>(full);
+    if (v == 0) {
+        return nullptr;
+    }
+    static uintptr_t sBegin = 0;
+    static uintptr_t sEnd = 0;
+    static bool sInit = false;
+    if (!sInit) {
+        sInit = true;
+        GetMainModuleRange(sBegin, sEnd);
+    }
+    if (sBegin == 0 || v < sBegin || v >= sEnd) {
+        return nullptr;
+    }
+    uint32_t offset = 0;
+    const uintptr_t base = EnsureAssetSegmentForSymbol(Low32(v), &offset);
+    if (base == 0) {
+        return nullptr;
+    }
+    return reinterpret_cast<void*>(base + offset);
+}
+
 // Venue texture-bank symbols, indexed by venue id. File scope because two callers must agree on
 // this list exactly: the runtime binder below, and gdx_boot_warm_asset_segments, which decodes the
 // same banks at boot so the runtime call is a cache hit. A second copy of this table would be a
@@ -7650,6 +7806,19 @@ extern "C" void gdx_boot_warm_asset_segments(void) {
     }
 
     std::memcpy(gSegments, savedSegments, sizeof(savedSegments));
+
+    /* Pin the venue building-texture range now rather than waiting for the first
+       course load: the SETTIMG o2r-delivery exclusion keys on it, and a building
+       drawn before gdx_load_venue_building_texture ever ran (course previews)
+       would otherwise be served the all-zero archive snapshot. */
+    {
+        uint32_t offset = 0;
+        const uintptr_t base =
+            EnsureAssetSegmentForSymbol(Low32(reinterpret_cast<uintptr_t>(D_8014A20)), &offset);
+        if (base != 0) {
+            sVenueBuildingTexBase.store(base + offset, std::memory_order_relaxed);
+        }
+    }
 
     gdx_port_logf("[boot-warm] decoded %d/%zu asset segments in %.1fms (segments table restored)\n",
                   warmed, std::size(kWarmSymbols),
@@ -7727,6 +7896,49 @@ extern "C" int gdx_load_venue_texture_segment(int venue) {
     return 1;
 }
 
+/* PORT replacement for func_800747EC's building-texture DMA (course_gadgets.c).
+ * On console that DMA lands a per-venue 0x800 slice of super_textures on top of
+ * course_track_gfx at D_8014A20; under PORT the destination
+ * Segment_SegmentedToVirtual(D_8014A20) masks a 64-bit host pointer to 24 bits
+ * and the copy lands nowhere, so every venue drew the ROM-baked scratch bytes
+ * (the "white buildings"). Write into the decoded segment-8 image instead --
+ * that is the storage the display-list resolver actually reads for D_8014A20.
+ * A verbatim ROM copy is correct here: no sAssetFixups row overlaps
+ * [0x14A20, 0x15220) (the last segment-8 row ends exactly at 0x14A20), and the
+ * decoded image stores N64-order bytes just like the ROM.
+ * Game-thread only (course load), same context as the venue segment loader
+ * above. Cache refresh on venue change is handled by the compare path in
+ * MakePersistentRawTextureCopy via the IsVenueBuildingTextureRange carve-out,
+ * keyed off the base recorded here. */
+extern "C" void gdx_load_venue_building_texture(unsigned int romOffset) {
+    uint32_t offset = 0;
+    const uintptr_t base =
+        EnsureAssetSegmentForSymbol(Low32(reinterpret_cast<uintptr_t>(D_8014A20)), &offset);
+    if (base == 0) {
+        gdx_port_logf("[segment] building texture: D_8014A20 did not resolve\n");
+        return;
+    }
+
+    /* Same address strip as Dma_PortRomOffset (decomp/src/sys/dma.c), so this
+       reads the exact bytes the console DMA would have. */
+    const uint32_t romPhys = romOffset & 0x1FFFFFFFu;
+    const uint32_t romBase = (romPhys >= 0x10000000u) ? (romPhys - 0x10000000u) : romPhys;
+
+    uint8_t staged[0x800];
+    if (!GdxSegmentSourceRead(romBase, static_cast<uint32_t>(sizeof(staged)), staged)) {
+        gdx_port_logf("[segment] building texture: ROM read failed at %08X\n", romBase);
+        return;
+    }
+
+    uint8_t* const dst = reinterpret_cast<uint8_t*>(base + offset);
+    sVenueBuildingTexBase.store(base + offset, std::memory_order_relaxed);
+    if (std::memcmp(dst, staged, sizeof(staged)) != 0) {
+        std::memcpy(dst, staged, sizeof(staged));
+        gdx_port_logf("[segment] building texture: wrote venue slice rom=%08X -> seg8+%05X\n",
+                      romOffset, offset);
+    }
+}
+
 /* Writable extent of the registered host range containing `host`, or 0 when the pointer is not
    inside any registered range. Exposed to decomp TUs because Dma_RomCopy resolves a 32-bit N64
    pointer to a host address and then writes `size` bytes into it, and nothing in that path
@@ -7734,6 +7946,75 @@ extern "C" int gdx_load_venue_texture_segment(int venue) {
 extern "C" size_t gdx_registered_host_capacity(const void* host) {
     return RegisteredHostRemaining(reinterpret_cast<uintptr_t>(host));
 }
+
+#ifdef _WIN32
+/* Name a Microsoft C++ exception (code 0xE06D7363) from its raw EXCEPTION_RECORD, for the
+ * crash handler in n64_sched.c (a C TU that cannot touch C++ RTTI). Two crashes on 2026-08-07
+ * logged only "code=0xE06D7363 pc=<KERNELBASE!RaiseException>" -- the throw site and the message
+ * were both invisible, which made the reports undiagnosable. The record's parameters are the
+ * MSVC throw ABI: [0] magic, [1] exception object, [2] ThrowInfo, [3] module base (x64). The
+ * ThrowInfo walk reads the mangled type name; if it names a std::exception lineage, what() is
+ * called through the object's real vtable. Every dereference is SEH-guarded: this runs while the
+ * process is already dying, so a garbage record must degrade to "no detail", never to a second
+ * fault escaping the handler. Buffers are static because the caller writes them straight into
+ * the crash report; the handler is serialized by its own sInHandler latch. */
+extern "C" const char* gdx_cxx_exception_name(const EXCEPTION_RECORD* rec) {
+    static char sName[192];
+    if (rec == NULL || rec->ExceptionCode != 0xE06D7363u || rec->NumberParameters < 4) {
+        return NULL;
+    }
+    __try {
+        const uint8_t* imageBase = reinterpret_cast<const uint8_t*>(rec->ExceptionInformation[3]);
+        const uint32_t* throwInfo = reinterpret_cast<const uint32_t*>(rec->ExceptionInformation[2]);
+        if (imageBase == NULL || throwInfo == NULL) {
+            return NULL;
+        }
+        // ThrowInfo: {attributes, pmfnUnwind, pForwardCompat, pCatchableTypeArray} -- RVAs on x64.
+        const uint32_t* cta = reinterpret_cast<const uint32_t*>(imageBase + throwInfo[3]);
+        if (cta[0] < 1) { // {nCatchableTypes, rva[]}
+            return NULL;
+        }
+        // CatchableType: {properties, pType(TypeDescriptor RVA), ...}.
+        const uint32_t* ct = reinterpret_cast<const uint32_t*>(imageBase + cta[1]);
+        // TypeDescriptor: {vftable, spare, char name[]} -- name like ".?AVexception@std@@".
+        const char* name = reinterpret_cast<const char*>(imageBase + ct[1]) + 2 * sizeof(void*);
+        size_t i = 0;
+        for (; i < sizeof(sName) - 1 && name[i] != '\0'; ++i) {
+            sName[i] = name[i];
+        }
+        sName[i] = '\0';
+        return sName;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return NULL;
+    }
+}
+
+extern "C" const char* gdx_cxx_exception_what(const EXCEPTION_RECORD* rec) {
+    static char sWhat[256];
+    if (rec == NULL || rec->ExceptionCode != 0xE06D7363u || rec->NumberParameters < 2) {
+        return NULL;
+    }
+    __try {
+        const std::exception* e =
+            reinterpret_cast<const std::exception*>(rec->ExceptionInformation[1]);
+        if (e == NULL) {
+            return NULL;
+        }
+        const char* w = e->what(); // virtual call through the live object's vtable
+        if (w == NULL) {
+            return NULL;
+        }
+        size_t i = 0;
+        for (; i < sizeof(sWhat) - 1 && w[i] != '\0'; ++i) {
+            sWhat[i] = w[i];
+        }
+        sWhat[i] = '\0';
+        return sWhat;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return NULL;
+    }
+}
+#endif
 
 /* Report a DMA whose destination is too small for the requested transfer. Rate-limited: a load
    loop that trips this once normally trips it on every block, and Dma_LoadAssets issues one call
@@ -7898,35 +8179,27 @@ extern "C" double gdx_gfx_interp_presents_per_sec(void) {
     return gGdxInterpPresentsPerSec;
 }
 
-/* Tick-budget reserve exchange between the host loop and the sub-frame burst.
+/* Sim-schedule slip exchange between the host loop and the sub-frame burst.
  *
- * The burst does NOT own the whole 60 Hz tick: only ~0.8 ms of the game frame runs before the gfx
- * task is submitted, and the game continues after osSpTaskStartGo, so several more milliseconds of
- * game work happen AFTER the burst returns -- inside the same tick. A budget guard that ignores
- * that tail hands the loop a 15.9 ms slot that is really ~9.8 ms, and consequently never fires.
- *
- * The reserve must be measured as WORK, never as elapsed wall-clock: deriving it from the interval
- * between bursts silently includes the logic pacer's sleep, which makes the estimate self-
- * reinforcing (healthy sim -> pacer sleeps -> reserve grows -> passes dropped -> more sleep). That
- * version converged on one pass per tick and pinned presents at 59.9/s. Only the host loop can
- * bracket real work, so it owns the arithmetic and publishes the answer here. */
-static double gGdxInterpLastBurstSec = 0.0;
-static double gGdxInterpNonBurstReserve = 0.008; // seeded near the observed tail; host refines it
+ * Slip is how far the tick finished PAST its running logic deadline (main.cpp
+ * sNextLogicDeadline), sampled after gdx_host_pace_logic_until: a healthy tick
+ * ends at (or sleeping until) the deadline and publishes ~0; a tick that could
+ * not afford its work publishes the shortfall. Only the host loop can measure
+ * this -- the deadline schedule lives there -- so it owns the sample and
+ * publishes it here for the burst pre-sizer (the AIMD controller) to steer on.
+ * See the controller's block comment in gdx_gfx_run for why slip, not per-pass
+ * cost, is the steering signal. */
+static double gGdxInterpSimSlipSec = 0.0;
 
-extern "C" double gdx_gfx_interp_last_burst_seconds(void) {
-    return gGdxInterpLastBurstSec;
-}
-
-extern "C" void gdx_gfx_interp_set_nonburst_reserve(double seconds) {
-    // Clamp rather than trust: a mode change or breakpoint can make one tick arbitrarily long, and
-    // a poisoned reserve would suppress every burst until it decayed back out.
-    if (seconds > 0.0 && seconds < 0.100) {
-        gGdxInterpNonBurstReserve = seconds;
+extern "C" void gdx_gfx_interp_set_sim_slip(double seconds) {
+    // A breakpoint / alt-tab stall can make one sample arbitrarily large; the running schedule
+    // re-anchors past 4 ticks of stall anyway, so cap what one sample can claim. Negative means
+    // the pacer slept to the deadline -- schedule healthy, slip zero.
+    if (seconds < 0.0) {
+        gGdxInterpSimSlipSec = 0.0;
+    } else if (seconds < 1.0) {
+        gGdxInterpSimSlipSec = seconds;
     }
-}
-
-static double gdx_gfx_interp_nonburst_reserve(void) {
-    return gGdxInterpNonBurstReserve;
 }
 /* [interp-pair] Pairing-quality readout. Largest prev->cur translation delta among slots that
    actually PAIRED this tick, and how many of those exceeded a plausible per-tick motion. See
@@ -7973,6 +8246,49 @@ extern "C" int gdx_gfx_interp_last_dropped(void) {
 // (batch sizes flip 4<->5 with boost state, spawns shift every downstream offset), and a snapped
 // batch renders exactly like the pre-Tier-3 build — so a high snap ratio means "shipped but inert",
 // which must be visible in one glance at the log, not discovered by eyeballing flames.
+// Per-racer matrices that spawned this tick and borrowed a keyframe from their racer's body
+// (GdxFixupSpawnedRacerMatrices). Non-zero during side/spin attacks is the fix working.
+static size_t gGdxInterpLastBorrowed = 0;
+extern "C" int gdx_gfx_interp_last_borrowed(void) {
+    return static_cast<int>(gGdxInterpLastBorrowed);
+}
+// Camera projection*view rebuilds (task #14). rebuilt = sub-frame matrices produced from an
+// interpolated pose; rejected = camera slots whose t=1 identity check failed this tick and fell back
+// to the element-wise lerp. A steady rejected>0 means the rebuild is shipped but inert for that
+// slot, which must be one glance in the log rather than a guess from how the game looks.
+// eyedelta is the largest per-tick |eye_cur - eye_prev| among verified pairs: the measurement a
+// cut-detection threshold would have to be derived from. No such threshold is applied yet -- the
+// existing cut/pause/absent-keyframe snap rules already disqualify the slot, and picking a number
+// before measuring one is how the last camera hypothesis went wrong.
+// Per-racer matrices whose previous keyframe had its rotation frozen because the racer crossed a
+// side-attack model-basis discontinuity this tick (GdxFixupBasisJumpMatrices). Expect brief
+// non-zero bursts twice per side attack and NEVER during a spin attack -- a non-zero reading
+// during a spin would mean the predicate is wrong, not that the fix is working harder.
+static size_t gGdxInterpLastBasisFixed = 0;
+extern "C" int gdx_gfx_interp_last_basis_fixed(void) {
+    return static_cast<int>(gGdxInterpLastBasisFixed);
+}
+static size_t gGdxInterpLastCamRebuilt = 0;
+static size_t gGdxInterpLastCamRejected = 0;
+static float gGdxInterpLastCamEyeDelta = 0.0f;
+extern "C" int gdx_gfx_interp_last_cam_rebuilt(void) {
+    return static_cast<int>(gGdxInterpLastCamRebuilt);
+}
+extern "C" int gdx_gfx_interp_last_cam_rejected(void) {
+    return static_cast<int>(gGdxInterpLastCamRejected);
+}
+extern "C" double gdx_gfx_interp_last_cam_eye_delta(void) {
+    return static_cast<double>(gGdxInterpLastCamEyeDelta);
+}
+// Why the camera rebuild did not run, per tick. Order matches GdxCamWhy:
+// poseread, id, unreadable, build, mismatch, prevpose, snap.
+static size_t gGdxInterpLastCamWhy[kCamWhyCount] = {};
+extern "C" int gdx_gfx_interp_last_cam_why(int which) {
+    if (which < 0 || which >= static_cast<int>(kCamWhyCount)) {
+        return -1;
+    }
+    return static_cast<int>(gGdxInterpLastCamWhy[which]);
+}
 static size_t gGdxInterpLastVpLerped = 0;
 static size_t gGdxInterpLastVpSnapped = 0;
 static size_t gGdxInterpLastVtxLerped = 0;
@@ -8206,7 +8522,69 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
     // GdxInterpBeginTick (see gGdxInterpNewTick) where a complete tick's set is available.
     // Emit this tick's determinism fingerprint (no-op unless GDX_INTERP_DETERMINISM set).
     // Placed on the common path so it runs identically whether interpolation is ON or OFF this tick.
+    // Repair spawned per-racer matrices BEFORE any refill runs, so the first sub-frame of an attack
+    // already tweens in lockstep with its machine. Must follow ConvertRoot (every matrix decision
+    // for the tick must exist) and precede GdxP0RefillScratch.
+    adapter.GdxFixupSpawnedRacerMatrices();
+    // Must follow the spawn fixup: a highlight matrix that spawned THIS tick has just been given a
+    // synthetic prev, and if its racer also crossed a basis discontinuity that prev needs the same
+    // rotation freeze. Running before would leave those slots unpaired and skip them.
+    // Measure BEFORE the fixup rewrites r.prev, otherwise the probe reports the repaired pair and
+    // the discontinuity it exists to size becomes invisible.
+    adapter.GdxBasisProbeTick();
+    adapter.GdxFixupBasisJumpMatrices();
     GdxInterpDeterminismTick();
+    // [attack-hl] Falsifiable emit: log ONLY the disagreement this probe exists to find -- a racer
+    // whose attack-highlight matrix snapped while its own body matrix lerped (or vice versa). Both
+    // draw the same machine at the same pose, so any disagreement puts them at different instants
+    // on screen. Silence across a run of side attacks refutes the hypothesis and sends the hunt
+    // back to the content/flicker-blend class; lines here confirm it and name the racer.
+    // Unconditional but self-limiting (24 lines a session): a disagreement is rare by construction,
+    // so there is nothing to gate against, and a gate would just be one more thing to forget to arm.
+    {
+        // POSITIVE CONTROL FIRST. A probe that reports zero without proving its subject occurred is
+        // worthless -- the first run of this probe returned a confident zero from a script that
+        // never reached a race. So count the ticks on which ANY highlight matrix was referenced at
+        // all: that number is the attack-tick count, and it must be non-zero before a zero
+        // disagreement count means anything.
+        static int sAttackHlLogs = 0;
+        static uint32_t sHighlightTicks = 0;
+        static uint32_t sDisagreeTicks = 0;
+        bool anyHighlight = false;
+        for (uint32_t r = 0; r < 30; ++r) {
+            const uint8_t body = adapter.GdxRacerMtxVerdict(r, 0);
+            const uint8_t hl = adapter.GdxRacerMtxVerdict(r, 2);
+            if (hl != 0) {
+                anyHighlight = true;
+            }
+            if (body != 0 && hl != 0 && body != hl && sAttackHlLogs < 24) {
+                ++sAttackHlLogs;
+                gdx_port_logf("[attack-hl] racer=%u body=%s highlight=%s  <-- same machine, "
+                              "different instants\n",
+                              r, body == 1 ? "LERPED" : "SNAPPED", hl == 1 ? "LERPED" : "SNAPPED");
+            }
+        }
+        if (anyHighlight) {
+            ++sHighlightTicks;
+            bool disagreed = false;
+            for (uint32_t r = 0; r < 30; ++r) {
+                const uint8_t body = adapter.GdxRacerMtxVerdict(r, 0);
+                const uint8_t hl = adapter.GdxRacerMtxVerdict(r, 2);
+                if (body != 0 && hl != 0 && body != hl) {
+                    disagreed = true;
+                }
+            }
+            if (disagreed) {
+                ++sDisagreeTicks;
+            }
+            // One summary line per 60 highlight ticks keeps this readable while still proving the
+            // subject occurred. attackTicks=0 in a whole run means the script never attacked.
+            if ((sHighlightTicks % 60u) == 0u) {
+                gdx_port_logf("[attack-hl] summary: attackTicks=%u disagreeTicks=%u\n", sHighlightTicks,
+                              sDisagreeTicks);
+            }
+        }
+    }
     gdx_perf_sub_end(GDX_PERF_SUB_XLATE);
     // [venueload] The discriminating measurement. If translation stays flat across these ticks the
     // cost is the load itself and a boot-time preload fixes it. If it spikes, the ++gConvertEpoch
@@ -8473,18 +8851,10 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
         // A frame-rate dip is a smoothness cost; a slow game clock is a correctness fault. Smoothness
         // is the thing that yields.
         //
-        // THE GUARD MUST PREDICT, NOT REACT. A first attempt asked "is the tick budget already
-        // spent?" before each pass, and it NEVER FIRED ONCE across 76 measured samples while ticks
-        // were overrunning by 7ms -- because the overrun happens DURING the pass that follows the
-        // check, not before it. With three ~5ms passes in a 16.68ms tick, the check at pass 2 sees
-        // ~14ms elapsed, waves it through, and the pass ends at ~21ms. Reacting to an overrun that
-        // has already happened is worthless; the pass has to be refused before it starts.
-        //
-        // So the test is "will this pass FIT?", using a measured cost rather than a guessed one:
-        // an exponential moving average of how long a pass has actually been taking. An EMA rather
-        // than the last sample because a single expensive pass (a shader compile, a texture upload)
-        // must not collapse the burst for the next tick, and rather than a fixed constant because
-        // per-pass cost varies by an order of magnitude between a menu and a 30-machine race.
+        // HOW IT DECIDES: an AIMD controller on the replay count, steered by the sim-schedule slip
+        // the host publishes each tick -- see the block comment on sAimdReplayCeiling below for
+        // why that signal and not a per-pass cost estimate (two predictive-cost versions of this
+        // guard were measured causing the very shortfall they existed to prevent).
         //
         // GDX_NO_INTERP_BUDGET=1 disables the guard for A/B without a rebuild. A suppressed guard
         // must reproduce the slow sim to earn the claim that it is what fixed it.
@@ -8492,120 +8862,83 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
             const char* e = getenv("GDX_NO_INTERP_BUDGET");
             return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
         }();
-        // PASS 0 AND THE REPLAYS ARE NOT THE SAME PRICE, and averaging them together is what kept
-        // this guard over-conservative. Pass 0 pays for the tick's real rendering work -- texture
-        // uploads, shader binds, cold caches -- while passes 1..M-1 re-execute the same command
-        // buffer with everything already resident. Measured: ticks running 1.83 passes averaged
-        // 2.98 ms/pass, while ticks running 1.02 passes averaged 6.20 ms/pass. Cost per pass
-        // appeared to DOUBLE as passes were removed, which is only possible if the first one carries
-        // most of the cost.
+        // CLOSED-LOOP BURST SIZING (AIMD). This replaces a predictive cost model, and the reasons
+        // it was replaced are load-bearing, so they are recorded here.
         //
-        // The guard only ever decides about passes k >= 1, so it must price a REPLAY, not a blended
-        // average that is dominated by a pass it has already committed to. Blending made a replay
-        // look several times more expensive than it is and refused passes the tick could easily
-        // afford -- visible as 3.6 ms of idle sitting unused every tick.
+        // The old guard priced a pass at its measured wall time and refused passes that "did not
+        // fit" the tick. That measurement is unusable under VSync: a present ends in
+        // WaitForSingleObject on the swapchain waitable (gfx_dxgi.cpp), so with a saturated
+        // swapchain the sample converges to one refresh interval -- 6.94 ms at 144 Hz --
+        // REGARDLESS of render work (gdx_perf.h: "includes any vsync/latency block"). Priced that
+        // way, a second sub-frame is affordable only while all non-burst work stays under ~2.8 ms,
+        // a property of the target rate rather than of the scene, and the one-sided estimator
+        // oscillated (refusal decays it 6%/tick; only a pass that ran can raise it). Measured
+        // result: a 61-82 presents/s band, mean 67.9, against a 144 Hz target. Run C with the
+        // guard bypassed: 144.0-145.9 presents/s, zero drops, sim_hz 59.2-60.0 -- every counted
+        // drop had been the guard's own decision.
         //
-        // THE REPLAY SEED MUST BE OPTIMISTIC, and this is not a tuning preference -- a pessimistic
-        // seed deadlocks. The replay estimate is only ever updated by a replay that actually ran, so
-        // seeding it high makes the guard refuse every replay, which means no samples arrive, which
-        // means the seed never moves. Seeded at 7 ms it pinned the burst to ~1.1 passes while 3.9 ms
-        // of every tick sat idle, and no amount of running longer would have recovered it.
+        // Per-tick wall time cannot steer this loop either: at 144 Hz the rational accumulator
+        // alternates 2- and 3-pass ticks (M averages 2.4), so tick length legitimately alternates
+        // ~13.9 / ~20.8 ms around the 16.68 ms tick while the host's RUNNING logic schedule
+        // absorbs the difference (short ticks recover what long ticks overran). A "did this tick
+        // overrun" test fires on every 3-pass tick by construction.
         //
-        // Seeded low the loop self-corrects in the safe direction: it attempts a replay, measures
-        // what it really cost, and the average climbs within a few ticks if replays are expensive.
-        // The downside is bounded -- at worst a handful of early ticks overrun slightly -- whereas
-        // the pessimistic failure is permanent and silent.
+        // So steer on the quantity the guard exists to protect: the sim schedule itself. main.cpp
+        // publishes, after the logic pacer, how far the tick finished past its running deadline
+        // (gdx_gfx_interp_set_sim_slip). Slip behaves as a queue: healthy operation holds it near
+        // zero with transient bumps that short ticks drain; a machine that cannot afford the burst
+        // grows it without bound -- the slow-motion failure observed directly rather than
+        // predicted. The trade is unchanged from the old guard: when slip says the sim is losing
+        // time, sub-frames are what yield, because a frame-rate dip is a smoothness cost while a
+        // slow game clock is a correctness fault.
         //
-        // Pass 0 keeps the realistic seed: it is never refused, so its estimate cannot deadlock, and
-        // it is tracked separately only because blending it into the replay price is what made
-        // replays look several times more expensive than they are.
-        static double gdxPass0CostEma = 0.007;
-        static double gdxReplayCostEma = 0.0005;
-        // THE BURST DOES NOT OWN THE WHOLE TICK, and assuming it did is why the first two versions of
-        // this guard never fired. Only ~0.8ms of the game frame runs BEFORE the gfx task is
-        // submitted; the game continues after osSpTaskStartGo, so roughly 6ms of game work still has
-        // to happen AFTER this loop returns, inside the same 16.68ms tick. Measured: window reads
-        // ~15.9ms of budget remaining while the tick actually ends up 19.5ms long.
-        //
-        // So reserve that tail. Rather than hardcode it -- it differs by scene, and a wrong constant
-        // silently mis-sizes every burst -- measure it: the interval between consecutive entries to
-        // this loop is one whole tick, and this loop's own duration is known, so the difference is
-        // everything else the tick does. An EMA of that is the reservation.
-        // The reserve must measure WORK, not elapsed time, and only the host loop can tell the
-        // difference. A first version derived it here, as (interval between loop entries) minus
-        // (this loop's duration) -- which silently included the logic pacer's SLEEP. That built a
-        // feedback loop that ate itself: a healthy sim means the pacer sleeps, sleep inflates the
-        // reserve, a bigger reserve drops more passes, fewer passes means more sleep. It converged
-        // on exactly one pass per tick, pinning presents at 59.9/s -- a perfect 60 Hz sim with
-        // interpolation contributing nothing, which is not the trade anyone asked for.
-        //
-        // So main.cpp publishes it instead: it brackets the tick's real work (tick start to the
-        // moment before gdx_host_pace_logic_until) and subtracts the burst, so idle time never
-        // enters. See gdx_gfx_interp_set_nonburst_reserve there.
-        // Reserve only the TAIL, not all non-burst work. The published figure covers everything in
-        // the tick that is not the burst, which includes the ~0.8 ms of game frame that ran BEFORE
-        // this loop was entered. That part is already spent and already reflected in the clock the
-        // guard compares against, so counting it again shrinks the budget twice and costs a whole
-        // pass: measured 3.6 ms of idle per tick sitting unused while the guard refused a 3.0 ms
-        // pass. Subtract the pre-burst offset so the reservation describes only what still has to
-        // happen after this loop returns.
-        const double gdxPreBurst = (gGdxInterpHostCfg.tickStart > 0.0 && gdxLoopStart > gGdxInterpHostCfg.tickStart)
-                                       ? (gdxLoopStart - gGdxInterpHostCfg.tickStart)
-                                       : 0.0;
-        double gdxReserve = gdx_gfx_interp_nonburst_reserve() - gdxPreBurst;
-        if (gdxReserve < 0.0) {
-            gdxReserve = 0.0;
-        }
-        // Never reserve so much that pass 0 is all the tick can ever afford -- at that point the
-        // guard would be permanently disabling interpolation rather than protecting it. Half the
-        // tick is the floor; beyond that the honest answer is that the machine cannot run this
-        // target, which the frame rate itself will report.
-        if (gGdxInterpHostCfg.tickDuration > 0.0 && gdxReserve > gGdxInterpHostCfg.tickDuration * 0.5) {
-            gdxReserve = gGdxInterpHostCfg.tickDuration * 0.5;
-        }
-        const double gdxBudgetEnd =
-            (gGdxInterpHostCfg.tickDuration > 0.0)
-                ? (gGdxInterpHostCfg.tickStart + gGdxInterpHostCfg.tickDuration - gdxReserve)
-                : 0.0;
+        // AIMD on the replay ceiling: halve on sustained slip (multiplicative decrease, behind a
+        // cooldown so one decision can reach the signal before the next is taken), grow by one
+        // after a run of healthy ticks (additive increase). The ceiling starts at the cap: the
+        // optimistic start mis-sizes at most a cooldown's worth of early ticks, while a
+        // pessimistic start would spend every session's first seconds interpolating nothing.
+        // Unlike the old replay-cost EMA, neither direction can deadlock -- the increase is driven
+        // by healthy ticks, not by replays that must first be permitted to run.
+        static int sAimdReplayCeiling = 7; // replays beyond pass 0; pass telemetry arrays hold 8
+        static int sAimdHealthyTicks = 0;
+        static int sAimdCooldownTicks = 0;
         int budgetDropped = 0;
 
-        // PRE-SIZE THE BURST instead of only clipping it mid-loop. The mid-loop guard decides after
-        // the t values are already fixed at (k+1)/passes, so clipping the third pass of a 3-pass
-        // tick presents t=1/3 and t=2/3 and NEVER PRESENTS t=1 -- the motion stream skips the
-        // tick's newest pose and takes a double-width step into the next tick (0.33, 0.67, then
-        // 1.33): a judder spike riding exactly on the ticks that were already struggling. Owner-
-        // visible as the "caps at 120" feel: the cadence plateau is expected quantization (all-2s
-        // x 60 Hz = 120), but the skipped terminal pose made it jarring rather than merely lower.
+        // PRE-SIZE THE BURST; never clip it mid-loop. The t values are fixed at (k+1)/passes, so
+        // clipping the third pass of a 3-pass tick would present t=1/3 and t=2/3 and NEVER PRESENT
+        // t=1 -- the motion stream skips the tick's newest pose and takes a double-width step into
+        // the next tick (0.33, 0.67, then 1.33): a judder spike riding exactly on the ticks that
+        // were already struggling. Sizing BEFORE the loop lets the t denominator shrink with the
+        // decision: a tick sized to 2 passes presents t=1/2 and t=1 -- evenly spaced, terminal
+        // pose correct, no skip.
         //
-        // Predicting the affordable pass count BEFORE the loop lets the t denominator shrink with
-        // it: a tick sized to 2 passes presents t=1/2 and t=1 -- evenly spaced, terminal pose
-        // correct, no skip. The mid-loop guard stays as the backstop for mispredictions (a pass
-        // that runs far over its estimate can still push the budget past the wall).
-        //
-        // Affordability arithmetic: pass 0 always runs (this loop owns presentation; see the
-        // guard's pass-0 rule), so the question is how many REPLAYS fit after it.
-        if (!sNoBudgetGuard && gdxBudgetEnd > 0.0 && gdxLoopStart > 0.0 && passes > 1 &&
-            gdxReplayCostEma > 0.0) {
-            const double room = gdxBudgetEnd - gdxLoopStart - gdxPass0CostEma;
-            int affordable = 1;
-            if (room > 0.0) {
-                const double replays = room / gdxReplayCostEma;
-                // Cap the intermediate before the int conversion: with the optimistic replay seed
-                // (0.0005s) `replays` can be in the tens of thousands, which is UB territory for a
-                // float->int cast only above INT_MAX, but clamping first costs nothing and reads
-                // as intent rather than luck.
-                affordable = 1 + static_cast<int>(std::min(replays, 64.0));
+        // Pass 0 always runs (this loop owns presentation; see the pass-0 rule in the loop), so
+        // the ceiling only ever bounds REPLAYS. A mid-burst stall (shader compile, texture upload)
+        // is answered one tick later through the slip signal, not by aborting the burst it
+        // happened in -- that abort is what produced the skipped-terminal-pose judder.
+        if (!sNoBudgetGuard && gGdxInterpHostCfg.tickDuration > 0.0) {
+            const double slip = gGdxInterpSimSlipSec;
+            const double tickDur = gGdxInterpHostCfg.tickDuration;
+            if (sAimdCooldownTicks > 0) {
+                --sAimdCooldownTicks;
             }
-            if (affordable < passes) {
-                budgetDropped += passes - affordable;
-                passes = affordable;
-                // DECAY ON SHRINK — the same one-sided-estimator lesson as the in-loop guard, which
-                // this pre-sizer initially failed to inherit and promptly re-proved: a spike
-                // inflated gdxReplayCostEma, the pre-sizer clamped every burst to 1 pass, no replay
-                // ever ran again to supply a cheaper sample, and presents pinned at 60/s for an
-                // entire session (passes=1 planned=3 on every pace line). Any estimator that gates
-                // the only activity that can update it MUST decay when it says no.
-                gdxReplayCostEma *= 0.94;
+            if (slip > tickDur * 0.5) {
+                // Sustained slip: the sim is losing real time. Halve, then hold for ~0.5 s so the
+                // smaller burst can reach the published signal before the next decision.
+                if (sAimdCooldownTicks == 0 && sAimdReplayCeiling > 0) {
+                    sAimdReplayCeiling /= 2;
+                    sAimdCooldownTicks = 30;
+                }
+                sAimdHealthyTicks = 0;
+            } else if (slip < tickDur * 0.125) {
+                if (++sAimdHealthyTicks >= 30 && sAimdReplayCeiling < 7) {
+                    ++sAimdReplayCeiling;
+                    sAimdHealthyTicks = 0;
+                }
+            }
+            if (passes > 1 + sAimdReplayCeiling) {
+                budgetDropped += passes - (1 + sAimdReplayCeiling);
+                passes = 1 + sAimdReplayCeiling;
             }
         }
 
@@ -8657,39 +8990,12 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
             // construction: window/passes yields 7.93ms gaps inside the tick and 8.75ms across the
             // tick boundary, averaging ~120 fps. Do not re-attempt without first explaining why
             // whole ticks are refused.
-            // Budget guard. See the block comment on sNoBudgetGuard above the loop for why dropping
-            // sub-frames is the correct response and a slow simulation is not.
-            //
             // Pass 0 is never dropped: this loop owns presentation for the whole tick
             // (gGdxInterpPresentedLastTick tells the host not to present again), so skipping every
             // pass would leave the previous frame on screen and turn a rate dip into a freeze. One
             // present per tick is the floor, which is exactly the non-interpolated behaviour.
-            //
-            // Checked BEFORE the work rather than after, because the point is to not start a pass
-            // that cannot finish inside the tick. The remaining passes are counted as dropped so the
-            // telemetry stays honest -- presents/s must not be flattered by frames we chose to skip.
-            if (k > 0 && !sNoBudgetGuard && gdxBudgetEnd > 0.0 && gGdxInterpNowFn != nullptr) {
-                const double nowSec = gGdxInterpNowFn();
-                if (nowSec + gdxReplayCostEma > gdxBudgetEnd) {
-                    budgetDropped = passes - k;
-                    dropped += budgetDropped;
-                    // DECAY ON REFUSAL, or this estimator can never recover. It is one-sided: the
-                    // only thing that updates it is a replay that was allowed to run, so any upward
-                    // excursion is self-locking. Replays are genuinely expensive during boot and
-                    // load, the average climbs, and from then on every replay is refused -- which
-                    // means no cheap sample can ever arrive to bring it back down. Observed exactly
-                    // that: presents pinned at 59.8/s with 3 ms of every tick idle, while the
-                    // accumulator was still asking for 2-3 passes.
-                    //
-                    // Shrinking the estimate each time it causes a refusal makes the guard probe
-                    // again after a few ticks. If replays really are expensive the next sample puts
-                    // the average straight back up; if the scene got cheaper it settles at the new
-                    // cost. The sim stays protected either way, because a probe can overrun by at
-                    // most one replay.
-                    gdxReplayCostEma *= 0.94;
-                    break;
-                }
-            }
+            // Replays are bounded by the AIMD pre-sizer above; there is deliberately no mid-loop
+            // refusal (see the pre-sizer comment on the skipped-terminal-pose judder).
             const double gdxPassStart = (gGdxInterpNowFn != nullptr) ? gGdxInterpNowFn() : 0.0;
             if (k < 8) {
                 gdxAttemptAt[k] = gdxPassStart;
@@ -8723,6 +9029,7 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
             adapter.GdxP0RefillScratch(t); // lerp(prev,cur,t) into every non-snapped scratch slot
             adapter.GdxVpRefillScratch(t);  // Tier 2: carousel viewports, same t
             adapter.GdxVtxRefillScratch(t); // Tier 3: effects vertices, same t
+            adapter.GdxScreenProbe(t);      // where the machine actually lands this sub-frame
             // Re-arm the task's entry ucode variant. Replaying a display list must start from the
             // same RSP state pass 0 started from; a mid-list variant switch leaks forward otherwise.
             // See gdxTaskVariant above for the measurement this fixes.
@@ -8875,30 +9182,12 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
             if (k < 8) {
                 gdxAttemptOk[k] = delivered;
             }
-            // Feed the budget guard's cost estimate. Only DELIVERED passes count: a pass the limiter
-            // refused returns without rendering, so timing it would drag the average toward zero and
-            // the guard would then wave through passes that cannot possibly fit.
-            //
-            // 1/8 smoothing -- fast enough to follow a scene change within a few ticks, slow enough
-            // that one shader-compile stall does not suppress the next tick's whole burst.
-            if (delivered && gdxPassStart > 0.0 && gGdxInterpNowFn != nullptr) {
-                const double cost = gGdxInterpNowFn() - gdxPassStart;
-                if (cost > 0.0 && cost < 0.5) { // ignore absurd samples (breakpoint, alt-tab, resize)
-                    double& ema = (k == 0) ? gdxPass0CostEma : gdxReplayCostEma;
-                    ema += (cost - ema) * 0.125;
-                }
-            }
             lastT = t;
         }
         // Hand pacing back before leaving the burst, so the host's own taskless-VI present and
         // every non-interpolated path keep honouring the limiter exactly as they do today.
         gdx_fast3d_set_subframe_present(0);
 
-        // Publish this burst's duration so the host can subtract it from the tick's total WORK and
-        // hand back the reserve (see the block comment on gdxReserve above).
-        if (gGdxInterpNowFn != nullptr && gdxLoopStart > 0.0) {
-            gGdxInterpLastBurstSec = gGdxInterpNowFn() - gdxLoopStart;
-        }
         gdx_perf_sub_begin(GDX_PERF_SUB_POST);
         gdxPostTimerOpen = true;
 
@@ -8932,12 +9221,13 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
                 // mean opposite things: limiter drops say presentation is ahead of schedule, budget
                 // drops say the tick could not afford the burst and the sim was about to lose time.
                 gdx_port_logf("[interp-pace] passes=%d planned=%d window=%.2fms g1=%.2f%s g2=%.2f%s g3=%.2f%s "
-                              "presented=%d dropped=%d budget=%d\n",
+                              "presented=%d dropped=%d budget=%d aimd=%d slip=%.2fms\n",
                               passes, gdxPlannedPasses, gdxPaceWindow * 1000.0,
                               g1, (passes > 1 && !gdxAttemptOk[1]) ? "X" : "",
                               g2, (passes > 2 && !gdxAttemptOk[2]) ? "X" : "",
                               g3, (passes > 3 && !gdxAttemptOk[3]) ? "X" : "",
-                              presented, dropped, budgetDropped);
+                              presented, dropped, budgetDropped, sAimdReplayCeiling,
+                              gGdxInterpSimSlipSec * 1000.0);
             }
         }
 
@@ -8946,6 +9236,16 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
         gGdxInterpLastDropped = dropped;
         gGdxInterpLastT = static_cast<double>(lastT);
         gGdxInterpLastLerped = adapter.GdxP1Lerped();
+        gGdxInterpLastBorrowed = adapter.GdxP1BorrowedKeyframes();
+        // Read straight from the file-scope camera counters rather than through the adapter: the
+        // pose history outlives the adapter by design (several tasks per tick), and so do these.
+        gGdxInterpLastBasisFixed = gGdxBasisJumpFixed;
+        gGdxInterpLastCamRebuilt = gGdxCamRebuilds;
+        gGdxInterpLastCamRejected = gGdxCamRejects;
+        gGdxInterpLastCamEyeDelta = gGdxCamMaxEyeDelta;
+        for (size_t w = 0; w < kCamWhyCount; ++w) {
+            gGdxInterpLastCamWhy[w] = gGdxCamWhy[w];
+        }
         gGdxInterpLastVpLerped = adapter.GdxVpLerped();
         gGdxInterpLastVpSnapped = adapter.GdxVpSnapped();
         gGdxInterpLastVtxLerped = adapter.GdxVtxLerped();

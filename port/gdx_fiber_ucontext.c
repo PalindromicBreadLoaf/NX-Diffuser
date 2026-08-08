@@ -2,30 +2,22 @@
  *
  * Mirrors the Win32 backend's semantics using getcontext/makecontext/swapcontext.
  *
- * DESIGN NOTES
- * ------------
- * makecontext-arg hazard: makecontext passes its extra arguments as ints, so a
- * 64-bit pointer would be split across two int slots on LP64 (the classic
- * "pass hi/lo halves" idiom). We sidestep that entirely: the trampoline takes
- * ZERO makecontext arguments and reads the target fiber from a thread-local set
- * immediately before the switch. Simpler and safe on any ABI.
+ * makecontext passes its extra arguments as ints, so a 64-bit pointer would be split across two
+ * int slots on LP64. The trampoline sidesteps that by taking ZERO makecontext arguments and
+ * reading the target fiber from a thread-local instead -- safe on any ABI.
  *
- * Deferred makecontext: getcontext() runs at create time (it only needs a valid
- * uc_stack, which we set then), but makecontext() is deferred to the first
- * gdx_fiber_switch so sTrampolineArg is written in the same breath as the resume
- * -- no window where a stale value could be read.
+ * makecontext() is deferred to the first gdx_fiber_switch (getcontext() runs at create time,
+ * since it only needs a valid uc_stack) so sTrampolineArg is written in the same breath as the
+ * resume, leaving no window where a stale value could be read.
  *
- * Stacks: 1 MB by default, allocated with mmap(MAP_PRIVATE|MAP_ANONYMOUS) plus a
- * PROT_NONE guard page at the low end (stacks grow down, so an overflow faults on
- * the guard instead of silently smashing neighbouring memory). This approximates
- * Win32's stack-reserve-with-guard behavior closely enough for the scheduler.
+ * Stacks are mmap'd with a PROT_NONE guard page at the LOW end: stacks grow down, so an overflow
+ * faults on the guard instead of silently smashing neighbouring memory. That approximates Win32's
+ * stack-reserve-with-guard behavior closely enough for the scheduler.
  *
- * swapcontext cost: swapcontext performs a sigprocmask syscall on every switch to
- * save/restore the signal mask. The scheduler switches a few times per VI frame,
- * so this is acceptable for now. If profiling ever shows it hurts, the escape
- * hatch is to replace the swapcontext internals here with a ~40-line x86-64 asm
- * switch (save/restore callee-saved regs + rsp only, no signal-mask syscall)
- * behind this exact same API -- no caller in n64_sched.c changes.
+ * swapcontext performs a sigprocmask syscall on every switch to save/restore the signal mask. The
+ * scheduler switches only a few times per VI frame, so that is acceptable; if it ever is not, the
+ * escape hatch is a ~40-line x86-64 asm switch behind this same API, with no caller change in
+ * n64_sched.c.
  */
 #include "gdx_fiber.h"
 
@@ -67,8 +59,8 @@ static void gdx_fiber_ucontext_trampoline(void) {
     GdxFiber* f = sTrampolineArg;
     f->entry(f->arg);
     /* Entry is not expected to return (the decomp threads reschedule through
-     * __osCleanupThread). uc_link is NULL by design -- there is nowhere to go --
-     * so abort loudly rather than execute undefined behavior. */
+     * __osCleanupThread), and uc_link is NULL by design, so there is nowhere to go. Abort
+     * loudly rather than execute undefined behavior. */
     abort();
 }
 
@@ -98,7 +90,6 @@ GdxFiber* gdx_fiber_create(GdxFiberEntry entry, void* arg, size_t stackSize) {
     pageSc = sysconf(_SC_PAGESIZE);
     page = (pageSc > 0) ? (size_t) pageSc : 4096u;
 
-    /* Round the usable stack up to a page multiple, then add one guard page. */
     usable = (stackSize + page - 1u) & ~(page - 1u);
     total = usable + page;
 
@@ -114,10 +105,8 @@ GdxFiber* gdx_fiber_create(GdxFiberEntry entry, void* arg, size_t stackSize) {
         return NULL;
     }
 
-    /* Guard page at the lowest address; the stack grows down into `usable`. */
     if (mprotect(mem, page, PROT_NONE) != 0) {
-        /* Non-fatal: without the guard an overflow is undiagnosed, but the
-         * fiber still works. Keep going rather than fail creation. */
+        /* Non-fatal: without the guard an overflow is undiagnosed, but the fiber still works. */
     }
 
     if (getcontext(&f->ctx) != 0) {
@@ -144,8 +133,8 @@ void gdx_fiber_switch(GdxFiber* to) {
     sCurrent = to;
     if (!to->started) {
         to->started = 1;
-        /* Set the trampoline target immediately before arming/resuming so the
-         * thread-local read at trampoline entry sees exactly this fiber. */
+        /* Immediately before arming/resuming, so the thread-local read at trampoline entry
+         * sees exactly this fiber. */
         sTrampolineArg = to;
         makecontext(&to->ctx, gdx_fiber_ucontext_trampoline, 0);
     }

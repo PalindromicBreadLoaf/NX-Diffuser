@@ -1,17 +1,15 @@
 // port/gdx_dump_launch.h — per-class offline "Dump All" launcher.
 //
-// The in-game Workshop "Asset Dump" section (port/gdx_menu.cpp) drives the offline dump surface, one
-// child process PER SELECTED CLASS so a single broken class can never abort the rest of the batch.
-// This header is the seam between the ImGui UI (which only READS the shared snapshot) and the detached
-// worker thread (which spawns the child processes).
+// The in-game Workshop "Asset Dump" section (port/gdx_menu.cpp) runs one child process PER SELECTED
+// CLASS so a single broken class can never abort the rest of the batch. This header is the seam
+// between the ImGui UI (which only READS the shared snapshot) and the detached worker thread that
+// spawns the children.
 //
-// NATIVE-FIRST: when the native `gdx-extract.exe` ships next to the game exe (the deployed
-// layout, and dev builds that copy it there), the launcher drives `gdx-extract dump` for everything —
-// the --list-classes probe AND the per-class runs — with no Python required. The Python interpreter +
-// tools/gen_dump_all.py path remains only as a DEV FALLBACK for source checkouts where the native
-// binary has not been built/copied yet. The section renders disabled (with one plain explanatory line,
-// never an error popup) only when NEITHER backend is available. Nothing here ever writes outside the
-// game's own dump directory (passed in as the dumpDir); AppData/XDG are never touched.
+// Backends, in preference order: the native `gdx-extract.exe` next to the game exe drives everything
+// (the --list-classes probe and the per-class runs) with no Python; a Python interpreter +
+// tools/gen_dump_all.py covers source checkouts where that binary has not been built/copied yet. With
+// neither available the section renders disabled with one plain line, never an error popup. Nothing
+// here writes outside the caller-supplied dumpDir; AppData/XDG are never touched.
 
 #pragma once
 
@@ -102,9 +100,8 @@ void GdxDumpStartBatch(const DumpEnvironment& env, const std::vector<std::string
 
 bool GdxDumpBatchRunning();
 
-// Cooperative cancel: the worker stops AFTER the current class finishes. No child process is killed
-// (a running dump is left to complete cleanly), so cancel latency == the current class's remaining
-// runtime. Documented behavior, not a bug.
+// Cooperative cancel: the worker stops AFTER the current class finishes, and no child is killed, so
+// cancel latency equals the current class's remaining runtime.
 void GdxDumpRequestCancel();
 
 // Latest snapshot for the UI. Render-thread safe (guarded internally).

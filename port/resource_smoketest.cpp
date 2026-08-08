@@ -1,10 +1,8 @@
 // G-Diffuser — resource smoke test.
-// Standalone exe (links libultraship ONLY, not the game objects). Verifies what's checkable
-// headlessly: init the resource manager, mount the .o2r, and register the resource factories.
-//
-// NOTE: actually LOADING a resource needs the global Context (set by full CreateInstance) and,
-// for textures, a GPU/renderer — i.e. a real display. That end-to-end load+render check happens
-// with the full game on a real desktop, not in this headless test.
+// Standalone exe linking libultraship ONLY, not the game objects. Scope stops at mounting the
+// .o2r and registering factories: actually loading a resource needs the global Context (set by
+// full CreateInstance) and, for textures, a real GPU, so the end-to-end load+render check
+// belongs to the full game on a desktop rather than here.
 
 #include "resource/ResourceFactories.h"
 #include "ship/Context.h"

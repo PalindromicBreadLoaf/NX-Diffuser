@@ -1,16 +1,12 @@
 // port/gdx_menu_internal.h — helpers shared between the menu shell and its registry.
 //
-// The G-Diffuser menu is two translation units by design:
-//   port/gdx_menu.cpp          the shell: window, header, sidebar, search, MenuDrawItem, and the
-//                              WIDGET_CUSTOM blocks that no generic widget can express;
-//   port/gdx_menu_registry.cpp the contents: one declaration per control (see port/ui/MenuTypes.h).
-// The registry's callbacks are where the live side effects happen — applying a resolution
-// multiplier, flipping fullscreen, toggling a GuiWindow, queueing the CVar flush — so both TUs
-// need the same small set of libultraship accessors. They are declared here, and defined once in
-// gdx_menu.cpp, so there is exactly one copy of each. Everything is main-thread only: the whole
-// menu draws inside Gui::StartDraw/EndDraw.
+// The menu is two translation units: port/gdx_menu.cpp (the shell) and port/gdx_menu_registry.cpp
+// (the contents, one declaration per control). The registry's callbacks are where the live side
+// effects happen — applying a resolution multiplier, flipping fullscreen, toggling a GuiWindow,
+// queueing the CVar flush — so both need the same libultraship accessors. Declared here and defined
+// once in gdx_menu.cpp, so there is exactly one copy of each.
 //
-// Not a public header. Nothing outside the menu should include it.
+// Main-thread only: the whole menu draws inside Gui::StartDraw/EndDraw. Not a public header.
 
 #pragma once
 

@@ -45,9 +45,8 @@ namespace {
 
 constexpr unsigned kHeaderSize = 24;
 constexpr uint32_t kFormatVersion = 1u;
-/* Debounce window: flush the journal once a write burst has been idle for this
- * many host frames (about half a second at 60 Hz). A user save is a bounded
- * burst, so this coalesces it into a single atomic sidecar write. */
+/* Idle host frames (about half a second at 60 Hz) before the journal is flushed. A user
+ * save is a bounded write burst, so waiting it out coalesces it into one sidecar write. */
 constexpr int kDebounceFrames = 30;
 
 struct DirtyRange {
@@ -70,7 +69,7 @@ std::string g_tmpPath;
 
 /* Workshop-menu status (read-only introspection; see the getters at the bottom). */
 bool g_sidecarPresent = false;      /* a valid .gdd/.bak was loaded this boot */
-bool g_lastFlushOk = true;          /* most recent flush attempt succeeded */
+bool g_lastFlushOk = true;
 bool g_formatRefusedThisBoot = false; /* MFS uninitialized AND format refused this boot */
 
 /* --- CRC helpers ------------------------------------------------------------ */
@@ -187,7 +186,6 @@ bool savesDirectory(std::string& out) {
     return true;
 }
 
-/* Base file name of a possibly-qualified disk path (strip any directory). */
 std::string baseName(const char* name) {
     if (name == nullptr) {
         return std::string();
@@ -206,8 +204,8 @@ void insertRange(uint32_t offset, const unsigned char* data, uint32_t len) {
     uint64_t newStart = offset;
     uint64_t newEnd = (uint64_t)offset + len;
 
-    /* Gather the span of existing ranges that overlap or touch the new one.
-     * Ranges are kept sorted by offset, so the affected ranges are contiguous. */
+    /* Ranges are kept sorted by offset, so everything overlapping or touching the new
+     * range is one contiguous run and can be collapsed in a single pass. */
     size_t first = g_ranges.size();
     size_t last = 0;
     bool any = false;
@@ -287,8 +285,8 @@ LoadStatus loadSidecar(const std::string& path, std::vector<DirtyRange>& out) {
     uint32_t recordCount = getU32(&buf[16]);
     uint32_t storedCrc = getU32(&buf[20]);
 
-    /* CRC covers every byte except the 4 CRC bytes at offset 20. Recompute over
-     * a scratch copy with that field zeroed, matching how flush builds it. */
+    /* The CRC covers every byte except the 4 CRC bytes at offset 20, so recompute over a
+     * scratch copy with that field zeroed -- the same shape flush builds. */
     std::vector<uint8_t> scratch(buf);
     scratch[20] = scratch[21] = scratch[22] = scratch[23] = 0;
     if (crc32(scratch.data(), scratch.size()) != storedCrc) {
@@ -298,7 +296,6 @@ LoadStatus loadSidecar(const std::string& path, std::vector<DirtyRange>& out) {
         return LoadStatus::HashMismatch;
     }
 
-    /* Parse records. */
     std::vector<DirtyRange> parsed;
     size_t pos = kHeaderSize;
     for (uint32_t i = 0; i < recordCount; i++) {
@@ -352,11 +349,9 @@ void gdx_disk_save_init(const char* diskName, const unsigned char* pristine, uns
     g_sourceHash = 0;
     g_diskSize = size;
     g_sidecarPresent = false;
-    /* Reset the flush-status latch per boot/disk so a stale FAILED from a prior
-     * disk cannot leak into this one. It stays the honest "not failed" state (true)
-     * until a flush is actually attempted. The getter (gdx_disk_last_flush_ok) is
-     * binary, so "no flush attempted this boot" and "last flush succeeded" both read
-     * as "ok" in the Workshop panel. */
+    /* Reset per boot/disk so a stale FAILED from a prior disk cannot leak into this one.
+     * The getter is binary, so "no flush attempted yet" and "last flush succeeded" both
+     * read as ok in the Workshop panel. */
     g_lastFlushOk = true;
 
     if (pristine == nullptr || size == 0) {
@@ -385,9 +380,8 @@ void gdx_disk_save_init(const char* diskName, const unsigned char* pristine, uns
     g_tmpPath = g_gddPath + ".tmp";
     g_active = true;
 
-    /* Load the primary sidecar; on failure fall back to the rolled backup, then
-     * to pristine-only. One log line per outcome. A sidecar whose fingerprint
-     * does not match this pristine image is NEVER applied. */
+    /* Primary sidecar, else the rolled backup, else pristine-only. A sidecar whose
+     * fingerprint does not match this pristine image is NEVER applied. */
     LoadStatus primary = loadSidecar(g_gddPath, g_ranges);
     if (primary == LoadStatus::Loaded) {
         g_sidecarPresent = true;
@@ -410,16 +404,12 @@ void gdx_disk_save_init(const char* diskName, const unsigned char* pristine, uns
     g_ranges.clear();
     if (primary == LoadStatus::Missing && backup == LoadStatus::Missing) {
         gdx_port_logf("[disk-save] no disk save found, pristine (sidecar: %s)\n", g_gddPath.c_str());
-        /* Fresh install: no sidecar exists at all, so there is nothing to protect.
-         * Auto-arm the one-shot DD-format gate for THIS boot so the MFS RAM area is
-         * initialized without a manual Workshop opt-in and without needing a restart.
-         * Transient runtime state only -- do NOT CVarSave() (persisting runtime flags
-         * to config is the exact defect the input_bridge.c postmortem warns against);
-         * gdx_disk_allow_format() consumes and clears the flag when the format runs.
-         * Deliberately NOT armed in the corrupted/rejected-sidecar branch below: an
-         * existing-but-unreadable save must never be auto-formatted -- the manual
-         * Workshop opt-in remains the only path for the sidecar-present-but-
-         * uninitialized case. */
+        /* Fresh install: no sidecar exists at all, so there is nothing to protect. Arm the
+         * one-shot DD-format gate for THIS boot so the MFS RAM area initializes without a
+         * manual Workshop opt-in or a restart. Transient runtime state only -- do NOT
+         * CVarSave() it; gdx_disk_allow_format() consumes and clears it when the format
+         * runs. Deliberately NOT armed in the rejected-sidecar branch below: an existing
+         * but unreadable save must never be auto-formatted. */
         CVarSetInteger("gEnhancements.Workshop.AllowDDFormatOnce", 1);
     } else {
         gdx_port_logf("[disk-save] backup %s unusable (%s); pristine-only\n", g_bakPath.c_str(),
@@ -461,8 +451,8 @@ void gdx_disk_save_flush(void) {
         return;
     }
 
-    /* Build the whole sidecar image in memory, then compute the file CRC over it
-     * with the CRC field zeroed. */
+    /* The file CRC is taken over the whole image with the CRC field zeroed, so the image
+     * has to be assembled in memory before the field can be filled in. */
     std::vector<uint8_t> image;
     image.insert(image.end(), { 'G', 'D', 'D', '1' });
     putU32(image, kFormatVersion);
@@ -500,8 +490,8 @@ void gdx_disk_save_flush(void) {
         return;
     }
 
-    /* Roll the current sidecar to .bak so a failed replace still leaves a good
-     * previous copy, then atomically move the temp into place. */
+    /* Roll the live sidecar to .bak first, so a failed replace still leaves a good copy
+     * behind, then atomically move the temp into place. */
 #ifdef _WIN32
     MoveFileExA(g_gddPath.c_str(), g_bakPath.c_str(), MOVEFILE_REPLACE_EXISTING);
     if (!MoveFileExA(g_tmpPath.c_str(), g_gddPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
@@ -539,24 +529,18 @@ void gdx_disk_save_tick(void) {
 }
 
 int gdx_disk_allow_format(void) {
-    /* DEFAULT FALSE. The port must not auto-format an uninitialized or foreign
-     * MFS RAM area on its own: with the durable sidecar in place, an unprompted
-     * format would overwrite the user's prior saved disk state.
+    /* DEFAULT FALSE. With the durable sidecar in place, an unprompted format of an
+     * uninitialized or foreign MFS RAM area would overwrite the user's prior saved disk
+     * state. The Workshop menu's "Initialize DD save area" arms a one-shot flag that this
+     * guard consumes exactly once, clearing and re-saving it so a single format runs and
+     * the flag never fires again unprompted. The format lands in the in-memory image and,
+     * through the dirty-range journal, in the sidecar -- never in the user's .ndd.
      *
-     * One-shot opt-in (Workshop menu "Initialize DD save area"): the menu writes
-     * gEnhancements.Workshop.AllowDDFormatOnce = 1 (persisted for the NEXT boot).
-     * The guard consumes it exactly once here -- clearing it in the runtime store
-     * and re-saving the config so a single format runs and the flag never fires
-     * again unprompted. The format lands in the in-memory disk image and, via the
-     * dirty-range journal, in the sidecar only -- never in the user's .ndd.
-     *
-     * TERMINAL-ONLY CONSUMPTION: this predicate is now called exclusively from
-     * genuinely terminal not-initialized sites -- func_i1_80404830's second-pass
-     * failure (mfs_ram.c, after Mfs_ReadRamArea) and func_80706518's media-init
-     * recovery (sys_leo_dd.c). It is no longer reachable from the transient
-     * wiped-cache first-pass inside Mfs_ValidateRamVolume, which used to consume
-     * the armed one-shot spuriously and format from a stale/empty cache. So the
-     * one-shot can only be consumed when the on-disk volume is truly invalid. */
+     * TERMINAL-ONLY CONSUMPTION: call this only from genuinely terminal not-initialized
+     * sites -- func_i1_80404830's second-pass failure (mfs_ram.c) and func_80706518's
+     * media-init recovery (sys_leo_dd.c). The transient wiped-cache first pass inside
+     * Mfs_ValidateRamVolume must not reach it, or the armed one-shot is consumed
+     * spuriously and formats from a stale/empty cache. */
     if (CVarGetInteger("gEnhancements.Workshop.AllowDDFormatOnce", 0) != 0) {
         CVarSetInteger("gEnhancements.Workshop.AllowDDFormatOnce", 0);
         CVarSave();
@@ -567,14 +551,10 @@ int gdx_disk_allow_format(void) {
 }
 
 void gdx_disk_log_format_refused(void) {
-    /* Composite condition for the Workshop menu: this is only ever called from a
-     * genuinely terminal not-initialized site -- func_i1_80404830's second-pass
-     * failure (mfs_ram.c) or func_80706518's media-init recovery (sys_leo_dd.c) --
-     * after that site observes N64DD_MEDIA_NOT_INIT (MFS area truly uninitialized)
-     * and gdx_disk_allow_format() returned 0. It is NOT called from the transient
-     * wiped-cache first-pass validate, so the latch is truthful: it reflects a
-     * genuinely uninitialized disk with the format opt-in disarmed, never a
-     * normal mount's transient first-pass miss. Latch it for the menu's button. */
+    /* Same terminal-only call sites as gdx_disk_allow_format, after that site observed
+     * N64DD_MEDIA_NOT_INIT and the guard returned 0. Keeping the transient wiped-cache
+     * first-pass validate out of here is what makes the latch truthful for the Workshop
+     * button: a genuinely uninitialized disk, not a normal mount's first-pass miss. */
     g_formatRefusedThisBoot = true;
     static int logged = 0;
     if (logged) {

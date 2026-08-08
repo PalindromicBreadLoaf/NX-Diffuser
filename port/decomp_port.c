@@ -1,14 +1,18 @@
 // G-Diffuser — decomp-side port subsystems.
-// Compiled WITH the decomp's headers/flags (part of the gdiffuser_game target), so it uses
-// the real game types. Provides port reimplementations / placeholders for symbols that lived
-// in N64-platform files excluded from the host build (segment system, save, fixed-address
-// data). Placeholders let the exe LINK and boot; real backing (resource system, LUS save)
-// comes next.
+// Compiled WITH the decomp's headers and flags (part of the gdiffuser_game target), so it sees
+// the real game types. Holds the port reimplementations and placeholders for symbols that lived
+// in N64-platform files excluded from the host build: segment system, save, fixed-address data.
 
 #include "global.h"
+#include "fzx_camera.h"
 #include "fzx_course.h"
 #include "fzx_game.h"
+#include "fzx_racer.h" /* gRacers + the ATTACK_STATE_* enum, for the side-attack predicate below */
 #include "n64_rdram.h"
+/* Last, like n64_rdram.h: it declares size_t parameters and deliberately includes no platform
+   headers of its own (see the contract note at the top of it), so global.h must land first. */
+#include "gdx_camera_pose.h"
+#include "gdx_discord.h" /* GdxDiscordSnapshot, filled by gdx_discord_snapshot below */
 
 /* port_log.h pulls in <stdio.h> which clashes with the decomp's libc/stdint.h.
    Use gdx_ck (defined in n64_sched.c, which CAN include stdio.h) for logging. */
@@ -165,14 +169,11 @@ void gdx_rdram_init(void) {
         gdx_register_host_range(D_A007000, 1);
         gdx_register_host_range(D_A008000, 1);
     }
-    // Banks 9-11 (D_A009000..D_A00B000, decomp's
-    // fzx_segmentA.h:15-17) -- same 1-byte-LinkStubs-on-Linux-PIE registration
-    // as banks 0-8 above, extending the range n64_gfx_bridge.cpp's kBankLow32[]
-    // now also covers. D_A009000/D_A00A000 are unreferenced placeholders (see
-    // tools/gen_link_stubs.py's EXTRA_DATA_SYMS) always linked via LinkStubs.c;
-    // D_A00B000 is live (gRoadTypeMenuItems, decomp/src/overlays/expansion_kit/
-    // A3AE0.c:534-544) but only exists in the EK-only port/gen/EkLinkStubs.c, so
-    // it must stay behind EXPANSION_KIT like its bridge-side extern declaration.
+    // Banks 9-11 (decomp's fzx_segmentA.h:15-17), same registration as banks 0-8 above and
+    // matching n64_gfx_bridge.cpp's kBankLow32[]. D_A009000/D_A00A000 are unreferenced
+    // placeholders always linked via LinkStubs.c; D_A00B000 is live (gRoadTypeMenuItems,
+    // overlays/expansion_kit/A3AE0.c:534-544) but exists only in the EK-only EkLinkStubs.c, so it
+    // must stay behind EXPANSION_KIT like its bridge-side extern.
     {
         extern unsigned char D_A009000[];
         extern unsigned char D_A00A000[];
@@ -210,21 +211,13 @@ void gdx_rdram_init(void) {
     }
 #endif
 
-    // A1 (podium/ending fireworks invisible): EndingCutsceneEffects_DrawFireworks
-    // (decomp/src/overlays/ending/ending_effects.c) SETTIMGs these three compiled-in
-    // u16[64] sparkle textures directly -- real, full-size host arrays, not
-    // LinkStubs placeholders, so ResolveWideAssetStubPointer miscounted them as
-    // unbound stubs ("[stub-miss] ... taken verbatim"). "Verbatim" was also
-    // pixel-wrong: their u16 literals (e.g. 0xFFFE/0xFFFF) are compiled at their
-    // native (host, little-endian) byte order, but Fast3D's RGBA16 texture reader
-    // wants a big-endian byte stream -- the same endianness class as the
-    // sTransitionPalette/backgroundBuffer bug transition.c already works around.
-    // gdx_set_native_rgba16_texture_range marks each array so the SETTIMG wide-
-    // pointer path byte-swaps it into a persistent copy before Fast3D samples it
-    // (this is the actual pixel fix); gdx_register_host_pointer_stub additionally
-    // marks it as a recognized identity so the stub-miss census stops naming it.
-    // Sizes are 64 elements * sizeof(u16) = 128 bytes each (counted from the
-    // array initializers in ending_effects.c).
+    // EndingCutsceneEffects_DrawFireworks (decomp/src/overlays/ending/ending_effects.c) SETTIMGs
+    // these three compiled-in u16[64] sparkle textures directly. They are real host arrays, not
+    // LinkStubs placeholders, so their u16 literals sit in host little-endian order while Fast3D's
+    // RGBA16 reader wants a big-endian byte stream — the same endianness class transition.c works
+    // around for sTransitionPalette/backgroundBuffer. gdx_set_native_rgba16_texture_range is the
+    // pixel fix (byte-swap into a persistent copy before sampling);
+    // gdx_register_host_pointer_stub only silences the stub-miss census. 64 * sizeof(u16) each.
     {
         extern u16 D_i7_8014ADA8[];
         extern u16 D_i7_8014AE30[];
@@ -237,14 +230,10 @@ void gdx_rdram_init(void) {
         gdx_register_host_pointer_stub(D_i7_8014AEB8, 128u);
     }
 
-    // A2 (sCourseMinimapPalette stub-miss at venue load): this IS the same TLUT
-    // minimap.c already pre-swaps under #ifdef PORT (MINIMAP_TLUT_ENTRY), so its
-    // compiled bytes are already big-endian-correct -- unlike the fireworks
-    // arrays above, it must NOT go through gdx_set_native_rgba16_texture_range
-    // (that would re-swap already-correct bytes back to broken). Register it as a
-    // recognized identity only, purely to silence the stub-miss census entry this
-    // legitimate, sampled-every-frame array otherwise produces. 4 entries *
-    // sizeof(u16) = 8 bytes (CLEAR/BLACK/WHITE/GREY, minimap.c).
+    // minimap.c already pre-swaps this TLUT under #ifdef PORT (MINIMAP_TLUT_ENTRY), so its
+    // compiled bytes are ALREADY big-endian-correct. Unlike the fireworks arrays above it must NOT
+    // go through gdx_set_native_rgba16_texture_range — that would re-swap correct bytes back to
+    // broken. Identity registration only, to silence the stub-miss census.
     {
         extern u16 sCourseMinimapPalette[];
         gdx_register_host_pointer_stub(sCourseMinimapPalette, 8u);
@@ -286,6 +275,34 @@ size_t gdx_gfxpool_effects_vtx_bytes(void) {
     return sizeof(((GfxPool*) 0)->effectsVtxBuffer);
 }
 
+/* Ground truth for the three PER-RACER matrix arrays, all Mtx[30] indexed by racer->id:
+     unk_20308 - the machine body model matrix, written every drawn tick
+     unk_20A88 - the second per-racer matrix (reflection pass / settings screen)
+     unk_21208 - the ATTACK HIGHLIGHT matrix, written ONLY while attackHighlightScale != 0
+   The bridge maps a rerouted pool offset back to (field, racer id) with these, so a matrix that
+   spawns mid-race (the highlight) can borrow its missing previous keyframe from the same racer's
+   body matrix instead of snapping to t=1 out of step with the machine it belongs to.
+   offsetof from the real type for the usual reason: the N64 struct-comment offsets are 0x1A008 low
+   on the host because sizeof(Gfx) doubles under PORT. */
+void gdx_gfxpool_racer_mtx_layout(size_t* outBody, size_t* outSecond, size_t* outHighlight,
+                                  size_t* outStride, size_t* outCount) {
+    if (outBody != NULL) {
+        *outBody = offsetof(GfxPool, unk_20308);
+    }
+    if (outSecond != NULL) {
+        *outSecond = offsetof(GfxPool, unk_20A88);
+    }
+    if (outHighlight != NULL) {
+        *outHighlight = offsetof(GfxPool, unk_21208);
+    }
+    if (outStride != NULL) {
+        *outStride = sizeof(((GfxPool*) 0)->unk_20308[0]);
+    }
+    if (outCount != NULL) {
+        *outCount = sizeof(((GfxPool*) 0)->unk_20308) / sizeof(((GfxPool*) 0)->unk_20308[0]);
+    }
+}
+
 void* gdx_rdram_alloc_raw(size_t size, size_t align) {
     size_t base = (gdx_rdram_bump + (align - 1u)) & ~(align - 1u);
     if (base + size > gdx_rdram_persist_top) {
@@ -317,35 +334,24 @@ void* gdx_rdram_persist_alloc_raw(size_t size, size_t align) {
     return gdx_rdram + base;
 }
 
-/* ALLOC_PEEK on console returns the arena cursor WITHOUT
-   advancing it (transient scratch, overwritten by the next real allocation).
-   The bump shim previously served peeks straight from the mode arena cursor
-   (gdx_rdram_bump). That is a race: the texture loader (object.c cases
-   17/18/20/21) peeks a staging buffer, DMAs MIO0-compressed data into it, then
-   calls mio0Decode, which cooperatively yields every 4096 output bytes
-   (torch/lib/libmio0/mio0.c). During a yield any other fiber committing via
-   Arena_Allocate(ALLOC_FRONT/BACK) bumps gdx_rdram_bump forward from exactly
-   where the peek sits, and the next commit can land on top of the live
-   compressed source mid-decode.
-   Fix: peeks are now served from a dedicated GDX_RDRAM_STAGING_SIZE block
-   (gdx_rdram_staging_base..+GDX_RDRAM_STAGING_SIZE) that sits BEFORE
-   gdx_rdram_arena_start and is never touched by gdx_rdram_alloc_raw or
-   gdx_rdram_persist_alloc_raw. FRONT/BACK commits physically cannot reach it.
+/* ALLOC_PEEK on console returns the arena cursor WITHOUT advancing it — transient scratch that
+   the next real allocation may overwrite.
 
-   INVARIANT: every peek is served from the SAME base offset within the
-   staging block (no bump, no accumulation across calls) — this mirrors
-   console PEEK semantics, where the next commit (or the next peek) may
-   overwrite a previous peek's contents. This is only correct if at most one
-   peek is ever "live" (allocated but not yet fully consumed) at a time.
-   Verified against every compiled ALLOC_PEEK call site (decomp/src/game/object.c,
-   decomp/src/overlays/ovl_i10/1459A0.c — decomp/src/sys/segment.c is excluded
-   from the PORT build, see port/CMakeLists.txt): each texture load does at
-   most one FRONT commit, then ONE peek that is either consumed synchronously
-   (header parse, e.g. object.c's func_800AA6BC on an 8-byte peek) before the
-   next peek call, or handed once to mio0Decode and not touched again until
-   the following iteration's peek. The save-load peek in 1459A0.c is consumed
-   synchronously via Sram_ReadWrite with no yield. No caller holds two live
-   peeks concurrently, so serving every peek at the block base is safe. */
+   Peeks MUST NOT be served from gdx_rdram_bump. The texture loader (object.c cases 17/18/20/21)
+   peeks a staging buffer, DMAs MIO0-compressed data into it, then calls mio0Decode, which
+   cooperatively yields every 4096 output bytes (torch/lib/libmio0/mio0.c); during a yield another
+   fiber's Arena_Allocate(ALLOC_FRONT/BACK) bumps the cursor forward from exactly where the peek
+   sits and the next commit lands on the live compressed source mid-decode. The dedicated
+   GDX_RDRAM_STAGING_SIZE block used instead sits BEFORE gdx_rdram_arena_start, where FRONT/BACK
+   commits physically cannot reach it.
+
+   INVARIANT: every peek is served from the SAME base offset in the staging block — no bump, no
+   accumulation — which matches console PEEK semantics but is only correct if at most one peek is
+   live at a time. Verified against every compiled ALLOC_PEEK call site (decomp/src/game/object.c
+   and decomp/src/overlays/ovl_i10/1459A0.c; decomp/src/sys/segment.c is excluded from the PORT
+   build): each texture load does at most one FRONT commit, then ONE peek that is either consumed
+   synchronously before the next peek call or handed once to mio0Decode and not touched again.
+   Re-check this census before adding a caller. */
 void* gdx_rdram_peek_raw(size_t size, size_t align) {
     size_t base;
 
@@ -354,11 +360,8 @@ void* gdx_rdram_peek_raw(size_t size, size_t align) {
         return gdx_rdram + base;
     }
 
-    // Oversized peek (bigger than the dedicated staging block): fall back to
-    // the old cursor behavior. Still racy against a concurrent FRONT/BACK
-    // commit landing at gdx_rdram_bump, but this path should never be hit by
-    // any known compiled caller (see census above) — log once per distinct
-    // size so a regression or new caller is visible without spamming.
+    // Oversized peek: falls back to the racy cursor path. No compiled caller reaches this (see
+    // the census above), so log once per distinct size to make a regression or new caller visible.
     {
         extern void gdx_cki(const char*, int);
         static size_t gdx_rdram_peek_overflow_last = (size_t)-1;
@@ -405,37 +408,23 @@ void gdx_rdram_mode_reset(void) {
     gdx_rdram_bump = gdx_rdram_mode_baseline;
 
 #ifdef PORT
-    /* SCRAMBLED-TEXT FIX.
-       The glyph/texture decode cache stores HOST pointers (gdx_rdram + offset)
-       into this bump arena. Rewinding the bump here re-issues those exact offsets
-       to the next mode's decodes, so any cache entry that survives the rewind now
-       maps a glyph key to memory holding a DIFFERENT glyph's bytes. On a cache HIT
-       the decode is skipped and the stale pointer is served verbatim -> crisp but
-       wrong letters (CAPTAIN FALCON -> C3OP3IC, SILENCE, editor node/warning text),
-       consistent per screen and random across runs.
+    /* The glyph/texture decode cache stores HOST pointers (gdx_rdram + offset) into this bump
+       arena, so rewinding the bump re-issues those exact offsets to the next mode's decodes: any
+       surviving cache entry then maps a glyph key to a DIFFERENT glyph's bytes, and a cache HIT
+       serves it verbatim — crisp but wrong letters, consistent per screen and random across runs.
 
-       The decomp resets the cache only on the func_80079EC8 transition path
-       (object.c:1417); the reload path func_80079F1C (game.c:883) rewinds objects
-       but NOT the cache, leaving stale host pointers into a reused arena. Because
-       the bump arena is rewound ONLY through here (Arena_StartInit and
-       Arena_DefaultStartInit both route to gdx_rdram_mode_reset; gdx_rdram_alloc_raw
-       only advances), invalidating the cache on every rewind makes the two atomic
-       regardless of which decomp path triggered the transition — no cache entry can
-       ever outlive the memory it points into. */
+       The decomp only resets the cache on the func_80079EC8 transition path (object.c:1417); the
+       reload path func_80079F1C (game.c:883) rewinds objects but NOT the cache. Since the arena is
+       rewound ONLY through this function, invalidating here makes the two atomic whichever decomp
+       path triggered the transition, so no cache entry can outlive the memory it points into. */
     func_80077D44();
 
-    /* Belt-and-suspenders for the whole "stale GPU texture at a reused arena
-       address" class (minimap outline, decoded glyphs, decoded UI): the Fast3D
-       texture cache keys some formats by address alone, so a rewind that re-hands
-       an address to different content would keep serving the previous upload.
-       A full clear here forces every subsequent upload to re-decode. Mode
-       transitions are infrequent, so the cost is negligible. This complements the
-       format-specific content-hash work done in the interpreter.
-       Guarded by timing rather than a per-call interpreter null-check (a C TU
-       cannot inspect the C++ interpreter instance): this rewind branch runs only
-       after the baseline call above, i.e. on a real game-mode transition, by which
-       point the renderer is live — the same call-site-timing guarantee that
-       gdx_workshop.cpp's hot-reload caller relies on. */
+    /* Covers the same class on the GPU side: Fast3D keys some texture formats by address alone, so
+       a rewind that re-hands an address to different content keeps serving the previous upload.
+       Mode transitions are infrequent, so a full clear costs nothing. Safe to call unguarded
+       because this branch runs only after the baseline call above — i.e. on a real mode
+       transition, by which point the renderer is live. A C TU cannot null-check the C++
+       interpreter instance, so that call-site timing IS the guard. */
     gfx_texture_cache_clear();
 #endif
 }
@@ -521,8 +510,30 @@ static void* Gdx_ResolvePortAddress(uintptr_t addr) {
 
     /* If a PORT call path already preserved a full host pointer, keep it.  The
        low32 reconstruction below is only for legacy u32 paths such as
-       osVirtualToPhysical() and display-list command words. */
+       osVirtualToPhysical() and display-list command words.
+
+       One exception: a wide pointer can still be an ASSET PLACEHOLDER. C code taking
+       &aVpFullScreen hands us the real host address of a zero BSS stub whose bytes live in the
+       decoded segment image, so returning it verbatim zeroes every
+       camera->currentVp{Scale,Trans}{X,Y} and silently kills the position markers, the rival
+       marker, the ending fireworks and the background stars. Mirrors
+       ResolveWideAssetStubPointer on the graphics side; non-placeholder wide pointers fall
+       through unchanged (see the bijection argument at that helper). */
     if (wideAddr > 0xFFFFFFFFULL) {
+        /* Kill switch: GDX_WIDE_ASSET_RESOLVE=0 returns the pointer verbatim, so a texture
+           regression can be attributed to this hook or ruled out at runtime without a rebuild. */
+        extern void* gdx_resolve_wide_asset_pointer(const void* full);
+        extern int gdx_wide_asset_resolve_enabled(void);
+        void* wideAsset = gdx_wide_asset_resolve_enabled()
+                              ? gdx_resolve_wide_asset_pointer((const void*)addr)
+                              : NULL;
+        if (wideAsset != NULL) {
+            if (resolveLogs < 12) {
+                resolveLogs++;
+                gdx_addr_log("wide-asset", addr, wideAsset);
+            }
+            return wideAsset;
+        }
         if (resolveLogs < 12) {
             resolveLogs++;
             gdx_addr_log("full", addr, (void*)addr);
@@ -686,19 +697,13 @@ void Segment_LoadAssets(void) {
 }
 
 /*
- * The original Segment_LoadOverlays() also prepared per-mode graphics memory:
- * its tail runs Segment_SetupSegment4/7/9/10/5 and the Segment_LoadSegment*
- * content DMAs (decomp/src/sys/segment.c, excluded from the port build).
- * Dropping that chain left segments 4 and 7 permanently unset -- every element
- * drawn through them (countdown faces, start arc, race HUD overlays via
- * hud_gfx on segment 4; machine-part graphics via machine_global_gfx on
- * segment 7; create_machine_textures in Create Machine) was missing or read a
- * garbage base. The buffers are carved in sys_gfx.c's PORT block
- * (gSegment1B8550 = segment 4, gSegment1E23F0 = segment 7); this fills them
- * from the ROM image and points the segment table at them, mirroring the
- * console per-mode switch. Loads are synchronous -- Dma_LoadAssets is a
- * memcpy from gdx_rom_buffer on the port, so the console's async split is
- * unnecessary.
+ * Replaces the tail of the original Segment_LoadOverlays() — Segment_SetupSegment4/7/9/10/5 plus
+ * the Segment_LoadSegment* content DMAs — which lives in decomp/src/sys/segment.c, excluded from
+ * the port build. Without it segments 4 and 7 stay unset and everything drawn through them
+ * (hud_gfx countdown faces, start arc, race HUD; machine_global_gfx machine parts;
+ * create_machine_textures) reads a garbage base. The buffers are carved in sys_gfx.c's PORT block;
+ * this fills them from the ROM image and points the segment table at them. Loads are synchronous
+ * because Dma_LoadAssets is a memcpy on the port, so the console's async split buys nothing.
  */
 extern uintptr_t gSegment1B8550VramStart;
 extern uintptr_t gSegment1E23F0VramStart;
@@ -714,20 +719,14 @@ extern uintptr_t gGdxCourseEditTexturesVramEnd;
 extern uintptr_t gSegment2738A0VramStart;
 extern uintptr_t gSegment2738A0VramEnd;
 
-/* Mode-transition hitch fix: gSegment1B8550 (seg4) and gSegment1E23F0 (seg7) are two FIXED
-   host buffers reused across every mode transition -- only their CONTENT rotates among a small,
-   fixed set of ROM assets (hud_gfx/create_machine_textures for seg4; machine_global_gfx/
-   expansion_kit_textures_beta for seg7). Profiling (`[transition] GMI_A..GMI_B (Controller_Reset +
-   Segment_LoadOverlays) took 131.02ms`, vs. 5-20ms for every other mode-change step) traced to
-   Dma_LoadAssets's cooperative yield (decomp/src/sys/dma.c, every 32KB) round-tripping through a
-   full vsync-locked host frame each time it fires (port/n64_sched.c's gdx_yield ->
-   SwitchToFiber(sHostFiber) -> main.cpp's frame loop presents before control returns). A few
-   hundred KB reload costs ~8 frames at ~16.6ms == the measured 131ms, even though the bytes being
-   copied are frequently IDENTICAL to what is already resident (e.g. race -> race retry, or any
-   race-class mode -> another race-class mode all load the exact same hud_gfx/machine_global_gfx).
-   Skipping the DMA when the requested variant already matches what's resident in the buffer is
-   behaviourally identical (same buffer, same bytes) and collapses same-variant transitions to the
-   cheap Segment_SetAddress-only path the `default:` case already took. */
+/* seg4 and seg7 are two FIXED host buffers reused across every mode transition; only their
+   CONTENT rotates among a small fixed set of ROM assets. Reloading unconditionally cost 131ms per
+   transition (vs 5-20ms for every other mode-change step) because Dma_LoadAssets yields every 32KB
+   (decomp/src/sys/dma.c) and each yield round-trips through a full vsync-locked host frame — a few
+   hundred KB is ~8 frames. The copied bytes are frequently IDENTICAL to what is resident (race ->
+   race retry loads the same hud_gfx). Skipping the DMA when the requested variant already matches
+   is behaviourally identical and collapses those transitions to the Segment_SetAddress-only path
+   the `default:` case already took. */
 typedef enum { GDX_SEG4_CONTENT_NONE, GDX_SEG4_CONTENT_HUD_GFX, GDX_SEG4_CONTENT_CREATE_MACHINE } GdxSeg4Content;
 typedef enum { GDX_SEG7_CONTENT_NONE, GDX_SEG7_CONTENT_MACHINE_GLOBAL, GDX_SEG7_CONTENT_EK_TEXTURES } GdxSeg7Content;
 typedef enum {
@@ -741,16 +740,11 @@ static GdxSeg9Content sGdxSeg9Resident = GDX_SEG9_CONTENT_NONE;
 static GdxSeg9Content sGdxSeg9Active = GDX_SEG9_CONTENT_NONE;
 static size_t sGdxSeg9ActiveSize = 0;
 
-/* Carve byte-order pass (served-copy family): the carves these
-   loaders fill are what gSegments[4]/[7] serve at draw time, but only the
-   bridge's separate heap images ever received the generated fixups. Seg-8's
-   identical fix put the start arc and Nintex boards on screen; the same
-   disease here left the pause-menu TLUT-setup DL (seg-4 carve, BE garbage ->
-   palette mode never enabled -> striped text) and the countdown faces / arc
-   screens (seg-7 machine_global DLs) broken. Texture regions are not in the
-   fixup tables, so already-working texture consumers are unaffected; calls
-   with images that have no fixup entries (create_machine, EK textures) are
-   no-ops by construction. */
+/* Byte-order fixups must be applied to the CARVES too, not only to the bridge's separate heap
+   images: the carves are what gSegments[4]/[7] serve at draw time. Skipping them leaves the
+   pause-menu TLUT-setup DL as big-endian garbage (palette mode never enabled -> striped text) and
+   breaks the countdown faces / arc screens. Texture regions are absent from the fixup tables, so
+   working texture consumers are unaffected, and images with no fixup entries are no-ops. */
 extern void gdx_fixup_asset_segment_image(unsigned char segment, unsigned int rom_base,
                                            unsigned char* data, unsigned int size);
 extern void gdx_register_asset_segment_command_ranges(unsigned char segment, unsigned int rom_base,
@@ -828,9 +822,8 @@ static int gdx_activate_machine_models_segment9(void) {
     const size_t romStart = (size_t)PORT_machine_models_ROM_START;
     const unsigned int span = (unsigned int)(PORT_machine_models_ROM_END - PORT_machine_models_ROM_START);
 
-    /* Stage the compressed span through the shim (archive-first, raw fallback),
-     * then probe the staged bytes -- byte-identical to the old direct
-     * gdx_rom_buffer probe/decode. A source miss trips the same invalid path. */
+    /* Stage the compressed span through the shim (archive-first, raw fallback) and probe the
+     * staged bytes; a source miss trips the same invalid path as a bad header. */
     if (dest == NULL || capacity == 0 ||
         !GdxSegmentSourceRead((unsigned int)romStart, span, sGdxSeg9Stage) ||
         sGdxSeg9Stage[0] != 'M' || sGdxSeg9Stage[1] != 'I' ||
@@ -840,10 +833,9 @@ static int gdx_activate_machine_models_segment9(void) {
     }
 
     if (sGdxSeg9Resident != GDX_SEG9_CONTENT_MACHINE_MODELS) {
-        /* The MIO0 header's decoded size (big-endian u32 at +4)
-         * was previously trusted implicitly; a corrupt ROM could decompress past the
-         * RDRAM carve. Check it against the carve capacity before decoding (the EK
-         * disk path below already does the equivalent required>capacity check). */
+        /* The MIO0 header's decoded size (big-endian u32 at +4) must be checked against the carve
+         * capacity: a corrupt ROM would otherwise decompress past it. The EK disk path below does
+         * the equivalent required>capacity check. */
         {
             unsigned int decodedSize = ((unsigned int)sGdxSeg9Stage[4] << 24) |
                                        ((unsigned int)sGdxSeg9Stage[5] << 16) |
@@ -871,11 +863,8 @@ static int gdx_activate_machine_models_segment9(void) {
     Segment_SetAddress(9, gSegment22B0A0VramStart);
     sGdxSeg9Active = GDX_SEG9_CONTENT_MACHINE_MODELS;
     sGdxSeg9ActiveSize = capacity;
-    /* Segment-9 ceremony diagnostic: GP-ending cutscenes (GAMEMODE_GP_END_CS)
-       could silently drop vehicle models when this activation failed. Every
-       failure branch above already logs via gdx_ck; add the success line here so a
-       GP-ending run shows that machine_models was actually bound and for which
-       game mode. */
+    /* Success line to match the gdx_ck on every failure branch above: a GP-ending cutscene that
+       silently drops vehicle models is otherwise indistinguishable from one that never got here. */
     {
         extern void gdx_cki(const char*, int);
         gdx_cki("[segment] seg9 active=machine_models size", (int)sGdxSeg9ActiveSize);
@@ -884,34 +873,19 @@ static int gdx_activate_machine_models_segment9(void) {
     return 1;
 }
 
-/* [seg9diag] instrumentation gate: gdx_dbg_logf (used throughout this block)
- * always reaches stderr/OutputDebugString regardless of env vars -- unlike
- * gdx_ck/gdx_cki it has no built-in opt-out -- so without this gate every
- * [seg9diag] line below would spam stderr/OutputDebugString on a normal run
- * even with no diagnostics requested. Reads the shared developer-gate cache
- * (port/gdx_dev_gates.{h,c}) so the Dev Tools "Write gdiffuser-run.log" toggle
- * and GDX_LOG can no longer disagree; the accessor is declared with the other
- * externs at the top of this file because this TU cannot include the port
- * headers (see the top-of-file note about <stdio.h> clashing with the decomp's
- * libc/stdint.h). */
+/* gdx_dbg_logf has no built-in opt-out (unlike gdx_ck/gdx_cki), so the [seg9diag] lines below
+ * need this gate or they spam stderr on a normal run. Reads the shared developer-gate cache so
+ * the Dev Tools log toggle and GDX_LOG cannot disagree. */
 static int gdx_seg9diag_enabled(void) {
     return gdx_dev_gate_log_file();
 }
 
 #ifdef EXPANSION_KIT
-/* Task 3 diag (Course Edit node-info panel still blank at runtime, [nodeinfo]
- * scatter investigation): entry/state/result tracing for the seg-9 activation
- * this game mode depends on. Uses gdx_dbg_logf (always reaches stderr/
- * OutputDebugString; persists to gdiffuser-run.log when GDX_LOG is set -- see
- * the extern declaration above), NOT gdx_ck/gdx_cki, so these lines are not
- * silently dropped when GDX_TRACE is unset. Low-noise: activation only runs
- * on a mode transition into Course Edit, not per frame. Gated on
- * gdx_seg9diag_enabled() (GDX_LOG) so a normal run stays silent.
- *
- * The fill call is pulled out of the original single OR-chained `if` into an
- * explicit `fillOk` local so its result can be logged -- the precheck
- * (dest/capacity/required) still short-circuits BEFORE the fill is attempted,
- * exactly as the original expression did; no behavioral change. */
+/* Entry/state/result tracing for the seg-9 activation Course Edit depends on. Uses gdx_dbg_logf,
+ * not gdx_ck/gdx_cki, so the lines are not silently dropped when GDX_TRACE is unset; gated on
+ * gdx_seg9diag_enabled() so a normal run stays silent. Runs only on a mode transition, not per
+ * frame. `fillOk` is a separate local purely so its result can be logged — the precheck must
+ * still short-circuit BEFORE the fill is attempted. */
 static int gdx_activate_course_edit_segment9(void) {
     unsigned char* dest = (unsigned char*)osPhysicalToVirtual(gGdxCourseEditTexturesVramStart);
     size_t capacity = (size_t)(gGdxCourseEditTexturesVramEnd - gGdxCourseEditTexturesVramStart);
@@ -1335,16 +1309,338 @@ void Segment_LoadOverlays(void) {
 // ---- Save system -------------------------------------------------------------
 // Save_LoadStaffGhostRecord and Save_SaveSettingsProfiles are defined in
 // decomp/src/overlays/ovl_i2/save.c, which compiles on the port -- no shim here.
-// Save_LoadStaffGhostRecord no longer returns -1 on PORT: its #ifdef PORT branch
-// pulls the raw archive-file bytes for the course's staff_ghost_records/* o2r entry
-// and parses the Torch payload in place, because no libultraship factory is
-// registered for that resource type (see the TODO in
-// port/resource/ResourceFactories.cpp). This matters beyond the ghost itself -- func_i10_8012B580 seeds every
-// standard-cup CPU pacing target from ghostInfo.raceTime, so the old -1 stub left
-// that seed uninitialized and degenerated CPU pacing.
+// Save_LoadStaffGhostRecord's #ifdef PORT branch pulls the raw archive-file bytes for the course's
+// staff_ghost_records/* o2r entry and parses the Torch payload in place, because no libultraship
+// factory is registered for that resource type (see the TODO in
+// port/resource/ResourceFactories.cpp). It must NOT be stubbed out: func_i10_8012B580 seeds every
+// standard-cup CPU pacing target from ghostInfo.raceTime, so a failing load degenerates CPU pacing
+// well beyond the ghost itself.
 
 // ---- Graphics pool ---------------------------------------------------------
 // D_1000000: the N64 graphics pool (segment 0x01) — a real runtime buffer (NOT an o2r asset),
 // so display-list/matrix allocations have somewhere to live.
 // (aVp* viewports and D_80149A0 are real assets provided by the generated asset bindings.)
 GfxPool D_1000000;
+
+// ---- Camera pose snapshot + projection-view rebuild -------------------------
+// The projection-view matrix (GfxPool::unk_20208[camera->id]) is the one pool matrix that must
+// not be lerped element-wise. Camera_UpdateProjectionViewMtx's live EXPANSION_KIT branch
+// (camera.c:1249-1276) widens fov from a term of the matrix that fov itself produced -- a
+// feedback loop -- so the finished matrix is not an affine function of the camera state and a
+// midpoint lerp of two finished matrices is not the matrix the loop would have settled on at
+// that midpoint. These entry points let the bridge interpolate the INPUTS instead and re-run
+// the exact build per sub-frame. See port/gdx_camera_pose.h for the contract.
+//
+// Everything here writes to caller-supplied or local storage only: no gCameras write, no
+// GfxPool write. Interpolation stays render-only.
+
+/* Camera_MatrixToMtx has NO header declaration -- camera.c:976 defines it above its single
+   in-file call site (camera.c:1278) and no header in decomp/include exposes it. Declared here
+   rather than in fzx_camera.h because decomp/ is off-limits to this subsystem. It is the sole
+   correct MtxF -> Mtx conversion for this matrix: it carries the little-endian `j ^ 1` column
+   swap libultraship's GfxSpMatrix needs (see the comment at camera.c:993-996), which the
+   generic Matrix_ToMtx does not. Hand-rolling the conversion here would silently transpose
+   16-bit halves. */
+extern void Camera_MatrixToMtx(MtxF* mtxF, Mtx* mtx2);
+/* Same file-local-extern convention the decomp itself uses for this global: it is defined in
+   game.c:22 and every consumer re-declares it (camera.c:555, racer.c:562, course.c:3386...),
+   because no header carries it. Matches gGameMode at the top of this file. */
+extern s32 gNumPlayers;
+
+int gdx_camera_pose_count(void) {
+    /* The live count sNumCameras (camera.c:21) is file-scope in camera.c with no header
+       declaration, so it is not reachable from here and camera.c is off-limits. Return the
+       gCameras array bound instead (camera.c:17) -- the caller validates each slot anyway, and
+       an idle slot simply never matches a matrix the bridge is asked to rebuild. */
+    return GDX_CAMERA_POSE_MAX;
+}
+
+int gdx_camera_pose_read(int index, GdxCameraPose* out) {
+    const Camera* camera;
+
+    if (out == NULL) {
+        return 0;
+    }
+    if ((unsigned)index >= (unsigned)GDX_CAMERA_POSE_MAX) {
+        memset(out, 0, sizeof(*out));
+        return 0;
+    }
+
+    camera = &gCameras[index];
+
+    out->eyeX = camera->eye.x;
+    out->eyeY = camera->eye.y;
+    out->eyeZ = camera->eye.z;
+    out->atX = camera->at.x;
+    out->atY = camera->at.y;
+    out->atZ = camera->at.z;
+    /* basis.y is UP (fzx_math.h:65-68 labels the Mtx3F rows forward/up/side); it is what
+       camera.c:1254 hands Matrix_SetLookAt. */
+    out->upX = camera->basis.y.x;
+    out->upY = camera->basis.y.y;
+    out->upZ = camera->basis.y.z;
+    out->fov = camera->fov;
+    out->nearZ = camera->near;
+    out->farZ = camera->far;
+    out->fovScaleX = camera->fovScaleX;
+    out->fovScaleY = camera->fovScaleY;
+    out->frustrumCenterX = camera->frustrumCenterX;
+    out->frustrumCenterY = camera->frustrumCenterY;
+    /* Snapshotted, not read live at rebuild time: the rebuild runs later, on the host thread,
+       and must gate the fov widening on the value this pose was captured under. */
+    out->numPlayers = (int)gNumPlayers;
+    /* camera->id, not `index`: the id is what selects the GfxPool slot at camera.c:1278, so a
+       consumer matching a pool offset back to a pose must compare against the same field.
+       They are equal in practice (the sole assignment is camera.c:2177) but the id is the one
+       the game actually indexes with. */
+    out->id = (int)camera->id;
+    out->valid = 1;
+    return 1;
+}
+
+int gdx_camera_build_projview(const GdxCameraPose* pose, void* outMtx64) {
+    MtxF projectionMtx;
+    MtxF viewMtx;
+    MtxF projectionViewMtx;
+    Mtx scratchMtx;
+    u16 perspectiveScale;
+    f32 lookAtX;
+    f32 lookAtY;
+    f32 lookAtZ;
+    f32 normalX;
+    f32 normalY;
+    f32 normalZ;
+    f32 trueUpX;
+    f32 trueUpY;
+    f32 trueUpZ;
+    f32 magnitude;
+
+    if ((pose == NULL) || (outMtx64 == NULL) || (pose->valid == 0)) {
+        return 0;
+    }
+
+    /* Matrix_SetLookAt reports degenerate input only by NOT writing: each of its three early
+       returns (math.c:1013/1027/1041) leaves the caller's MtxF partially filled and skips
+       Matrix_ToMtx entirely. The game survives that because camera->viewMtx is persistent and
+       still holds the previous tick's complete matrix; a rebuild from local scratch has no such
+       fallback, so detect the same three conditions here -- same expressions, same unnormalized
+       operands, same `<= 0.0f` test -- and refuse before anything is built. The caller then
+       leaves the game's own matrix in place for that sub-frame. */
+    lookAtX = pose->eyeX - pose->atX;
+    lookAtY = pose->eyeY - pose->atY;
+    lookAtZ = pose->eyeZ - pose->atZ;
+    magnitude = SQ(lookAtX) + SQ(lookAtY) + SQ(lookAtZ);
+    if (magnitude <= 0.0f) {
+        return 0; /* eye == at */
+    }
+
+    normalX = (pose->upY * lookAtZ) - (pose->upZ * lookAtY);
+    normalY = (pose->upZ * lookAtX) - (pose->upX * lookAtZ);
+    normalZ = (pose->upX * lookAtY) - (pose->upY * lookAtX);
+    magnitude = SQ(normalX) + SQ(normalY) + SQ(normalZ);
+    if (magnitude <= 0.0f) {
+        return 0; /* up parallel to (eye - at) */
+    }
+
+    trueUpX = (lookAtY * normalZ) - (lookAtZ * normalY);
+    trueUpY = (lookAtZ * normalX) - (lookAtX * normalZ);
+    trueUpZ = (lookAtX * normalY) - (lookAtY * normalX);
+    magnitude = SQ(trueUpX) + SQ(trueUpY) + SQ(trueUpZ);
+    if (magnitude <= 0.0f) {
+        return 0; /* trueUp underflowed to zero */
+    }
+
+    /* Zero every scratch before the first Matrix_Set* call. Both builders write all 16 MtxF
+       elements on their success paths, but only Matrix_ToMtx writes the Mtx, and the degenerate
+       paths above skip it -- so the Mtx must start defined. Cheap, and it makes the failure mode
+       of any future early return a zero matrix rather than stack garbage. */
+    memset(&projectionMtx, 0, sizeof(projectionMtx));
+    memset(&viewMtx, 0, sizeof(viewMtx));
+    memset(&projectionViewMtx, 0, sizeof(projectionViewMtx));
+    memset(&scratchMtx, 0, sizeof(scratchMtx));
+    perspectiveScale = 0;
+
+    /* NEVER pass NULL for mtx/mtxF/perspectiveScale. Matrix_SetLookAt and Matrix_SetFrustrum
+       substitute the SHARED file-scope sDefaultMtx/sDefaultMtxF on NULL (math.c:1001-1006,
+       math.c:1067-1072), which would make a render-only rebuild scribble on state the game
+       thread also uses; perspectiveScale is dereferenced with no NULL guard at all
+       (math.c:1104-1109). scratchMtx exists purely to absorb the Mtx* out-param -- the game
+       stores that one in gfxPool->unk_20008/unk_20108, which this must not touch.
+       perspectiveScale is likewise local and discarded: it is a pure function of near + far
+       (math.c:1101-1110), so it carries no interpolation state, and writing the pose's copy
+       back into camera->perspectiveScale would be a game-state write. */
+    Matrix_SetFrustrum(&scratchMtx, &projectionMtx, pose->fov, pose->nearZ, pose->farZ, pose->fovScaleX,
+                       pose->frustrumCenterX, pose->fovScaleY, pose->frustrumCenterY, &perspectiveScale);
+
+    Matrix_SetLookAt(&scratchMtx, &viewMtx, pose->eyeX, pose->eyeY, pose->eyeZ, pose->atX, pose->atY, pose->atZ,
+                     pose->upX, pose->upY, pose->upZ);
+
+    Camera_CalculateProjectionViewMtx(&projectionViewMtx, &projectionMtx, &viewMtx);
+
+    /* The EK fov feedback loop, camera.c:1256-1275, reproduced verbatim. This is why the inputs
+       are interpolated and the build re-run instead of the finished matrix being lerped: fov
+       depends on projectionViewMtx.m[3][1], which depends on fov. Re-running it per sub-frame
+       lands on the loop's fixed point for that sub-frame's inputs; lerping two settled matrices
+       does not. gNumPlayers comes from the pose, not the live global (see the read function). */
+    if (pose->fovIsResolved) {
+        /* Threshold already decided for this tick; rebuild the frustum at the interpolated
+           resolved fov and skip the branch entirely. Nothing here may re-test the 30000 cutoff. */
+        if (pose->resolvedFov != pose->fov) {
+            Matrix_SetFrustrum(&scratchMtx, &projectionMtx, pose->resolvedFov, pose->nearZ, pose->farZ,
+                               pose->fovScaleX, pose->frustrumCenterX, pose->fovScaleY, pose->frustrumCenterY,
+                               &perspectiveScale);
+            Camera_CalculateProjectionViewMtx(&projectionViewMtx, &projectionMtx, &viewMtx);
+        }
+    } else if (pose->numPlayers != 2) {
+        f32 var_fv0;
+        f32 fov;
+
+        var_fv0 = ABS(projectionViewMtx.m[3][1]);
+
+        if (var_fv0 > 30000.0f) {
+            var_fv0 -= 30000.0f;
+            var_fv0 /= SHT_MAX - 30000.0f;
+            if (var_fv0 >= 1.0f) {
+                var_fv0 = 1.0f;
+            }
+            fov = pose->fov + ((85.0f - pose->fov) * var_fv0);
+
+            Matrix_SetFrustrum(&scratchMtx, &projectionMtx, fov, pose->nearZ, pose->farZ, pose->fovScaleX,
+                               pose->frustrumCenterX, pose->fovScaleY, pose->frustrumCenterY, &perspectiveScale);
+            Camera_CalculateProjectionViewMtx(&projectionViewMtx, &projectionMtx, &viewMtx);
+        }
+    }
+
+    Camera_MatrixToMtx(&projectionViewMtx, (Mtx*) outMtx64);
+    return 1;
+}
+
+/* Run the build once for a single tick's pose and report the fov the EK widening branch settled
+   on, so the caller can interpolate that resolved value instead of re-testing the threshold at
+   every sub-frame. Writes pose->resolvedFov / pose->fovIsResolved. Returns 1 on success. */
+int gdx_camera_resolve_fov(GdxCameraPose* pose) {
+    MtxF projectionMtx;
+    MtxF viewMtx;
+    MtxF projectionViewMtx;
+    Mtx scratchMtx;
+    u16 perspectiveScale;
+
+    if (pose == NULL) {
+        return 0;
+    }
+    pose->resolvedFov = pose->fov;
+    pose->fovIsResolved = 0;
+
+    memset(&projectionMtx, 0, sizeof(projectionMtx));
+    memset(&viewMtx, 0, sizeof(viewMtx));
+    memset(&projectionViewMtx, 0, sizeof(projectionViewMtx));
+    memset(&scratchMtx, 0, sizeof(scratchMtx));
+    perspectiveScale = 0;
+
+    Matrix_SetFrustrum(&scratchMtx, &projectionMtx, pose->fov, pose->nearZ, pose->farZ, pose->fovScaleX,
+                       pose->frustrumCenterX, pose->fovScaleY, pose->frustrumCenterY, &perspectiveScale);
+    Matrix_SetLookAt(&scratchMtx, &viewMtx, pose->eyeX, pose->eyeY, pose->eyeZ, pose->atX, pose->atY, pose->atZ,
+                     pose->upX, pose->upY, pose->upZ);
+    Camera_CalculateProjectionViewMtx(&projectionViewMtx, &projectionMtx, &viewMtx);
+
+    if (pose->numPlayers != 2) {
+        f32 var_fv0 = ABS(projectionViewMtx.m[3][1]);
+
+        if (var_fv0 > 30000.0f) {
+            var_fv0 -= 30000.0f;
+            var_fv0 /= SHT_MAX - 30000.0f;
+            if (var_fv0 >= 1.0f) {
+                var_fv0 = 1.0f;
+            }
+            pose->resolvedFov = pose->fov + ((85.0f - pose->fov) * var_fv0);
+        }
+    }
+    pose->fovIsResolved = 1;
+    return 1;
+}
+
+/* Ground truth for GfxPool::unk_20208, the Mtx[4] the finished projection-view matrix lands in
+   (camera.c:1278, indexed by camera->id). Sibling of gdx_gfxpool_racer_mtx_layout above and
+   offsetof-derived for the same reason: the N64 struct-comment offsets in sys.h are 0x1A008 low
+   on the host because sizeof(Gfx) doubles under PORT, so a hand-copied constant would aim the
+   bridge's "is this pool offset a camera matrix" test into unk_20108 (the view matrices) and
+   rebuild the wrong slot. */
+void gdx_gfxpool_camera_mtx_layout(size_t* outProjView, size_t* outStride, size_t* outCount) {
+    if (outProjView != NULL) {
+        *outProjView = offsetof(GfxPool, unk_20208);
+    }
+    if (outStride != NULL) {
+        *outStride = sizeof(((GfxPool*) 0)->unk_20208[0]);
+    }
+    if (outCount != NULL) {
+        *outCount = sizeof(((GfxPool*) 0)->unk_20208) / sizeof(((GfxPool*) 0)->unk_20208[0]);
+    }
+}
+
+// ---- Side-attack model-basis discontinuity ----------------------------------
+// racer.c:4555-4566 is the only place a racer's model basis changes DISCONTINUOUSLY:
+//
+//     if (racer->unk_27C != 0) {
+//         if (racer->attackState == ATTACK_STATE_SIDE) {
+//             racer->modelBasis.x = racer->trueBasis.x;              // hard assignment
+//         } else { // ATTACK_STATE_SPIN
+//             racer->modelBasis.x = trueBasis.x*COS(unk_27C) + trueBasis.z*SIN(unk_27C);
+//         }
+//
+// The spin branch enters continuously -- unk_27C starts at 0, so COS=1/SIN=0 makes the first
+// attack tick identical to the pre-attack basis -- and then ramps. The side branch jumps: one
+// tick the basis is the cross-product visual basis (racer.c:4666-4671), the next it is the
+// physics basis. racer.c:4621-4638 re-derives modelBasis.z and .y from .x, so the jump reaches
+// the whole basis, and racer.c:5985 builds the body matrix from it. Interpolating a pool matrix
+// across that jump renders the machine at an orientation it never occupied.
+//
+// Exposed as the raw predicate rather than a computed "did it transition" flag: the transition
+// has an off-by-one on EXIT that only the caller can resolve. On the last attack tick the
+// assignment above still runs (unk_27C is non-zero when racer.c:4555 is evaluated) and only THEN
+// does racer.c:4569-4574 clear unk_27C and attackState -- so a snapshot taken after the racer
+// update reads "inactive" on a tick whose matrix is still the attacked one. The real
+// discontinuity is between that tick and the next. See the bridge's exit-pending handling.
+int gdx_racer_side_attack_count(void) {
+    return (int) (sizeof(gRacers) / sizeof(gRacers[0]));
+}
+
+int gdx_racer_side_attack_active(int index) {
+    const Racer* racer;
+
+    if ((unsigned) index >= (unsigned) (sizeof(gRacers) / sizeof(gRacers[0]))) {
+        return 0;
+    }
+    racer = &gRacers[index];
+    /* Exactly the condition guarding the hard assignment: the outer `unk_27C != 0` test AND the
+       SIDE arm of the inner branch. Spin deliberately reads 0 -- it has no discontinuity. */
+    return (racer->unk_27C != 0) && (racer->attackState == ATTACK_STATE_SIDE);
+}
+
+/* Discord Rich Presence game-state sample (port/gdx_discord.cpp). Lives here because this is the
+   TU with the decomp headers; the presence builder stays free of decomp types. Called from the
+   host loop's PerfTicks window, after gdx_dispatch, so every field is this frame's post-update
+   value (gGameMode flips mid-dispatch — port/input_bridge.c documents the staleness contract). */
+void gdx_discord_snapshot(GdxDiscordSnapshot* out) {
+    extern s32 gGameMode;
+    extern s16 gGameModeChangeState;
+    extern s8 gTitleDemoState;
+    extern s32 gCourseIndex;
+    extern s32 gCupType;
+    extern s32 gDifficulty;
+    extern s32 gNumPlayers;
+    extern s32 gTotalLapCount;
+    extern s8 gGamePaused;
+
+    out->mode = GET_MODE(gGameMode);
+    out->modeChanging = (gGameModeChangeState != GAMEMODE_UPDATE);
+    out->titleDemo = (gTitleDemoState != TITLE_DEMO_INACTIVE);
+    out->courseIndex = gCourseIndex;
+    out->cupType = gCupType;
+    out->difficulty = gDifficulty;
+    out->numPlayers = gNumPlayers;
+    out->totalLaps = gTotalLapCount;
+    out->paused = (gGamePaused != 0);
+    out->playerLap = gRacers[0].lap;
+    out->playerPosition = gRacers[0].position;
+    out->playerFinished = (gRacers[0].stateFlags & RACER_STATE_FINISHED) != 0;
+}

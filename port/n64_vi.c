@@ -1,16 +1,14 @@
 // port/n64_vi.c — VI (video interface) bridge.
 //
-// libultraship's VI stubs (os_vi.cpp) are disabled for this port (os_vi.cpp is filtered out of the
-// libultraship build). We provide the VI surface here so the decomp's frame pacing works under the
+// libultraship's own VI stubs (os_vi.cpp) are filtered out of this port's libultraship build, so
+// the VI surface lives here instead, shaped so the decomp's frame pacing works under the
 // cooperative fiber scheduler:
 //
-//   - osViSwapBuffer(fb) records the framebuffer the game wants shown next.
-//   - osViGetCurrent/NextFramebuffer() are used by the decomp in busy-wait loops; they YIELD to the
-//     host (gdx_yield) so the host can advance the framebuffer rotation between checks, then return
-//     the tracked value. Without the yield those spins would deadlock the single cooperative thread.
-//   - osViSetEvent records the queue/message the game wants on each retrace; gdx_vi_tick() (called
-//     by the host loop) advances current<-next and posts that retrace message, which wakes the Main
-//     scheduler thread.
+//   - osViGetCurrent/NextFramebuffer() are called by the decomp inside busy-wait loops, so they
+//     YIELD to the host before returning the tracked value. Without the yield those spins would
+//     deadlock the single cooperative thread.
+//   - osViSetEvent records the queue/message the game wants on each retrace; gdx_vi_tick(), called
+//     by the host loop, advances current<-next and posts it, waking the Main scheduler thread.
 
 #include "PR/os_vi.h"
 #include "PR/os_message.h"
@@ -18,7 +16,7 @@
 
 extern void gdx_yield(void);
 
-// VI clock global (decomp initialize.c, which set this, is excluded — it did N64 hardware I/O).
+// Set here because decomp initialize.c, which normally sets it, is excluded (N64 hardware I/O).
 s32 osViClock = 48681812; // VI_NTSC_CLOCK
 
 static void* sCurrentFb = (void*) 0;
@@ -32,7 +30,7 @@ void osViSwapBuffer(void* fb) {
 }
 
 void* osViGetCurrentFramebuffer(void) {
-    gdx_yield(); // cooperative: let the host advance VI between busy-wait checks
+    gdx_yield(); // let the host advance VI between the caller's busy-wait checks
     return sCurrentFb;
 }
 
@@ -67,10 +65,9 @@ void osViSetYScale(f32 scale) {
     (void) scale;
 }
 
-/* Live VI retrace divider readout for the host (main.cpp's interpolation gate). D_800CCFBC is the
-   game's own divider (sys_main.c:153): 1 = full 60 Hz, 3 = Course Edit's ~20 Hz cursor mode,
-   2 = the EAD demo. Exposed as an accessor -- same boundary idiom as gGameMode elsewhere in port/
-   -- because main.cpp deliberately avoids the decomp include tree. */
+/* D_800CCFBC is the game's own VI retrace divider (sys_main.c:153): 1 = full 60 Hz, 2 = the EAD
+   demo, 3 = Course Edit's ~20 Hz cursor mode. Exposed as an accessor -- same boundary idiom as
+   gGameMode elsewhere in port/ -- because main.cpp deliberately avoids the decomp include tree. */
 extern s32 D_800CCFBC;
 int gdx_vi_divider(void) {
     return (int) D_800CCFBC;

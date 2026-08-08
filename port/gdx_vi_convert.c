@@ -2,11 +2,9 @@
 
 #include "gdx_vi_convert.h"
 
-/* Matches libultraship/src/fast/interpreter.cpp:
+/* Must match libultraship/src/fast/interpreter.cpp:
  *   #define SCALE_5_8(VAL_) (((VAL_)*0xFF) / 0x1F)
- * i.e. expand a 5-bit channel [0..31] to 8-bit [0..255] the same way the
- * interpreter's RGBA16 texture import does, so a fallback present of a
- * framebuffer is indistinguishable from drawing it as a texture. */
+ * so a fallback present of a framebuffer is indistinguishable from drawing it as a texture. */
 static uint8_t gdx_scale_5_8(uint32_t v5) {
     return (uint8_t)((v5 * 0xFFu) / 0x1Fu);
 }

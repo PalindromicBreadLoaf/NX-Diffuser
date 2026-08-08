@@ -1,123 +1,54 @@
-// port/gdx_audio_thread.cpp — Phase 3: SoH-style dedicated audio production thread.
+// Dedicated audio production thread.
 //
-// THE PROBLEM (measured, see engram design/audio-pipeline-hm-ports)
-// ------------------------------------------------------------------------------------------
-// Before this file: audio production ran as a cooperative "Audio" fiber (decomp/src/sys/
-// sys_audio.c's Audio_ThreadEntry), woken once per VI tick alongside every other decomp
-// thread by port/n64_sched.c's single-OS-thread scheduler, driven from port/main.cpp's frame
-// loop. Actual PCM synthesis (the software RSP interpreter, port/n64_audio_hle.c) ran on yet
-// a THIRD fiber (decomp/src/sys/sys_main.c's "Sched"/"Main" thread, via its
-// EVENT_MESG_AUDIO_TASK_SET handler -> Sched_SpTaskStartAudio -> osSpTaskStart ->
-// port/n64_sched.c's osSpTaskStartGo). All three fibers share ONE real OS thread with no
-// preemption. When the GAME thread's fiber runs a long synchronous, non-yielding stretch
-// (Segment_LoadAssets during a course/menu transition — measured up to ~131 ms via the
-// [transition] GMI_A..GMI_B timing line), NOTHING else on that one OS
-// thread can run either, including the Audio/Sched fibers — audio production stops dead for
-// the whole stretch. A 2048-frame (64ms) cushion in osAiGetLength (libultraship/.../os.cpp)
-// papered over ordinary host-scheduling jitter but could never survive a 131ms hitch; the
-// measured result was 725 holes of ~10ms silence in a 113s capture.
+// Audio production used to run as a cooperative "Audio" fiber (decomp/src/sys/sys_audio.c's
+// Audio_ThreadEntry) woken once per VI tick by port/n64_sched.c's single-OS-thread scheduler, with
+// PCM synthesis on yet a third fiber. All of them share ONE real OS thread with no preemption, so
+// a long synchronous, non-yielding game-thread stretch (Segment_LoadAssets during a course
+// transition, measured up to ~131 ms) stopped audio production dead for its whole duration -- 725
+// holes of ~10ms silence in a 113s capture, far past what os.cpp's 2048-frame osAiGetLength
+// cushion could absorb. A real, independent OS thread cannot be wedged that way; this mirrors
+// Shipwright's OTRAudio_Thread.
 //
-// THE FIX: give audio a REAL, independent OS thread (this file), matching HarbourMasters/
-// Shipwright's proven architecture (OTRGlobals.cpp's OTRAudio_Thread). Because it is a
-// genuinely separate OS thread, the game thread being wedged inside a long synchronous load
-// no longer stops it from running.
+// CROSS-THREAD TOUCHPOINTS. The only game-thread code that mutates gAudioCtx's command-queue state
+// goes through decomp/src/audio/disk/lib/thread.c's public API: AudioThread_QueueCmd and its typed
+// variants (thread.c:440-521), AudioThread_ScheduleProcessCmds (thread.c:523-548, called from ~20
+// sites in external.c -- the real game-thread entry point, since QueueCmd alone never crosses
+// threads), and AudioThread_ResetAudioHeap / AudioThread_PreNMIInternal. The consumer side is
+// AudioThread_CreateTask -> CreateTaskImpl (thread.c:18-269), which this file calls once per tick.
+// Everything else CreateTaskImpl reaches -- AudioLoad_DecreaseSampleDmaTtls / ProcessLoads /
+// ProcessScriptLoads, osAiSetNextBuffer, AudioSynth_Update, gdx_audio_hle_run -- touches only
+// gAudioCtx-owned buffers and gAudioCtx's own DMA-completion queues. None of them touch the game's
+// segment/asset arena (Arena_Allocate, Segment_LoadAssets), which the game thread owns
+// exclusively, so ProcessLoads is safe to keep running on ticks driven from this thread.
 //
-// ===============================================================================================
-// CROSS-THREAD TOUCHPOINT ENUMERATION (design point 1 — read this before changing anything here)
-// ===============================================================================================
-// PRODUCERS — game-thread-side code that mutates gAudioCtx's command-queue state. Reached only
-// through decomp/src/audio/disk/lib/thread.c's public API (never gAudioCtx.threadCmdBuf /
-// threadCmdWritePos / threadCmdReadPos directly):
-//   - AudioThread_QueueCmd / QueueCmdF32 / QueueCmdU32 / QueueCmdS8 / QueueCmdU16
-//     (thread.c:440-521): write one AudioCmd into
-//     gAudioCtx.threadCmdBuf[threadCmdWritePos & 0xFF], then increment threadCmdWritePos.
-//   - AudioThread_ScheduleProcessCmds (thread.c:523-548): reads threadCmdReadPos/
-//     threadCmdWritePos, osSendMesg's the packed (readPos<<8 | writePos) pair to
-//     gAudioCtx.threadCmdProcQueue, then commits threadCmdReadPos = threadCmdWritePos. Called
-//     from ~20 sites in decomp/src/audio/disk/external.c — the Audio_SeqCmd*/Audio_SetVolume/
-//     Audio_Player*-style public API game logic calls every frame. THIS is the real
-//     game-thread entry point; QueueCmd alone never crosses threads without it.
-//   - AudioThread_ResetAudioHeap (thread.c:695-718) / AudioThread_PreNMIInternal
-//     (thread.c:722-728): also touch gAudioCtx.resetStatus/specId/resetTimer, and call
-//     ScheduleProcessCmds themselves.
-// CONSUMER — audio-side drain, reached only via AudioThread_CreateTask -> CreateTaskImpl
-// (thread.c:18-269), which this file calls once per production tick (see
-// gdx_audio_produce_one_tick in port/n64_sched.c):
-//   - thread.c:182-197: while (gdx_audio_cmdring_pop(...) != -1) — the PORT drain; the #else
-//     branch is the original osRecvMesg(threadCmdProcQueueP, ...) loop —
-//     AudioThread_ProcessCmds(...) drains the ring from the LAST token's snapshot readPos
-//     up to its writePos, applying each AudioCmd to gAudioCtx.seqPlayers/channels
-//     (thread.c:603-628).
-//   - Also audio-side and self-contained (verified by reading decomp/src/audio/disk/lib/
-//     load.c — design point 7's explicit ask): AudioLoad_DecreaseSampleDmaTtls,
-//     AudioLoad_ProcessLoads, AudioLoad_ProcessScriptLoads. These touch ONLY gAudioCtx's own
-//     heap pool (AudioHeap_*) and its own DMA-completion queues (curAudioFrameDmaQueue,
-//     syncDmaQueue, externalLoadQueue — all gAudioCtx members) via sDmaHandler/sLeoHandler
-//     (already wired for synchronous host-DMA completion). NONE of them touch the game's
-//     segment/asset arena (Arena_Allocate, Segment_LoadAssets) — that arena is owned
-//     exclusively by the GAME thread's loaders. CONFIRMED: the audio thread's own work is
-//     self-contained and never depends on anything a long synchronous game-thread load would
-//     be mutating, so ProcessLoads is safe to keep running on ticks driven from this thread
-//     (no need to move it back to a game-thread-driven tick).
-//   - osAiSetNextBuffer (thread.c:98, forwards to libultraship's SDLAudioPlayer) and
-//     AudioSynth_Update (thread.c:203, decomp/src/audio/disk/lib/synthesis.c) — also touch
-//     only gAudioCtx-owned buffers (aiBuffers[3], curAbiCmdBuf).
-//   - gdx_audio_hle_run (port/n64_audio_hle.c) — executes the Acmd list AudioSynth_Update just
-//     built. Its state (sDmem, sAdpcmBook) is a private static in that TU, touched only from
-//     this call path; the game thread never touches it.
+// FIBER AFFINITY -- a crash risk, not a data race. CreateTaskImpl (thread.c:117) and several
+// AudioLoad_Sync* functions reachable through AudioThread_ProcessGlobalCmd call
+// osRecvMesg(..., OS_MESG_BLOCK). A blocking wait on an empty queue reaches __osEnqueueAndYield ->
+// __osDispatchThread -> SwitchToFiber, and Win32 fibers are only valid on the OS thread that
+// called ConvertThreadToFiber (the host thread). In this port those waits are expected never to
+// block -- every DMA handler completes synchronously and posts its completion inline -- but that
+// is an assumption about glue this file does not own. port/n64_sched.c's __osEnqueueAndYield
+// therefore checks the calling OS thread against the host thread ID and spin-yields instead of
+// touching the fiber scheduler, turning a would-be crash into a bounded, diagnosable stall.
 //
-// A SECOND, SEPARATE HAZARD found while enumerating (a fiber-affinity crash risk, not a
-// gAudioCtx data race): AudioThread_CreateTaskImpl (thread.c:117) and several
-// AudioLoad_Sync* functions reachable through AudioThread_ProcessGlobalCmd
-// (thread.c:274-398, e.g. AUDIOCMD_OP_GLOBAL_SYNC_LOAD_*) call
-// osRecvMesg(..., OS_MESG_BLOCK) on gAudioCtx's own DMA-completion queues. On a blocking wait
-// against an empty queue, decomp/src/libultra/os/recvmesg.c calls __osEnqueueAndYield ->
-// __osDispatchThread -> SwitchToFiber (port/n64_sched.c) — and Win32 fibers are only valid on
-// the OS thread that converted itself via ConvertThreadToFiber (the original host/main
-// thread). If THIS dedicated audio thread — a real, separate std::thread — ever reached one
-// of those blocking waits, calling into the fiber scheduler would corrupt or crash it. In
-// this port these waits are expected to never actually block (every DMA handler this port
-// wires up completes synchronously and posts its completion message inline, before
-// CreateTaskImpl's preceding NOBLOCK drain even runs), but that is an assumption about
-// decomp/port-glue behavior this file does not control on its own. Mitigated defensively in
-// port/n64_sched.c: __osEnqueueAndYield now checks the calling OS thread against the host
-// thread ID recorded by gdx_sched_init() and, if it doesn't match, logs once (rate-limited)
-// and returns (spin-yield) instead of touching the fiber scheduler — turning a would-be crash
-// into a bounded, diagnosable stall.
+// MUTEX BOUNDARY. Both sides of the threadCmdBuf ring sit inside sAudioCtxMutex: this file holds
+// it across its ENTIRE per-tick production call (gdx_audio_produce_one_tick, which itself runs
+// AudioThread_CreateTask + gdx_audio_hle_run), and thread.c's AudioThread_QueueCmd takes
+// gdx_audio_ctx_lock/unlock around the ring write under #ifdef PORT. That one function is the
+// chokepoint every QueueCmd* variant funnels through, so locking there covers every producer write
+// without touching each variant. The mutex is RECURSIVE because a command HANDLER inside the
+// mutexed drain may re-enter QueueCmd (ScheduleProcessCmds re-schedules when a STOP left the ring
+// "finished"), which a plain mutex would self-deadlock on. ScheduleProcessCmds itself needs no
+// lock: under PORT it pushes onto the lock-free CmdRing below, whose release-store/acquire-load
+// pair publishes the producer's preceding threadCmdBuf writes to the consumer.
 //
-// MUTEX BOUNDARY (design point 6)
-// ------------------------------------------------------------------------------------------
-// BOTH sides of the threadCmdBuf ring are now inside the same recursive mutex, sAudioCtxMutex:
-//   - CONSUMER: this file holds it across its ENTIRE per-tick production call
-//     (gdx_audio_produce_one_tick(), which itself calls AudioThread_CreateTask() +
-//     gdx_audio_hle_run() — see port/n64_sched.c), so the whole drain runs under the lock.
-//   - PRODUCER: decomp/src/audio/disk/lib/thread.c's AudioThread_QueueCmd (thread.c:440-467)
-//     takes gdx_audio_ctx_lock/unlock (exported with C linkage from gdx_audio_thread.h) around
-//     the threadCmdBuf write under #ifdef PORT. That one function is the single chokepoint:
-//     QueueCmdF32/QueueCmdU32/QueueCmdS8/QueueCmdU16 all funnel through it, so locking there
-//     covers every producer write without touching each variant.
-// AudioThread_ScheduleProcessCmds needs no lock of its own: under PORT it no longer osSendMesg's
-// the (readPos<<8 | writePos) token at all — it pushes onto the lock-free CmdRing below
-// (thread.c:523-548), whose release-store/acquire-load pair publishes the producer's preceding
-// threadCmdBuf writes to the consumer. AudioThread_ProcessCmds is audio-side only, reached from
-// CreateTaskImpl's drain, i.e. already inside this file's mutexed tick.
-// The mutex is recursive because a command HANDLER inside the mutexed drain may re-enter
-// QueueCmd (ScheduleProcessCmds re-schedules when a STOP left the ring "finished"), which a
-// plain mutex would self-deadlock on.
-//
-// KILL SWITCH (design point 5)
-// ------------------------------------------------------------------------------------------
-// GDX_AUDIO_THREAD env var (default ON unless set to "0") / --audio-thread / --no-audio-thread
-// CLI args (checked in that order, CLI wins — mirrors the --seed-boot-logo /
-// --diag-settimg pattern already used in port/n64_gfx_bridge.cpp). OFF reverts completely to
-// the legacy fiber-driven path: decomp/src/sys/sys_audio.c's Audio_ThreadEntry resumes
-// producing every VI tick, and libultraship/.../os.cpp's osAiGetLength keeps its original
-// 2048-frame under-report cushion — i.e. the pre-Phase-3 behavior, byte-for-byte, for a clean
-// A/B comparison.
-// ===============================================================================================
+// KILL SWITCH. GDX_AUDIO_THREAD (default ON unless set to "0"), overridden by --audio-thread /
+// --no-audio-thread, CLI last. OFF reverts completely to the legacy fiber path -- Audio_ThreadEntry
+// producing every VI tick, and os.cpp's original 2048-frame osAiGetLength cushion -- i.e. the
+// pre-thread behavior byte for byte, for a clean A/B.
 
 #include "gdx_audio_thread.h"
-#include "gdx_perf.h"  // GDX_PERF audio-tick duration telemetry (no-op when disabled)
+#include "gdx_perf.h"
 #include "port_log.h"
 #include "libultraship/bridge/audiobridge.h"
 
@@ -131,18 +62,14 @@
 #include <mutex>
 #include <thread>
 
-// Defined in port/n64_sched.c, which already includes the decomp audio headers this needs
-// (AudioTask/OSTask/gAudioContextInitialized) — see that file's own comment for why this TU
-// stays decomp-header-free (matches port/n64_audio_hle.c's existing precedent).
+// Defined in port/n64_sched.c, which already includes the decomp audio headers this needs. This
+// TU deliberately stays decomp-header-free, like port/n64_audio_hle.c.
 extern "C" int gdx_audio_produce_one_tick(void);
 
 namespace {
 
-// Guards decomp's gAudioCtx thread-cmd queue handoff — see the MUTEX BOUNDARY comment above
-// for exactly what this does and does not protect yet.
-// Recursive: AudioThread_QueueCmd (decomp thread.c) takes this lock at the producer
-// chokepoint; if any command HANDLER inside the mutexed drain ever re-queues a command,
-// a plain mutex would self-deadlock. Recursion makes that whole class impossible.
+// Guards decomp's gAudioCtx thread-cmd queue handoff; see the MUTEX BOUNDARY comment above.
+// Recursive because a command handler inside the mutexed drain may re-queue a command.
 std::recursive_mutex sAudioCtxMutex;
 
 std::mutex sWakeMutex;
@@ -151,71 +78,31 @@ std::thread sAudioThread;
 std::atomic<bool> sStopRequested{ false };
 std::atomic<bool> sThreadActive{ false }; // resolved kill-switch value, cached for this run
 
-// Safety cap on ticks produced per wake. AudioThread_CreateTaskImpl (thread.c) can legitimately
-// return without producing a task (its own totalTaskCount % specUnk4 gating) — that is not a
-// terminal condition for the catch-up loop, just "not yet", so the loop does not break early on
-// it. This cap only exists to bound worst-case per-wake CPU work if something upstream keeps
-// reporting Buffered() below DesiredBuffered indefinitely (e.g. during the brief window before
-// the SDL device is fully warmed up).
+// AudioThread_CreateTaskImpl can legitimately return without producing a task (its own
+// totalTaskCount % specUnk4 gating), which means "not yet", not "stop" -- so the catch-up loop
+// must not break early on it. This cap only bounds worst-case per-wake CPU work if something
+// upstream keeps reporting Buffered() below DesiredBuffered indefinitely, e.g. before the SDL
+// device is warmed up.
 constexpr int kMaxTicksPerWake = 64;
 
-// ===============================================================================================
-// THREAD-CMD RING (the definitive fix for the Release 64DD SIGABRT — engram crash/release-64dd-
-// mfs-abort, id 1815)
-// ===============================================================================================
-// THE RACE THIS REPLACES. gAudioCtx.threadCmdProcQueue is the ONE message queue that genuinely
-// crosses the game/host OS thread and this dedicated audio OS thread:
-//   - PRODUCER (game/host thread): decomp/src/audio/disk/lib/thread.c's AudioThread_
-//     ScheduleProcessCmds, called from ~20 sites in external.c every game frame, osSendMesg's a
-//     packed (readPos<<8 | writePos) token telling the consumer which slice of threadCmdBuf to
-//     apply.
-//   - PRODUCER (this audio thread, rare): AudioThread_CreateTaskImpl (thread.c:198) re-schedules
-//     via the same ScheduleProcessCmds when a STOP command left the ring "finished".
-//   - CONSUMER (this audio thread): AudioThread_CreateTaskImpl (thread.c:182-197) drains it
-//     once per production tick.
-// Routing that token through the decomp libultra osSendMesg/osRecvMesg body meant BOTH OS threads
-// executed the kernel message-queue path concurrently. The gdx_mq_lock guard in n64_sched.c
-// serialized the queue DATA, but the host thread still mutates the run queue / waiter lists /
-// fibers via __osEnqueueAndYield/__osDispatchThread OUTSIDE that lock (only the deferred-wake
-// DRAIN takes it), so the audio thread running osSendMesg's body still collided with the host's
-// unlocked scheduler mutations — glibc-detected heap/list corruption (SIGABRT, si_code -6) during
-// SLMFSLoad 64DD boot.
+// Lock-free ring replacing gAudioCtx.threadCmdProcQueue, the ONE message queue that genuinely
+// crosses the game/host OS thread and this one. Its (readPos<<8 | writePos) token tells the
+// consumer which slice of threadCmdBuf to apply; it has two producers (the game thread via
+// AudioThread_ScheduleProcessCmds, and this thread when CreateTaskImpl re-schedules after a STOP)
+// and one consumer (CreateTaskImpl's per-tick drain).
 //
-// THE FIX. Carry that token over a dedicated lock-free ring that touches ZERO libultra scheduler
-// state. The audio thread's per-tick path therefore never calls osSendMesg/osRecvMesg/dispatch for
-// this queue at all — it cannot corrupt the host's run queue because it never reaches it.
+// Routing that token through decomp's libultra osSendMesg/osRecvMesg meant BOTH OS threads
+// executed the kernel message-queue path concurrently. n64_sched.c's gdx_mq_lock serializes the
+// queue DATA, but the host thread still mutates the run queue / waiter lists / fibers OUTSIDE that
+// lock (only the deferred-wake drain takes it), so the audio thread still collided with it --
+// glibc-detected heap/list corruption (SIGABRT) during 64DD boot. This ring touches ZERO libultra
+// scheduler state, so that path is simply never reached from here.
 //
-// RESIDUAL FIX (engram crash/release-64dd-residual, #1832): the ring above only moved
-// AudioThread_ScheduleProcessCmds off the kernel. AudioThread_CreateTaskImpl STILL called
-// osSendMesg every tick to post gAudioCtx.totalTaskCount to taskStartQueue — the post-rebuild core
-// caught the audio thread there, concurrent with the boot fiber's SLMFSLoad->LeoSpdlMotor
-// osSendMesg during the 64DD disk mount -> glibc heap/list abort. That send is now routed to a
-// plain atomic counter (gdx_audio_taskstart_post below), because taskStartQueue has NO consumer in
-// this port (AudioThread_WaitForAudioTask, its only reader, is never called — write-only, no host
-// waiter), so the message never needed the kernel at all.
-//
-// The remaining audio-thread-reachable os-queue calls stay on the existing path deliberately, and
-// none of them enters the libultra run-queue/waiter/fiber machinery from the audio thread:
-//   - curAudioFrameDmaQueue is audio-thread-local (its producer is the inline, synchronous host-DMA
-//     completion handler on this same thread, so CreateTaskImpl's NOBLOCK drain always empties it
-//     first and its one OS_MESG_BLOCK loop never actually blocks; even if it did, __osEnqueueAndYield
-//     spin-yields from a non-host thread — n64_sched.c — a bounded stall, never a run-queue mutation).
-//   - audioResetQueue is written by CreateTaskImpl (thread.c) only when gAudioCtx.resetStatus != 0
-//     (an audio-heap spec reset), i.e. never during the 64DD boot window this crash lives in; its
-//     osSendMesg is left on the PORT path (which, from a non-host thread, defers the wake via
-//     gdx_sched_defer_wake and does NOT mutate the run queue). It cannot be ring-converted the way
-//     taskStartQueue was because its consumer (AudioThread_ResetAudioHeap, thread.c) does an
-//     OS_MESG_BLOCK recv that, under the legacy-fiber kill-switch path, relies on the cooperative
-//     __osEnqueueAndYield fiber switch — a lock-free ring spin would deadlock that mode. Flagged as
-//     the one conditional, out-of-boot-window residual for a possible follow-up.
-//
-// A bounded MPMC ring (Dmitry Vyukov's algorithm) rather than a strict SPSC one because the queue
-// has TWO producers (game thread + the audio-thread self-reschedule above) feeding one consumer.
-// Each cell's release-store / acquire-load also publishes the producer's preceding threadCmdBuf
-// writes to the consumer, so the command payload is visible after a successful pop. Initialized
-// once at static-construction time (before any thread starts); never reset at runtime, so a
-// concurrent AudioThread_InitMesgQueues re-init (audio-heap reset) can never race the ring — stale
-// tokens are harmless because ProcessCmds NOOPs each AudioCmd slot as it applies it.
+// Bounded MPMC (Vyukov) rather than strict SPSC, because of the two producers above. Each cell's
+// release-store / acquire-load also publishes the producer's preceding threadCmdBuf writes, so the
+// command payload is visible after a successful pop. Initialized once at static-construction time
+// and never reset at runtime, so a concurrent AudioThread_InitMesgQueues (audio-heap reset) cannot
+// race it; stale tokens are harmless because ProcessCmds NOOPs each AudioCmd slot as it applies it.
 class CmdRing {
 public:
     CmdRing() {
@@ -288,20 +175,22 @@ private:
 
 CmdRing sCmdRing;
 
-// ===============================================================================================
-// TASK-START POST (residual Release 64DD SIGABRT fix — engram crash/release-64dd-residual, #1832)
-// ===============================================================================================
-// AudioThread_CreateTaskImpl (decomp/src/audio/disk/lib/thread.c) posted gAudioCtx.totalTaskCount
-// to gAudioCtx.taskStartQueue via osSendMesg on EVERY production tick. That was the one remaining
-// decomp osSendMesg the dedicated audio OS thread still executed — the post-rebuild crash core
-// caught it running concurrently with the boot fiber's SLMFSLoad->LeoSpdlMotor osSendMesg during
-// the 64DD disk mount, corrupting the glibc heap/list (both threads inside the libultra
-// message-queue kernel; the host mutates the run queue via osStartThread OUTSIDE gdx_mq_lock).
-// taskStartQueue has NO consumer in this port — AudioThread_WaitForAudioTask (its only reader) is
-// never called — so the send never needed to reach the kernel at all. It is now a plain atomic
-// counter: the audio thread records "a task was created" host-observably without ever entering
-// osSendMesg. If a future host-side consumer ever needs the count/token, read these instead of
-// re-adding a cross-thread message queue.
+// AudioThread_CreateTaskImpl posted gAudioCtx.totalTaskCount to gAudioCtx.taskStartQueue via
+// osSendMesg on EVERY tick -- the last decomp osSendMesg this thread still executed, and the one a
+// crash core caught running concurrently with the boot fiber's SLMFSLoad->LeoSpdlMotor osSendMesg
+// during a 64DD mount. taskStartQueue has NO consumer in this port (AudioThread_WaitForAudioTask,
+// its only reader, is never called), so the send never needed the kernel at all: it is now a plain
+// atomic counter. If a host-side consumer ever needs the count or token, read these rather than
+// reintroducing a cross-thread message queue.
+//
+// The other audio-thread-reachable os-queue calls stay on the existing path deliberately, and none
+// of them enters the libultra run-queue/waiter/fiber machinery from this thread.
+// curAudioFrameDmaQueue is audio-thread-local (its producer is the inline, synchronous host-DMA
+// completion on this same thread, so CreateTaskImpl's NOBLOCK drain always empties it first).
+// audioResetQueue is written only when gAudioCtx.resetStatus != 0, i.e. never during the 64DD boot
+// window, and cannot be ring-converted the way taskStartQueue was: its consumer does an
+// OS_MESG_BLOCK recv that, under the legacy-fiber kill-switch path, relies on the cooperative
+// __osEnqueueAndYield fiber switch, which a lock-free ring spin would deadlock.
 std::atomic<uint32_t> sTaskStartCount{ 0 };
 std::atomic<uint32_t> sTaskStartLastToken{ 0 };
 
@@ -330,10 +219,9 @@ void AudioThreadMain() {
 
     while (!sStopRequested.load(std::memory_order_relaxed)) {
         {
-            // 5ms self-pump timeout (design point 2): survives render stalls/loads on the main
-            // thread — this thread never depends on gdx_audio_thread_notify_frame() actually
-            // being called in a timely fashion, only on it eventually being called OR this
-            // timeout firing, whichever comes first.
+            // 5ms self-pump: this thread never depends on gdx_audio_thread_notify_frame()
+            // arriving in a timely fashion, only on it eventually arriving OR this timeout
+            // firing, so a stalled main thread cannot stop production.
             std::unique_lock<std::mutex> wakeLock(sWakeMutex);
             sWakeCv.wait_for(wakeLock, 5ms);
         }
@@ -379,17 +267,12 @@ extern "C" void gdx_audio_thread_start(int argc, char** argv) {
     sStopRequested.store(false, std::memory_order_relaxed);
     sAudioThread = std::thread(AudioThreadMain);
 
-    // Clean teardown on signal-driven exit. libultraship's crash handler installs a SIGTERM/SIGINT/
-    // SIGQUIT ShutdownHandler that calls exit() DIRECTLY (CrashHandler.cpp) — a window close, a
-    // `kill`, or a desktop-session shutdown therefore bypasses main()'s gdx_audio_thread_stop().
-    // exit() then runs static destructors, reaching this file's global sAudioThread while it is
-    // still joinable, and std::thread::~thread() on a joinable thread calls std::terminate() (seen
-    // on Linux as "terminate called without an active exception"). Registering the stop with
-    // std::atexit fixes it: [basic.start.term] guarantees that because sAudioThread's construction
-    // is sequenced before this atexit registration, the registered handler runs BEFORE
-    // ~sAudioThread — so the thread is always signalled and joined first. Idempotent with main()'s
-    // explicit stop (the second call no-ops on the already-joined, non-joinable thread). Registered
-    // once; gdx_audio_thread_start() is called a single time at boot, but guard anyway.
+    // libultraship's crash handler installs a SIGTERM/SIGINT/SIGQUIT ShutdownHandler that calls
+    // exit() DIRECTLY, so a window close or `kill` bypasses main()'s gdx_audio_thread_stop().
+    // exit() then runs static destructors and reaches sAudioThread while it is still joinable,
+    // and ~std::thread() on a joinable thread calls std::terminate(). [basic.start.term] fixes it:
+    // sAudioThread's construction is sequenced before this registration, so the handler runs
+    // BEFORE ~sAudioThread. Idempotent with main()'s explicit stop, which then no-ops.
     static bool sAtexitRegistered = false;
     if (!sAtexitRegistered) {
         sAtexitRegistered = true;
@@ -412,9 +295,8 @@ extern "C" void gdx_audio_thread_notify_frame(void) {
     if (!sThreadActive.load(std::memory_order_relaxed)) {
         return;
     }
-    // No predicate flag: a notify lost to a race just means the next production happens on the
-    // 5ms self-pump timeout instead of immediately — within the tolerance the design already
-    // budgets for, not a correctness issue.
+    // No predicate flag: a notify lost to a race only means the next production waits for the 5ms
+    // self-pump instead of happening immediately.
     sWakeCv.notify_one();
 }
 
@@ -430,11 +312,9 @@ extern "C" void gdx_audio_ctx_unlock(void) {
     sAudioCtxMutex.unlock();
 }
 
-// Thread-cmd ring bridge for decomp/src/audio/disk/lib/thread.c (see the CmdRing comment above).
-// gdx_audio_cmdring_push replaces AudioThread_ScheduleProcessCmds' osSendMesg; gdx_audio_cmdring_pop
-// replaces AudioThread_CreateTaskImpl's drain-loop osRecvMesg. Both keep the osSendMesg/osRecvMesg
-// OS_MESG_NOBLOCK return convention (0 = ok, -1 = full/empty) so thread.c's existing control flow
-// is untouched.
+// Ring bridge for decomp/src/audio/disk/lib/thread.c: push replaces ScheduleProcessCmds'
+// osSendMesg, pop replaces CreateTaskImpl's drain-loop osRecvMesg. Both keep the OS_MESG_NOBLOCK
+// return convention (0 = ok, -1 = full/empty) so thread.c's control flow is untouched.
 extern "C" int gdx_audio_cmdring_push(unsigned int token) {
     return sCmdRing.Enqueue(static_cast<uint32_t>(token)) ? 0 : -1;
 }
@@ -450,17 +330,15 @@ extern "C" int gdx_audio_cmdring_pop(unsigned int* out) {
     return 0;
 }
 
-// Replaces AudioThread_CreateTaskImpl's per-tick osSendMesg to taskStartQueue (see the TASK-START
-// POST comment above). Lock-free, touches ZERO libultra scheduler state — the whole point of the
-// residual 64DD SIGABRT fix. Relaxed ordering is sufficient: no other data is published through
-// this counter, it is diagnostic only (taskStartQueue has no consumer in this port).
+// Replaces CreateTaskImpl's per-tick osSendMesg to taskStartQueue (see the comment above).
+// Relaxed ordering is sufficient: no other data is published through this counter.
 extern "C" void gdx_audio_taskstart_post(unsigned int token) {
     sTaskStartLastToken.store(static_cast<uint32_t>(token), std::memory_order_relaxed);
     sTaskStartCount.fetch_add(1, std::memory_order_relaxed);
 }
 
-// Diagnostic accessors for the task-start counter above. Not currently consumed; provided so a
-// future host-side reader never needs to reintroduce a cross-thread message queue.
+// Diagnostic accessors, not currently consumed; provided so a future host-side reader never needs
+// to reintroduce a cross-thread message queue.
 extern "C" unsigned int gdx_audio_taskstart_count(void) {
     return sTaskStartCount.load(std::memory_order_relaxed);
 }

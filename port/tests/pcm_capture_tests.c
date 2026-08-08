@@ -1,23 +1,22 @@
-/* G-Diffuser -- standalone unit-test harness for port/gdx_audio_capture.c (the streaming PCM
- * capture module used by the R2 bit-identical audio gate, C-R2.3). Console exe, no game deps,
- * no libultraship, no decomp headers -- the module is compiled unmodified alongside this file
- * (see port/CMakeLists.txt's gdx_pcm_capture_tests) and driven entirely through its public API
- * (gdx_pcm_capture_init/arm/feed/active/finished/shutdown), plus the test-only reset seam
- * gdx_pcm_capture_reset_for_test() so one process can run several independent capture sessions.
+/* Standalone unit-test harness for port/gdx_audio_capture.c. Console exe, no game deps, no
+ * libultraship, no decomp headers: the module compiles unmodified alongside this file (see
+ * port/CMakeLists.txt's gdx_pcm_capture_tests) and is driven entirely through its public API, plus
+ * the test-only reset seam gdx_pcm_capture_reset_for_test() so one process can run several
+ * independent capture sessions.
  *
- * The capture module reads GDX_PCM_CAPTURE / GDX_PCM_CAPTURE_FRAMES from the environment, so each
- * case sets those (portable putenv helper), resets the module, re-inits, feeds known s16 stereo
- * frames, then reads the produced <prefix>.pcm and <prefix>.pcm.sha256 straight back off disk to
- * verify: (1) the file bytes are exactly the fed samples, (2) the frame-cap stop is honored,
- * (3) the streamed SHA-256 in the sidecar equals an INDEPENDENT SHA-256 (a second implementation
- * transcribed here) of the file's bytes, (4) active/finished/no-op semantics.
+ * The module reads GDX_PCM_CAPTURE / GDX_PCM_CAPTURE_FRAMES from the environment, so each case sets
+ * those, resets the module, re-inits, feeds known s16 stereo frames, then reads the produced
+ * <prefix>.pcm and <prefix>.pcm.sha256 back off disk to verify: the file bytes are exactly the fed
+ * samples, the frame cap is honored, the streamed SHA-256 in the sidecar equals an INDEPENDENT
+ * SHA-256 (a second implementation, transcribed below) of the file's bytes, and the
+ * active/finished/no-op semantics hold.
  */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* ---- Public API under test (mirror of gdx_audio_capture.h; kept local to avoid an include path). */
+/* Public API under test, mirrored locally to avoid an include path. */
 void gdx_pcm_capture_init(void);
 void gdx_pcm_capture_arm(void);
 void gdx_pcm_capture_feed(const int16_t* frames, unsigned int frameCount, unsigned int sampleRate);
@@ -27,9 +26,7 @@ void gdx_pcm_capture_shutdown(void);
 /* Test-only reset seam (declared in gdx_audio_capture.c, not the public header). */
 void gdx_pcm_capture_reset_for_test(void);
 
-/* ==========================================================================
- * Sub-check bookkeeping (same shape as dsp_tests.c).
- * ========================================================================== */
+/* Sub-check bookkeeping, same shape as dsp_tests.c. */
 static int gSubChecks = 0;
 static int gSubFails = 0;
 
@@ -49,9 +46,7 @@ static void checkEqLong(const char* what, long got, long expected) {
     }
 }
 
-/* ==========================================================================
- * Independent SHA-256 (second implementation, for cross-checking the module's digest).
- * ========================================================================== */
+/* Independent SHA-256, a second implementation used to cross-check the module's own digest. */
 typedef struct { uint32_t s[8]; uint64_t n; uint8_t b[64]; } Sha;
 static const uint32_t K[64] = {
     0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
@@ -102,9 +97,7 @@ static void shaHex(Sha* x, char out[65]) {
     out[64] = '\0';
 }
 
-/* ==========================================================================
- * Small file / env helpers (plain CRT -- this test never runs on a fiber).
- * ========================================================================== */
+/* File and env helpers. Plain CRT is fine here: this test never runs on a fiber. */
 static void setEnv(const char* name, const char* value) {
 #ifdef _WIN32
     char buf[512];
@@ -164,9 +157,6 @@ static int sidecarMatchesFile(const char* prefix) {
     return strcmp(got, expected) == 0;
 }
 
-/* ==========================================================================
- * Cases.
- * ========================================================================== */
 static void CaseFrameLimitStop(void) {
     const char* prefix = "gdx_pcm_test_limit";
     const unsigned limit = 100;
@@ -304,9 +294,8 @@ static void CaseArmIdempotentAndDeterministic(void) {
 }
 
 static void CaseWriteBehindBufferBoundary(void) {
-    /* Mirrors GDX_PCM_WRITE_BUF_CAP in port/gdx_audio_capture.c (256 KiB write-behind buffer).
-     * That #define is module-private (not exposed via gdx_audio_capture.h), so the value is
-     * duplicated here deliberately -- if the module's cap ever changes, update this constant too. */
+    /* GDX_PCM_WRITE_BUF_CAP is module-private, so this 256 KiB value is duplicated deliberately.
+     * If the module's cap ever changes, update this constant too. */
     const size_t writeBufCap = 256u * 1024u;
     const unsigned bytesPerFrame = 4u; /* s16 stereo */
     const unsigned framesExact = (unsigned)(writeBufCap / bytesPerFrame); /* lands exactly on the cap */

@@ -1,7 +1,6 @@
 // G-Diffuser — GDX_INPUT_SCRIPT: dev-only deterministic tick-level input playback.
 //
-// See gdx_input_script.h for the integration contract (gdx_input_script_override, called from
-// input_bridge.c's gdx_controller_poll once per host poll).
+// See gdx_input_script.h for the integration contract.
 //
 // ---------------------------------------------------------------------------------------------
 // SCRIPT FORMAT (plain text, one command per line, '#' starts a full-line comment, keywords are
@@ -44,20 +43,17 @@
 //       takes (see gdx_request_quit, main.cpp).
 //
 //   (implicit) END at EOF
-//       Once every command has run, logs "[autotest] script complete (<n> commands)" once and
-//       returns control to physical input — gdx_input_script_override becomes a permanent no-op
-//       for the rest of the process.
+//       Once every command has run, control returns to physical input — gdx_input_script_override
+//       becomes a permanent no-op for the rest of the process.
 //
 // PARSE ERRORS: a malformed line disables playback entirely (fail safe to physical input) and
 // logs "[autotest] script parse error at line <n>: <line text>". Nothing partially loaded runs.
 // ---------------------------------------------------------------------------------------------
 
-// This TU originally used MSVC's Annex K functions (sscanf_s/getenv_s/fopen_s/strtok_s), none of
-// which glibc provides -- it never compiled on Linux. sscanf_s also takes an extra buffer-size
-// argument per %s that plain sscanf does not, so no macro can satisfy both compilers; the field
-// widths below (%127s, %31s) are what actually bounds those writes, and they are portable. Turning
-// off C4996 for this file keeps MSVC quiet without weakening anything, since the G-Diffuser target
-// does not define _CRT_SECURE_NO_WARNINGS globally. Must precede every include.
+// MSVC's Annex K functions (sscanf_s/getenv_s/fopen_s/strtok_s) are not in glibc, and sscanf_s
+// takes an extra buffer-size argument per %s that plain sscanf does not, so no macro can satisfy
+// both compilers. The field widths below (%127s, %31s) are what bounds those writes, and they are
+// portable. The G-Diffuser target does not define this globally. Must precede every include.
 #define _CRT_SECURE_NO_WARNINGS 1
 
 #include "gdx_input_script.h"
@@ -78,22 +74,19 @@
 #endif
 
 // decomp global (decomp/include/fzx_game.h: GAMEMODE_* enum + GET_MODE(m) = (m & 0x1F)). Declared
-// locally as a plain int — same boundary idiom n64_gfx_bridge.cpp uses for the same global — so
-// this TU has no decomp header dependency.
+// locally as a plain int — same boundary idiom n64_gfx_bridge.cpp uses — so this TU has no decomp
+// header dependency.
 extern int gGameMode;
 
-// main.cpp: closes the LUS window via the identical path SDL_QUIT/WM_CLOSE take
-// (Ship::Context -> Window::Close(), which just sets the window backend's "running" flag false).
+// main.cpp: closes the LUS window via the same path SDL_QUIT/WM_CLOSE take.
 extern void gdx_request_quit(void);
 
-// n64_gfx_bridge.cpp: arms a one-shot BMP dump of the next presented frame to
-// "autotest/<label>.bmp". See that file for the implementation (reuses the existing
-// GDX_CAPTURE_FRAMES / GDX_DIAG_TRANSITION_DUMP frame-mirror dump code path).
+// n64_gfx_bridge.cpp: arms a one-shot BMP dump of the next presented frame.
 extern void gdx_request_frame_dump(const char* label);
 
 // N64 standard controller bitmask (decomp/include/controller.h BTN_*; identical layout to LUS's
-// OSContPad.button — see input_bridge.c's file header). Redefined locally with the GDX_ prefix so
-// this TU stays decomp-header-free; values are fixed by the N64 SI protocol and never change.
+// OSContPad.button). Redefined locally with the GDX_ prefix so this TU stays decomp-header-free;
+// the values are fixed by the N64 SI protocol and never change.
 #define GDX_BTN_A 0x8000
 #define GDX_BTN_B 0x4000
 #define GDX_BTN_Z 0x2000
@@ -144,7 +137,6 @@ static int gdx_ci_streq(const char* a, const char* b) {
     return *a == '\0' && *b == '\0';
 }
 
-// Parses one '+'-joined button token (e.g. "A+START", "L+R+Z", or a single "A") into a bitmask.
 // Returns 1 on success, 0 if any name is unrecognized. `tok` is modified (strtok-style split).
 static int gdx_parse_buttons(char* tok, unsigned short* outButtons) {
     unsigned short bits = 0;
@@ -175,7 +167,6 @@ static int gdx_parse_buttons(char* tok, unsigned short* outButtons) {
     return 1;
 }
 
-// Strips a trailing CR/LF (and any trailing whitespace) in place.
 static void gdx_rstrip(char* s) {
     size_t n = strlen(s);
     while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r' || s[n - 1] == ' ' || s[n - 1] == '\t')) {
@@ -183,7 +174,7 @@ static void gdx_rstrip(char* s) {
     }
 }
 
-// Skips leading whitespace; returns a pointer into `s`.
+// Returns a pointer into `s`, not a copy.
 static char* gdx_lskip(char* s) {
     while (*s == ' ' || *s == '\t') {
         s++;
@@ -200,7 +191,7 @@ static int s_cmdCount = 0;
 static int s_cmdCap = 0;
 
 static int s_state = -1; // -1 = unread, 0 = disabled (unset / open failed / parse error), 1 = active
-static int s_ip = 0;          // index of the currently-executing command
+static int s_ip = 0;
 static int s_counter = -1;    // HOLD: polls remaining (counts down). WAITMODE: polls elapsed (counts up). -1 = not started.
 static int s_loggedComplete = 0;
 
@@ -236,15 +227,15 @@ static int gdx_script_push(GdxScriptOp op, unsigned short buttons, signed char s
     return 1;
 }
 
-// Parses one already-trimmed, non-blank, non-comment line. Returns 1 on success, 0 on a
-// malformed line (caller aborts the whole load on failure).
+// `line` is already trimmed, non-blank and non-comment. Returns 0 on a malformed line; the caller
+// aborts the whole load on failure.
 static int gdx_script_parse_line(char* line) {
     char kw[16];
     size_t kwLen;
     char* rest;
 
-    // Manual keyword extraction (rather than sscanf's "%n") -- MSVC's secure CRT restricts %n
-    // for the printf family by default and this avoids relying on scanf-side %n support at all.
+    // Manual keyword extraction rather than sscanf's "%n": MSVC's secure CRT restricts %n by
+    // default, so this avoids relying on scanf-side %n support at all.
     kwLen = strcspn(line, " \t");
     if (kwLen == 0 || kwLen >= sizeof(kw)) {
         return 0;
@@ -322,19 +313,18 @@ static int gdx_script_parse_line(char* line) {
     return 0; // unrecognized keyword
 }
 
-// Loads and parses GDX_INPUT_SCRIPT. Sets s_state to 0 (disabled) or 1 (active). Called exactly
-// once, from the first gdx_input_script_override() call.
+// Called exactly once, from the first gdx_input_script_override().
 static void gdx_script_load(void) {
     const char* path;
     FILE* f = NULL;
     int lineNo = 0;
     char line[512];
 
-    s_state = 0; // default to disabled; only flipped to 1 on a fully clean parse
+    s_state = 0; // only flipped to 1 on a fully clean parse
 
     path = getenv("GDX_INPUT_SCRIPT");
     if (path == NULL || path[0] == '\0') {
-        return; // env unset — the common case, zero further cost
+        return;
     }
 
     f = fopen(path, "r");
@@ -358,7 +348,7 @@ static void gdx_script_load(void) {
             s_cmds = NULL;
             s_cmdCount = 0;
             s_cmdCap = 0;
-            s_state = 0; // fail safe: disable playback entirely, fall back to physical input
+            s_state = 0; // fail safe: never run a partially loaded script
             return;
         }
     }
@@ -379,13 +369,12 @@ void gdx_input_script_override(GdxInputPad* pad) {
         gdx_script_load();
     }
     if (s_state != 1 || pad == NULL) {
-        return; // disabled, or (after EOF) finished — no-op, control stays with physical input
+        return; // disabled, or finished after EOF — control stays with physical input
     }
 
-    // Advance the state machine by exactly one poll. Instant commands (LOG/SHOT/QUIT, and a
-    // WAITMODE whose condition already matches) do not consume a poll on their own -- the loop
-    // keeps advancing `s_ip` within THIS call until something actually claims the poll (a HOLD
-    // still counting down, an unmatched/timed-out WAITMODE) or the script ends.
+    // Exactly one poll is consumed per call. Instant commands (LOG/SHOT/QUIT, and a WAITMODE whose
+    // condition already matches) do not consume one on their own, so the loop keeps advancing
+    // `s_ip` within THIS call until something claims the poll or the script ends.
     for (;;) {
         GdxScriptCmd* cmd;
 
@@ -402,10 +391,9 @@ void gdx_input_script_override(GdxInputPad* pad) {
         switch (cmd->op) {
             case GDX_SCRIPT_OP_HOLD: {
                 if (cmd->frames <= 0) {
-                    // Zero/negative-length hold: nothing to apply, skip without consuming a poll.
                     s_ip++;
                     s_counter = -1;
-                    continue;
+                    continue; // zero-length hold: skip without consuming a poll
                 }
                 if (s_counter < 0) {
                     s_counter = cmd->frames;

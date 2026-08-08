@@ -187,15 +187,12 @@ void GdxInputViewer::DrawElement() {
             }
         };
 
-        // Shoulder triggers (top corners) + Start (centre) + Z (bottom centre). All are
-        // grey on the real controller except Start, which is red.
+        // Grey on the real controller, except Start, which is red.
         rectButton(18.0f, 42.0f, 92.0f, 63.0f, "L", kButtonL, neutral);
         rectButton(268.0f, 42.0f, 342.0f, 63.0f, "R", kButtonR, neutral);
         rectButton(162.0f, 74.0f, 200.0f, 95.0f, "START", kButtonStart, startActive);
         rectButton(166.0f, 166.0f, 196.0f, 186.0f, "Z", kButtonZ, neutral);
 
-        // Right-hand face buttons: A (blue, larger, lower) with B (green) to its upper-left,
-        // and the C-button diamond (yellow) above.
         circleButton(298.0f, 146.0f, 20.0f, "A", kButtonA, active, label);
         circleButton(254.0f, 120.0f, 15.0f, "B", kButtonB, bActive, label);
         circleButton(302.0f, 76.0f, 10.0f, "C", kCUp, cActive, darkLabel);
@@ -203,7 +200,6 @@ void GdxInputViewer::DrawElement() {
         circleButton(322.0f, 94.0f, 10.0f, "C", kCRight, cActive, darkLabel);
         circleButton(302.0f, 112.0f, 10.0f, "C", kCDown, cActive, darkLabel);
 
-        // Analog stick: left-centre, on the central prong.
         const ImVec2 analogCenter = point(82.0f, 104.0f);
         draw->AddCircle(analogCenter, 27.0f * scale, outline, 32, thickness);
         draw->AddLine(point(57.0f, 104.0f), point(107.0f, 104.0f), Color(255, 255, 255, 0.12f, opacity),
@@ -216,9 +212,6 @@ void GdxInputViewer::DrawElement() {
         draw->AddCircleFilled(Add(analogCenter, analogOffset), 10.0f * scale,
                               (stickX != 0 || stickY != 0) ? active : muted, 24);
 
-        // D-pad cluster: classic plus-shape tucked into the left grip, below-left of the
-        // stick. Center hub is always drawn; each arm outlines when released and fills
-        // (grey) when its bit is pressed, matching the pressed=filled convention above.
         if (CVarGetInteger("gInputViewer.ShowDpad", 1) != 0) {
             const float dpadRound = 2.0f * scale;
             auto dpadArm = [&](float x1, float y1, float x2, float y2, unsigned short mask) {
@@ -230,7 +223,7 @@ void GdxInputViewer::DrawElement() {
                     draw->AddRect(point(x1, y1), point(x2, y2), outline, dpadRound, 0, thickness);
                 }
             };
-            // Center hub (35.5,151.5)-(48.5,164.5); arms extend 15px on each axis.
+            // Hub is (35.5,151.5)-(48.5,164.5); each arm extends 15px along one axis.
             dpadArm(35.5f, 136.5f, 48.5f, 151.5f, kDpadUp);
             dpadArm(35.5f, 164.5f, 48.5f, 179.5f, kDpadDown);
             dpadArm(20.5f, 151.5f, 35.5f, 164.5f, kDpadLeft);

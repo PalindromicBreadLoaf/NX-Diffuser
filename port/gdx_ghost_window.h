@@ -4,12 +4,10 @@
 #include "ship/window/gui/GuiWindow.h"
 
 /**
- * @brief Browser for the host-side per-course player-ghost library.
+ * @brief Browser for the host-side per-course player-ghost library (see gdx_ghost_io.h).
  *
- * The vanilla SRAM slot remains compatible with the base game, while validated GDG1 copies under
- * `ghosts/` next to the executable remove the one-total-saved-ghost cartridge limitation. Players
- * can select any three local/imported entries per exact course. Staff ghosts remain owned by the
- * original ROM/EK unlock and loading paths.
+ * Selection is capped at three entries per exact course, the engine's native ghost count.
+ * Staff ghosts stay owned by the original ROM/EK unlock and loading paths.
  */
 class GdxGhostWindow : public Ship::GuiWindow {
   public:

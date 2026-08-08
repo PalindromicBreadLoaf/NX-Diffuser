@@ -1,64 +1,42 @@
 // port/gdx_ek_disk_overrides.c -- bounded post-fill override layer for the
 // fan-translated Expansion Kit disk (LuigiBlood/Zoinkity English .ndd).
 //
-// RETIRED: gdx_ek_disk_overrides_apply() is a no-op. The game serves the raw disk bytes
-// gdx_ek_assets_fill() wrote, unmodified. The overrides masked the underlying disk-data mismatch
-// documented below instead of fixing it, and the real fix belongs at the data layer: diff the
-// translated .ndd against a retail-JP disk to find where the Create-Machine label sub-block
-// actually lives on this dump. The glyph arrays and the apply mechanism are kept in place,
-// unreferenced, so they can be re-armed as a stopgap without re-deriving them.
+// RETIRED: gdx_ek_disk_overrides_apply() is a no-op; the game serves the raw disk bytes
+// gdx_ek_assets_fill() wrote. The overrides masked the disk-data mismatch below instead of
+// fixing it, and the fix belongs at the data layer: diff the translated .ndd against a
+// retail-JP disk to find where the Create-Machine label sub-block actually lives on this
+// dump. The glyph arrays and the apply mechanism stay here, unreferenced, so they can be
+// re-armed as a stopgap without re-deriving them.
 //
-// ROOT CAUSE (established by offline decodes of the affected offsets, viewed as images):
-//   The translated disk's Create-Machine LABEL SUB-BLOCK was re-authored in a way
-//   that no longer matches the retail-JP layout the generated diskOffset table in
-//   gen/EkAssetBindings.c assumes. Three I8 heading/caption glyphs land on garbage
-//   or on the wrong slot:
-//     - aMachineCreateMachineNameTex (48x12, drawn machine_create_draw.c:797):
-//         the disk byte range at its retail offset 0x00C8B070 actually decodes to
-//         a legible but MISPLACED English "Settings" glyph (48x12) -- i.e. the
-//         translator's own English labels exist but at incompatible offsets/sizes.
-//     - aMachineCreateSettingsTex (72x12, drawn :799): retail offset 0x00C8B2B0
-//         decodes to structureless noise.
-//     - D_xk3_80138930  (32x16 Weight caption, drawn :374): retail offset
-//         0x00C8B610 decodes to structureless noise.
-//   Positive controls that PROVE the pipeline and the retail-JP offsets are
-//   otherwise correct on this disk: aMachineCreateKgTex@0x00C8C450 decodes to a
-//   pixel-perfect "kg" (16x16) and the weight digit strip @0x00C8C550 is clean --
-//   both AFTER the broken labels, so there is no global shift, only the label
-//   sub-block is corrupt. The correct 72x12 SETTINGS and 32x16 WEIGHT glyphs are
-//   NOT present at any recoverable offset on this disk (the translator overwrote
-//   them), so a disk re-anchor cannot recover them.
+// The mismatch, established by offline decodes of the affected offsets viewed as images:
+// this dump's Create-Machine LABEL SUB-BLOCK was re-authored and no longer matches the
+// retail-JP layout gen/EkAssetBindings.c's generated diskOffset table assumes. Three I8
+// glyphs land on garbage or on the wrong slot:
+//     - aMachineCreateMachineNameTex (48x12, drawn machine_create_draw.c:797): its retail
+//         offset 0x00C8B070 decodes to a legible but MISPLACED English "Settings" glyph --
+//         the translator's English labels exist, at incompatible offsets/sizes.
+//     - aMachineCreateSettingsTex (72x12, drawn :799): 0x00C8B2B0 decodes to noise.
+//     - D_xk3_80138930 (32x16 Weight caption, drawn :374): 0x00C8B610 decodes to noise.
+// Only that sub-block is affected: aMachineCreateKgTex@0x00C8C450 (a pixel-perfect 16x16
+// "kg") and the weight digit strip @0x00C8C550 both sit AFTER the broken labels and decode
+// correctly, so there is no global shift. The correct 72x12 SETTINGS and 32x16 WEIGHT
+// glyphs are not present at any offset on this disk, so re-anchoring cannot recover them.
 //
-// COURSE-EDIT NOTE -- RULED OUT:
-//   A suspected "hard content discontinuity at 0x00CDEE48"
-//   shifting every Course-Edit part-type icon into noise. Direct offline decode of
-//   ALL 72 RGBA16 24x12 part-type icons (0x00CDEE48..0x00CE9048) at delta 0 on
-//   THIS disk shows every one is a coherent, recognizable icon (cylinders, gates,
-//   building silhouettes, sky gradients, landmine pyramids, ...), and the trailing
-//   GFX display lists D_9014908..D_9014DF8 are valid GBI at their retail offsets.
-//   The fill already copies correct pixels; there is NO offset shift for Course
-//   Edit, so NO override is emitted for it. (If solid rectangles are still seen in
-//   the node panel at runtime, the cause is downstream rendering, not disk offsets.)
+// Course Edit needs no override, contrary to the suspected content discontinuity at
+// 0x00CDEE48: an offline decode of all 72 RGBA16 24x12 part-type icons
+// (0x00CDEE48..0x00CE9048) at delta 0 on this disk yields coherent icons throughout, and
+// the trailing display lists D_9014908..D_9014DF8 are valid GBI at their retail offsets.
+// Solid rectangles in the node panel at runtime are a rendering problem, not an offset one.
 //
-// MECHANISM: this runs once, right after gdx_ek_assets_fill() in disk_buffer.cpp.
-//   For each broken label it copies an authored, exact-dimension English I8 glyph
-//   (white text = 0xFF on transparent 0x00, matching the game's I8 gradient/prim
-//   draw) over the noise the fill wrote. Disk-independent and survives generator
-//   regeneration (the generated file is never touched). Compiled in the decomp TU
-//   environment (see gen/EkAssetBindings.c) so it uses u8 + a byte-copy loop
-//   instead of <string.h>.
-//
-// The glyph arrays below are generated (port scratchpad emit_override.py: Arial
-// Bold rasterized at the slot dimensions and hard-thresholded to I8). Regenerate
-// there if the label text/style ever changes.
+// The glyph arrays below are generated (port scratchpad emit_override.py: Arial Bold
+// rasterized at the slot dimensions and hard-thresholded to I8). Regenerate there if the
+// label text/style ever changes.
 
 typedef unsigned char u8;
 
-/* This TU is compiled in the decomp TU environment (see the file header above),
-   so it cannot include <stdlib.h>/port_log.h directly (stdio.h clashes with the
-   decomp's own libc/stdint.h -- same constraint as decomp_port.c). Use the same
-   extern-declaration workaround: gdx_dbg_logf (a real, non-static symbol defined
-   in n64_sched.c) for the retirement notice logged by the no-op below. */
+/* Compiled in the decomp TU environment, so <stdlib.h>/port_log.h are off limits
+   (stdio.h clashes with the decomp's own libc/stdint.h -- same constraint as
+   decomp_port.c). gdx_dbg_logf is a real, non-static symbol in n64_sched.c. */
 extern void gdx_dbg_logf(const char* fmt, ...);
 
 // aMachineCreateMachineNameTex -- 48x12 I8 heading ("NAME").
@@ -120,8 +98,7 @@ extern u8 D_xk3_80138930[];
 extern u8 D_xk3_80138B30[];
 // D_xk3_80138CB0 (DELETE, 48x16 I4, disk offset 0x00C8B990), the FILE menu's
 // aMachineCreateMachineRegistrationTex tab icon, and aMachineCreateEnterTex/
-// aMachineCreateReturnTex were binary-decode-verified CORRECT on this disk -- they need
-// no override.
+// aMachineCreateReturnTex decode correctly on this disk; they need no override.
 
 static void gdx_copy_bytes(u8* dst, const u8* src, unsigned int n) {
     unsigned int i;
@@ -130,9 +107,8 @@ static void gdx_copy_bytes(u8* dst, const u8* src, unsigned int n) {
     }
 }
 
-// Apply the bounded Create-Machine label overrides. RETIRED -- see the note at the top of this
-// file. Now a no-op, kept callable so disk_buffer.cpp's call site (immediately after
-// gdx_ek_assets_fill()) needs no change.
+// Retired (see the file header). Kept callable so disk_buffer.cpp's call site, immediately
+// after gdx_ek_assets_fill(), needs no change.
 void gdx_ek_disk_overrides_apply(void) {
     gdx_dbg_logf("[ek-override] label overrides removed (owner decision 2026-07-24): serving raw disk bytes\n");
 }

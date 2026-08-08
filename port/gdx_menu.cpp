@@ -1,29 +1,16 @@
 // port/gdx_menu.cpp — implementation of the G-Diffuser modern full-screen menu.
 //
-// See gdx_menu.h for the high-level design. This file is pure port-side wiring against LUS's
-// public ImGui + CVar API. All feature controls retain their original CVar names, defaults, and
-// callbacks; this file changes their presentation and information architecture only.
-//
-// WHAT LIVES WHERE
-// ----------------
-// This file is the SHELL and the draw dispatcher:
-//   - the window, header tab strip, sidebar, content pane, search box and quit modal;
-//   - MenuDrawItem(), which turns one registered GdxUI::WidgetInfo into ImGui calls;
-//   - DrawSearchResults(), which walks the same registry to find INDIVIDUAL controls;
-//   - the WIDGET_CUSTOM blocks (status read-outs, tables, modals) that no generic widget can
-//     express.
-// The menu's CONTENTS — every section, page and control — are declared as data in
-// port/gdx_menu_registry.cpp against the model in port/ui/MenuTypes.h. Adding a control means
-// adding one AddWidget() entry there; it then appears on its page AND in search, with its disable
-// reasons and tooltip, with no edit to this file.
+// See gdx_menu.h for the design. This file is the SHELL and the draw dispatcher: the window, header
+// tab strip, sidebar, content pane, search box and quit modal; MenuDrawItem(), which turns one
+// registered GdxUI::WidgetInfo into ImGui calls; DrawSearchResults(); and the WIDGET_CUSTOM blocks
+// that no generic widget can express. The CONTENTS live in port/gdx_menu_registry.cpp.
 //
 // CVar NAMES ARE STRING LITERALS ON PURPOSE
 // -----------------------------------------
-// libultraship defines CVAR_* macros (e.g. CVAR_MENU_BAR_OPEN) in cmake/cvars.cmake, but that
-// file is include()d only inside libultraship/src (libultraship/src/CMakeLists.txt:1), so its
-// add_compile_definitions() do NOT reach the port/ target. We therefore spell the CVar names as
-// literals here; each matches cvars.cmake exactly (cross-checked against
-// libultraship/cmake/cvars.cmake). The port's own knobs use the gEnhancements.* convention.
+// libultraship defines CVAR_* macros (e.g. CVAR_MENU_BAR_OPEN) in cmake/cvars.cmake, but that file
+// is include()d only inside libultraship/src (libultraship/src/CMakeLists.txt:1), so its
+// add_compile_definitions() do NOT reach the port/ target. Each literal below matches cvars.cmake
+// exactly. The port's own knobs use the gEnhancements.* convention.
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -39,9 +26,7 @@
 #include "gdx_menu.h"
 #include "gdx_menu_internal.h" // the helpers below, shared with port/gdx_menu_registry.cpp
 
-#include <imgui.h> // vendored in libultraship's imgui; already on the port target's include path
-                   // (main.cpp already pulls it transitively via GuiWindow.h). Mirrors the
-                   // <imgui.h> include used across LUS (e.g. GuiWindow.h:4).
+#include <imgui.h>
 
 #include "ship/Context.h"           // Ship::Context::GetInstance()
 #include "ship/window/Window.h"     // Ship::Window::GetGui() + the SetResolutionMultiplier/
@@ -61,9 +46,8 @@
 
 #include <cstring> // strcmp (Audio tab: SDL driver-name check)
 
-// SDL audio driver name for the Audio tab's output-status line. Declared here rather than
-// pulling in <SDL2/SDL.h> (this TU builds inside libultraship's include environment where the
-// SDL umbrella clashes); the signature matches SDL_audio.h exactly.
+// Declared here rather than pulling in <SDL2/SDL.h>: this TU builds inside libultraship's include
+// environment, where the SDL umbrella clashes. Signature matches SDL_audio.h exactly.
 extern "C" const char* SDL_GetCurrentAudioDriver(void);
 
 #include <algorithm>
@@ -75,10 +59,7 @@ extern "C" const char* SDL_GetCurrentAudioDriver(void);
 #include <string>
 
 #include "ui/UIWidgets.hpp" // CVar-bound ImGui widgets: read + draw + write + persist + tooltip in
-                           // one call, replacing the hand-written CVarGet/CVarSet/GdxSaveCvars/
-                           // SetTooltip quadruple this file used to spell out per option. port/ is
-                           // already an include dir on this target, so the "ui/" prefix needs no
-                           // CMake change (port/CMakeLists.txt:325-329).
+                           // one call
 
 #include "gdx_console_log.h" // Console page: drains the queued port-log lines into the LUS console
 #include "gdx_ghost_io.h" // .gdg ghost import/export C API (Practice tab Export / Import buttons)
@@ -103,32 +84,22 @@ extern "C" void gdx_game_request_reset(void);
 // offers disk deletion ONLY on a passed verdict; it never deletes anything itself.
 extern "C" int gdx_disk_archive_verified(void);
 
-// From port/n64_gfx_bridge.cpp: frame-interpolation telemetry for the Graphics tab's
-// "subframes last tick" status line. Declared here rather than pulling in n64_gfx_bridge.h (this
-// TU doesn't otherwise need the gfx bridge's internals) — signatures match the header exactly.
+// Frame-interpolation telemetry for the Stats page. Declared here rather than pulling in
+// n64_gfx_bridge.h — signatures match the header exactly.
 extern "C" int gdx_gfx_interp_last_subframes(void);
 extern "C" double gdx_gfx_interp_last_t(void);
-// Real-FPS visibility: true presented frames/sec, the live master
-// toggle state, and last-tick per-slot tween/snap counts — shown on the Stats page.
 extern "C" int gdx_gfx_interp_host_active(void);
 extern "C" double gdx_gfx_interp_presents_per_sec(void);
 extern "C" int gdx_gfx_interp_last_lerped(void);
 extern "C" int gdx_gfx_interp_last_snapped(void);
-// Per-tick truth (n64_gfx_bridge.cpp): main.cpp forces interpolation off THIS tick (Course Edit /
-// Create Machine editors) even while the raw CVar above is still on. The Stats block below must
-// show the paused truth in that case rather than the (stale) live numbers.
+// Per-tick truth: main.cpp forces interpolation off for a tick (Course Edit / Create Machine
+// editors) while the raw CVar above is still on, so the Stats block must show the paused truth
+// rather than the stale live numbers.
 extern "C" int gdx_gfx_interp_tick_active(void);
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// Small helpers (main-thread only — the whole menu draws inside Gui::StartDraw/EndDraw).
-//
-// These used to live in an anonymous namespace. They are now a named one, declared in
-// port/gdx_menu_internal.h, because port/gdx_menu_registry.cpp needs them too: the registry's
-// callbacks are what apply the live side effects (SetResolutionMultiplier, SetFullscreen,
-// ToggleVisibility, the CVar flush), and duplicating a second copy of each in that TU is exactly
-// how two copies drift apart. The `using namespace` below keeps every call site in this file
-// spelling them unqualified, as before.
-// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Small helpers, main-thread only (the whole menu draws inside Gui::StartDraw/EndDraw). A named
+// namespace declared in port/gdx_menu_internal.h rather than an anonymous one, because
+// port/gdx_menu_registry.cpp calls these too and a second copy there would drift.
 
 namespace gdxmenu {
 
@@ -146,10 +117,9 @@ std::shared_ptr<Ship::Gui> GdxGui() {
     return window->GetGui();
 }
 
-// Returns the live top-level window, or nullptr if it is not up yet. The window exposes the
-// render-backend setters the graphics "read-once" trio needs to apply live (SetResolutionMultiplier
-// and SetMsaaLevel are virtuals on the Ship::Window base — Window.h:140,145 — so a plain window
-// pointer is enough; SetTextureFilter is Fast3d-only and needs the downcast helper below).
+// Returns the live top-level window, or nullptr if it is not up yet. SetResolutionMultiplier and
+// SetMsaaLevel are virtuals on the Ship::Window base (Window.h:140,145), so this is enough for
+// them; SetTextureFilter is Fast3d-only and needs the downcast helper below.
 std::shared_ptr<Ship::Window> GdxWindow() {
     auto ctx = Ship::Context::GetInstance();
     if (ctx == nullptr) {
@@ -158,17 +128,14 @@ std::shared_ptr<Ship::Window> GdxWindow() {
     return ctx->GetWindow();
 }
 
-// Returns the window downcast to Fast::Fast3dWindow, or nullptr if the window is not up yet or the
-// active backend is not Fast3d. dynamic_pointer_cast is null-safe: on any non-Fast3d backend it
-// yields nullptr and callers simply skip the live apply (the CVar is still saved, so it takes
-// effect on the next restart). Used only for SetTextureFilter, which lives on Fast3dWindow (it
-// takes a Fast::FilteringMode, a type the Ship::Window base does not know).
+// The window downcast to Fast::Fast3dWindow, or nullptr on any non-Fast3d backend — callers then
+// skip the live apply and the saved CVar takes effect on the next restart. Needed only for
+// SetTextureFilter, which takes a Fast::FilteringMode the Ship::Window base does not know.
 std::shared_ptr<Fast::Fast3dWindow> GdxFast3dWindow() {
     return std::dynamic_pointer_cast<Fast::Fast3dWindow>(GdxWindow());
 }
 
 // Schedules a CVar flush to gdiffuser.cfg.json at end of frame (coalesced — safe to call often).
-// This is exactly the pattern LUS uses after a visibility change (GuiMenuBar.cpp:46).
 void GdxSaveCvars() {
     auto gui = GdxGui();
     if (gui != nullptr) {
@@ -176,11 +143,10 @@ void GdxSaveCvars() {
     }
 }
 
-// Flips a registered GuiWindow's LIVE visibility by name. NOTE (see DEVELOPER_TAB.md): a bare
-// CVarSetInteger on the visibility CVar is a NO-OP for an already-constructed window, because the
-// window checks its in-memory mIsVisible each frame (the CVar is read only once, at construction).
-// ToggleVisibility() flips mIsVisible AND mirrors+persists the CVar (GuiWindow.cpp), which is what
-// we want for a live toggle.
+// Flips a registered GuiWindow's LIVE visibility by name. A bare CVarSetInteger on the visibility
+// CVar is a NO-OP for an already-constructed window: it checks its in-memory mIsVisible each frame
+// and reads the CVar only at construction. ToggleVisibility() flips mIsVisible AND mirrors +
+// persists the CVar (GuiWindow.cpp).
 // Returns false when the named window does not exist, so callers can say so instead of leaving a
 // button that silently does nothing.
 bool GdxToggleWindow(const char* name) {
@@ -194,12 +160,11 @@ bool GdxToggleWindow(const char* name) {
     }
     window->ToggleVisibility();
 
-    // Raise it. Gui::Draw() draws the full-screen menu BEFORE the tool windows, and libultraship
-    // registers the Console with ImGuiWindowFlags_NoFocusOnAppearing, so a window turned on from
-    // inside the menu appears UNFOCUSED and therefore behind the menu that opened it. The window is
-    // genuinely open and genuinely drawing -- it is just underneath an opaque full-screen panel,
-    // which is indistinguishable from a dead button. Focusing it on the frame it becomes visible
-    // puts it on top; on the way back to hidden there is nothing to focus.
+    // Gui::Draw() draws the full-screen menu BEFORE the tool windows, and libultraship registers
+    // the Console with ImGuiWindowFlags_NoFocusOnAppearing, so a window turned on from inside the
+    // menu appears unfocused and therefore underneath an opaque full-screen panel — genuinely
+    // drawing, but indistinguishable from a dead button. Focusing it on the frame it becomes
+    // visible puts it on top; on the way back to hidden there is nothing to focus.
     if (window->IsVisible()) {
         ImGui::SetWindowFocus(name);
     }
@@ -221,10 +186,9 @@ void GdxComingSoon(const char* label) {
     ImGui::TextDisabled("%s  -  Coming soon", label);
 }
 
-// Marks the item just submitted as differing from its stock default: a subtle accent asterisk
-// drawn inline to the right, with an explanatory tooltip (the SoH "modified" cue). No-op when the
-// value is unchanged. Call immediately after a widget (and after its own hover tooltip, if any) so
-// the SameLine anchors to that widget. Purely presentational — reads no state of its own.
+// Marks the item just submitted as differing from its stock default (the SoH "modified" cue). Call
+// immediately after a widget, and after its own hover tooltip if any, so the SameLine anchors to
+// that widget.
 void GdxModifiedMarker(bool changed) {
     if (!changed) {
         return;
@@ -302,13 +266,9 @@ std::string GdxLowercase(std::string value) {
     return value;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// "Data & Files" (General tab): live on-disk state for the three original setup inputs. Every
-// line below is backed by a live, cheaply-rechecked signal rather than static copy -- see the
-// per-row comments for exactly what is and is not determinable from this file. gdx_menu.cpp
-// cannot reach disk_buffer.cpp's IPL/EK disk load state, so it reports filesystem +
-// archive-mount facts instead of guessing which source was actually read.
-// ─────────────────────────────────────────────────────────────────────────────────────────────
+// "Data & Files" (General tab): live on-disk state for the three original setup inputs. This TU
+// cannot reach disk_buffer.cpp's IPL/EK disk load state, so it reports filesystem + archive-mount
+// facts rather than guessing which source was actually read.
 
 // True if any mounted archive's filename (case-insensitive) matches `basename` exactly. Mirrors
 // main.cpp's own basename-match pattern (main.cpp:427-431) for the version-gate scan.
@@ -342,10 +302,9 @@ void GdxDrawDataAndFilesPanel() {
         "them are safe to delete once setup has completed.");
     ImGui::Spacing();
 
-    // G-Diffuser is always portable and the current working directory is set to the data directory
-    // at boot (gdx_firstboot.cpp's FirstBootRun chdir; see also gdx_workshop.cpp's exeDir() helper,
-    // which relies on the same fact). A failed query degrades to "." -- still correct in practice
-    // since every canonical name below is looked up relative to the CWD either way.
+    // The working directory is the data directory: gdx_firstboot.cpp's FirstBootRun chdirs there at
+    // boot. A failed query degrades to "." -- still correct, since every canonical name below is
+    // looked up relative to the CWD either way.
     std::error_code dirEc;
     std::filesystem::path dataDir = std::filesystem::current_path(dirEc);
     if (dirEc) {
@@ -356,10 +315,8 @@ void GdxDrawDataAndFilesPanel() {
     const ImVec4 kGdxWarn = ImVec4(0.90f, 0.70f, 0.30f, 1.0f);
     const ImVec4 kGdxBad = ImVec4(1.0f, 0.40f, 0.40f, 1.0f);
 
-    // ── F-Zero X ROM ─────────────────────────────────────────────────────────────────────────
-    // Live signal: gdx_rom_buffer (rom_buffer.h). Non-null means the port genuinely has the raw
-    // cartridge image resident in memory THIS session -- the one row here with a true "in use"
-    // fact rather than an inference, because rom_buffer.cpp exports the pointer directly.
+    // gdx_rom_buffer non-null means the raw cartridge image is resident THIS session -- the one row
+    // here with a true "in use" fact rather than an inference.
     ImGui::SeparatorText("F-Zero X ROM (.z64)");
     if (gdx_rom_buffer != nullptr) {
         ImGui::TextColored(kGdxWarn, "In use from: %s", gdx_rom_path[0] != '\0' ? gdx_rom_path : "(unknown path)");
@@ -370,64 +327,76 @@ void GdxDrawDataAndFilesPanel() {
         "Deletable once setup has completed and Archive coverage below reads 0 fallbacks across a "
         "full play session.");
 
-    // ── 64DD IPL ROM ─────────────────────────────────────────────────────────────────────────
-    // No live "which source is loaded" getter is exposed outside disk_buffer.cpp, so this reports
-    // the two independently-checkable facts instead of guessing: whether the
-    // original file is present next to the game, and whether the dedicated archive is mounted.
+    // disk_buffer.cpp exposes no "which source is loaded" getter, so this reports the two
+    // independently-checkable facts: is the original file present, and is the archive mounted.
     ImGui::SeparatorText("64DD IPL ROM (N64DDIPLROM.n64)");
     {
         std::error_code ec;
         bool iplFilePresent =
             std::filesystem::is_regular_file(dataDir / gdx::SetupIplFileName(), ec);
         ec.clear();
+        // Mount state alone is misleading right after a first-boot extraction: the archive file is
+        // on disk but only mounts on the next launch. Check file presence separately so the panel
+        // never claims an existing archive is absent.
+        bool iplArchivePresent = std::filesystem::is_regular_file(dataDir / "n64ddipl.o2r", ec);
+        ec.clear();
         bool iplArchiveMounted = GdxArchiveMounted("n64ddipl.o2r");
         ImGui::Text("Original file: %s", iplFilePresent ? "present" : "not present");
-        ImGui::Text("Archive (n64ddipl.o2r): %s", iplArchiveMounted ? "mounted" : "not mounted");
+        ImGui::Text("Archive (n64ddipl.o2r): %s",
+                    iplArchiveMounted ? "mounted"
+                    : iplArchivePresent ? "present (mounts on next launch)"
+                                        : "not present");
         if (!iplFilePresent && iplArchiveMounted) {
             ImGui::TextColored(kGdxOk, "Served from the archive.");
-        } else if (!iplFilePresent && !iplArchiveMounted) {
+        } else if (!iplFilePresent && iplArchivePresent && !iplArchiveMounted) {
+            ImGui::TextColored(kGdxWarn, "Archive generated -- restart G-Diffuser to mount it.");
+        } else if (!iplFilePresent && !iplArchivePresent) {
             ImGui::TextColored(kGdxBad, "Neither the file nor the archive is present -- do not delete anything here.");
         }
     }
     ImGui::TextDisabled("Deletable once setup has completed (the port never reads the IPL file again after that).");
 
-    // ── Expansion Kit disk ───────────────────────────────────────────────────────────────────
-    // Reports presence of the original, of the managed copy (gdx::ManagedDiskPath), and of the
-    // disk archive, plus the boot-time deletion-gate verdict. The deletable line is shown ONLY on a
-    // passed verdict (gdx_disk_archive_verified) -- otherwise the panel never suggests deletion.
+    // The "deletable" line is shown ONLY on a passed deletion-gate verdict
+    // (gdx_disk_archive_verified); otherwise the panel never suggests deletion.
     ImGui::SeparatorText("Expansion Kit disk (.ndd)");
     {
         std::error_code ec;
         bool diskFilePresent =
             std::filesystem::is_regular_file(dataDir / gdx::SetupDiskFileName(), ec);
         ec.clear();
+        // The media/ managed copy was retired; a row for it only appears when a legacy install
+        // still carries one, so current installs stop seeing a permanently-red "not present".
         std::string managedPath = gdx::ManagedDiskPath(dataDir.string());
         bool managedPresent = !managedPath.empty() && std::filesystem::is_regular_file(managedPath, ec);
+        ec.clear();
+        bool diskArchivePresent = std::filesystem::is_regular_file(dataDir / "fzerox-disk.o2r", ec);
         ec.clear();
         bool diskArchiveMounted = GdxArchiveMounted("fzerox-disk.o2r");
         bool archiveVerified = gdx_disk_archive_verified() != 0;
         ImGui::Text("Original file: %s", diskFilePresent ? "present" : "not present");
-        ImGui::Text("Managed copy (media/): %s", managedPresent ? "present" : "not present");
-        ImGui::Text("Archive (fzerox-disk.o2r): %s", diskArchiveMounted ? "mounted" : "not mounted");
+        if (managedPresent) {
+            ImGui::Text("Managed copy (media/): present (legacy, no longer used)");
+        }
+        ImGui::Text("Archive (fzerox-disk.o2r): %s",
+                    diskArchiveMounted ? "mounted"
+                    : diskArchivePresent ? "present (mounts on next launch)"
+                                         : "not present");
         if (archiveVerified) {
-            // Hard gate passed: this boot reconstructed the disk from the archive AND proved it
-            // byte-identical to the managed copy. Only here may the panel state that the disk is deletable.
             ImGui::TextColored(kGdxOk,
-                               "Disk archive: verified byte-identical -- original and managed copy deletable.");
-        } else if (diskArchiveMounted && !diskFilePresent && managedPresent) {
-            ImGui::TextColored(kGdxOk, "Served from the archive or managed copy.");
-        } else if (!diskFilePresent && managedPresent) {
-            ImGui::TextColored(kGdxOk, "Served from the managed copy.");
-        } else if (!managedPresent && !diskArchiveMounted) {
-            ImGui::TextColored(kGdxBad, "No managed copy or archive yet -- do NOT delete the original disk.");
+                               "Disk archive: verified byte-identical -- the original disk is deletable.");
+        } else if (diskArchiveMounted && !diskFilePresent) {
+            ImGui::TextColored(kGdxOk, "Served from the archive.");
+        } else if (diskArchivePresent && !diskArchiveMounted) {
+            ImGui::TextColored(kGdxWarn, "Archive generated -- restart G-Diffuser to mount it.");
+        } else if (!diskArchivePresent) {
+            ImGui::TextColored(kGdxBad, "No archive yet -- do NOT delete the original disk.");
         }
     }
     ImGui::TextDisabled(
-        "The original .ndd and the managed copy are deletable ONLY after the row above reads "
-        "\"verified byte-identical\" (a boot reconstructed the disk from the archive and proved it "
-        "matches). Your saves live in saves/*.gdd -- back those up regardless.");
+        "The original .ndd is deletable ONLY after the row above reads \"verified byte-identical\" "
+        "(a boot reconstructed the disk from the archive and proved it matches). Your saves live "
+        "in saves/*.gdd -- back those up regardless.");
 
-    // ── Archive coverage (gdx_segment_source_fallback_total / FamilyStats) ─────────────────────
     ImGui::Spacing();
     ImGui::SeparatorText("Archive coverage");
     unsigned int fallbackTotal = gdx_segment_source_fallback_total();
@@ -461,222 +430,139 @@ void GdxDrawDataAndFilesPanel() {
 
 using namespace gdxmenu;
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// Construction — pin visibility CVar + register the port's gEnhancements.* CVars at 1:1 defaults.
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-
-// Base ctor: (visibilityConsoleVariable, isVisible). "gOpenMenuBar" is the compatibility CVar the
-// LUS F1 / Esc / Gamepad-Back toggle flips, so binding to it makes those keys open this menu. Start
-// hidden (isVisible=false) — the menu is opt-in via F1.
+// "gOpenMenuBar" is the compatibility CVar libultraship's F1 / Esc / Gamepad-Back toggle flips, so
+// binding to it makes those keys open this menu.
 GdxMenu::GdxMenu() : Ship::GuiWindow("gOpenMenuBar", false, "G-Diffuser Menu") {
     CVarRegisterFloat("gSettings.Menu.BackgroundOpacity", 0.85f);
-    // Section and per-section sidebar selection are persisted BY NAME (see gdx_menu.h). The
-    // integer gSettings.Menu.ActiveHeader / ActivePage pair this replaces stored positions in an
-    // enum, so any page reorder silently re-pointed a stored selection at a different page — which
-    // is what the kMenuLayoutVersion reset existed to paper over. A name cannot drift; at worst it
-    // names a page that no longer exists, which falls back to the section's first page.
+    // Persisted BY NAME (see gdx_menu.h): at worst it names a page that no longer exists, which
+    // falls back to the section's first page.
     CVarRegisterString("gSettings.Menu.ActiveSection", "Settings");
-    // Gamepad menu navigation ON by default. This is the LUS "gControlNav" CVar; enabling it lets a
-    // connected pad both OPEN the menu (Gamepad Back) and navigate it, and blocks game input while
-    // the menu is up (see libultraship Gui.cpp / ControlDeck.cpp). Essential on the ROG Ally (no
-    // keyboard). The port also feeds ImGui nav from the SDL controller directly (port/gdx_imgui_nav)
-    // so this works with any SDL pad — including a raw DualSense — regardless of the ImGui backend's
-    // own gamepad reading (ImGui's Win32 backend only sees XInput). CVarRegisterInteger is a no-op
-    // if the user already set it, so an explicit OFF in the config is preserved.
+    // libultraship's own CVar: a connected pad can both OPEN the menu (Gamepad Back) and navigate
+    // it, and game input is blocked while the menu is up (Gui.cpp / ControlDeck.cpp). On by
+    // default — essential on a handheld with no keyboard. Every CVarRegister* call in this ctor is
+    // a no-op once the CVar has a stored value, so user settings are never clobbered.
     CVarRegisterInteger("gControlNav", 1);
-    // One-time migration: configs written before gamepad nav worked have gControlNav stored as 0
-    // (the checkbox existed but navigation was broken, so turning it off was the only sane choice).
-    // A stored value beats the register default above, which would leave nav permanently dead for
-    // exactly the users who tried it early. Flip it ON once; the marker keeps any later deliberate
-    // OFF choice intact.
+    // One-time migration: a stored value beats the register default above, so configs written while
+    // gamepad nav was still broken would keep it dead forever. The marker is written once, so a
+    // later deliberate OFF stays intact. Same pattern for the two migrations below.
     if (CVarGetInteger("gdx.Migrations.ControlNavDefaultOn", 0) == 0) {
         CVarSetInteger("gdx.Migrations.ControlNavDefaultOn", 1);
         CVarSetInteger("gControlNav", 1);
         CVarSave();
     }
-    // Register the port's own feature CVars so a fresh gdiffuser.cfg.json reproduces today's
-    // confirmed-good behavior. CVarRegisterInteger is a no-op when the CVar already has a value
-    // (i.e. it was loaded from config), so existing user settings are never clobbered.
+    // AUDIO. All live-read on the audio thread except BufferFrames, which InitAudio (main.cpp)
+    // reads once — so a change to it applies on the next restart. LowPassHz is a cutoff in Hz and 0
+    // disables the filter; MasterVolume 100 skips the gain multiply entirely, so the default is
+    // bit-exact; Reverb governs the HLE path only, since LLE reverb is the ucode's own.
     //
-    // AUDIO tab CVars (all live-read on the audio thread except BufferFrames). Defaults:
-    //   gEnhancements.Audio.LLE          = 1     -> LLE (accurate cxd4 RSP) engine, current default.
-    //   gEnhancements.Audio.LowPassHz    = 15000 -> output reconstruction low-pass cutoff in Hz;
-    //                                               0 disables the filter. (Decided value per the
-    //                                               task; AUDIO_SETTINGS_SCOPE.md's text says 11000
-    //                                               — flagged for verification.)
-    //   gEnhancements.Audio.MasterVolume = 100   -> final-stage output gain 0..100 (%). 100 = no-op
-    //                                               (applied on the s16 copy in os.cpp's
-    //                                               osAiSetNextBuffer; 100 skips the multiply so the
-    //                                               default is bit-exact).
-    //   gEnhancements.Audio.Reverb       = 1     -> HLE reverb wet->dry return ON (1) / OFF (0).
-    //                                               Honored live by n64_audio_hle.c's A_MIXER kill
-    //                                               switch. Affects the HLE path only (LLE reverb is
-    //                                               the ucode's own).
-    //   gEnhancements.Audio.BufferFrames = 4096  -> dedicated-audio-thread reservoir size in frames.
-    //                                               Read ONCE at InitAudio (main.cpp) -> a change
-    //                                               applies on restart. 4096 = today's hardcoded value.
-    // Every default reproduces today's confirmed-good behavior (the optionality constitution: every
-    // default 1:1). CVarRegisterInteger is a no-op when the CVar already has a value (loaded from
-    // config), so existing user settings are never clobbered.
-    //
-    // The GRAPHICS controls bind to LUS-owned g* CVars (gInternalResolution, gMSAAValue,
-    // gTextureFilter, ...), which libultraship registers itself; we must NOT re-register those.
+    // The GRAPHICS controls bind to libultraship-owned g* CVars (gInternalResolution, gMSAAValue,
+    // gTextureFilter, ...), which libultraship registers itself. Do NOT re-register those.
     CVarRegisterInteger("gEnhancements.Audio.LLE", 1);
     CVarRegisterInteger("gEnhancements.Audio.LowPassHz", 15000);
     CVarRegisterInteger("gEnhancements.Audio.MasterVolume", 100);
     CVarRegisterInteger("gEnhancements.Audio.Reverb", 1);
     CVarRegisterInteger("gEnhancements.Audio.BufferFrames", 4096);
 
-    // GRAPHICS tab enhancement CVars (port-owned; distinct from the LUS-owned g* CVars used in
-    // DrawGraphicsMenu). Every default reproduces today's rendering (the optionality constitution):
-    //   gEnhancements.Graphics.Widescreen         = 1   -> today's always-on aspect correction. Read
-    //                                                      live in interpreter.cpp AdjXForAspectRatio;
-    //                                                      1 = current 16:9 hor+ (byte-identical),
-    //                                                      0 = 4:3 pillarbox.
-    //   gEnhancements.Graphics.WidescreenUI       = 1   -> true-corner 1P HUD + selected full-width
-    //                                                      2D scopes. 0 = stock proportional 4:3 UI
-    //                                                      placement. See the default note below.
-    //   gEnhancements.Graphics.DrawDistance       = 100 -> per-venue far-render scale in %. 100 = stock
-    //                                                      (1.0x, bit-exact). course.c Course_Draw,
-    //                                                      clamped 100..300.
-    //   gEnhancements.Graphics.ForceMaxMachineLOD = 0   -> 0 = stock distance-based machine LOD; 1 pins
-    //                                                      the highest-detail model. racer.c Racer_Draw.
+    // GRAPHICS (port-owned; distinct from the libultraship g* CVars). Every default reproduces
+    // today's rendering, except the two widescreen switches below. Widescreen is read live in
+    // interpreter.cpp AdjXForAspectRatio: 1 = the current 16:9 hor+ output, 0 = 4:3 pillarbox.
     CVarRegisterInteger("gEnhancements.Graphics.Widescreen", 1);
-    // 2D widescreen layout: true-corner 1P HUD, full-width SELECT MACHINE blue background, and
-    // full-width race transitions. Other menu artwork remains 4:3.
-    //
-    // DEFAULT ON, and this is the second deliberate exception to the "every default reproduces
-    // stock" rule above (Widescreen itself is the first). Shipping 3D widescreen ON while the HUD
-    // stays proportional 4:3 is the jarring half-state: the world fills the screen and the HUD
-    // floats inboard of the corners it belongs in, which reads as a defect rather than a choice.
-    // The two switches describe one feature, so they ship together.
+    // Default ON, the second deliberate exception to "every default reproduces stock" (Widescreen
+    // is the first): 3D widescreen behind a 4:3-placed HUD reads as a defect rather than a choice,
+    // so the two switches ship together. Covers the true-corner 1P HUD, the full-width SELECT
+    // MACHINE background and race transitions; other menu artwork stays 4:3.
     CVarRegisterInteger("gEnhancements.Graphics.WidescreenUI", 1);
-    // One-time migration: this registered (and therefore persisted) as 0 before the default
-    // flipped, so existing configs pin the old value and would never see the new default. Same
-    // marker pattern as gdx.Migrations.ControlNavDefaultOn / ReduceEditorFlashingOn below; a later
-    // deliberate OFF stays untouched because the marker is only ever written once.
     if (CVarGetInteger("gdx.Migrations.WidescreenUiDefaultOn", 0) == 0) {
         CVarSetInteger("gdx.Migrations.WidescreenUiDefaultOn", 1);
         CVarSetInteger("gEnhancements.Graphics.WidescreenUI", 1);
         CVarSave();
     }
-    // Split-screen HUD anchoring (2P/3P/4P). Consumed by gdx_widescreen_split_ui_active()
-    // (port/input_bridge.c), which requires gdx_widescreen_ui_active() as well — this is a strict
-    // subset, not an independent feature, and it is inert while the switch above is off.
-    //
-    // Its own switch rather than an overload of WidescreenUI: the split-screen HUD is authored to a
-    // per-column grid rather than to screen edges, so a handful of mid-column elements (interval,
-    // reverse, the 3P spare minimap) stay on the stock centred path by design. That is a judgment
-    // call about layout, and a judgment call deserves its own opt-out.
+    // Split-screen HUD anchoring (2P/3P/4P). gdx_widescreen_split_ui_active() (port/input_bridge.c)
+    // requires gdx_widescreen_ui_active() too, so this is a strict subset and inert while the
+    // switch above is off. It gets its own switch because the split HUD is authored to a per-column
+    // grid rather than to screen edges, leaving a few mid-column elements (interval, reverse, the
+    // 3P spare minimap) on the stock centred path — a layout judgment call worth its own opt-out.
     CVarRegisterInteger("gEnhancements.Graphics.WidescreenSplitUI", 1);
+    // UltrawideMode off is bit-exact 16:9 (every consumer collapses to an IEEE-exact 1.0 factor).
+    // On, the game-side CPU culls (track chunks, racers, fireworks, stars) widen to the true frame
+    // so content stops popping at the edges of 21:9/32:9 windows; 3D hor+ needs no switch because
+    // it already works at any aspect.
+    // HudMaxAspect 0 leaves ANCHOR-scoped HUD elements on the true screen corners at any aspect. A
+    // value in [1.334, 8) confines the HUD to a centred band of that aspect instead, for 32:9 users
+    // who find the corners too far apart.
+    CVarRegisterInteger("gEnhancements.Graphics.UltrawideMode", 0);
+    CVarRegisterFloat("gEnhancements.Graphics.HudMaxAspect", 0.0f);
+    CVarRegisterInteger("gEnhancements.Graphics.HideRaceCurtain", 0);
+    CVarRegisterInteger("gEnhancements.Graphics.RemoveBorders", 0);
     CVarRegisterInteger("gEnhancements.Graphics.DrawDistance", 100);
     CVarRegisterInteger("gEnhancements.Graphics.ForceMaxMachineLOD", 0);
-    //   gEnhancements.Graphics.FramePacing = 0 -> off = stock. libultraship's Fast3D backend already
-    //                                             limits the loop to ~60fps; when on, port/gdx_frame_
-    //                                             pacer.c pins it to the N64 NTSC rate (~59.94Hz).
-    //                                             Recommend VSync OFF when enabled (avoids beating).
+    // FramePacing and FrameInterpolation are mutually exclusive pacing owners, both read live.
+    // libultraship's Fast3D backend already caps the loop to ~60fps; FramePacing pins it to the N64
+    // NTSC rate (~59.94Hz) instead, and wants VSync OFF to avoid beating against the display.
     CVarRegisterInteger("gEnhancements.Graphics.FramePacing", 0);
-    //   gEnhancements.Graphics.FrameInterpolation = 0 -> off = stock single-pass render. EXPERIMENTAL:
-    //                                             when on, port/n64_gfx_bridge.cpp + port/gdx_interp.cpp
-    //                                             tween M sub-frame presents per 60 Hz logic tick
-    //                                             (dual-pool matrix lerp) for smoother motion on
-    //                                             high-refresh displays. Read LIVE (gdx_interp::
-    //                                             P2HostActive), same idiom as FramePacing above; the
-    //                                             two are mutually exclusive pacing owners.
     CVarRegisterInteger("gEnhancements.Graphics.FrameInterpolation", 0);
-    //   gEnhancements.Graphics.InterpDebugOverlay = 0 -> off = no overlay (default). When on AND
-    //                                             FrameInterpolation is on, shows the live
-    //                                             "subframes last tick" stat line below the toggle.
-    //                                             Purely diagnostic; no effect on rendering/pacing.
     CVarRegisterInteger("gEnhancements.Graphics.InterpDebugOverlay", 0);
-    //   gEnhancements.Graphics.InterpTargetMode = 0 -> Match Refresh Rate (default): the sub-frame
-    //                                             target follows the display's current refresh rate,
-    //                                             read live via Ship::Window::GetCurrentRefreshRate().
-    //                                             1 -> Capped: the target is InterpTargetFps below
-    //                                             instead. Only consulted while FrameInterpolation is
-    //                                             on; read LIVE by main.cpp's per-tick M derivation
-    //                                             (M = clamp(ceil(target/60), 1, kGdxInterpMaxSubframes)).
-    //   gEnhancements.Graphics.InterpTargetFps  = 120 -> Capped-mode target frame rate, UI range
-    //                                             60..480. Values above the display's own refresh
-    //                                             rate waste GPU without improving output.
+    // InterpTargetMode 0 follows the display (Ship::Window::GetCurrentRefreshRate()), 1 uses
+    // InterpTargetFps. Both feed main.cpp's per-tick M derivation,
+    // M = clamp(ceil(target/60), 1, kGdxInterpMaxSubframes).
     CVarRegisterInteger("gEnhancements.Graphics.InterpTargetMode", 0);
     CVarRegisterInteger("gEnhancements.Graphics.InterpTargetFps", 120);
-    //   gEnhancements.Graphics.InterpolateCamera = 1 -> ON. Also interpolates G_MTX_PROJECTION pool
-    //                                             matrices. Only consulted while FrameInterpolation
-    //                                             is on, so the default cannot alter stock behavior;
-    //                                             it selects what interpolation MEANS once enabled.
-    //                                             race.c loads the combined projection*view camera
-    //                                             with G_MTX_PROJECTION and course.c emits no
-    //                                             gSPMatrix at all, so with this off the camera AND
-    //                                             the entire track stay at 60 Hz while machines
-    //                                             interpolate -- objects smoothed against a static
-    //                                             world. Off is offered only as an escape hatch.
+    // Consulted only while FrameInterpolation is on, so this selects what interpolation MEANS
+    // rather than whether it runs. race.c loads the combined projection*view camera with
+    // G_MTX_PROJECTION and course.c emits no gSPMatrix at all, so with this off the camera AND the
+    // whole track stay at 60 Hz while machines tween against a static world.
     CVarRegisterInteger("gEnhancements.Graphics.InterpolateCamera", 1);
+    // InterpRigidBasis rescales element-wise-lerped per-racer basis rows back to rigid; without it
+    // the machine's basis collapses up to 18% mid-tick (rowlen 0.0818 at t=0.5 against 0.10000 at
+    // t=1), shearing the model for a sub-frame. InterpBasisJump freezes the previous keyframe's
+    // rotation across a side attack's two model-basis discontinuities (racer.c:4556). Both default
+    // 0 pending owner A/B and are pinned either way by GDX_INTERP_ROT_FIX / GDX_INTERP_BASIS_FIX;
+    // they are registered so the console can reach them, since an env-var-only switch is not a
+    // shipped fix.
+    CVarRegisterInteger("gEnhancements.Graphics.InterpRigidBasis", 0);
+    CVarRegisterInteger("gEnhancements.Graphics.InterpBasisJump", 0);
 
-    // GAMEPLAY tab CVars. Every default reproduces stock behavior (the optionality constitution):
-    //   gEnhancements.Gameplay.AutosaveOnRecord  = 0    -> off. Stock F-Zero X already commits the
-    //                                                      NUMERIC records (times/best-lap/max-speed/
-    //                                                      death-race) to SRAM immediately on finish
-    //                                                      (menus.c:252-268); this toggle only adds
-    //                                                      auto-persisting the best GHOST replay,
-    //                                                      which stock saves solely via the manual
-    //                                                      Save-Ghost prompt. 0 keeps ghosts manual =
-    //                                                      stock behavior. Consumed in menus.c
-    //                                                      (Gdx_AutosaveGhostOnRecord).
+    // Discord Rich Presence (port/gdx_discord.cpp) is a privacy feature: OFF by default, and while
+    // off nothing is initialized — no thread, no socket. The Show* toggles pick which fields the
+    // presence may publish and default ON, because enabling the master is already the opt-in.
+    CVarRegisterInteger("gEnhancements.Online.DiscordPresence", 0);
+    CVarRegisterInteger("gEnhancements.Online.DiscordShowCourse", 1);
+    CVarRegisterInteger("gEnhancements.Online.DiscordShowLap", 1);
+    CVarRegisterInteger("gEnhancements.Online.DiscordShowPosition", 1);
+    CVarRegisterInteger("gEnhancements.Online.DiscordShowMode", 1);
+    CVarRegisterInteger("gEnhancements.Online.DiscordShowTimer", 1);
+
+    // GAMEPLAY. Stock F-Zero X already commits the NUMERIC records to SRAM on finish
+    // (menus.c:252-268), so AutosaveOnRecord adds only auto-persisting the best GHOST replay, which
+    // stock saves solely via the manual Save-Ghost prompt (menus.c Gdx_AutosaveGhostOnRecord).
     CVarRegisterInteger("gEnhancements.Gameplay.AutosaveOnRecord", 0);
-    //   gEnhancements.Gameplay.SkippableTransitions = 0 -> off = stock (transitions play fully). When
-    //                                                      on, the transition overlay fast-completes
-    //                                                      (transition.c Transition_Update). [PB].
     CVarRegisterInteger("gEnhancements.Gameplay.SkippableTransitions", 0);
-    //   gEnhancements.Gameplay.ReduceEditorFlashing = 1 -> on by default: the node blink/checker
-    //                                                      parity and the flagged-node size pulse
-    //                                                      advance at half rate, halving the ~20 Hz
-    //                                                      strobe on modern displays. Off restores the
-    //                                                      stock N64 Course Edit strobe bit-identical.
-    //                                                      Consumed in course_edit/191080.c
-    //                                                      func_xk2_800E04E0 (#ifdef PORT).
+    // On by default: the node blink/checker parity and the flagged-node size pulse advance at half
+    // rate, halving Course Edit's ~20 Hz strobe on modern displays (course_edit/191080.c
+    // func_xk2_800E04E0, #ifdef PORT). Off is bit-identical to stock.
     CVarRegisterInteger("gEnhancements.Gameplay.ReduceEditorFlashing", 1);
-    // One-time migration: the CVar originally registered (and therefore persisted) as 0 before the
-    // default flipped to ON, so existing configs pin the old value. Same marker pattern as
-    // gdx.Migrations.ControlNavDefaultOn above; a later deliberate OFF stays untouched.
     if (CVarGetInteger("gdx.Migrations.ReduceEditorFlashingOn", 0) == 0) {
         CVarSetInteger("gdx.Migrations.ReduceEditorFlashingOn", 1);
         CVarSetInteger("gEnhancements.Gameplay.ReduceEditorFlashing", 1);
         CVarSave();
     }
 
-    // PRACTICE tab CVars. Every default reproduces stock behavior:
-    //   gEnhancements.Practice.ShowLapDeltas = 0 -> off = stock (nothing drawn). When on, a small
-    //                                               lap-split delta vs the session best (or a loaded
-    //                                               ghost's same lap, once ghosts run in Practice) is
-    //                                               drawn in Practice mode only. hud.c (#ifdef PORT).
+    // PRACTICE. Both are drawn under #ifdef PORT in hud.c / camera.c; photo mode saves and restores
+    // eye/at/fov each frame so unpausing is 1:1.
     CVarRegisterInteger("gEnhancements.Practice.ShowLapDeltas", 0);
-    //   gEnhancements.Practice.PhotoMode = 0 -> off = stock. When on, pausing during a race hides the
-    //                                           HUD and frees the camera; camera.c saves/restores
-    //                                           eye/at/fov each frame so unpausing is 1:1. camera.c +
-    //                                           hud.c (#ifdef PORT). (GhostBrowserOpen is auto-
-    //                                           registered by the GuiWindow ctor in main.cpp.)
     CVarRegisterInteger("gEnhancements.Practice.PhotoMode", 0);
 
-    // Workshop (texture packs + dump). Every knob defaults OFF/empty per the optionality
-    // constitution: a fresh config mounts no override behavior and renders bit-identically to stock.
-    //   gEnhancements.Workshop.TexturePacks = 0 -> off = stock rendering. When on, the Tier-B shim
-    //                                              (n64_gfx_bridge.cpp) rewrites a common-asset load
-    //                                              to a mounted pack's "textures/pack/<key>" resource.
+    // WORKSHOP. TexturePacks on lets the Tier-B shim (n64_gfx_bridge.cpp) rewrite a common-asset
+    // load to a mounted pack's "textures/pack/<key>" resource.
     CVarRegisterInteger("gEnhancements.Workshop.TexturePacks", 0);
-    //   gEnhancements.Workshop.TextureDump — RETIRED. Asset Dump supersedes it: that path decodes
-    //   named assets straight from the archive instead of waiting for gameplay to walk past each
-    //   texture, so it is both complete and reproducible. The runtime hook in gdx_workshop.cpp still
-    //   reads this CVar, so it is forced to 0 here rather than merely un-registered -- a user who had
-    //   it ON would otherwise keep dumping forever with no surviving checkbox to turn it off.
+    // TextureDump is retired in favour of Asset Dump, but the runtime hook in gdx_workshop.cpp
+    // still reads it — hence forced to 0 rather than merely un-registered, so a user who had it ON
+    // does not keep dumping forever with no surviving checkbox to turn it off.
     CVarSetInteger("gEnhancements.Workshop.TextureDump", 0);
-    //   gEnhancements.Workshop.DisabledPacks = "" -> comma-joined mods/*.o2r basenames to skip at
-    //                                               mount time (per-pack enable toggles in the tab).
+    // Comma-joined mods/*.o2r basenames to skip at mount time.
     CVarRegisterString("gEnhancements.Workshop.DisabledPacks", "");
-    //   gEnhancements.Workshop.AllowDDFormatOnce = 0 -> one-shot: when set to 1 (persisted), the D6
-    //                                                  disk-format guard consumes it at the NEXT boot
-    //                                                  to authorize a single MFS format into the
-    //                                                  sidecar (never the .ndd), then clears it.
+    // One-shot: set to 1, the D6 disk-format guard consumes it at the NEXT boot to authorize a
+    // single MFS format into the sidecar (never the .ndd), then clears it.
     CVarRegisterInteger("gEnhancements.Workshop.AllowDDFormatOnce", 0);
 
     // Seed the "last cutoff" restore value from whatever is persisted (falls back to 15000).
@@ -739,18 +625,16 @@ void GdxMenu::RestoreNavTuning() {
 }
 
 void GdxMenu::DrawElement() {
-    // Defensive: the registry is built in InitElement(), which libultraship calls before any Draw.
-    // Building it here too costs one bool test per frame and removes the possibility of drawing an
-    // empty menu (or indexing an empty mDisabledInfo) if that ordering ever changes.
+    // The registry is built in InitElement(), which libultraship calls before any Draw. Repeating
+    // the guard here costs one bool test and rules out drawing an empty menu (or indexing an empty
+    // mDisabledInfo) should that ordering ever change.
     if (!mRegistered) {
         InitElement();
     }
 
-    // ONCE PER FRAME, before anything draws. Every disable/hide reason is evaluated here and the
-    // answer cached in DisabledInfo::active; MenuDrawItem only ever reads the cached bool. This is
-    // the whole reason DisabledInfo exists (port/ui/MenuTypes.h): several controls share the same
-    // condition, and without the cache each would re-read the same CVar (or re-query the window)
-    // once per frame per widget.
+    // ONCE PER FRAME, before anything draws: every disable/hide reason is evaluated here and cached
+    // in DisabledInfo::active, and MenuDrawItem only reads the cache. Several controls share the
+    // same condition, so without this each would re-read the same CVar once per widget per frame.
     for (GdxUI::DisabledInfo& info : mDisabledInfo) {
         if (info.evaluation != nullptr) {
             info.active = info.evaluation(info);
@@ -788,18 +672,17 @@ void GdxMenu::DrawElement() {
         mFocusSidebar = navActive;
     }
 
-    // Nav feel, applied only while THIS menu is open with gamepad nav on and restored on close
-    // (Draw) or when the user turns nav off. Tune here if it still feels off.
+    // Nav feel, applied only while THIS menu is open with gamepad nav on, and restored on close or
+    // when the user turns nav off.
     //
-    // ImGui derives its repeat rates from io.KeyRepeat*: nav moves at Delay*0.72 / Rate*0.80, slider
-    // tweaks at Delay*0.72 / Rate*0.30. The stock 0.275/0.050 gives 25 selection moves per second,
-    // which overshoots badly on a pad; 0.40/0.105 lands at ~12 moves/s while still tweaking a slider
-    // at ~32 steps/s (and L1/R1 remain the fine/coarse modifiers).
+    // ImGui derives its repeat rates from io.KeyRepeat*: nav moves at Delay*0.72 / Rate*0.80,
+    // slider tweaks at Delay*0.72 / Rate*0.30. The stock 0.275/0.050 gives 25 selection moves per
+    // second, which overshoots badly on a pad; 0.40/0.105 lands at ~12 moves/s while still tweaking
+    // a slider at ~32 steps/s.
     //
-    // ConfigNavCursorVisibleAlways is what makes the focus rectangle actually appear: both of the
-    // ways this menu parks focus hide it. SetKeyboardFocusHere passes NoSetNavCursorVisible, and
-    // SetFocusID hides the cursor outright unless the last activation came from a pad — so the menu
-    // opened with a real NavId and nothing drawn, and the first press looked like it did nothing.
+    // ConfigNavCursorVisibleAlways is what makes the focus rectangle appear at all: both ways this
+    // menu parks focus hide it — SetKeyboardFocusHere passes NoSetNavCursorVisible, and SetFocusID
+    // hides the cursor unless the last activation came from a pad.
     if (navActive && !mNavTuningApplied) {
         ImGuiIO& io = ImGui::GetIO();
         mSavedKeyRepeatDelay = io.KeyRepeatDelay;
@@ -836,11 +719,9 @@ void GdxMenu::DrawElement() {
         menuSize.y = (std::max)(menuSize.y, (std::min)(available.y, 480.0f));
 
         ImGui::SetCursorPos((available - menuSize) * 0.5f);
-        // NavFlattened on the block + sidebar + content children: ImGui gamepad/keyboard
-        // navigation cannot cross a child-window border without it, so a pad could move
-        // within the sidebar but NEVER reach the content pane's widgets ("can't enter the
-        // sub-menus to edit settings"). Flattened, the whole panel is one nav surface:
-        // Right from a sidebar page crosses into the content and A activates widgets.
+        // NavFlattened on the block + sidebar + content children: ImGui nav cannot cross a
+        // child-window border without it, so a pad could move within the sidebar but never reach
+        // the content pane's widgets. Flattened, the whole panel is one nav surface.
         if (ImGui::BeginChild("##ModernMenuBlock", menuSize, ImGuiChildFlags_NavFlattened,
                               ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
             DrawHeader();
@@ -912,14 +793,11 @@ void GdxMenu::DrawElement() {
 void GdxMenu::DrawHeader() {
     const bool navActive = CVarGetInteger("gControlNav", 0) != 0;
 
-    // Shoulder buttons cycle the header tabs (wrapping). ImGui only reads the D-pad for menu
-    // movement; it uses L1/R1 for window-cycling ONLY while the Menu button (FaceLeft) is held, and
-    // as slider tweak-speed ONLY while a slider is actively being dragged. A bare shoulder tap in
-    // this single fullscreen window hits neither of those paths, so an edge-triggered read is safe
-    // and needs no SetKeyOwner juggling. Suppressed while any item is active so we never yank focus
-    // out of a slider/text field mid-edit.
-    // Tab count and labels come from the registry now (mMenuOrder), not from a hardcoded array that
-    // had to be kept in step with the Header enum by hand.
+    // Shoulder buttons cycle the header tabs (wrapping). ImGui spends L1/R1 on window-cycling only
+    // while FaceLeft is held, and on slider tweak-speed only while a slider is being dragged, so a
+    // bare shoulder tap in this single fullscreen window hits neither path and an edge-triggered
+    // read needs no SetKeyOwner juggling. Suppressed while an item is active so this never yanks
+    // focus out of a slider or text field mid-edit.
     const int tabCount = static_cast<int>(mMenuOrder.size());
     if (navActive && !ImGui::IsAnyItemActive() && tabCount > 0) {
         int dir = 0;
@@ -949,18 +827,15 @@ void GdxMenu::DrawHeader() {
         ImGui::TableNextRow();
 
         ImGui::TableSetColumnIndex(0);
-        // Flattened like the sidebar and content children: an unflattened child is a single nav item
-        // that a pad has to press A to enter and B to leave, which made the tab strip feel like a
-        // dead block. Flattened, Up from the sidebar lands straight on a tab.
+        // Flattened like the sidebar and content children: an unflattened child is a single nav
+        // item a pad must press A to enter and B to leave. Flattened, Up from the sidebar lands
+        // straight on a tab.
         if (ImGui::BeginChild("##HeaderNavigation", ImVec2(0, height), ImGuiChildFlags_NavFlattened,
                               ImGuiWindowFlags_HorizontalScrollbar)) {
-            // Discoverability: flank the tab strip with shoulder-button hints when gamepad nav is on,
-            // so the L1/R1 tab-cycling is visible rather than hidden.
+            // Flank the tab strip with shoulder-button hints, so L1/R1 tab cycling is discoverable.
             if (navActive) {
                 ImGui::AlignTextToFramePadding();
                 ImGui::TextDisabled(ICON_FA_CHEVRON_LEFT " LB");
-                // UIWidgets::Tooltip is the IsItemHovered + SetTooltip pair (UIWidgets.cpp:98), so
-                // these stay attached to the item just submitted exactly as before.
                 UIWidgets::Tooltip("Previous tab (L1 / LB)");
             }
             for (int i = 0; i < tabCount; ++i) {
@@ -997,8 +872,8 @@ void GdxMenu::DrawHeader() {
         UIWidgets::Tooltip("Quit G-Diffuser");
         ImGui::SameLine();
         if (ImGui::Button(ICON_FA_UNDO "##Reset", actionSize)) {
-            // The menu is already on the host/UI side of the bridge; request the reset directly.
-            // Ctrl+R still uses the console command, and both converge on the same deferred flag.
+            // The menu is already on the host side of the bridge, so request the reset directly.
+            // Ctrl+R goes through the console command; both converge on the same deferred flag.
             gdx_game_request_reset();
         }
         UIWidgets::Tooltip("Reset game (Ctrl+R)");
@@ -1017,10 +892,9 @@ void GdxMenu::DrawHeader() {
 
 void GdxMenu::DrawSidebar() {
     // When flagged (menu just opened or the tab changed) and gamepad nav is on, park the nav cursor
-    // on the active page so the pad has a sensible starting point. SetKeyboardFocusHere() targets the
-    // NEXT submitted item and is the reliable idiom for moving nav focus with NavEnableGamepad;
-    // SetItemDefaultFocus() covers the very first appearance of the child. From here, pressing Right
-    // hands off to the content pane via ImGui's spatial nav.
+    // on the active page. SetKeyboardFocusHere() targets the NEXT submitted item and is the
+    // reliable idiom under NavEnableGamepad; SetItemDefaultFocus() covers the child's very first
+    // appearance.
     const bool wantFocus = mFocusSidebar && CVarGetInteger("gControlNav", 0) != 0;
 
     auto sidebarButton = [&](const std::string& sidebar) {
@@ -1037,9 +911,6 @@ void GdxMenu::DrawSidebar() {
         }
     };
 
-    // The page list IS the registry's sidebarOrder for the active section. The switch over ~15
-    // Page enum values this replaces had to be edited in lockstep with the enum, PageTitle() and
-    // HeaderForPage(); the three could and did drift.
     auto section = mMenuEntries.find(mActiveSection);
     if (section != mMenuEntries.end()) {
         for (const std::string& sidebar : section->second.sidebarOrder) {
@@ -1051,12 +922,9 @@ void GdxMenu::DrawSidebar() {
     mFocusSidebar = false;
 }
 
-// Draws the active page: its registered widgets, laid out across SidebarEntry::columnCount columns.
-//
-// Columns are what stop a dense page from being one long scroll. The registration decides how many
-// (1-3) and which column each control belongs to; this only performs the layout, and collapses to a
-// single column on a narrow content pane, where two columns would be narrower than the widgets in
-// them.
+// The registration decides how many columns (1-3) a page has and which one each control belongs to;
+// this only lays them out, collapsing to a single column on a content pane too narrow to hold the
+// widgets side by side.
 void GdxMenu::DrawCurrentPage() {
     if (mSearch[0] != '\0') {
         if (DrawSearchResults() == 0) {
@@ -1089,9 +957,8 @@ void GdxMenu::DrawCurrentPage() {
     for (int i = 0; i < columnGroups; ++i) {
         const bool useColumns = columns > 1 && i < columns;
         if (useColumns) {
-            // NavFlattened for the same reason as every other child in this menu (see DrawElement):
-            // an unflattened child is one nav stop a pad must press A to enter, so the second column
-            // would be unreachable by gamepad.
+            // NavFlattened for the same reason as every other child here (see DrawElement):
+            // unflattened, the second column would be unreachable by gamepad.
             ImGui::BeginChild(("##PageColumn" + std::to_string(i)).c_str(), ImVec2(columnWidth, 0.0f),
                               ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_NavFlattened);
         }
@@ -1107,22 +974,11 @@ void GdxMenu::DrawCurrentPage() {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// WIDGET-LEVEL SEARCH.
-//
-// This walks the SAME registry MenuDrawItem draws from, so anything on a page is findable and
-// anything findable is really on a page. What it replaces was a hand-typed table of PAGE keywords:
-// searching "reverb" could at best offer you "the Audio page", and a control whose keyword nobody
-// remembered to type was invisible to search entirely.
-//
-// Each hit draws the LIVE control (so it can be changed right there, without navigating) followed
-// by a button naming where it lives — "Enhancements -> Visuals, Col 2" — which jumps the menu to
-// that page and briefly outlines the control.
-//
-// Page-level hits are still produced, from SidebarEntry::searchTerms, which is where the old
-// keyword table's terms were carried to. Nothing that used to be findable stopped being findable.
-// Returns the number of results drawn.
-// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Widget-level search: walks the SAME registry MenuDrawItem draws from, so anything on a page is
+// findable and anything findable is really on a page. Each hit draws the LIVE control, so it can be
+// changed right there, followed by a button naming where it lives ("Enhancements -> Visuals, Col
+// 2") that jumps the menu to that page and briefly outlines it. Page-level hits come from
+// SidebarEntry::searchTerms. Returns the number of results drawn.
 uint32_t GdxMenu::DrawSearchResults() {
     // Spaces are stripped from BOTH sides of the comparison (upstream does the same), so "lowpass"
     // finds "Low-pass"-adjacent wording and "framepacing" finds "Frame pacing".
@@ -1211,9 +1067,6 @@ uint32_t GdxMenu::DrawSearchResults() {
                         MenuDrawItem(widget);
                     }
 
-                    // "Go there" affordance. Deliberately a button rather than plain text: this is
-                    // the navigate half of the feature, and a label that merely tells you where to
-                    // look is not navigation.
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
                     const std::string origin = "  " ICON_FA_ARROW_RIGHT "  " + sectionName + " -> " + sidebarName +
                                                ", Col " + std::to_string(col + 1);
@@ -1261,10 +1114,6 @@ void GdxMenu::DrawQuitModal() {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// Section / sidebar selection and registry construction.
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-
 void GdxMenu::SelectSection(const std::string& section) {
     if (mMenuEntries.count(section) == 0) {
         return;
@@ -1283,8 +1132,7 @@ void GdxMenu::SelectSidebar(const std::string& sidebar) {
     if (section == mMenuEntries.end() || section->second.sidebars.count(sidebar) == 0) {
         return;
     }
-    // Persisted per SECTION, so each tab remembers where you were in it independently — the single
-    // global "active page" integer could only remember one.
+    // Persisted per SECTION, so each tab remembers where you were in it independently.
     CVarSetString(section->second.sidebarCvar, sidebar.c_str());
     GdxSaveCvars();
 }
@@ -1354,15 +1202,10 @@ void GdxMenu::AddWidget(const std::string& section, const std::string& sidebar, 
     //
     // It must be the struct MATCHING widget.type, not the base. MenuDrawItem reaches its options
     // through static_pointer_cast, which does no checking: handed a plain WidgetOptions for a
-    // WIDGET_TEXT, `options->color` reads past the end of the allocation, and the garbage enum that
-    // comes back is then fed to ColorValues.at() -- which throws std::out_of_range. Nothing catches
-    // it, so the process dies.
-    //
-    // That is exactly what happened: the first control on Dev Tools -> General is a WIDGET_TEXT
-    // registered with no .Options() (gdx_menu_registry.cpp:1061), so opening Dev Tools killed the
-    // game the instant the page drew. Settings -> Controls (:695) carried the same latent crash.
-    // Allocating by type fixes the whole class, rather than requiring every future registration to
-    // remember .Options() on precisely the subset of types that dereference it.
+    // WIDGET_TEXT, `options->color` reads past the end of the allocation and the garbage enum goes
+    // to ColorValues.at(), which throws std::out_of_range with nothing to catch it. Allocating by
+    // type here fixes the whole class, instead of requiring every future registration to remember
+    // .Options() on precisely the subset of types that dereference it.
     if (widget.options == nullptr) {
         switch (widget.type) {
             case GdxUI::WIDGET_TEXT:
@@ -1391,8 +1234,7 @@ void GdxMenu::AddWidget(const std::string& section, const std::string& sidebar, 
                 widget.options = std::make_shared<UIWidgets::RadioButtonsOptions>();
                 break;
             default:
-                // Decorative and custom types (separators, custom blocks) never downcast; they only
-                // ever read the base fields, so the base struct is the correct allocation.
+                // Decorative and custom types never downcast; they read only the base fields.
                 widget.options = std::make_shared<UIWidgets::WidgetOptions>();
                 break;
         }
@@ -1408,24 +1250,19 @@ void GdxMenu::AddWidget(const std::string& section, const std::string& sidebar, 
     columns[index].push_back(std::move(widget));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// MenuDrawItem — one registered WidgetInfo -> ImGui.
-//
-// Order of operations, and why:
+// One registered WidgetInfo -> ImGui. Order of operations:
 //   1. hideWhen / preFunc            decide whether the control exists this frame at all
-//   2. disableWhen                   turn the active named reasons into ONE tooltip that lists
-//                                    every reason, so a control greyed for two reasons says both
+//   2. disableWhen                   turn the active named reasons into ONE tooltip listing all of
+//                                    them, so a control greyed for two reasons says both
 //   3. the widget itself             via the UIWidgets CVar-bound library
 //   4. callback                      side effects, only when the widget reported a change
 //   5. modified marker / note        the "* changed from default" cue and the "(restart)" suffix
-//   6. postFunc                      anything that has to react to state the widget cannot report
+//   6. postFunc                      anything reacting to state the widget cannot report
 //   7. highlight                     the search-navigation outline
 //
-// NOTE: unlike Lighthouse's MenuDrawItem, this does NOT overwrite options->color with a global
-// theme colour. Each Options struct's own default (LightBlue for checkboxes, Gray for sliders) is
-// what every one of this menu's call sites already used, and forcing one colour on all of them
-// would silently restyle the entire menu.
-// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Unlike Lighthouse's MenuDrawItem, this does NOT overwrite options->color with a global theme
+// colour: each Options struct's own default is what every call site here relies on, and forcing one
+// colour on all of them would silently restyle the whole menu.
 void GdxMenu::MenuDrawItem(GdxUI::WidgetInfo& widget) {
     widget.ResetDisables();
 
@@ -1448,8 +1285,7 @@ void GdxMenu::MenuDrawItem(GdxUI::WidgetInfo& widget) {
         }
     }
     if (!widget.activeDisables.empty()) {
-        // The named-reason payoff: a greyed control states WHY, and can state several reasons at
-        // once. Built into a member string because UIWidgets' Options structs borrow the pointer.
+        // Built into a member string because UIWidgets' Options structs borrow the pointer.
         mDisabledTooltip = "This setting is unavailable because:";
         for (GdxUI::DisableOption reason : widget.activeDisables) {
             mDisabledTooltip += "\n  - ";
@@ -1471,23 +1307,15 @@ void GdxMenu::MenuDrawItem(GdxUI::WidgetInfo& widget) {
         ImGui::BeginGroup();
     }
 
-    // A widget registered WITHOUT .Options() must fall back to that widget type's defaults, never
-    // dereference null. WidgetInfo::options is a shared_ptr populated only by .Options(), and it is
-    // legitimately absent for the decorative types (WIDGET_SEPARATOR, WIDGET_CUSTOM, ...) — so
-    // "absent" cannot be treated as a programming error the switch is allowed to assume away.
+    // A widget registered WITHOUT .Options() must fall back to that type's defaults, never
+    // dereference null: options is populated only by .Options() and is legitimately absent for the
+    // decorative types (WIDGET_SEPARATOR, WIDGET_CUSTOM, ...), so the switch below cannot assume
+    // it away. The registry is hand-edited and grown, and "remember .Options() on this subset of
+    // types or the game dies on that page" is not a contract worth shipping.
     //
-    // It bit us immediately: the first control on Dev Tools -> General is a WIDGET_TEXT registered
-    // with no Options (gdx_menu_registry.cpp:1061), and the unguarded
-    //   auto options = std::static_pointer_cast<TextOptions>(widget.options); options->color
-    // dereferenced null the instant that page drew, so opening Dev Tools killed the process. The
-    // same latent crash sat on Settings -> Controls (gdx_menu_registry.cpp:695).
-    //
-    // Fixing it here rather than only at those two call sites is deliberate: the registry is meant
-    // to be edited by hand and grown, and "you must remember .Options() on this subset of types or
-    // the game dies on that page" is not a contract worth shipping.
     // The argument is a type tag only; the fallback it names is a function-local static, so the
-    // returned reference stays valid after the call (returning a reference to the caller's
-    // temporary would trade the null deref for a dangling one).
+    // returned reference outlives the call (a reference to the caller's temporary would trade the
+    // null deref for a dangling one).
     const auto optionsOr = [&widget](auto tag) -> const decltype(tag)& {
         using T = decltype(tag);
         static const T kDefaults{};
@@ -1608,17 +1436,15 @@ void GdxMenu::MenuDrawItem(GdxUI::WidgetInfo& widget) {
         widget.callback(widget);
     }
 
-    // "Changed from the stock default" asterisk. The default comes from the widget's own
-    // CheckboxOptions::defaultValue, so the marker and the control can never disagree about what
-    // stock is (this is what the old GdxCVarCheckboxMarked helper guaranteed by hand).
+    // The default comes from the widget's own CheckboxOptions::defaultValue, so the marker and the
+    // control can never disagree about what stock is.
     if (widget.modifiedMarker && widget.type == GdxUI::WIDGET_CVAR_CHECKBOX) {
         const bool def = optionsOr(UIWidgets::CheckboxOptions{}).defaultValue;
         GdxModifiedMarker((CVarGetInteger(widget.cVar, def) != 0) != def);
     }
 
-    // The greyed suffix ("(restart)", "(applies on restart)", "(disabled in-race)"). UIWidgets has
-    // no slot for one, and every one of these was a deliberate SameLine + TextDisabled at the old
-    // call site, so it stays exactly that — just declared rather than written out.
+    // The greyed suffix ("(restart)", "(disabled in-race)"). UIWidgets has no slot for one, so it
+    // stays a SameLine + TextDisabled — just declared in the registry rather than written out.
     if (!UIWidgets::IsCStringEmpty(widget.note)) {
         ImGui::SameLine();
         ImGui::TextDisabled("%s", widget.note);
@@ -1630,9 +1456,8 @@ void GdxMenu::MenuDrawItem(GdxUI::WidgetInfo& widget) {
 
     if (highlight) {
         ImGui::EndGroup();
-        // Pulsing outline around the control the search sent us to. ImGui has no "flash this item"
-        // primitive, and Lighthouse's own highlightWidget/navigateWidgetName globals (Menu.cpp:29-33)
-        // are declared but never read, so this is ours.
+        // Pulsing outline around the control the search sent us to; ImGui has no "flash this item"
+        // primitive, and Lighthouse's highlightWidget/navigateWidgetName globals are never read.
         const ImVec2 min = ImGui::GetItemRectMin() - ImVec2(4.0f, 3.0f);
         const ImVec2 max = ImGui::GetItemRectMax() + ImVec2(4.0f, 3.0f);
         const float pulse = 0.5f + 0.5f * std::sin(static_cast<float>(ImGui::GetTime()) * 6.0f);
@@ -1648,20 +1473,13 @@ void GdxMenu::MenuDrawItem(GdxUI::WidgetInfo& widget) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// Audio output status — WIDGET_CUSTOM (Settings -> Audio).
-//
-// Not expressible as a widget: it reads three live values and picks between three different
-// renderings. Diagnostic first-class citizen — a "no audio" report is undebuggable remotely
-// without knowing which backend the session picked and whether samples are actually queued.
-// ─────────────────────────────────────────────────────────────────────────────────────────────
+// A "no audio" report is undebuggable remotely without knowing which backend the session picked and
+// whether samples are actually queued.
 void GdxMenu::DrawAudioStatus() {
-    // Reports the ACTUAL active AudioPlayer backend (via AudioPlayerBackendName) rather than
-    // SDL_GetCurrentAudioDriver(), which returns "none" for the WASAPI/CoreAudio backends even
-    // when they are working — misleading on Windows. For the SDL backend we additionally surface
-    // SDL_GetCurrentAudioDriver() (e.g. "pipewire"/"pulse"), where a "dummy" driver means the
-    // launch environment lost the audio socket (sandboxed/naked launcher env): the game
-    // synthesizes fine but the samples go nowhere.
+    // The backend name comes from AudioPlayerBackendName, not SDL_GetCurrentAudioDriver(), which
+    // returns "none" for the working WASAPI/CoreAudio backends. For the SDL backend the SDL driver
+    // is surfaced as well ("pipewire"/"pulse"); "dummy" there means the launch environment lost the
+    // audio socket, so the game synthesizes fine but the samples go nowhere.
     const char* backend = AudioPlayerBackendName();
     const bool isSdl = std::strcmp(backend, "SDL") == 0;
     const char* sdlDriver = isSdl ? SDL_GetCurrentAudioDriver() : nullptr;
@@ -1676,9 +1494,8 @@ void GdxMenu::DrawAudioStatus() {
     }
     ImGui::Text("Queued samples: %d / %d desired", buffered, desired);
 
-    // The red warning is meaningful ONLY when SDL is the active backend and its underlying
-    // driver is missing or "dummy". WASAPI/CoreAudio legitimately report no SDL driver, so
-    // suppress the warning for them (it would be a false alarm).
+    // Only meaningful when SDL is the active backend: WASAPI/CoreAudio legitimately report no SDL
+    // driver, so warning about it there would be a false alarm.
     if (isSdl && sdlDriver == nullptr) {
         ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
                            "No SDL audio device is open. Audio is synthesized but discarded.");
@@ -1689,19 +1506,13 @@ void GdxMenu::DrawAudioStatus() {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// Ghost import / export — WIDGET_CUSTOM (Enhancements -> Practice).
+// Export is read-only. Import adds a validated player replay to the per-course PC library and
+// mirrors it into SRAM only when that does not evict another course; it stays disabled while an
+// on-track race is live, to avoid mutating ghost state alongside the game fiber. Both use the
+// default path next to the exe (ghost_export.gdg); a proper file picker remains future work.
 //
-// Calls the port's gdx_ghost_io C API (port/gdx_ghost_io.c). Export is read-only. Import adds a
-// validated player replay to the per-course PC library and mirrors it into SRAM only when that does
-// not evict another course. It stays disabled while an on-track race is live to avoid mutating
-// ghost state alongside the game fiber. Both use the default path next to the exe
-// (ghost_export.gdg); a proper file picker remains future work.
-//
-// Stays a custom block rather than becoming two WIDGET_BUTTONs: the pair shares a status buffer and
-// a resolved path that both branches format into, and the export tooltip interpolates that path
-// (see the note at that call), which no Options struct can carry.
-// ─────────────────────────────────────────────────────────────────────────────────────────────
+// A custom block rather than two WIDGET_BUTTONs: the pair shares a status buffer and a resolved
+// path that both branches format into, and the export tooltip interpolates that path.
 void GdxMenu::DrawGhostIo() {
     ImGui::TextDisabled("Ghost replay (.gdg)");
 
@@ -1723,10 +1534,8 @@ void GdxMenu::DrawGhostIo() {
             }
         }
     }
-    // Left as a raw SetTooltip rather than UIWidgets::Tooltip: the text interpolates a runtime
-    // filesystem path, and UIWidgets::Tooltip runs every tooltip through WrappedText at 80
-    // columns (UIWidgets.cpp:98-102), which would insert newlines at the spaces inside a path
-    // like "...\Proyectos Mios\..." and make the destination unreadable.
+    // Raw SetTooltip rather than UIWidgets::Tooltip: that runs every tooltip through WrappedText at
+    // 80 columns, which would break this path at the spaces inside it.
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Writes the currently-saved ghost replay to:\n%s",
                           haveDefault ? path : "(unavailable)");
@@ -1734,10 +1543,8 @@ void GdxMenu::DrawGhostIo() {
 
     ImGui::SameLine();
 
-    // The in-race lockout is a NAMED disable reason on this button
-    // (DISABLE_FOR_RACE_IN_PROGRESS, evaluated once per frame in RegisterDisableReasons), so the
-    // greyed button now states why it is greyed instead of only being annotated beside it. The
-    // "(disabled in-race)" label is kept as well, because it is visible without hovering.
+    // The in-race lockout is the named reason DISABLE_FOR_RACE_IN_PROGRESS, so the greyed button
+    // states why. The "(disabled in-race)" label stays too, because it is visible without hovering.
     const bool inGame = mDisabledInfo[GdxUI::DISABLE_FOR_RACE_IN_PROGRESS].active;
     ImGui::BeginDisabled(inGame);
     if (ImGui::Button("Import ghost")) {
@@ -1795,26 +1602,17 @@ void GdxMenu::DrawToolWindowPage(const char* name, const char* description) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// Frame-interpolation live statistics — WIDGET_CUSTOM (Dev Tools -> Stats).
-//
-// Real presented-FPS visibility. When Frame Interpolation is on the sim runs at 60 Hz but the
-// renderer presents multiple sub-frames per tick, so ImGui's own io.Framerate (which counts one
-// frame per present) is the true presented rate. We show it alongside the fixed 60 Hz logic rate
-// ("144 fps (sim 60 Hz)") plus the live sub-frame count and the previous tick's tween/snap
-// breakdown, so a "cost without benefit" regression (lerped == 0) is visible at a glance. These
-// reuse the existing bridge getters — no extra per-frame cost.
-// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Presented rate alongside the 60 Hz logic rate, plus the live sub-frame count and the previous
+// tick's tween/snap breakdown — so a "cost without benefit" regression (lerped == 0) is visible at
+// a glance.
 void GdxMenu::DrawInterpStats() {
     if (gdx_gfx_interp_host_active() == 0) {
         return;
     }
     ImGui::SeparatorText("Frame Interpolation");
     if (gdx_gfx_interp_tick_active() == 0) {
-        // The menu's toggle is on, but main.cpp forced interpolation off THIS tick (Course
-        // Edit / Create Machine editors force the stock single-present path). The live
-        // numbers below are from before the editor was entered, so show the paused truth
-        // instead of stale/misleading figures.
+        // The toggle is on but main.cpp forced interpolation off this tick, so the numbers below
+        // are from before the editor was entered. Show the paused truth instead of stale figures.
         ImGui::TextDisabled("Interpolation paused (editor active)");
     } else {
         const double presentedFps = gdx_gfx_interp_presents_per_sec();
@@ -1822,7 +1620,8 @@ void GdxMenu::DrawInterpStats() {
         const int m = gdx_gfx_interp_last_subframes();
         const int lerped = gdx_gfx_interp_last_lerped();
         const int snapped = gdx_gfx_interp_last_snapped();
-        // presents/s meter is bridge-measured; fall back to ImGui's rate before the first window fills.
+        // The presents/s meter is bridge-measured; fall back to ImGui's rate until the first
+        // window fills.
         const double shownFps = (presentedFps > 0.0) ? presentedFps : static_cast<double>(imguiFps);
         ImGui::Text("Presented: %.0f fps (sim 60 Hz)", shownFps);
         ImGui::Text("Sub-frames/tick (M): %d", m);
@@ -1836,11 +1635,8 @@ void GdxMenu::DrawInterpStats() {
     ImGui::Separator();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// WORKSHOP — the three custom blocks. The "Enable texture packs" toggle and the Content Installs
-// roadmap lines are plain registry widgets; everything below needs a table, a subprocess snapshot
-// or a modal, so each is one WIDGET_CUSTOM entry.
-// ─────────────────────────────────────────────────────────────────────────────────────────────
+// The Workshop custom blocks. Each needs a table, a subprocess snapshot or a modal, which no plain
+// registry widget can express.
 void GdxMenu::DrawTexturePacks() {
     static char sReloadStatus[160] = "";
     const ImVec4 kRed = ImVec4(0.90f, 0.25f, 0.25f, 1.0f);
@@ -1863,15 +1659,13 @@ void GdxMenu::DrawTexturePacks() {
 
             ImGui::TableSetColumnIndex(0);
             bool enabled = !p.disabled;
-            // Deliberately still ImGui::Checkbox, not UIWidgets::Checkbox: this one lives in a
-            // 32px WidthFixed column, and UIWidgets' re-implementation always adds
-            // ItemInnerSpacing.x * 2 of label gutter to its bounding box even for an empty
-            // "##" label (UIWidgets.cpp:372-373), which would push it out of the column. Only the
-            // tooltip is folded. The pack state is not a CVar either -- it lives in the
-            // comma-joined DisabledPacks list that GdxWorkshopSetPackDisabled maintains.
+            // ImGui::Checkbox, not UIWidgets::Checkbox: this lives in a 32px WidthFixed column, and
+            // UIWidgets' re-implementation always adds ItemInnerSpacing.x * 2 of label gutter to
+            // its bounding box even for an empty "##" label, which would push it out of the column.
+            // The pack state is not a CVar either -- it lives in the comma-joined DisabledPacks
+            // list that GdxWorkshopSetPackDisabled maintains.
             if (ImGui::Checkbox("##en", &enabled)) {
-                // Toggling the checkbox rewrites the persisted disable list; the change takes effect
-                // on the next Reload (or the next boot) since the archive set is mounted once.
+                // The archive set is mounted once, so this takes effect on the next Reload or boot.
                 GdxWorkshopSetPackDisabled(p.basename.c_str(), enabled ? 0 : 1);
             }
             UIWidgets::Tooltip("Enable or disable this pack. Takes effect on the next Reload or boot.");
@@ -1912,29 +1706,22 @@ void GdxMenu::DrawTexturePacks() {
     if (sReloadStatus[0] != '\0') {
         ImGui::TextDisabled("%s", sReloadStatus);
     }
-
-    // Texture Dump (the play-until-you-see-it runtime dumper) was retired here: Asset Dump below
-    // supersedes it, decoding named assets straight from the archive instead of depending on which
-    // textures gameplay happened to walk past. Its CVar is forced to 0 at registration so an
-    // already-on setting cannot outlive the checkbox. "Open dump folder" survives as part of the
-    // Asset Dump section -- both dumpers wrote to the same dump/ directory.
 }
 
-// Offline per-class asset dump, native-first via the bundled gdx-extract (falls back to
-// tools/gen_dump_all.py in dev checkouts without the native binary). Implementation lives in
-// port/gdx_dump_launch.{h,cpp}; this block only READS the shared snapshot -- every subprocess runs
-// on a detached worker thread, one child PER CLASS so a broken class never aborts the rest.
+// Offline per-class asset dump, native-first via the bundled gdx-extract (falling back to
+// tools/gen_dump_all.py in dev checkouts without the native binary). The work lives in
+// port/gdx_dump_launch.{h,cpp}; this block only READS the shared snapshot. Every subprocess runs on
+// a detached worker thread, one child PER CLASS so a broken class never aborts the rest.
 //
 // Custom rather than registry data because the class list is DISCOVERED AT RUNTIME (an async
-// `--list-classes` probe), so the per-class checkboxes cannot be declared ahead of time; their
-// disabled state is therefore driven from the batch snapshot this block already reads, not from
-// the named-reason map (a reason evaluated once per frame would have to take the same snapshot a
-// second time, and the snapshot is a locked copy).
+// `--list-classes` probe), so the per-class checkboxes cannot be declared ahead of time. Their
+// disabled state comes from the batch snapshot this block already holds rather than from the
+// named-reason map, which would have to take a second locked copy of it.
 void GdxMenu::DrawAssetDump() {
     const ImVec4 kRed = ImVec4(0.90f, 0.25f, 0.25f, 1.0f);
 
-    // Discover the backend once (pure filesystem/PATH -- no subprocess), and kick the async
-    // `--list-classes` probe once. Both cached across frames via function-local statics.
+    // Backend discovery is pure filesystem/PATH, no subprocess; the class-list probe is async.
+    // Both run once and are cached across frames by the function-local statics.
     static gdx::DumpEnvironment sDumpEnv = gdx::GdxDumpDiscover();
     static bool sProbeKicked = (gdx::GdxDumpBeginClassListProbe(sDumpEnv), true);
     (void)sProbeKicked;
@@ -1950,15 +1737,13 @@ void GdxMenu::DrawAssetDump() {
     const bool running = snap.running;
     const std::vector<std::string> dumpClasses = gdx::GdxDumpCurrentClasses();
 
-    // -- Per-class checkboxes (persisted as gEnhancements.Workshop.DumpClass.<name>, default on) --
     ImGui::BeginDisabled(!sDumpEnv.available || running);
     if (ImGui::BeginTable("##DumpClasses", 2, ImGuiTableFlags_SizingStretchProp)) {
         for (const auto& cls : dumpClasses) {
             ImGui::TableNextColumn();
-            // Per-class CVar name is built at runtime, but CVarCheckbox takes the name as a
-            // plain const char* so the dynamic key works unchanged. DefaultValue(true) is the
-            // old `CVarGetInteger(key, 1)` default: every class starts checked. Nested inside
-            // the outer BeginDisabled above -- ImGui's BeginDisabled(false) preserves an
+            // The per-class CVar name (gEnhancements.Workshop.DumpClass.<name>) is built at
+            // runtime; CVarCheckbox takes a plain const char*, so the dynamic key works unchanged.
+            // Nested inside the BeginDisabled above -- ImGui's BeginDisabled(false) preserves an
             // already-disabled scope, so the rows stay greyed while a dump runs.
             std::string cvarKey = "gEnhancements.Workshop.DumpClass." + cls;
             std::string label = gdx::GdxDumpPrettyName(cls) + "##dumpclass_" + cls;
@@ -1983,7 +1768,7 @@ void GdxMenu::DrawAssetDump() {
     }
     ImGui::EndDisabled();
 
-    // -- Cancel (cooperative: stops AFTER the current class finishes) --
+    // Cancel is cooperative: it stops AFTER the current class finishes.
     ImGui::SameLine();
     ImGui::BeginDisabled(!running || snap.cancelRequested);
     if (ImGui::Button("Cancel")) {
@@ -1993,7 +1778,6 @@ void GdxMenu::DrawAssetDump() {
     UIWidgets::Tooltip("Stops after the current class finishes. The running class is left to "
                        "complete cleanly - no child process is killed.");
 
-    // -- Per-class progress lines + batch summary --
     for (const auto& p : snap.classes) {
         std::string pretty = gdx::GdxDumpPrettyName(p.name);
         switch (p.phase) {
@@ -2027,15 +1811,13 @@ void GdxMenu::DrawAssetDump() {
         ImGui::TextDisabled("%s", snap.summary.c_str());
     }
 
-    // Every dumper writes into the same dump/ directory, so one shortcut serves all of them.
-    // This is the only in-menu way to reach that folder.
     if (ImGui::Button("Open dump folder")) {
         GdxOpenFolder(GdxWorkshopDumpDir(true));
     }
     UIWidgets::Tooltip("Open the dump/ folder in your file browser (created if absent).");
 }
 
-// 64DD durable-save sidecar status + the one-shot format authorization modal.
+// 64DD durable-save sidecar status and the one-shot format authorization modal.
 void GdxMenu::DrawDdSave() {
     const ImVec4 kRed = ImVec4(0.90f, 0.25f, 0.25f, 1.0f);
 
@@ -2069,18 +1851,11 @@ void GdxMenu::DrawDdSave() {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// DEVELOPER — the pop-out buttons for the LUS dev windows.
-//    Console + Stats are auto-registered by the LUS Gui ctor; Gfx Debugger is registered in
-//    main.cpp at boot. Each button toggles the LIVE window via GetGuiWindow(name)->
-//    ToggleVisibility() (a bare CVarSet would not move an already-constructed window).
-//
-// Custom because the three share one error line: a missing window is REPORTED rather than
-// ignored, and the report belongs to the group, not to any one button.
-// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Pop-out buttons for the libultraship dev windows. Custom because the three share one error line:
+// a missing window is REPORTED rather than ignored, and the report belongs to the group.
 void GdxMenu::DrawDevToolButtons() {
-    // These names must match the registrations in main.cpp / the libultraship Gui ctor exactly, and
-    // a typo used to produce a button that looked fine and did nothing at all.
+    // These names must match the registrations in main.cpp / the libultraship Gui ctor exactly. A
+    // typo produces a button that looks fine and does nothing.
     static std::string sToolStatus;
     struct ToolButton {
         const char* label;
@@ -2110,34 +1885,27 @@ void GdxMenu::DrawDevToolButtons() {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// 8b) DEVELOPER GATES — the checkbox surface for port/gdx_dev_gates.{h,c}.
-//
-// These rows replace ~25 environment variables that were previously invisible and undiscoverable.
-// Everything here is table-driven: adding a gate to kGates in gdx_dev_gates.c makes it appear
-// with no edit to this function.
+// The checkbox surface for port/gdx_dev_gates.{h,c}. Table-driven: adding a gate to kGates in
+// gdx_dev_gates.c makes it appear here with no edit to this function.
 //
 // Three sections, matching the bucket policy:
-//   Logging     (Bucket D) — persisted CVar adopted at boot; carries the honest "applies to new
-//                            output; restart to capture boot" caveat, and is DISABLED when an
-//                            environment variable pinned it for this run.
+//   Logging     (Bucket D) — persisted CVar adopted at boot; carries the "applies to new output;
+//                            restart to capture boot" caveat, and is DISABLED when an environment
+//                            variable pinned it for this run.
 //   Diagnostics (Bucket A) — logging only, safe to leave on, live.
 //   Behaviour   (Bucket B) — CHANGES RENDERING OR GAME BEHAVIOUR. Whole section compiled out
 //                            unless GDX_DEV_TOOLS (Debug-only by default; see port/CMakeLists.txt).
 //
 // A toggle writes the CVar, schedules the config save, and calls gdx_dev_gates_refresh() so the
-// change lands on the CURRENT frame rather than the next one (the frame loop's own refresh already
-// ran before the menu drew).
-// ─────────────────────────────────────────────────────────────────────────────────────────────
+// change lands on the CURRENT frame: the frame loop's own refresh already ran before the menu drew.
 void GdxMenu::DrawDevGates() {
     ImGui::SeparatorText("Developer gates");
     ImGui::TextWrapped("These replace the port's GDX_* environment variables. Changes apply "
                        "immediately and persist in gdiffuser.cfg.json. A variable exported at "
                        "launch still works and is marked below.");
 
-    // Confirmed rather than immediate: this discards every gate the user set, across all three
-    // sections at once, and there is no undo once the config is saved. Someone half-way through
-    // bisecting a bug can lose the whole setup to one stray click.
+    // Confirmed rather than immediate: this discards every gate across all three sections at once
+    // with no undo, and one stray click would cost someone their whole bisect setup.
     if (ImGui::Button("Reset all gates to defaults")) {
         ImGui::OpenPopup("##resetgates");
     }
@@ -2181,11 +1949,9 @@ void GdxMenu::DrawDevGates() {
          ++bucketIndex) {
         const int bucket = kBucketOrder[bucketIndex];
 #ifndef GDX_DEV_TOOLS
-        // Bucket B is not compiled into this build: its gates are hard-wired to 0 with no getenv and
-        // no CVar read, so drawing live checkboxes would be a lie. Silently skipping the section was
-        // its own problem though -- the docs and the Behavior gates are referenced elsewhere, and a
-        // section that simply is not there reads as "this build is broken" rather than "this build
-        // deliberately excludes it". Say so instead of vanishing.
+        // Bucket B is not compiled into this build: its gates are hard-wired to 0 with no getenv
+        // and no CVar read, so live checkboxes would be a lie. Say the section is excluded rather
+        // than dropping it, which would read as "this build is broken".
         if (bucket == GDX_GATE_BUCKET_BEHAVIOR) {
             ImGui::SeparatorText("Behavior overrides (not in this build)");
             ImGui::TextDisabled("Compiled out of Release. These gates change what the game renders or\n"
@@ -2239,18 +2005,17 @@ void GdxMenu::DrawDevGates() {
                     ImGui::EndDisabled();
                 }
 
-                // AllowWhenDisabled: a pinned row is exactly the row a user most needs explained --
-                // without this flag ImGui suppresses hover on disabled items, so the one checkbox
-                // that refuses to move is also the only one that will not say why.
+                // AllowWhenDisabled: ImGui otherwise suppresses hover on disabled items, so the one
+                // checkbox that refuses to move would also be the only one that never says why.
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
                     ImGui::SetTooltip("%s\n\nEnvironment: %s\nSetting: %s", gdx_dev_gate_help(id),
                                       gdx_dev_gate_env_name(id), gdx_dev_gate_cvar_name(id));
                 }
                 GdxModifiedMarker(value != (gdx_dev_gate_default(id) != 0));
 
-                // Order matters. A BOOT gate that is merely PRESENT in the environment but resolved
-                // to off is now freely toggleable, so it gets the useful restart hint rather than a
-                // "(started from ...)" label that would be stale the moment the user ticked it.
+                // Order matters: a BOOT gate merely PRESENT in the environment but resolved to off
+                // is freely toggleable, so it gets the restart hint rather than a "(started from
+                // ...)" label that would be stale the moment the user ticked it.
                 if (pinned) {
                     ImGui::SameLine();
                     ImGui::TextDisabled("(pinned ON by %s this run)", gdx_dev_gate_env_name(id));
@@ -2265,9 +2030,8 @@ void GdxMenu::DrawDevGates() {
         }
     }
 
-    // Environment variables that deliberately stay environment variables (Bucket C): they are
-    // consumed before the console exists, or they carry a value rather than a flag. Listed so the
-    // Dev Tools page is a complete map of the port's switches rather than a partial one.
+    // Bucket C stays environment-only: consumed before the console exists, or carrying a value
+    // rather than a flag. Listed so this page is a complete map of the port's switches.
     ImGui::SeparatorText("Environment only (no setting)");
     ImGui::TextWrapped("Consumed before the settings system exists, or not a simple on/off:");
     ImGui::BulletText("GDX_INPUT_SCRIPT - deterministic input playback for unattended tests");
@@ -2280,18 +2044,13 @@ void GdxMenu::DrawDevGates() {
 }
 
 // The port's release version, single source of truth for user-facing surfaces. Bumped by hand at
-// release points — there is deliberately no build-count automation, because a version a human
-// didn't choose is a build id, not a version.
+// release points: a version a human did not choose is a build id, not a version.
 static constexpr const char* kGdxVersionString = "1.0.0";
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// 9) ABOUT — the Kiziio logo (loaded once from gdiffuser.o2r's branding/ entry via Fast3dGui),
-//    the version line, the EK-required boot notice, and credits.
-// ─────────────────────────────────────────────────────────────────────────────────────────────
 void GdxMenu::DrawAboutMenu() {
-    // Lazy one-shot load on first open rather than at boot: the About page is visited rarely, and
-    // a failed load (archive predating the branding entry) must degrade to the text title, never
-    // block the menu. tried/loaded are separate so a failure doesn't retry every frame.
+    // Lazy one-shot load on first open rather than at boot: the About page is visited rarely, and a
+    // failed load (an archive predating the branding entry) must degrade to the text title rather
+    // than block the menu. tried/loaded are separate so a failure does not retry every frame.
     static bool sLogoTried = false;
     static bool sLogoLoaded = false;
     if (!sLogoTried) {
@@ -2309,7 +2068,7 @@ void GdxMenu::DrawAboutMenu() {
             Ship::Context::GetInstance()->GetWindow()->GetGui());
         ImTextureID logo = (gui != nullptr) ? gui->GetTextureByName("gdx-logo") : nullptr;
         if (logo != nullptr) {
-            // Source is 1024x324; draw at a width that fits the pane, aspect preserved.
+            // Source is 1024x324; the height below preserves that aspect.
             const float w = std::min(420.0f, ImGui::GetContentRegionAvail().x);
             const float h = w * (324.0f / 1024.0f);
             ImGui::Image(logo, ImVec2(w, h));

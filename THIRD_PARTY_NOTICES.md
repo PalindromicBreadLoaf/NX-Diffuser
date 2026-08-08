@@ -15,6 +15,8 @@ must remain with binary packages.
 | Torch | `gdx-extract` asset processor | `LICENSES/MIT-Torch.txt` |
 | cxd4 RSP core | Low-level audio RSP interpreter | `LICENSES/CC0-1.0.txt` |
 | SSE2NEON | ARM SIMD compatibility header used by cxd4 | `LICENSES/MIT-SSE2NEON.txt` |
+| discord-rpc | Discord Rich Presence (optional, off by default) | `LICENSES/MIT-discord-rpc.txt` |
+| RapidJSON | JSON serialization inside discord-rpc | `LICENSES/MIT-rapidjson.txt` |
 
 ## Runtime and extraction dependencies
 
@@ -32,6 +34,8 @@ are included both under `LICENSES/` and beside the fonts in release packages.
 - `decomp-recipes/` contains CC0-licensed extraction metadata and no embedded game payload.
 - `fzerox.o2r` is generated locally from files supplied by the user and must not be redistributed
   with G-Diffuser.
+- RSP microcode (aspMain) is not shipped in the source tree or in binaries; the low-level audio
+  path reads it from `fzerox.o2r`, where extraction places it from the user's own ROM.
 - `gdiffuser.o2r` contains only the MIT-licensed Fast3D shaders required to initialize the renderer.
 - The Input Viewer is drawn with ImGui primitives. No Ship of Harkinian controller PNGs are included.
 - No game-derived application icon is included. Builds use the platform default until original,

@@ -1,12 +1,12 @@
 // G-Diffuser — in-window first-time setup flow (ImGui). See gdx_firstboot_gui.h.
 //
-// This TU is part of the G-Diffuser exe target. It runs AFTER libultraship is up (window + Gui +
-// FileDropMgr exist) and BEFORE the game boots, so it may freely touch LUS state and ImGui.
+// Part of the G-Diffuser exe target. Runs AFTER libultraship is up (window + Gui + FileDropMgr exist)
+// and BEFORE the game boots, so it may freely touch LUS state and ImGui.
 //
-// Frame pump: the game loop is not running yet, so this flow drives its own GUI-only frames using the
-// abstract Window interface — HandleEvents / StartDraw / StartFrame / RunGuiOnly / EndDraw / EndFrame,
-// mirroring Fast3dWindow::DrawAndRunGraphicsCommands but substituting RunGuiOnly() (which clears/binds
-// the game framebuffer and renders no gfx task) for the game's Run(). No libultraship change needed —
+// The game loop is not running yet, so this flow drives its own GUI-only frames through the abstract
+// Window interface — HandleEvents / StartDraw / StartFrame / RunGuiOnly / EndDraw / EndFrame —
+// mirroring Fast3dWindow::DrawAndRunGraphicsCommands with RunGuiOnly() (clears/binds the game
+// framebuffer, renders no gfx task) in place of the game's Run(). That needs no libultraship change:
 // RunGuiOnly()/StartFrame()/EndFrame() are all pure-virtual on Ship::Window.
 
 #include "gdx_firstboot_gui.h"
@@ -64,12 +64,10 @@ struct Row {
     std::string warning;       // visible warning shown on an OK row (unrecognized-but-accepted dump)
     std::string okHeader;      // overrides the "OK (...)" header text when non-empty (region label, or
                                // the archive-satisfied message when the original file is gone)
-    // The actual filesystem path Recheck() resolved and validated this row against -- normally
-    // equal to RowPath(i) (the canonical dataDir path), but for the disk row it may instead be the
-    // managed-copy fallback path (see Recheck's managed-copy handling), and for the ROM/disk rows it may
-    // be the accepted Japanese alternate name (SetupRomFileNameJp/SetupDiskFileNameJp). Callers that
-    // need the row's real on-disk location (rather than always the canonical path) must use this,
-    // not RowPath(i).
+    // The path Recheck() actually resolved and validated this row against. Usually RowPath(i), but the
+    // disk row may resolve to the managed-copy fallback and the ROM/disk rows to the accepted Japanese
+    // alternate name (SetupRomFileNameJp/SetupDiskFileNameJp). Anything needing the row's real on-disk
+    // location must read this, never RowPath(i).
     std::string resolvedPath;
     // True when the ROM row resolved to the accepted Japanese dump: setup must SKIP archive
     // extraction (US recipes cannot process it) and complete for the experimental raw-ROM boot.
@@ -112,11 +110,11 @@ class SetupScreen {
             }
             w->GetMouseStateManager()->StartFrame();
             w->GetGui()->StartDraw(); // ImGui NewFrame + menu/registered windows
-            DrawUI();                 // our setup window, drawn into the same ImGui frame
+            DrawUI();                 // must land inside that same ImGui frame
             w->StartFrame();          // size the game framebuffers
             w->RunGuiOnly();          // clear/bind the game FB, run no gfx task
             w->GetGui()->EndDraw();   // composite + ImGui::Render + present floating windows
-            w->EndFrame();            // swap buffers
+            w->EndFrame();
         }
 
         if (fileDrop != nullptr) {
@@ -176,11 +174,9 @@ class SetupScreen {
         return "";
     }
 
-    // Hash-validated archive kind for a given row's canonical name (companion to ArchiveForCanonical) --
-    // used so Recheck()'s "satisfied by installed archive" determination goes through
-    // GdxFirstbootArchiveSatisfies (F1 fix) instead of a bare presence probe, which would accept a
-    // corrupt/foreign archive as satisfying the row. Returns false via outKind left unset when the
-    // canonical name is unrecognized (mirrors ArchiveForCanonical's empty-string case).
+    // Companion to ArchiveForCanonical, so Recheck()'s "satisfied by installed archive" decision runs
+    // through the hash-validating GdxFirstbootArchiveSatisfies rather than a presence probe, which
+    // would accept a corrupt/foreign archive. False (outKind untouched) for an unrecognized name.
     static bool ArchiveKindForCanonical(const char* canonicalName, GdxFirstbootArchiveKind& outKind) {
         if (std::string(canonicalName) == SetupRomFileName())  { outKind = GdxFirstbootArchiveKind::Game; return true; }
         if (std::string(canonicalName) == SetupDiskFileName()) { outKind = GdxFirstbootArchiveKind::Disk; return true; }
@@ -196,13 +192,12 @@ class SetupScreen {
         r.okHeader.clear();
         r.jpRom = false;
         if (!fs::is_regular_file(fs::path(dst), ec)) {
-            // Accepted alternate names: probe them before any derived fallback so a JP test folder
-            // (baserom.jp.rev0.z64 / baserom.jp.ek.ndd) or a folder holding the US prototype IPL
-            // dump filename (64DD_IPL_US_MJR.n64) is detected without renaming.
+            // Accepted alternate names come before any derived fallback, so a JP test folder
+            // (baserom.jp.rev0.z64 / baserom.jp.ek.ndd) or a folder holding the US prototype IPL dump
+            // under its own name (64DD_IPL_US_MJR.n64) is detected without renaming.
             if (std::string(r.canonicalName) == SetupIplFileName()) {
-                // Shared with the boot path (gdx_firstboot.cpp's FirstBootRun, gdx_extract_launch.cpp's
-                // ensureIplArchive) via GdxFindIplSourceInDir so the accepted IPL alt name can never
-                // drift between the wizard and boot-time extraction again.
+                // GdxFindIplSourceInDir is shared with FirstBootRun and ensureIplArchive so the
+                // accepted IPL alt name cannot drift between the wizard and boot-time extraction.
                 std::string found = GdxFindIplSourceInDir(mDataDir);
                 if (!found.empty()) {
                     dst = found;
@@ -222,9 +217,9 @@ class SetupScreen {
                     }
                 }
             }
-            // The disk row's canonical copy may be gone because the user deleted their
-            // original .ndd after a PRIOR setup already created the managed backup under
-            // <dataDir>/media. Resolve against that managed copy rather than reporting Missing.
+            // The disk row's canonical copy may be gone because the user deleted their original .ndd
+            // after a prior setup created the managed backup under <dataDir>/media; resolve against
+            // that copy rather than reporting Missing.
             if (!fs::is_regular_file(fs::path(dst), ec) &&
                 std::string(r.canonicalName) == SetupDiskFileName()) {
                 std::string managed = ManagedDiskPath(mDataDir);
@@ -234,13 +229,11 @@ class SetupScreen {
                 }
             }
             if (!fs::is_regular_file(fs::path(dst), ec)) {
-                // Acceptance chain: before reporting Missing, honor the fact that a requirement
-                // met by its INSTALLED ARCHIVE is satisfied, not missing — the original file is
-                // deletable and the game boots archive-only from it (rom_buffer.cpp / disk_buffer.cpp).
-                // Show that truthfully in the OK/green state instead of falsely demanding the original.
-                // Use the hash-validated GdxFirstbootArchiveSatisfies (F1 fix) rather than a bare
-                // existence probe -- a present-but-corrupt/foreign archive must not read as satisfied
-                // here any more than it does in FirstBootRun's own SetupComplete fast path.
+                // A requirement met by its INSTALLED ARCHIVE is satisfied, not missing: the original
+                // is deletable and the game boots archive-only from it (rom_buffer.cpp /
+                // disk_buffer.cpp), so the row must go green instead of demanding the original back.
+                // GdxFirstbootArchiveSatisfies hashes rather than probes -- a corrupt/foreign archive
+                // must not read as satisfied here any more than in FirstBootRun's fast path.
                 const char* archiveName = ArchiveForCanonical(r.canonicalName);
                 std::string archivePath = (fs::path(mDataDir) / archiveName).string();
                 GdxFirstbootArchiveKind archiveKind;
@@ -274,16 +267,14 @@ class SetupScreen {
         }
         r.status = RowStatus::Ok;
         r.reason.clear();
-        // Record the path actually resolved above (canonical dataDir path, or the managed-copy fallback
-        // for the disk row) so callers needing the real on-disk location -- e.g.
-        // ConfirmAndStartExtraction's WriteSetupComplete/EnsureManagedDiskCopy calls, and the "File:"
-        // provenance line in DrawAcquire -- don't re-derive it and risk showing the wrong path.
+        // Record what was actually resolved above so callers that need the real on-disk location --
+        // ConfirmAndStartExtraction's WriteSetupComplete call, DrawAcquire's "File:" line -- never
+        // re-derive it and land on the canonical path when a fallback was used.
         r.resolvedPath = dst;
 
-        // SHA-1 identity recognition (region/dump labelling). Hashing happens only when a row is
-        // (re)checked, never per frame; even the 64.9 MB disk is negligible in normal setup use. The
-        // rulesets (ROM strict US-rev0; IPL/disk accept-with-label-or-warning) and all message text
-        // live centrally in gdx_firstboot.cpp so the future JP build reuses the same tables.
+        // Hashing happens only when a row is (re)checked, never per frame, so even the 64.9 MB disk is
+        // affordable here. The rulesets (ROM strict US-rev0; IPL/disk accept-with-label-or-warning) and
+        // every message string live in gdx_firstboot.cpp so the future JP build reuses the tables.
         GdxInputRecognition rec = GdxRecognizeInput(r.canonicalName, dst, mExeDir);
         switch (rec.verdict) {
             case GdxInputVerdict::VerifiedKnown:
@@ -359,29 +350,24 @@ class SetupScreen {
         if (!AllRowsOk()) {
             return;
         }
-        // Use the disk row's Recheck-resolved actual path, not always RowPath(1): a managed-copy-only
-        // re-run (original .ndd deleted after a prior setup already created the managed
-        // backup) resolves and validates against <dataDir>/media, not the canonical dataDir path.
-        // Passing RowPath(1) here would record a nonexistent canonical path in the sidecar and make
-        // EnsureManagedDiskCopy warn spuriously about failing to (re)create a copy that already exists.
+        // A managed-copy-only re-run (original .ndd deleted after a prior setup made the backup)
+        // validated against <dataDir>/media, so RowPath(1) would record a nonexistent canonical path
+        // in the sidecar and make EnsureManagedDiskCopy warn about a copy that already exists.
         const std::string& diskPath = mRows[1].resolvedPath.empty() ? RowPath(1) : mRows[1].resolvedPath;
-        // Same resolved-path rule for the ROM row: an accepted Japanese dump typically lives under
-        // its own alternate name (SetupRomFileNameJp) -- though recognition is by HASH, so a JP dump
-        // under the canonical US filename is also accepted; resolvedPath is correct either way.
+        // Same rule for the ROM row: an accepted Japanese dump usually lives under its own alternate
+        // name (SetupRomFileNameJp), and recognition is by hash, so resolvedPath is right either way.
         const std::string& romPath = mRows[0].resolvedPath.empty() ? RowPath(0) : mRows[0].resolvedPath;
         if (!WriteSetupComplete(mDataDir, romPath, diskPath, RowPath(2))) {
             mDropError = "Could not save the setup state next to the game.";
             return;
         }
-        // The disk row is validated and committed at dataDir/kDiskName (via CopyInputInto in
-        // Browse()/HandleDrop()). The SEPARATE media/ backup copy that used to be created here is
-        // retired (v1.0.0): it predates full .o2r support, and with fzerox-disk.o2r as the port's
-        // stable copy it was a third copy of a 64MB file whose only readers all fall back to the
-        // dataDir committed copy anyway. Existing media/ copies from older installs remain honored
-        // read-only; only creation is gone. See the matching retirement notes in gdx_firstboot.cpp.
-        // Accepted Japanese ROM: the US recipe tree cannot extract it, so skip archive extraction
-        // entirely and complete setup for the experimental raw-ROM boot (rom_buffer loads the ROM
-        // directly; FirstBootRun's fast path recognizes the recorded JP hash on later boots).
+        // Browse()/HandleDrop() already committed the disk at dataDir/kDiskName. No separate media/
+        // backup is written: fzerox-disk.o2r is the port's stable copy, and every reader falls back to
+        // the committed copy anyway. media/ copies from older installs stay honored read-only.
+        //
+        // The US recipe tree cannot extract an accepted Japanese ROM, so setup skips extraction and
+        // completes for the experimental raw-ROM boot (rom_buffer loads it directly; FirstBootRun's
+        // fast path recognizes the recorded JP hash on later boots).
         if (mRows[0].jpRom) {
             gdx_port_logf("[setup] user confirmed all inputs; Japanese ROM accepted -- skipping "
                           "archive extraction (raw-ROM boot, experimental)\n");
@@ -408,17 +394,29 @@ class SetupScreen {
                           archive.c_str());
             return;
         }
-        // Hot-mount pattern (see port/gdx_workshop.cpp GdxWorkshopReload): AddArchive rebuilds the
-        // virtual file system internally. No game threads run during setup, so no quiesce is needed.
-        // The main.cpp C4 mount-time version gate does NOT re-run on this hot-mount, but it is
-        // SUBSUMED: extraction only installs fzerox.o2r when its SHA-256 equals this build's golden
-        // reference, which is strictly stronger than the gate's ROM-CRC version-entry check (a correct
-        // golden archive necessarily carries the expected US-rev0 version stamp).
+        // AddArchive rebuilds the virtual file system internally (see GdxWorkshopReload); no game
+        // threads run during setup, so no quiesce is needed. main.cpp's mount-time version gate does
+        // not re-run here, but it is subsumed: extraction installs fzerox.o2r only when its SHA-256
+        // equals this build's golden reference, which is strictly stronger than the gate's ROM-CRC
+        // version-entry check.
         if (am->AddArchive(archive) != nullptr) {
             mArchiveMounted = true;
             gdx_port_logf("[setup] hot-mounted %s\n", archive.c_str());
         } else {
             gdx_port_logf("[setup] WARNING: AddArchive(%s) failed; raw-ROM fallback\n", archive.c_str());
+        }
+        // The same extraction run also installs the IPL and disk archives; without this they sit on
+        // disk unmounted until the next launch and Data & Files reports them as such.
+        for (const char* extraName : { "n64ddipl.o2r", "fzerox-disk.o2r" }) {
+            const std::string extra = (fs::path(mDataDir) / extraName).string();
+            if (!fs::is_regular_file(fs::path(extra), ec)) {
+                continue;
+            }
+            if (am->AddArchive(extra) != nullptr) {
+                gdx_port_logf("[setup] hot-mounted %s\n", extra.c_str());
+            } else {
+                gdx_port_logf("[setup] WARNING: AddArchive(%s) failed; file-based fallback\n", extra.c_str());
+            }
         }
     }
 
@@ -432,9 +430,8 @@ class SetupScreen {
             case Phase::Extracting: {
                 ExtractProgress p = GdxExtractPollStatus();
                 mStage = p.stage;
-                // Copy the ring-buffer snapshot + real-progress counters into GUI-owned state BEFORE any
-                // GdxExtractResetAsync() below, which clears the launcher's own copy. On a failed Done
-                // this is what lets ExtractFailed keep showing the log the user needs to read.
+                // Copy the ring buffer + counters into GUI-owned state BEFORE any GdxExtractResetAsync()
+                // below clears the launcher's copy; that is what lets ExtractFailed keep showing the log.
                 mLog.assign(p.log.begin(), p.log.end());
                 mEntriesSeen = p.entriesSeen;
                 mSubStage = p.subStage;
@@ -509,9 +506,8 @@ class SetupScreen {
 
             switch (r.status) {
                 case RowStatus::Ok:
-                    // okHeader overrides the file name in the header: the EK disk region label
-                    // ("translated Expansion Kit disk"), or the archive-satisfied message when the
-                    // original file has been deleted and its installed archive covers the requirement.
+                    // okHeader replaces the file name: the EK disk region label, or the
+                    // archive-satisfied message when the original is gone and its archive covers it.
                     ImGui::TextColored(ImVec4(0.35f, 0.80f, 0.35f, 1.0f), "OK  (%s)",
                                        r.okHeader.empty() ? r.canonicalName : r.okHeader.c_str());
                     if (!r.warning.empty()) {
@@ -528,10 +524,9 @@ class SetupScreen {
                     ImGui::TextColored(ImVec4(0.85f, 0.70f, 0.35f, 1.0f), "Missing");
                     break;
             }
-            // Provenance: show the path Recheck actually resolved and validated (the managed media/
-            // copy, or the installed archive, when the canonical original is gone) rather than always
-            // the canonical dataDir path -- which previously mislabeled a managed/archive hit as the
-            // deleted root file (Defect 1 provenance fix). Falls back to the canonical path pre-check.
+            // Show the path Recheck resolved (managed media/ copy, or the installed archive, when the
+            // original is gone), not the canonical dataDir path -- that would label a managed/archive
+            // hit as the deleted root file. Falls back to the canonical path before the first check.
             const std::string shownPath = r.resolvedPath.empty() ? RowPath(i) : r.resolvedPath;
             ImGui::PushTextWrapPos(0.0f);
             ImGui::TextDisabled("File: %s", shownPath.c_str());
@@ -559,14 +554,9 @@ class SetupScreen {
         if (AllRowsOk()) {
             ImGui::TextColored(ImVec4(0.35f, 0.80f, 0.35f, 1.0f), "All three files are verified.");
             ImGui::TextWrapped("Confirm to build fzerox.o2r from your ROM and continue to the game.");
-            // The deletable-files statement. Named per-file so the reader never has to guess which
-            // originals are safe to remove. The media/ managed copy is TRANSITIONAL (deletable once
-            // the disk archive verifies — the green line in Data & Files), and saves live ONLY in
-            // saves/*.gdd.
-            // JP exception: an accepted Japanese ROM boots RAW -- no fzerox.o2r is
-            // ever built for it, so the ROM file is the ONLY copy of the game data. The generic
-            // "all deletable" paragraph told JP users to delete a file the app privately requires;
-            // gate it and state the JP truth instead.
+            // The deletable-files statement names each file, so the reader never has to guess which
+            // originals are safe to remove. A Japanese ROM needs the opposite statement: it boots RAW,
+            // no fzerox.o2r is ever built for it, so that ROM file is the only copy of the game data.
             if (mRows[0].jpRom) {
                 ImGui::TextWrapped(
                     "Japanese ROM install (experimental): KEEP the ROM file -- it stays required "
@@ -593,8 +583,8 @@ class SetupScreen {
     }
 
     void DrawExtracting() {
-        // Stage label (matches gdx_extract_launch.h's ExtractProgress::subStage contract: 0 = cart,
-        // 1 = validating the cart archive, 2 = the independent IPL font-block archive).
+        // subStage values are gdx_extract_launch.h's ExtractProgress contract: 0 = cart, 1 =
+        // validating the cart archive, 2 = the independent IPL font-block archive.
         const char* stageLabel = "Extracting game assets...";
         if (mSubStage == 1) {
             stageLabel = "Validating extracted archive...";
@@ -605,11 +595,10 @@ class SetupScreen {
         ImGui::TextWrapped("This happens once and usually takes only a few seconds.");
         ImGui::Spacing();
 
-        // Real progress when a total is known (GDX_O2R_EXPECTED_ENTRY_COUNT for the cart stage, the
-        // frozen 2-entry IPL archive for the ipl stage) -- counted from the extractor's own per-asset
-        // "Processing" stdout lines (see gdx_extract_launch.cpp's looksLikeEntryProgressLine). The
-        // validating sub-stage has no comparable per-entry signal (it is a few hash/zip checks after the
-        // extractor child has already exited), so it always falls back to the indeterminate bar below.
+        // Determinate only when a total is known (GDX_O2R_EXPECTED_ENTRY_COUNT for cart, the frozen
+        // 2-entry IPL archive for ipl), counted from the extractor's own per-asset "Processing" lines
+        // (gdx_extract_launch.cpp's looksLikeEntryProgressLine). The validating sub-stage is a few
+        // hash/zip checks after the child exited, with no per-entry signal, so it stays indeterminate.
         const int total = (mSubStage == 2) ? GdxExtractExpectedIplEntryCount() : GdxExtractExpectedCartEntryCount();
         if (mSubStage != 1 && total > 0) {
             int done = mEntriesSeen;
@@ -630,9 +619,9 @@ class SetupScreen {
         DrawLogView();
     }
 
-    // Bordered, auto-scrolling scrollback of the extractor's stdout (ring-buffer snapshot from
-    // GdxExtractPollStatus). Shared by the live Extracting view and the ExtractFailed view so a failure
-    // never loses the diagnostic context the single-line summary used to discard.
+    // Auto-scrolling scrollback of the extractor's stdout (ring-buffer snapshot from
+    // GdxExtractPollStatus). Shared by the Extracting and ExtractFailed views so a failure keeps the
+    // diagnostic context a one-line summary would drop.
     void DrawLogView() {
         ImFont* mono = GdxGuiFontMono();
         if (mono != nullptr) {
@@ -663,8 +652,7 @@ class SetupScreen {
         ImGui::TextWrapped("You can continue with the raw ROM (assets are read directly, which is slower "
                            "and less compatible), or retry the extraction.");
         ImGui::Spacing();
-        // Keep the log visible on failure -- this is the actual diagnostic detail the single reduced
-        // line used to lose; the user (or an issue report) needs it to see what went wrong.
+        // The log is the diagnostic detail a user or an issue report needs; keep it visible here.
         DrawLogView();
         ImGui::Separator();
         if (ImGui::Button("Continue anyway (raw assets)")) {
@@ -679,9 +667,8 @@ class SetupScreen {
         }
     }
 
-    // ── File-drop callback plumbing ────────────────────────────────────────────────────────────────
-    // FileDroppedFunc is a plain C function pointer (no user data), so forward through a file-scope
-    // pointer to the active screen. The callback fires on the main thread inside HandleEvents().
+    // FileDroppedFunc is a plain C function pointer with no user data, so the callback forwards
+    // through a file-scope pointer to the active screen. It fires on the main thread in HandleEvents().
     static bool OnFileDroppedThunk(char* path);
 
     std::string mDataDir;
@@ -692,8 +679,8 @@ class SetupScreen {
     std::string mError;      // extraction failure reason (surfaced in DrawExtractFailed)
     std::string mDropError;  // transient "unrecognized drop" message
     bool mArchiveMounted = false;
-    std::vector<std::string> mLog; // ring-buffer snapshot of extractor stdout (GUI-owned copy -- see
-                                    // Tick()'s comment on why this survives GdxExtractResetAsync())
+    std::vector<std::string> mLog; // GUI-owned copy of the extractor stdout ring buffer; see Tick()
+                                    // for why it must survive GdxExtractResetAsync()
     int mEntriesSeen = 0;          // real per-entry progress counter for the current sub-stage
     int mSubStage = 0;             // 0 = cart, 1 = validating cart, 2 = ipl (ExtractProgress::subStage)
 };

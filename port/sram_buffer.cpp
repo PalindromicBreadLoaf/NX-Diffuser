@@ -18,22 +18,19 @@
 
 // Host-side persistence for the game's cart-SRAM save (settings, course/death-race
 // records, cup completion, character engine tuning, single-slot player/staff ghost).
-// Mirrors rom_buffer.cpp's pattern: this is a host .cpp TU (part of the G-Diffuser
-// exe target, not the gdiffuser_game decomp object library) so it can freely use the
-// MSVC CRT. The decomp side (decomp/src/overlays/ovl_i2/save.c) only ever calls the
-// three C-linkage entry points below; it never sees fopen/FILE* etc.
+// Host .cpp TU (G-Diffuser exe target, not the gdiffuser_game decomp object library),
+// so the CRT is available here. decomp/src/overlays/ovl_i2/save.c only ever calls the
+// three C-linkage entry points below; it never sees fopen/FILE*.
 extern "C" {
 
 static uint8_t s_sramBuffer[GDX_SRAM_SIZE];
 static bool s_initialized = false;
 
-// On Windows the save lives in <exedir>/saves/fzerox.sav; on POSIX it lives in
-// <cwd>/saves/fzerox.sav (CWD-relative), matching the 64DD disk-save sidecar
-// (disk_savefile.cpp) and the ghost I/O (gdx_ghost_io.c), so every save artifact shares
-// the same per-user working directory instead of the (often read-only) exe directory.
-// Each platform's gdx_sram_path migrates its legacy save into place on first resolution,
-// only when no current-convention save exists yet so an already-migrated one is never
-// clobbered.
+// Windows: <exedir>/saves/fzerox.sav. POSIX: <cwd>/saves/fzerox.sav, matching the 64DD
+// disk-save sidecar (disk_savefile.cpp) and the ghost I/O (gdx_ghost_io.c) so every save
+// artifact shares one per-user directory rather than the often read-only exe directory.
+// Each platform's gdx_sram_path migrates its legacy save on first resolution, and only
+// when no current-convention save exists, so an already-migrated one is never clobbered.
 #ifdef _WIN32
 static bool gdx_sram_path(wchar_t* outPath, size_t outCapChars) {
     wchar_t exePath[MAX_PATH] = {};
@@ -74,18 +71,14 @@ static bool gdx_sram_path(wchar_t* outPath, size_t outCapChars) {
     return true;
 }
 #else
-// POSIX: resolve the save file CWD-relative as "saves/fzerox.sav", mirroring the 64DD
-// disk-save sidecar (disk_savefile.cpp's savesDirectory(), which uses "." as the exe dir on
-// POSIX and mkdir's "./saves" with mode 0755) and the ghost I/O convention. This keeps the
-// cartridge SRAM save in the same per-user working directory as every other save artifact,
-// instead of next to the executable -- the exe directory is read-only inside an AppImage,
-// /opt, or Flatpak deployment, where an exe-relative flush would silently fail and lose the
-// save.
+// POSIX resolves CWD-relative rather than exe-relative because the exe directory is
+// read-only inside an AppImage, /opt or Flatpak deployment, where a flush would silently
+// fail and lose the save. Matches disk_savefile.cpp's savesDirectory() ("." as the exe dir
+// on POSIX, mkdir "./saves" 0755) and the ghost I/O convention.
 
-// Move srcPath -> dstPath. Uses rename(2) (atomic within a filesystem); on a cross-device
-// EXDEV it falls back to a byte copy followed by unlinking the source. Returns true on a
-// completed move. The caller only invokes this when dstPath does not yet exist, so an
-// existing current-convention save is never overwritten.
+// rename(2) is atomic within a filesystem; a cross-device EXDEV falls back to a byte copy
+// plus unlink. Callers only invoke this when dstPath does not yet exist, so an existing
+// current-convention save is never overwritten.
 static bool gdx_sram_move_file(const char* srcPath, const char* dstPath) {
     if (rename(srcPath, dstPath) == 0) {
         return true;
@@ -134,8 +127,6 @@ static bool gdx_sram_path(char* outPath, size_t outCap) {
     const char* fileName = "fzerox.sav";
     const char* savesDir = "saves";
 
-    // New convention: CWD-relative "saves/fzerox.sav" (mkdir "saves", 0755), matching
-    // disk_savefile.cpp's savesDirectory() exactly.
     if (strlen(savesDir) + 1 + strlen(fileName) >= outCap) {
         return false;
     }
@@ -146,8 +137,7 @@ static bool gdx_sram_path(char* outPath, size_t outCap) {
     strcat(outPath, "/");
     strcat(outPath, fileName);
 
-    // Legacy save from older POSIX builds: exe-relative <exedir>/saves/fzerox.sav, resolved
-    // via /proc/self/exe. Migrate it into the CWD-relative location on first resolution, but
+    // Older POSIX builds wrote exe-relative <exedir>/saves/fzerox.sav. Migrate that in, but
     // ONLY when no CWD-relative save exists yet, so an already-migrated (or freshly written)
     // save is never clobbered.
     if (access(outPath, F_OK) != 0) {
@@ -254,9 +244,9 @@ static void gdx_sram_flush(void) {
         return;
     }
 
-    // Atomic write-through: stage to fzerox.sav.tmp, flush, then MoveFileEx-replace
-    // the live file. A crash mid-write can no longer truncate/half-write the real
-    // save -- the previous fzerox.sav stays intact until the temp is complete.
+    // Stage to fzerox.sav.tmp and MoveFileEx-replace, so a crash mid-write cannot truncate
+    // or half-write the live save -- the previous fzerox.sav stays intact until the temp
+    // is complete.
     wchar_t tempPath[MAX_PATH * 2] = {};
     if (wcslen(path) + 4 >= sizeof(tempPath) / sizeof(tempPath[0])) {
         gdx_port_logf("[sram] WARNING: save path too long for temp file; save not persisted.\n");
@@ -294,9 +284,8 @@ static void gdx_sram_flush(void) {
         return;
     }
 
-    // Atomic write-through: stage to fzerox.sav.tmp, flush, then rename over the live file. A
-    // crash mid-write can no longer truncate the real save -- rename(2) is atomic within a
-    // filesystem, so the previous fzerox.sav stays intact until the temp is complete.
+    // Stage to fzerox.sav.tmp and rename over the live file: rename(2) is atomic within a
+    // filesystem, so a crash mid-write cannot truncate the real save.
     char tempPath[4096 + 8] = {};
     if (strlen(path) + 4 >= sizeof(tempPath)) {
         gdx_port_logf("[sram] WARNING: save path too long for temp file; save not persisted.\n");
@@ -331,7 +320,7 @@ static void gdx_sram_flush(void) {
 }
 
 void gdx_sram_read(unsigned int offset, void* dst, unsigned int size) {
-    gdx_sram_init(); // defensive: guarantee the image is loaded even if Sram_Init() wasn't called first
+    gdx_sram_init(); // load order is not guaranteed: Sram_Init() may not have run yet
     if (dst == nullptr) {
         return;
     }

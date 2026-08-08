@@ -2,11 +2,7 @@
  * fallback's RGBA5551 -> RGBA8888 conversion routine.
  *
  * Compiles gdx_vi_convert.c UNMODIFIED (no game objects, no libultraship, no
- * decomp headers) and drives it through its public entry point with known
- * pixel patterns. Mirrors the harness style of port/tests/dsp_tests.c.
- *
- * Build target: gdx_vi_fallback_tests (see port/CMakeLists.txt). Run it after
- * a normal build to validate the conversion.
+ * decomp headers). Build target: gdx_vi_fallback_tests (see port/CMakeLists.txt).
  */
 
 #include <stdint.h>
@@ -17,7 +13,8 @@
 
 static int g_failures = 0;
 
-/* SCALE_5_8 reference (matches interpreter.cpp / gdx_vi_convert.c). */
+/* Independent restatement of SCALE_5_8 (interpreter.cpp / gdx_vi_convert.c), so the expected
+ * values below carry their derivation rather than being magic numbers. */
 static uint8_t scale_5_8(uint32_t v5) {
     return (uint8_t)((v5 * 0xFFu) / 0x1Fu);
 }
@@ -59,7 +56,7 @@ int main(void) {
         check_pixel("composite", c, scale_5_8(5), scale_5_8(10), scale_5_8(20), 255);
     }
 
-    /* Multi-pixel buffer: verify stride/offsets across several pixels at once. */
+    /* Catches a wrong dst stride, which a one-pixel check cannot. */
     {
         const uint16_t src[4] = {
             0x0001,                 /* black opaque */
@@ -83,8 +80,7 @@ int main(void) {
         }
     }
 
-    /* Null-safety: must not crash. */
-    gdx_convert_rgba5551_to_rgba8888(NULL, NULL, 16);
+    gdx_convert_rgba5551_to_rgba8888(NULL, NULL, 16); /* must not crash */
     printf("[ ok ] null-argument safety\n");
 
     if (g_failures == 0) {

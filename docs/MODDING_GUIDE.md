@@ -154,7 +154,7 @@ Every texture has a key. Where it comes from decides whether you can replace it:
 Named keys are stable across runs and builds (that is what makes them safe to key on). Hash keys are
 just a fingerprint of the pixels so unnamed textures still get dumped for reference — but the game
 has no name to match them against at draw time, so a pack **cannot** override a `hash/...` texture
-today. The contact sheet marks these with a **"no key"** tag.
+today. You can spot them in `manifest.tsv` by the `hash/` prefix on the key.
 
 The build stamps a **key-scheme version** (currently `1`). If a future build renames symbols, the
 version bumps and the menu flags older packs as out of date. You normally never touch this.
@@ -270,8 +270,8 @@ there. Grep that file when something silently does not work.
 ## 10. Quick reference
 
 ```
-# Dump: Workshop tab -> "Dump textures while playing" -> play -> "Open dump folder"
-# Look:  open dump/index.html in a browser to find keys
+# Dump: Workshop tab -> Asset Dump -> run -> "Open dump folder"
+# Look:  dump/manifest.tsv lists every key with its native size and format
 # Edit:  repaint dump/<key>.png (keep size an integer multiple of the original)
 
 # Build a pack (metadata synthesized from flags):

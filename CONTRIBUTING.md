@@ -98,37 +98,26 @@ builds the whole set along with everything else.
 
 Executables land beside `G-Diffuser` — on the Visual Studio generator, `build/x64/port/Release/`.
 
-### 3. Run a scripted regression if you touched timing, pacing, or rendering
+### 3. Play it, if you touched timing, pacing or rendering
 
-The port can drive itself: set `GDX_INPUT_SCRIPT=<file>` and it replays scripted pad input at the
-game's own poll cadence — menus, race, quit — with no human at the controls. Two maintained scripts
-live in [`tools/autotest/`](tools/autotest/):
+There is no substitute for driving a race. Run with `GDX_PERF=1`, play, and read the `[interp-p2]`
+lines in `gdiffuser-run.log`.
 
-| Script | Route | What its telemetry proves |
-| --- | --- | --- |
-| `interp-perf.txt` | title → menus → machine select (15 s) → GP race (60 s) | frame pacing and the sim-rate contract under race load |
-| `cupsel-probe.txt` | title → straight into Cup Select, **cold** | asset-load stalls (the venue banks load once per process — a warm run proves nothing) |
-
-Run one against your test install (an install that has completed first-boot setup), then read the
-log:
-
-```sh
-GDX_PERF=1 GDX_INPUT_SCRIPT=tools/autotest/interp-perf.txt ./G-Diffuser
-grep "interp-p2" gdiffuser-run.log | tail
-```
-
-The one **hard contract**: in the `[interp-p2]` lines, `sim_hz` must hold ≈ 59.9 — that is the
-simulation clock, and a change that drags it below ~59 has broken game speed no matter what the
-frame counter says. `presents/s` may legitimately vary with load; `sim_hz` may not. The full field
+The one **hard contract** is `sim_hz`: it must hold ≈ 59.9. That is the simulation clock, and a
+change that drags it below ~59 has broken game speed no matter what the frame counter says —
+the symptom is the whole game running in slow motion, which is easy to miss on a frame-rate readout
+that still looks healthy. `presents/s` may legitimately vary with load; `sim_hz` may not. The field
 glossary is in [`docs/DIAGNOSTICS.md`](docs/DIAGNOSTICS.md).
 
-The script format (`WAIT` / `PRESS` / `WAITMODE` / `SHOT` / `QUIT` …) is documented at the top of
-`port/gdx_input_script.c`. If your change needs a route these scripts don't drive, write a new
-script and include it in the PR — it becomes the regression test for the next person.
+Two facilities help when a bug is visual rather than numeric: `GDX_CAPTURE_WINDOW=<start>:<count>`
+dumps real presented frames to BMP for pixel-diffing, and `gdxwin-modes.txt` records which game mode
+was live at which present index, so you can aim the window at the screen you care about.
 
-Two facilities worth knowing while you're here: `GDX_CAPTURE_WINDOW=<start>:<count>` dumps real
-presented frames to BMP for pixel-diffing, and `gdxwin-modes.txt` records which game mode was live
-at which present index so you can aim the window.
+The port can also replay recorded pad input (`GDX_INPUT_SCRIPT=<file>`; the format is documented at
+the top of `port/gdx_input_script.c`). It is useful for reproducing a fiddly sequence exactly, but
+treat its results with suspicion unless the script proves it reached the screen it claims to test —
+`LOG` lines fire whether or not the preceding `WAITMODE` succeeded, so a run that never left the
+menus will still print the marker saying it raced.
 
 ### 4. If you touched an asset recipe under `decomp/assets/yaml/`
 

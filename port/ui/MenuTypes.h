@@ -2,26 +2,11 @@
 //
 // PROVENANCE
 // ----------
-// Ported from HarbourMasters/Lighthouse, file src/port/UI/MenuTypes.h on branch `develop`.
-// Lighthouse is published under CC0 1.0 Universal (Creative Commons Public Domain Dedication) —
-// copy, modify and redistribute freely, no attribution required; this notice is courtesy, not
-// obligation. Same upstream libultraship as this fork; the registry is pure port-side data and
-// touches nothing below the public ImGui + CVar API. See port/ui/UIWidgets.hpp for the widget
-// library this file is the registry layer for.
-//
-// WHAT THIS REPLACES
-// ------------------
-// port/gdx_menu.cpp used to describe its menu twice, in two places that could silently disagree:
-//   1. a hand-rolled `enum class Page` with ~30 switch cases (PageTitle / HeaderForPage /
-//      FirstPageForHeader / DrawCurrentPage), plus one Draw<Name>Menu() function per page whose
-//      body was a straight-line sequence of widget calls; and
-//   2. a hand-maintained `static const SearchPage pages[]` table of PAGE-level keywords, typed by
-//      hand, which is what the search box matched against. Search could therefore only ever say
-//      "the Graphics page exists" — never "the control you are looking for is called Texture
-//      filter and it lives in Settings -> Graphics".
-// Describing every control as DATA instead makes both fall out for free: the sidebar is the
-// registry's key order, the page body is the registry's widget list, and search walks the same
-// list the drawer does, so a control cannot be visible-but-unsearchable (or vice versa) ever again.
+// Ported from HarbourMasters/Lighthouse, src/port/UI/MenuTypes.h on branch `develop`, published
+// under CC0 1.0 Universal (Creative Commons Public Domain Dedication) — copy, modify and
+// redistribute freely, no attribution required. Same upstream libultraship as this fork; the
+// registry is pure port-side data and touches nothing below the public ImGui + CVar API. See
+// port/ui/UIWidgets.hpp for the widget library this file is the registry layer for.
 //
 // THE MODEL
 // ---------
@@ -29,59 +14,31 @@
 //     └ SidebarEntry (a sidebar page: "Graphics"), columnCount 1..3
 //         └ WidgetInfo[column] — one entry per individual control
 //
+// The menu's contents are DATA so that search can walk the same list the drawer does: a control
+// cannot be visible-but-unsearchable, and one entry here puts it on its page and in search at once.
+//
 // ADAPTATIONS vs Lighthouse
 // -------------------------
 //  1. Namespaced. Upstream declares WidgetInfo/SidebarEntry/DisableOption/... at global scope;
-//     everything here lives in namespace GdxUI so the registry adds no unqualified global symbols
-//     to a port that already carries plenty (same reasoning as UIWidgets ADAPTATION #10).
-//  2. `Options()` is a set of type-safe overloads instead of upstream's
-//     `Options(OptionsVariant)` + `switch (type)` + `std::get<T>`. Upstream's version compiles for
-//     any Options struct and only discovers a type/widget mismatch at RUNTIME, as a
-//     std::bad_variant_access thrown out of the draw loop (Menu.cpp:547 catches it and asserts).
-//     Here a mismatched pair is a compile error, and MenuDrawItem needs no try/catch at all.
+//     everything here lives in namespace GdxUI (same reasoning as UIWidgets ADAPTATION #9).
+//  2. `Options()` is a set of type-safe overloads instead of upstream's `Options(OptionsVariant)` +
+//     `switch (type)` + `std::get<T>`, which compiles for any Options struct and only discovers a
+//     type/widget mismatch at RUNTIME, as a std::bad_variant_access thrown out of the draw loop
+//     (Menu.cpp:547 catches it and asserts). Here a mismatch is a compile error, and MenuDrawItem
+//     needs no try/catch.
 //  3. `comboItems` (ordered std::vector<const char*>) added. Upstream drives every combobox from
 //     UIWidgets::ComboboxOptions::comboMap, a std::unordered_map whose iteration order is
-//     unspecified — see UIWidgets.hpp's gap list: "CVarCombobox's std::unordered_map overload
-//     renders its rows in unspecified order, so it is unusable for any dropdown whose ordering is
-//     meaningful". Every dropdown in this menu is index-ordered (MSAA, texture filter, z-fighting,
+//     unspecified. Every dropdown in this menu is index-ordered (MSAA, texture filter, z-fighting,
 //     button outlines, audio backend), so the registry carries an ordered list and MenuDrawItem
 //     uses UIWidgets' vector overload.
-//  4. `disableWhen` / `hideWhen` added: declarative lists of DisableOption evaluated by
-//     MenuDrawItem against the once-per-frame disabled map. Upstream can only reach the disabled
-//     map from a hand-written `preFunc` lambda, so its every conditional control carries a lambda
-//     whose body is the same three lines. preFunc survives here for the cases that genuinely need
-//     code (updating a valuePointer, computing a note), but the common "grey this out while X"
-//     case is now one line of data.
-//  5. `note` added: the greyed suffix drawn on the same line after a control ("(restart)",
-//     "(applies on restart)", "(disabled in-race)"). gdx_menu.cpp drew these with an explicit
-//     SameLine + TextDisabled at the call site because UIWidgets has no slot for one; making it a
-//     field is what lets those call sites become data without losing the marker.
-//  6. `searchTerms` added, and SidebarEntry gained one too. This is where the old page-keyword
-//     table (gdx_menu.cpp's `static const SearchPage pages[]`) went: its terms are preserved as
-//     per-page search terms so nothing that used to be findable stopped being findable, while
-//     widget-level matching is the new capability on top.
-//  7. `modifiedMarker` added — the "changed from the default" asterisk that gdx_menu.cpp's
-//     GdxCVarCheckboxMarked() helper drew after ~15 checkboxes. Folding it into the registry keeps
-//     the marker and its tooltip while removing the helper.
-//  8. WIDGET_WINDOW_BUTTON dropped. Upstream's implementation calls UIWidgets::WindowButton, which
-//     toggles a GuiWindow through its visibility CVar — and gdx_menu.cpp:156-161 documents at
-//     length that a bare CVarSetInteger is a NO-OP for an already-constructed window in this fork
-//     (the window reads mIsVisible each frame and only samples the CVar at construction). The
-//     port's tool pages therefore stay WIDGET_CUSTOM over the existing DrawToolWindowPage(), which
+//  4. WIDGET_WINDOW_BUTTON dropped. Upstream's implementation calls UIWidgets::WindowButton, which
+//     toggles a GuiWindow through its visibility CVar — and a bare CVarSetInteger is a NO-OP for an
+//     already-constructed window in this fork (it reads mIsVisible each frame and samples the CVar
+//     only at construction). The tool pages stay WIDGET_CUSTOM over DrawToolWindowPage(), which
 //     uses ToggleVisibility() and additionally embeds the window's DrawElement() inline.
-//  9. WIDGET_AUDIO_BACKEND / WIDGET_VIDEO_BACKEND dropped: both call
+//  5. WIDGET_AUDIO_BACKEND / WIDGET_VIDEO_BACKEND dropped: both call
 //     Ship::Context::GetRawInstance(), which does not exist in this fork (UIWidgets ADAPTATION #3),
 //     and this port picks its audio backend through its own gEnhancements.Audio.Backend CVar.
-// 10. WIDGET_CVAR_RADIO_BUTTON added (upstream has no radio type at all); the Audio engine
-//     selector is a two-button radio group over one CVar.
-// 11. `raceDisable` dropped: it keys off Lighthouse's CVAR_SETTING("DisableChanges") race-lockout,
-//     which has no equivalent here. The one in-race lockout this port has (ghost import) is
-//     expressed as a normal DisableOption instead.
-// 12. MenuInit / RegisterMenuInitFunc / RegisterMenuUpdateFunc dropped: they exist so Lighthouse's
-//     many separate menu TUs can self-register at static-init time. This port registers from one
-//     place (port/gdx_menu_registry.cpp), called explicitly from GdxMenu::InitElement(), which is
-//     both simpler and free of static-initialisation-order questions.
-// 13. The audioBackendsMap / windowBackendsMap tables dropped with the widget types that used them.
 //
 // LICENSE: CC0 1.0 Universal. Original: https://github.com/HarbourMasters/Lighthouse
 
@@ -100,21 +57,13 @@
 
 namespace GdxUI {
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// Named disable reasons.
+// Named disable reasons. A greyed control that does not say WHY is a support burden, so each entry
+// is a reason GdxMenu can name in a "This setting is disabled because:" tooltip that lists several
+// at once. Every evaluation runs exactly once per frame (see DisabledInfo). Some are used as HIDE
+// conditions (WidgetInfo::hideWhen); the enum is shared so those are amortised too.
 //
-// A greyed-out control that does not say WHY is a support burden: the user sees a setting they
-// cannot move and has no way to discover what unlocks it. Each entry below is a reason a control
-// can be unavailable; GdxMenu owns a map from reason -> DisabledInfo, whose `evaluation` lambda
-// runs EXACTLY ONCE PER FRAME (that is the entire point of the struct — see DisabledInfo below),
-// and MenuDrawItem turns the active reasons for a widget into a "This setting is disabled
-// because:" tooltip that can list several at once.
-//
-// Some of these are used as HIDE conditions rather than disable conditions (WidgetInfo::hideWhen);
-// the enum is shared so their evaluations are also amortised to once per frame.
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// Deliberately kept to reasons that are ACTUALLY WIRED to a control. An unused entry here is dead
-// scaffolding that reads like a feature: it makes the enum look richer than the menu behaves.
+// Keep this to reasons ACTUALLY WIRED to a control: an unused entry makes the enum look richer than
+// the menu behaves.
 enum DisableOption {
     // Renderer / window state
     DISABLE_FOR_NO_WINDOW, // the Ship::Window is not up yet (fullscreen has nothing to toggle)
@@ -143,13 +92,11 @@ using WidgetFunc = std::function<void(WidgetInfo&)>;
 using DisableEvalFunc = std::function<bool(DisabledInfo&)>;
 using DisableVec = std::vector<DisableOption>;
 
-// `DisabledInfo` holds a reason's human-readable text and the evaluation that decides whether it
-// currently applies. GdxMenu::DrawElement() runs every evaluation once at the top of the frame and
-// caches the answer in `active`; MenuDrawItem then only reads the cached bool. Without this, a
-// condition shared by several widgets (e.g. "is interpolation on?") would re-read its CVar once per
-// widget per frame — which is exactly the redundancy the struct exists to prevent.
-// `value` is scratch space for evaluations that want to carry a number alongside the bool (e.g. a
-// count) without a second lookup at draw time.
+// Holds a reason's user-visible text and the evaluation that decides whether it currently applies.
+// GdxMenu::DrawElement() runs every evaluation once at the top of the frame and caches the answer
+// in `active`; MenuDrawItem only reads the cache, so a condition shared by several widgets (e.g.
+// "is interpolation on?") costs one CVar read per frame rather than one per widget.
+// `value` is scratch for evaluations that want to carry a number alongside the bool.
 struct DisabledInfo {
     DisableEvalFunc evaluation;
     const char* reason = "";
@@ -157,16 +104,16 @@ struct DisabledInfo {
     int32_t value = 0;
 };
 
-// How a registered entry is drawn. The CVAR_* variants read and write a CVar themselves (via the
-// UIWidgets CVar* wrappers); the plain variants operate on WidgetInfo::valuePointer and leave the
-// write to the widget's `callback`, which is what every non-CVar control in this menu needs (live
-// window state, a derived boolean, a remembered-value pair, ...).
+// The CVAR_* variants read and write a CVar themselves (via the UIWidgets CVar* wrappers); the
+// plain variants operate on WidgetInfo::valuePointer and leave the write to the widget's
+// `callback`, which is what every non-CVar control here needs (live window state, a derived
+// boolean, a remembered-value pair, ...).
 enum WidgetType {
     WIDGET_SEPARATOR,      // ImGui::Separator()
     WIDGET_SEPARATOR_TEXT, // ImGui::SeparatorText(name)
     WIDGET_TEXT,           // ImGui::TextWrapped(name), optionally coloured via TextOptions::color
     WIDGET_TEXT_DISABLED,  // ImGui::TextDisabled(name) — the unwrapped greyed note used throughout
-    WIDGET_COMING_SOON,    // "<name>  -  Coming soon" (the old GdxComingSoon() helper, as data)
+    WIDGET_COMING_SOON,    // "<name>  -  Coming soon"
     WIDGET_CHECKBOX,
     WIDGET_CVAR_CHECKBOX,
     WIDGET_COMBOBOX,
@@ -190,24 +137,18 @@ enum SectionColumns {
 //
 //  name            the visible label, and the primary search key
 //  cVar            the CVar backing the value (CVAR_* widget types only)
-//  type            selects the draw path in GdxMenu::MenuDrawItem
-//  options         the matching UIWidgets Options struct; set through the Options() overloads
+//  options         the Options struct MATCHING `type`; set through the Options() overloads
 //  valuePointer    where a non-CVar widget reads/writes (preFunc typically refreshes it first)
 //  comboItems      ordered dropdown rows (see ADAPTATION #3)
 //  radioValue      the value a WIDGET_CVAR_RADIO_BUTTON writes when picked
 //  callback        run after the widget reports a change — this is where side effects live
 //  preFunc         run before drawing: refresh valuePointer, set isHidden, compute a note
 //  postFunc        run after drawing: react to state the widget itself does not report
-//  customFunction  the body of a WIDGET_CUSTOM
 //  disableWhen     reasons that grey this control out (evaluated once per frame, see DisabledInfo)
 //  hideWhen        reasons that remove it from the page entirely
 //  activeDisables  scratch: the subset of disableWhen that is active this frame, used for the tooltip
-//  note            greyed suffix drawn on the same line after the control
 //  searchTerms     extra keywords the search box matches, beyond name + tooltip
-//  modifiedMarker  draw the "changed from the stock default" asterisk after this control
 //  isHidden        set by preFunc (or hideWhen) to skip this control this frame
-//  sameLine        draw on the same line as the previous control
-//  hideInSearch    never appear in search results (for controls that only make sense in context)
 struct WidgetInfo {
     std::string name;
     const char* cVar = "";
@@ -230,9 +171,9 @@ struct WidgetInfo {
     bool sameLine = false;
     bool hideInSearch = false;
 
-    // Type-safe Options() overloads (ADAPTATION #2). Overload resolution picks the exact-match
-    // derived overload over the WidgetOptions base one, so `.Options(UIWidgets::CheckboxOptions{})`
-    // stores a CheckboxOptions and MenuDrawItem's static_pointer_cast is sound by construction.
+    // Type-safe Options() overloads (ADAPTATION #2): overload resolution picks the exact-match
+    // derived overload over the WidgetOptions base one, so MenuDrawItem's static_pointer_cast is
+    // sound by construction.
     WidgetInfo& Options(const UIWidgets::CheckboxOptions& options_) {
         options = std::make_shared<UIWidgets::CheckboxOptions>(options_);
         return *this;
@@ -339,11 +280,10 @@ struct WidgetInfo {
     }
 };
 
-// One sidebar page. `columnCount` (1..3) is how many columns the page is drawn in; `columnWidgets`
-// holds the controls grouped by column. The two do not have to agree: a page may declare 2 columns
-// but only fill the first, which is how a dense page is split without reordering its registration.
-// `searchTerms` carries the page-level keywords the old `SearchPage pages[]` table held, so a query
-// like "netplay" still surfaces the page even when no individual control mentions the word.
+// One sidebar page. `columnCount` (1..3) and `columnWidgets` do not have to agree: a page may
+// declare 2 columns but fill only the first, which is how a dense page is split without reordering
+// its registration. `searchTerms` are page-level keywords, so a query like "netplay" surfaces the
+// page even when no individual control mentions the word.
 struct SidebarEntry {
     uint32_t columnCount = 1;
     std::vector<std::vector<WidgetInfo>> columnWidgets = {};
@@ -351,9 +291,7 @@ struct SidebarEntry {
 };
 
 // One header tab. `sidebarCvar` persists which sidebar page was last viewed inside this tab, BY
-// NAME — upstream does the same, and it is strictly better than the integer index gdx_menu.cpp used
-// to store, which silently pointed at a different page whenever the page order changed (hence the
-// kMenuLayoutVersion reset that used to be needed).
+// NAME, so reordering pages cannot re-point a stored selection at a different one.
 struct MainMenuEntry {
     std::string label;
     const char* sidebarCvar = "";

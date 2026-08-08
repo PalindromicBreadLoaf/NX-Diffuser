@@ -1,42 +1,26 @@
-// G-Diffuser -- standalone unit-test harness for port/n64_audio_hle.c (the software RSP audio
-// DSP interpreter). Console exe, no game deps, no file/asset deps -- everything is known
-// synthetic vectors constructed in this file.
+// Standalone unit-test harness for port/n64_audio_hle.c, the software RSP audio DSP interpreter.
+// Console exe, no game or asset dependencies -- every vector is synthetic and built in this file.
 //
-// ---------------------------------------------------------------------------------------------
-// HARNESS DESIGN
-// ---------------------------------------------------------------------------------------------
-// n64_audio_hle.c is a single TU with a small, genuinely public surface:
+// The interpreter is driven ENTIRELY through its real public entry point,
 //     void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes);
-// which interprets a stream of 8-byte {w0,w1} "Acmd" command words (the same ABI documented in
-// decomp/include/PR/abi.h) against a process-static 4KB DMEM scratch buffer and process-static
-// ADPCM codebook/loop-history side buffers -- there is no dependency on any decomp header or any
-// other port TU to exercise it. Its external dependencies (besides libc) are two pointer resolvers,
-// normally defined in n64_gfx_bridge.cpp:
-//     void* gdx_resolve_registered_host_address(unsigned int addr);
-//     void* gdx_resolve_module_host_address(unsigned int addr);
-// which turn a truncated 32-bit "address" carried in an Acmd word back into a real host pointer.
-// It also uses CVarGetInteger for optional audio enhancements; the harness returns each requested
-// default so the black-box tests continue to exercise stock DSP behavior.
+// exactly as port/n64_sched.c does for a real M_AUDTASK, so n64_audio_hle.c compiles into this
+// target completely unmodified (see port/CMakeLists.txt's gdx_dsp_tests). Extracting the DSP
+// kernels instead is not mechanical -- RunAdpcm/RunResample/RunFilter are static and ENVMIXER's
+// math lives inline in the dispatch switch -- and #include-ing the .c behind a testing guard would
+// change what is under test. Every path (VADPCM decode, loop restore, nibble unpack, resample, FIR
+// filter, envelope mixer) is reachable through ordinary Acmd command lists, using LOADBUFF/
+// SAVEBUFF to move known byte patterns in and out of the interpreter's private DMEM.
 //
-// Rather than invasively extracting the DSP kernels (RunAdpcm/RunResample/RunFilter are static,
-// and ENVMIXER's math lives inline in the opcode-dispatch switch, not its own function -- pulling
-// all of that out cleanly is not mechanical) or `#include`-ing the .c with a testing guard, this
-// harness drives n64_audio_hle.c ENTIRELY through its real public entry point, exactly the way
-// port/n64_sched.c does for a real M_AUDTASK, and supplies trivial stand-in definitions of the
-// two resolver externs (a flat linear table of "fake 32-bit address -> host pointer" regions,
-// populated by RegisterRegion() below). This is the least invasive option: n64_audio_hle.c is
-// compiled completely unmodified into this test target (see port/CMakeLists.txt's gdx_dsp_tests),
-// and every DSP code path -- VADPCM decode/loop-restore/nibble-unpack, resample, FIR filter,
-// envelope mixer -- is reachable and independently driveable through ordinary Acmd command lists
-// (LOADADPCM/SETLOOP/SETBUFF/ADPCM, RESAMPLE, FILTER prime+apply, ENVSETUP1/2+ENVMIXER), using
-// LOADBUFF/SAVEBUFF to move known byte patterns into/out of the interpreter's private DMEM.
+// Its only non-libc dependencies are the two pointer resolvers normally defined in
+// n64_gfx_bridge.cpp, which turn a truncated 32-bit Acmd "address" back into a host pointer, plus
+// CVarGetInteger. The stand-ins below are a flat table of fake-address regions (RegisterRegion) and
+// a CVar stub returning each requested default, so the tests exercise stock DSP behavior.
 //
-// Command-word encoders below (MkXxx) mirror the exact w0/w1 bit layouts read by
-// n64_audio_hle.c's `switch (op)` -- verified field-by-field against that file, not guessed.
+// The MkXxx encoders mirror the exact w0/w1 bit layouts n64_audio_hle.c's `switch (op)` reads,
+// verified field by field against that file.
 //
-// Each Test*() function returns 1 (pass) or 0 (fail), printing every failing sub-check with
-// expected/actual before returning. main() aggregates and exits nonzero if any test failed.
-// ---------------------------------------------------------------------------------------------
+// Each Test*() prints every failing sub-check with expected/actual; main() aggregates and exits
+// nonzero if any test failed.
 
 #include <stdint.h>
 #include <stdio.h>
@@ -44,12 +28,12 @@
 #include <string.h>
 #include <math.h>
 
-// ---- Authoritative RSP resample coefficient table, transcribed from the same canonical source
-// n64_audio_hle.c now uses (mupen64plus-rsp-hle RESAMPLE_LUT / Project64 AziAudio
-// Mupen64plusHLE/audio.c `RESAMPLE_LUT[64*4]`, extracted from the aspMain ucode data section).
-// This test-local copy exists so the resample tests validate the interpreter against an
-// INDEPENDENT copy of the ground-truth constants (not by reading the interpreter's own array).
-// Layout: kResampleLut[phase][tap], phase = (fracQ16 >> 10) & 63, taps weight {x[-1],x[0],x[+1],x[+2]}.
+// Authoritative RSP resample coefficients, transcribed from the same canonical source
+// n64_audio_hle.c uses (mupen64plus-rsp-hle RESAMPLE_LUT / Project64 AziAudio
+// Mupen64plusHLE/audio.c, extracted from the aspMain ucode data section). This test-local copy
+// exists so the resample tests check the interpreter against an INDEPENDENT copy of the ground
+// truth rather than against its own array. Layout: kResampleLut[phase][tap], phase =
+// (fracQ16 >> 10) & 63, taps weight {x[-1], x[0], x[+1], x[+2]}.
 #define S16T(x) ((int16_t)(x))
 static const int16_t kResampleLut[64][4] = {
     { S16T(0x0c39), S16T(0x66ad), S16T(0x0d46), S16T(0xffdf) },
@@ -124,14 +108,12 @@ static int16_t RefClampS16(int32_t v) {
     return (int16_t)v;
 }
 
-// ---- Stand-in for the two resolvers n64_audio_hle.c expects from n64_gfx_bridge.cpp. A flat
-// table of {fake 32-bit base, host pointer, size} regions, registered on demand by the tests
-// below. Mirrors the real resolver's "range containing this address" logic (see
-// n64_gfx_bridge.cpp's gdx_resolve_registered_host_address), just without the pointer-registry
-// machinery that's irrelevant to a single-process unit test. ----
-/* Stand-in for the game-side race flag n64_audio_hle.c's capped diagnostic probes
-   ([rs-cap]/[pcm-cap]) gate on; "active" here just means the probes may log, which is
-   harmless bounded noise in a unit-test run. */
+// Stand-in for the two resolvers n64_audio_hle.c expects from n64_gfx_bridge.cpp: a flat table of
+// {fake 32-bit base, host pointer, size} regions registered on demand by the tests below. Mirrors
+// the real resolver's "range containing this address" logic without the pointer-registry
+// machinery, which is irrelevant to a single-process unit test.
+/* Stand-in for the game-side race flag n64_audio_hle.c's capped diagnostic probes gate on. Here
+   it only means the probes may log, which is harmless bounded noise in a test run. */
 int gGdxRaceActive = 1;
 
 #define GDX_TEST_MAX_REGIONS 256
@@ -181,12 +163,12 @@ int CVarGetInteger(const char* name, int defaultValue) {
     return defaultValue;
 }
 
-// ---- The interpreter's real entry point (no header declares this; n64_audio_hle.c defines it
-// with external linkage and no prototype file exists, so we declare it ourselves). ----
+// No header declares this: n64_audio_hle.c defines it with external linkage and there is no
+// prototype file, so the harness declares it itself.
 extern void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes);
 
-// ---- Acmd command word pair. Layout-identical to n64_audio_hle.c's private GdxAcmd (two
-// uint32_t), which is all gdx_audio_hle_run cares about -- it never sees our struct's name. ----
+// Layout-identical to n64_audio_hle.c's private GdxAcmd (two uint32_t), which is all
+// gdx_audio_hle_run cares about -- it never sees this struct's name.
 typedef struct {
     uint32_t w0;
     uint32_t w1;
@@ -196,8 +178,8 @@ static void RunCmds(const Cmd* cmds, int count) {
     gdx_audio_hle_run(cmds, (unsigned int)(count * (int)sizeof(Cmd)));
 }
 
-// ---- Opcode numbers, mirrored from n64_audio_hle.c's GDX_A_* enum (EXPANSION_KIT numbering --
-// only the ones this harness exercises). ----
+// Mirrored from n64_audio_hle.c's GDX_A_* enum (EXPANSION_KIT numbering); only the ones this
+// harness exercises.
 #define OP_ADPCM     1u
 #define OP_CLEARBUFF 2u
 #define OP_ADDMIXER  4u
@@ -213,8 +195,7 @@ static void RunCmds(const Cmd* cmds, int count) {
 #define OP_SAVEBUFF  21u
 #define OP_ENVSETUP2 22u
 
-// ---- Command encoders. Each mirrors the exact bitfield extraction n64_audio_hle.c performs for
-// that opcode in gdx_audio_hle_run's switch statement. ----
+// Each encoder mirrors the exact bitfield extraction gdx_audio_hle_run performs for that opcode.
 static Cmd MkClearBuff(uint32_t dmem, uint32_t size) {
     Cmd c; c.w0 = (OP_CLEARBUFF << 24) | (dmem & 0xFFFFFFu); c.w1 = size; return c;
 }
@@ -283,9 +264,9 @@ static Cmd MkEnvMixer(uint32_t dmemSrc, uint32_t sampleCount, uint32_t swapLR,
            (((wetLeft >> 4) & 0xFFu) << 8) | ((wetRight >> 4) & 0xFFu);
     return c;
 }
-/* count8 = groups of 8 samples (abi.h's aAddMixer packs `count>>4`, same >>4-of-byte-count
-   convention as A_MIXER's count8 field above); a4 is intentionally NOT exposed here -- task A6
-   confirmed the interpreter no longer reads it (gainless unity add, matching mupen's alist_add). */
+/* count8 = groups of 8 samples (abi.h's aAddMixer packs `count>>4`, the same convention as
+   A_MIXER's count8 above). a4 is deliberately not exposed: the interpreter does not read it --
+   gainless unity add, matching mupen's alist_add. */
 static Cmd MkAddMixer(uint32_t count8, uint32_t dmemIn, uint32_t dmemOut) {
     Cmd c;
     c.w0 = (OP_ADDMIXER << 24) | ((count8 & 0xFFu) << 16);
@@ -293,7 +274,6 @@ static Cmd MkAddMixer(uint32_t count8, uint32_t dmemIn, uint32_t dmemOut) {
     return c;
 }
 
-// ---- Tiny test-framework bits ----
 static int gSubChecks = 0;
 static int gSubFails = 0;
 
@@ -339,10 +319,8 @@ static void DmemSave(uint32_t dmemSrc, void* hostDst, uint32_t sizeBytes) {
 
 // =================================================================================================
 // TEST 1 -- VADPCM frame-boundary continuity: decoding 2 frames in ONE call must be byte-identical
-// to decoding them in TWO separate calls with the persistent state buffer carried across calls.
-// This is exactly the class of bug the last-frame state write-back guards against (see RunAdpcm's
-// preamble-contract comment) -- a wrong state snapshot corrupts every subsequent chunk's
-// prediction, heard as crackle at chunk boundaries.
+// to decoding them in TWO calls with the persistent state buffer carried across. A wrong state
+// snapshot corrupts every later chunk's prediction, heard as crackle at chunk boundaries.
 // =================================================================================================
 static void PackAdpcmFrame(uint8_t out9[9], uint8_t header, const int8_t nibbles[16]) {
     int i;
@@ -355,9 +333,9 @@ static void PackAdpcmFrame(uint8_t out9[9], uint8_t header, const int8_t nibbles
 }
 
 static int TestAdpcmFrameBoundaryContinuity(void) {
-    /* One predictor, order 2: book[0]=coef(tap0,col0) weights hist2, book[8]=coef(tap1,col0)
-       weights hist1 -- both deliberately NONZERO so a broken state carry actually perturbs the
-       decoded waveform (zero coefficients would make this test pass trivially). */
+    /* One predictor, order 2: book[0] weights hist2, book[8] weights hist1. Both deliberately
+       NONZERO, or a broken state carry would not perturb the waveform and this would pass
+       trivially. */
     int16_t book[16];
     int8_t nibblesF1[16], nibblesF2[16];
     uint8_t frame1[9], frame2[9];
@@ -434,10 +412,10 @@ static int TestAdpcmFrameBoundaryContinuity(void) {
 
 // =================================================================================================
 // TEST 2 -- A_SETLOOP restore: the first post-loop ADPCM frame must read its predictor history from
-// the TAIL of loopState (NOT loopState[0]/[1], and NOT the note's own persistent adpcmdecState).
-// Reference convention (mupen64plus-rsp-hle adpcm_compute_residuals, last_samples = last_frame+14):
-// loopState[15] = NEWEST sample = hist1 (tap1/book[8] weight); loopState[14] = older = hist2
-// (tap0/book[0] weight). The full 16-short loopState also becomes the output preamble.
+// the TAIL of loopState -- not loopState[0]/[1], and not the note's own adpcmdecState. Reference
+// convention (mupen64plus-rsp-hle adpcm_compute_residuals, last_samples = last_frame+14):
+// loopState[15] is the newest sample = hist1 (tap1/book[8]), loopState[14] the older = hist2
+// (tap0/book[0]). The full 16-short loopState also becomes the output preamble.
 // =================================================================================================
 static int TestAdpcmLoopRestore(void) {
     int16_t book[16];
@@ -492,10 +470,10 @@ static int TestAdpcmLoopRestore(void) {
 }
 
 // =================================================================================================
-// TEST 3 -- scale/predictor nibble unpacking from a known header byte. Zero codebook isolates the
-// nibble-unpack + scale-shift arithmetic from any predictor contribution (predicted == 0 always).
-// header 0x30 -> shift=3 (high nibble), predIdx=0 (low nibble); dataByte[0]=0x5A -> nibble0=5
-// (high nibble, positive), nibble1=-6 (low nibble 0xA, sign-extended). residual = nibble<<shift.
+// TEST 3 -- scale/predictor nibble unpacking from a known header byte. A zero codebook isolates the
+// nibble unpack and scale shift from any predictor contribution (predicted == 0 always). Header
+// 0x30 -> shift=3 (high nibble), predIdx=0 (low nibble); dataByte[0]=0x5A -> nibble0 = 5,
+// nibble1 = 0xA sign-extended to -6. residual = nibble << shift.
 // =================================================================================================
 static int TestAdpcmNibbleUnpack(void) {
     int16_t zeroBook[16];
@@ -537,16 +515,13 @@ static int TestAdpcmNibbleUnpack(void) {
 }
 
 // =================================================================================================
-// TEST 4 -- Resample unity pitch (0x8000): with the EXACT ROM table, unity pitch is NOT a bit-exact
-// passthrough -- phase 0 of the real RSP table is {0x0c39,0x66ad,0x0d46,0xffdf}, a mild
-// band-limiting low-pass, so every output is the phase-0 4-tap FIR of the input (this is authentic
-// N64 behavior -- integer-ratio playback is slightly "soft" on hardware, not lossless). Asserting
-// the exact phase-0 FIR simultaneously pins the four row-0 table constants the interpreter uses.
-// At unity the fractional accumulator stays 0 (phase 0) for every output, the source cursor
-// advances one whole sample per output, and (task A5) A_INIT ZERO-PRIMES the 4-sample pre-roll
-// history rather than duplicating in[0] backward in time -- matches mupen64plus-rsp-hle's
-// alist_resample_reset (alist.c#L611-619), which memsets the pre-roll window and pitch_accu to 0
-// on init instead of seeding from the incoming buffer.
+// TEST 4 -- Resample at unity pitch (0x8000). With the exact ROM table this is NOT a bit-exact
+// passthrough: phase 0 is {0x0c39,0x66ad,0x0d46,0xffdf}, a mild band-limiting low-pass, so every
+// output is the phase-0 4-tap FIR of the input -- authentic hardware behavior. Asserting that exact
+// FIR also pins the four row-0 constants the interpreter uses. At unity the accumulator stays on
+// phase 0 and the source cursor advances one whole sample per output, and A_INIT ZERO-PRIMES the
+// 4-sample pre-roll rather than duplicating in[0] backward in time (mupen's alist_resample_reset,
+// alist.c#L611-619, memsets the window and pitch_accu instead of seeding from the buffer).
 // =================================================================================================
 static int TestResampleUnityPitch(void) {
     int16_t in[24];
@@ -584,13 +559,11 @@ static int TestResampleUnityPitch(void) {
 }
 
 // =================================================================================================
-// TEST 4b -- Known ROM table entries (row 0). Feed a single impulse of value V at source index 3
-// through the resampler at unity pitch: because phase is always 0 at unity and the source cursor
-// steps one sample per output, the impulse lands on exactly one tap per output, so
-//   out[1] = (V*L[3])>>15, out[2] = (V*L[2])>>15, out[3] = (V*L[1])>>15, out[4] = (V*L[0])>>15,
-// isolating each of the four phase-0 coefficients {L[0..3]} = {0x0c39,0x66ad,0x0d46,0xffdf}.
-// A drop-in of the wrong table (e.g. the old windowed-sinc, whose phase-0 row was {0,0x8000,0,0})
-// would fail every one of these.
+// TEST 4b -- Known ROM table entries, row 0. A single impulse of value V at source index 3 at unity
+// pitch lands on exactly one tap per output (phase is always 0, the cursor steps one sample per
+// output), so out[1] = (V*L[3])>>15, out[2] = (V*L[2])>>15, out[3] = (V*L[1])>>15 and
+// out[4] = (V*L[0])>>15 isolate the four phase-0 coefficients individually. The wrong table --
+// e.g. the old windowed-sinc, whose phase-0 row was {0,0x8000,0,0} -- fails every one of these.
 // =================================================================================================
 static int TestResampleTableRow0(void) {
     int16_t in[24];
@@ -622,18 +595,16 @@ static int TestResampleTableRow0(void) {
 }
 
 // =================================================================================================
-// TEST 4c -- PITCH-CHANGE CONTINUITY (the engine-sound crackle suspect). A looping engine sound is
-// resampled with a DIFFERENT pitch every audio tick (the sequencer rewrites freqScale each frame ->
-// a new A_RESAMPLE `pitch` per chunk), always with A_CONTINUE (A_INIT fires only on note (re)start,
-// verified in decomp synthesis.c AudioSynth_ProcessNote: `flags=A_CONTINUE; if(needsInit) flags=
-// A_INIT`). A defect in carrying the fractional accumulator / lastSample across a pitch change would
-// click at every tick boundary.
+// TEST 4c -- pitch-change continuity. A looping engine sound is resampled with a DIFFERENT pitch
+// every audio tick (the sequencer rewrites freqScale each frame), always with A_CONTINUE -- A_INIT
+// fires only on note (re)start (synthesis.c AudioSynth_ProcessNote). A defect carrying the
+// fractional accumulator or history across a pitch change clicks at every tick boundary.
 //
-// This drives the interpreter chunk-by-chunk with a per-chunk pitch schedule (state carried, dmemIn
-// base shifted forward by the whole source samples consumed so far, exactly as the CPU note pacing
-// does) and compares it BIT-EXACT against an independent continuous single-pass reference that never
-// resets state. It also asserts the physical no-click criterion: the sample-to-sample jump AT each
-// chunk boundary is no larger than the largest jump WITHIN the chunks (the signal's own slope).
+// Drives the interpreter chunk by chunk on a pitch schedule (state carried, dmemIn shifted forward
+// by the whole source samples consumed so far, as the CPU note pacing does) and compares BIT-EXACT
+// against an independent continuous single-pass reference that never resets state. Also asserts
+// the physical no-click criterion: the jump AT each chunk boundary is no larger than the largest
+// jump WITHIN the chunks, i.e. the signal's own slope.
 // =================================================================================================
 static int TestResamplePitchChangeContinuity(void) {
     enum { NCHUNK = 5, NOUT = 24, TOTAL = NCHUNK * NOUT, NSRC = 200 };
@@ -733,29 +704,25 @@ static int TestResamplePitchChangeContinuity(void) {
 }
 
 // =================================================================================================
-// TEST 4d -- ADPCM LOOP-WRAP lookahead + resample continuity (the sustained-engine-drone suspect).
-// A short looping ADPCM sample (e.g. an engine drone) wraps back to its loop point many times per
-// second. At each wrap synthesis.c emits, WITHIN one audio tick: decode the pre-loop-end frames
-// (A_CONTINUE) into DMEM, then aSetLoop + decode the loop-START frames (A_LOOP) into DMEM
-// CONTIGUOUSLY right after them, then ONE FinalResample over the whole contiguous buffer. The
-// resampler needs 2 samples of lookahead (taps x[+1],x[+2]); the concern (engram
-// architecture/a2-dsp-final suspect 2) is whether the lookahead samples straddling the wrap read
-// the real post-wrap (loop-start) PCM rather than stale/zero data -- if they read zero/stale, every
-// wrap clicks.
+// TEST 4d -- ADPCM loop-wrap lookahead + resample continuity. A short looping sample wraps back to
+// its loop point many times a second. At each wrap synthesis.c emits, WITHIN one audio tick: decode
+// the pre-loop-end frames (A_CONTINUE), then aSetLoop and decode the loop-START frames (A_LOOP)
+// CONTIGUOUSLY after them, then ONE FinalResample over the whole buffer. The resampler needs 2
+// samples of lookahead (taps x[+1], x[+2]), so the question is whether the taps straddling the wrap
+// read the real post-wrap PCM rather than stale or zero data -- if they read zero, every wrap clicks.
 //
-// This test builds an INTEGRATOR codebook (predicted == hist1, i.e. book col0 = {0, Q11-unity}), so
-// decoded[n] = decoded[n-1] + residual[n] -- a first-order integrator whose loop-wrap continuity
-// depends on the A_LOOP predictor-history restore being correct (a wrong restored hist1 offsets the
-// entire post-wrap segment == a DC step == a click). The residual pattern is a full-period sine so
-// the integrated waveform is smooth AND perfectly periodic (loopStart == the natural continuation of
-// loopEnd), i.e. a genuinely seamless loop. It then:
-//   (a) decodes pre-wrap (A_INIT) + post-wrap loop-start frame (A_LOOP) into CONTIGUOUS DMEM through
-//       the real interpreter and asserts the 48 decoded samples are bit-exact vs an independent
-//       integrator+restore reference (proves the post-wrap samples are present and contiguous), and
-//   (b) resamples a window that STRADDLES the wrap junction at a non-unity pitch and asserts it is
-//       bit-exact vs a continuous single-pass reference over that same concatenated PCM (proves the
-//       resampler's lookahead reads the real post-wrap samples, not stale/zero), plus a physical
-//       no-click assertion (the junction jump does not exceed the signal's own max interior slope).
+// The codebook is an INTEGRATOR (predicted == hist1, book col0 = {0, Q11-unity}), so
+// decoded[n] = decoded[n-1] + residual[n] and loop-wrap continuity depends entirely on A_LOOP
+// restoring the right history: a wrong restored hist1 offsets the whole post-wrap segment by a DC
+// step, i.e. a click. The residuals are a full-period sine, so the integrated waveform is smooth AND
+// perfectly periodic (loopStart is the natural continuation of loopEnd) -- a genuinely seamless
+// loop. It then:
+//   (a) decodes pre-wrap (A_INIT) plus the post-wrap loop-start frame (A_LOOP) into CONTIGUOUS DMEM
+//       and asserts all 48 samples are bit-exact against an independent integrator+restore
+//       reference, proving the post-wrap samples are present and contiguous; and
+//   (b) resamples a window STRADDLING the junction at non-unity pitch, asserting it is bit-exact
+//       against a continuous single-pass reference over the same concatenated PCM (proving the
+//       lookahead reads real post-wrap samples) plus a physical no-click check.
 // =================================================================================================
 static int TestAdpcmLoopWrapResampleContinuity(void) {
     enum { LBODY = 32, LWRAP = 16, NCAT = LBODY + LWRAP };
@@ -961,17 +928,15 @@ static int TestAdpcmLoopWrapResampleContinuity(void) {
 }
 
 // =================================================================================================
-// TEST 5 -- half/double pitch stepping: fracQ16 accumulates `pitch<<1` per output sample and wraps
-// at 0x10000, advancing the source cursor by (N*(pitch<<1))>>16 whole samples with a remainder of
+// TEST 5 -- half and near-double pitch stepping. fracQ16 accumulates `pitch<<1` per output and
+// wraps at 0x10000, advancing the source cursor by (N*(pitch<<1))>>16 whole samples with remainder
 // (N*(pitch<<1))&0xFFFF -- a closed-form invariant of the accumulator, independent of the FIR taps.
-// Verifies both state[4] (fracQ16) and state[3] (the most recent persisted history sample, i.e.
-// tap -1 for the NEXT call, which must equal input[delta-1]) -- state layout per task A5's
-// 4-history-sample rewrite (state[0..3] = persisted 4-sample window, state[4] = fracQ16).
+// Checks state[4] (fracQ16) and state[3] (the most recent persisted history sample, i.e. tap -1 for
+// the next call, which must equal input[delta-1]).
 //
-// `nOut` here is the NOMINAL requested output count; task A5 rounds the actual processed count up
-// to a whole 8-sample (16-byte) granule (mupen64plus-rsp-hle alist.c#L621-639's
-// `(count+0xf)&~0xf`), so this helper computes the closed-form invariant against that ROUNDED
-// count, matching what RunResample actually does internally.
+// `nOut` is the NOMINAL requested count; RunResample rounds the processed count up to a whole
+// 8-sample (16-byte) granule (mupen alist.c#L621-639's `(count+0xf)&~0xf`), so the invariant is
+// computed against that rounded count.
 // =================================================================================================
 static int RunResamplePitchCase(const char* label, uint32_t pitch, uint32_t nOut,
                                  const int16_t* in, uint32_t inCount) {
@@ -1014,11 +979,9 @@ static int TestResamplePitchStepping(void) {
        delta = (8*0x8000)>>16 = 4, frac = 0. */
     RunResamplePitchCase("half-pitch(0x4000) N=4(rounds to 8)", 0x4000u, 4, in, 40);
 
-    /* "Double" pitch: pitch is packed into a 16-bit Acmd field (`pitch = w0 & 0xFFFFu`), so the
-       conceptual 2.0x value 0x10000 does not fit -- it is not a DSP bug that it truncates to 0
-       (verified: an earlier version of this test used 0x10000 and got a silent truncation to
-       pitch==0, which is the ABI's real ceiling, not an interpreter defect). The maximum
-       representable pitch is 0xFFFF (~1.99997x). Requested N=4 -> rounds up to actualCount=8:
+    /* Pitch is packed into a 16-bit Acmd field, so the conceptual 2.0x value 0x10000 does not fit
+       and silently truncates to 0 -- the ABI's real ceiling, not an interpreter defect. The
+       maximum representable pitch is 0xFFFF (~1.99997x). Requested N=4 rounds up to 8:
        delta = (8*(0xFFFF<<1))>>16 = (8*0x1FFFE)>>16 = 0xFFFF0>>16 = 15, frac = 0xFFFF0 & 0xFFFF
        = 0xFFF0. */
     RunResamplePitchCase("near-double-pitch(0xFFFF) N=4(rounds to 8)", 0xFFFFu, 4, in, 40);
@@ -1027,12 +990,11 @@ static int TestResamplePitchStepping(void) {
 }
 
 // =================================================================================================
-// TEST 6 -- Resampler state continuity: one continuous call producing N samples must be
-// bit-identical to two chunked calls (with the persistent state buffer carried across calls, and
-// the second call's dmemIn shifted forward by the whole-sample delta consumed by the first chunk).
-// Both chunk sizes below are already whole 8-sample (16-byte) granules, so task A5's
-// round-up-to-8-samples count rounding is a no-op for every call here -- this test isolates STATE
-// continuity specifically; rounding itself gets its own dedicated case (see the A5 test below).
+// TEST 6 -- resampler state continuity: one continuous call producing N samples must be
+// bit-identical to two chunked calls, with the state buffer carried across and the second call's
+// dmemIn shifted forward by the whole-sample delta the first consumed. Both chunk sizes here are
+// already whole 8-sample granules, so count rounding is a no-op -- this isolates STATE continuity;
+// rounding has its own case below.
 // =================================================================================================
 static int TestResampleContinuity(void) {
     int16_t in[48];
@@ -1088,14 +1050,12 @@ static int TestResampleContinuity(void) {
 }
 
 // =================================================================================================
-// TEST 7 (task A3, corrected 2026-07-10) -- A_FILTER cross-block-windowed impulse response, WITHIN
-// one call. RunFilter applies the 8 primed Q15 coefficients DIRECTLY as a fixed 8-tap FIR (NO
-// per-call LUT averaging -- the earlier two-LUT-average model was a port-side fabrication that
-// halved the identity row; see RunFilter's header). The FIR slides across a 16-sample window =
-// [previous block's tail (8) ++ current block (8)]. This test drives ONE call covering TWO 8-sample
-// blocks and asserts the output against an INDEPENDENT reimplementation of that same direct-FIR
-// shape (not a second call into the interpreter) -- an impulse at the very start of block 0
-// straddles into block 1's window via the tail carry, exercising the cross-block state carry.
+// TEST 7 -- A_FILTER cross-block-windowed impulse response within ONE call. RunFilter applies the 8
+// primed Q15 coefficients DIRECTLY as a fixed 8-tap FIR, with no per-call LUT averaging (see
+// RunFilter's header for why averaging halves the identity row). The FIR slides across a 16-sample
+// window = [previous block's 8-sample tail ++ current block]. One call covers TWO blocks, checked
+// against an INDEPENDENT reimplementation of that shape rather than a second call into the
+// interpreter; the impulse at the very start of block 0 straddles into block 1 via the tail carry.
 // =================================================================================================
 static int TestFilterImpulseResponse(void) {
     int16_t coef[8] = { 4000, -2000, 2000, 1000, -1000, 500, -500, 200 };
@@ -1148,13 +1108,12 @@ static int TestFilterImpulseResponse(void) {
 }
 
 // =================================================================================================
-// TEST 8 (task A3, corrected 2026-07-10) -- A_FILTER cross-CALL continuity: the INPUT tail persists
-// across SEPARATE gdx_audio_hle_run calls, each with its OWN prime+apply pair -- exactly how
-// AudioSynth_FilterReverb/LoadFilterSize+LoadFilterBuffer actually drive this opcode (a fresh
-// prime+apply pair every audio tick). The coefficients are applied DIRECTLY (no averaging), so
-// re-priming the SAME table on the second call yields the SAME FIR -- what differs between the two
-// calls is purely the carried tail: call1's tail is zero (A_INIT), call2's tail is call1's real
-// input block (blockA), NOT zero. This pins the cross-call state carry across a block boundary.
+// TEST 8 -- A_FILTER cross-CALL continuity: the INPUT tail persists across SEPARATE
+// gdx_audio_hle_run calls, each with its own prime+apply pair -- exactly how
+// AudioSynth_FilterReverb drives this opcode, a fresh pair every audio tick. Coefficients are
+// applied directly, so re-priming the same table yields the same FIR and the ONLY difference
+// between the two calls is the carried tail: zero for call 1 (A_INIT), call 1's real input block
+// for call 2.
 // =================================================================================================
 static int TestFilterContinuity(void) {
     int16_t coef[8] = { 4000, -2000, 2000, 1000, -1000, 500, -500, 200 };
@@ -1218,24 +1177,20 @@ static int TestFilterContinuity(void) {
 }
 
 // =================================================================================================
-// TEST 8b (2026-07-10, protocol-level A_FILTER blocker) -- drives the FULL two-step A_FILTER
-// (prime f==2 + apply) through gdx_audio_hle_run with REAL host-order coefficient rows lifted from
-// decomp/src/audio/disk/lib/filter_data.c's gLowPassFilterData (the exact table AudioHeap_LoadFilter
-// copies into reverb->filterLeft/Right, host-order, no swap), exactly as AudioSynth_FilterReverb
-// emits the pair. Three properties, none referencing the interpreter's internal math -- they are the
-// externally-observable contract the reverb low-pass must satisfy:
-//   (1) IDENTITY passthrough: gLowPassFilterData row 0 = {0,0,0,32767,0,0,0,0} is the "cutoff 0 ==
-//       no filtering" row AudioHeap_LoadFilter loads; a loud DC buffer must come out at UNITY once
-//       the FIR window fills. This is the assertion the removed two-LUT averaging FAILED (it halved
-//       the identity row to -6 dB) -- the concrete reason enabling the op could only ATTENUATE,
-//       never faithfully pass, the wet reverb.
-//   (2) LOW-PASS + NON-ZERO: a real cutoff row (row 5) passes DC near its coefficient-sum gain
-//       (loud, non-zero output) but crushes a Nyquist (alternating +/-A) buffer far below that --
-//       i.e. it actually low-passes rather than zeroing or passing everything.
-//   (3) STATE CARRY across TWO apply calls: a second apply (A_CONTINUE) on a SILENT block still
-//       produces large output bled from the previous call's loud tail; a broken carry would zero it.
-// Run against the OLD averaging code, (1) and (2)'s DC-gain check fail (outputs ~halved); against
-// the corrected direct-FIR code they pass -- this is the test that would have caught the defect.
+// TEST 8b -- protocol-level A_FILTER: the full two-step prime+apply driven through
+// gdx_audio_hle_run with REAL host-order coefficient rows lifted from
+// decomp/src/audio/disk/lib/filter_data.c's gLowPassFilterData (the exact table
+// AudioHeap_LoadFilter copies into reverb->filterLeft/Right, host-order, no swap), exactly as
+// AudioSynth_FilterReverb emits the pair. Three externally observable properties, none referencing
+// the interpreter's internal math:
+//   (1) IDENTITY passthrough. Row 0 = {0,0,0,32767,0,0,0,0} is the "cutoff 0 == no filtering" row
+//       AudioHeap_LoadFilter loads; a loud DC buffer must come out at UNITY once the window fills.
+//       Two-LUT averaging halves that row to -6 dB, so the op could only ever attenuate the wet
+//       reverb, never faithfully pass it.
+//   (2) LOW-PASS and NON-ZERO. A real cutoff row (row 5) passes DC near its coefficient-sum gain
+//       but crushes a Nyquist (alternating +/-A) buffer far below that.
+//   (3) STATE CARRY across two apply calls. A second apply (A_CONTINUE) on a SILENT block still
+//       produces large output bled from the previous call's loud tail; a broken carry zeroes it.
 // =================================================================================================
 static int TestFilterLowpassProtocol(void) {
     /* Host-order rows, transcribed from gLowPassFilterData (filter_data.c): row 0 (identity) and
@@ -1345,14 +1300,12 @@ static int TestFilterLowpassProtocol(void) {
 }
 
 // =================================================================================================
-// TEST 9 (updated for task A2) -- ENVMIXER constant envelope, nead cascade semantics: with ramps
-// set to 0 (no ramping across the one block), dl = (s*curVolLeft)>>16, dr = (s*curVolRight)>>16
-// (true Q16 gain, unchanged), and wet CASCADES the dry-scaled sample PER CHANNEL:
-// wetL = (dl*envReverbVol2)>>16, wetR = (dr*envReverbVol2)>>16, where envReverbVol2 = a<<8 (`a` is
-// ENVSETUP1's 8-bit reverb-volume field) -- per mupen64plus-rsp-hle's envmix_nead
-// (alist.c#L512-562) and this port's own ENVSETUP1 case comment deriving why a<<8 shares the same
-// Q16 >>16 scale as curVolLeft/curVolRight. This replaces the previous (wrong-family) model, which
-// computed a single mono `wet = (s*reverbVol2)>>8` off the RAW input shared by both channels.
+// TEST 9 -- ENVMIXER with a constant envelope, nead cascade semantics. With ramps at 0,
+// dl = (s*curVolLeft)>>16 and dr = (s*curVolRight)>>16 (true Q16 gain), and wet CASCADES the
+// dry-scaled sample PER CHANNEL: wetL = (dl*envReverbVol2)>>16, wetR = (dr*envReverbVol2)>>16,
+// with envReverbVol2 = a<<8 from ENVSETUP1's 8-bit reverb-volume field. Per mupen's envmix_nead
+// (alist.c#L512-562) and the ENVSETUP1 comment deriving why a<<8 shares the same Q16 >>16 scale as
+// the dry volumes -- not a single mono wet value taken off the raw input.
 // =================================================================================================
 static int TestEnvMixerConstantGain(void) {
     int16_t src[8];
@@ -1411,13 +1364,11 @@ static int TestEnvMixerConstantGain(void) {
 }
 
 // =================================================================================================
-// TEST 10 -- A_MIXER saturation (deep-pass task 1, "MIXER SATURATION"). Real aMix SATURATES its
-// accumulate on real hardware (the RSP stores through a saturating vector op, DMEM only ever holds
-// s16). Mixing two near-full-scale buffers at near-unity gain overflows the s16 range; a missing
-// ClampS16 on this path would silently WRAP (a huge positive sum truncated into a small/negative
-// s16), which is exactly the "harsh static on loud instruments" symptom reported by the user. This
-// pins the expected CONSOLE behavior (clamp to +32767), not the wrapped value, against the real
-// A_MIXER opcode path in n64_audio_hle.c (case GDX_A_MIXER).
+// TEST 10 -- A_MIXER saturation. Real aMix SATURATES on hardware: the RSP stores through a
+// saturating vector op and DMEM only ever holds s16. Mixing two near-full-scale buffers at
+// near-unity gain overflows that range, and a missing clamp would silently WRAP a huge positive sum
+// into a small or negative value -- the "harsh static on loud instruments" symptom. Pins the
+// console behavior (+32767), not the wrapped value, against the real A_MIXER path.
 // =================================================================================================
 static int TestMixerSaturation(void) {
     int16_t inBuf[8], outBuf[8], result[8], expected[8];
@@ -1456,14 +1407,12 @@ static int TestMixerSaturation(void) {
 }
 
 // =================================================================================================
-// TEST 11 -- ADPCM order-2 predictor INDEX selection (deep-pass task 2). Every prior ADPCM test used
-// predIdx==0 exclusively. A codebook with 2+ predictors picks coefficients via the frame header's low
-// nibble (BookCoef's `predictorIndex*16` offset in n64_audio_hle.c) -- an off-by-one/indexing bug
-// there would silently decode with the WRONG predictor's coefficients for any sample bank whose
-// encoder used predictor index != 0, heard as a specific-instrument static/mistuning pattern (exactly
-// the reported "some instruments" symptom). Uses A_CONTINUE (flags=0) to seed hist1/hist2 directly
-// via the state buffer (bypassing A_INIT's hist=0 reset) so a single, first-sample, zero-residual
-// prediction isolates ONLY the predictor-index selection.
+// TEST 11 -- ADPCM order-2 predictor INDEX selection. Every other ADPCM test uses predIdx==0. A
+// codebook with 2+ predictors picks coefficients via the frame header's low nibble (BookCoef's
+// `predictorIndex*16` offset), and an indexing bug there silently decodes with the WRONG
+// predictor's coefficients for any bank whose encoder used a nonzero index -- heard as
+// instrument-specific static or mistuning. A_CONTINUE seeds hist1/hist2 straight from the state
+// buffer, bypassing A_INIT's reset, so one zero-residual first sample isolates the index selection.
 // =================================================================================================
 static int TestAdpcmPredictorIndexSelection(void) {
     int16_t book[32]; /* 2 predictors x 16 shorts each (8*order(2) per predictor) */
@@ -1513,18 +1462,14 @@ static int TestAdpcmPredictorIndexSelection(void) {
 }
 
 // =================================================================================================
-// TEST 12 -- ADPCM order-2 predictor + max scale nibble: no 32-bit-overflow polarity flip (deep-pass
-// task 2). Real hardware computes the order-2 predictor multiply-accumulate in a wide (48-bit) RSP
-// vector accumulator, never a 32-bit int. With BOTH codebook coefficients AND both history samples
-// simultaneously at their most negative representable value (-32768 -- the loudest possible signal
-// on both feedback taps at once), a naive `int32_t` accumulation
-// (book[tap0]*hist2 + book[tap1]*hist1) reaches 2^31, one bit past INT32_MAX: signed-integer-overflow
-// UB in C, which under typical 2's-complement wraparound FLIPS THE SIGN of the prediction (a
-// correctly-saturating +32767 becomes a corrupted -32768) -- a full-scale polarity-inverted spike
-// instead of a clean clip. Combined with the maximum scale nibble (15, the top of the "12-15" range
-// called out for this audit) and a large residual on top, to exercise both edge cases from the same
-// frame. This is the failing-test-first evidence for the int64_t accumulator fix applied to RunAdpcm
-// in n64_audio_hle.c (predAcc).
+// TEST 12 -- ADPCM order-2 predictor at extreme coefficients and max scale: no 32-bit-overflow
+// polarity flip. Hardware computes the predictor multiply-accumulate in a wide (48-bit) RSP vector
+// accumulator, never a 32-bit int. With BOTH codebook coefficients AND both history samples at
+// -32768 -- the loudest possible signal on both feedback taps at once -- a naive int32 accumulation
+// reaches 2^31, one bit past INT32_MAX: overflow UB that under 2's-complement wraparound FLIPS THE
+// SIGN, turning a correctly-saturating +32767 into -32768, a full-scale polarity-inverted spike
+// instead of a clean clip. Combined with the maximum scale nibble (15) and a large residual, so
+// both edges come from the same frame.
 // =================================================================================================
 static int TestAdpcmExtremeCoefficientAndMaxScaleSaturates(void) {
     int16_t book[16];
@@ -1573,20 +1518,16 @@ static int TestAdpcmExtremeCoefficientAndMaxScaleSaturates(void) {
 }
 
 // =================================================================================================
-// TEST 13 -- Reverb feedback decay: impulse in, assert DECAY not growth (deep-pass task 3, the Mute
-// City tunnel "boom"). decomp/src/audio/disk/lib/synthesis.c's per-tick reverb decay is exactly one
-// aMix call: `aMix(DMEM_2CH_SIZE>>4, reverb->decayRatio + 0x8000, DMEM_WET_LEFT_CH, DMEM_WET_LEFT_CH)`
-// (in-place, same DMEM address for in and out) -- the comment there, "(+0x8000) here is -100%",
-// confirms the gain field is SIGNED Q15 (0x8000 == -1.0 in Q15), so this op computes
-// dst_new = dst + dst*gain/32768 = dst*(decayRatio/32768). For any decayRatio in the SDK's valid
-// range [0, 0x7FFF] (i.e. never reaching or exceeding unity), that ratio is ALWAYS < 1.0 -- this is a
-// closed-form proof the op is mix-gain-stable, not just a spot check. This test drives the REAL
-// A_MIXER opcode path in n64_audio_hle.c (not the closed form) through many repeated ticks and
-// asserts the decayed magnitude never exceeds the previous tick's (no growth -- rules out the op
-// itself as an unbounded-resonance source) and has meaningfully decayed by the end (rules out a
-// silent no-op). NOTE: this pins the HLE mixer op only -- the reverb's actual field values
-// (decayRatio, filter coefficients, volume/leak) are ROM/decomp-owned data this file cannot read;
-// see the accompanying findings for what a runtime trace of those fields would need to confirm.
+// TEST 13 -- reverb feedback decay: impulse in, assert DECAY not growth (the Mute City tunnel
+// "boom"). synthesis.c's per-tick reverb decay is exactly one in-place aMix,
+// `aMix(DMEM_2CH_SIZE>>4, reverb->decayRatio + 0x8000, DMEM_WET_LEFT_CH, DMEM_WET_LEFT_CH)`, and
+// the comment there -- "(+0x8000) here is -100%" -- confirms the gain field is SIGNED Q15, so the
+// op computes dst = dst + dst*gain/32768 = dst*(decayRatio/32768). For any decayRatio in the SDK's
+// valid range [0, 0x7FFF] that ratio is always < 1.0: a closed-form proof the op is mix-gain
+// stable, not just a spot check. This drives the REAL A_MIXER path over many ticks and asserts the
+// magnitude never exceeds the previous tick's (ruling the op out as an unbounded-resonance source)
+// and has meaningfully decayed by the end (ruling out a silent no-op). It pins the mixer op ONLY:
+// the reverb's actual field values are ROM/decomp-owned data this file cannot read.
 // =================================================================================================
 static int TestReverbDecayNoGrowth(void) {
     enum { NITER = 8 };
@@ -1634,14 +1575,11 @@ static int TestReverbDecayNoGrowth(void) {
 }
 
 // =================================================================================================
-// TEST 14 (task A1) -- A_SETLOOP persistence across SEPARATE gdx_audio_hle_run calls. Call 1 issues
-// SETLOOP + ADPCM(A_LOOP) together; call 2 is a DIFFERENT invocation carrying ONLY ADPCM(A_LOOP),
-// with no SETLOOP of its own. Before this fix, the pending loop pointer was function-local and
-// reset to NULL at the top of every call, so call 2 would have silently fallen back to its own
-// (here deliberately garbage-filled) per-note state instead of the persisted loop history --
-// exactly the bug this port's synthesis.c comment (proven false, see n64_audio_hle.c's sSetLoop
-// comment) claimed couldn't happen. The same book/loopState construction as
-// TestAdpcmLoopRestore isolates loopState[14] into sample0 with zero ambiguity.
+// TEST 14 -- A_SETLOOP persistence across SEPARATE gdx_audio_hle_run calls. Call 1 issues SETLOOP
+// and ADPCM(A_LOOP) together; call 2 is a different invocation carrying ONLY ADPCM(A_LOOP), with no
+// SETLOOP of its own. With a function-local pending loop pointer, call 2 silently falls back to its
+// own (here deliberately garbage-filled) per-note state instead of the persisted loop history. The
+// same book/loopState construction as TestAdpcmLoopRestore isolates loopState[14] into sample0.
 // =================================================================================================
 static int TestSetLoopPersistsAcrossCalls(void) {
     int16_t book[16];
@@ -1701,15 +1639,14 @@ static int TestSetLoopPersistsAcrossCalls(void) {
 }
 
 // =================================================================================================
-// TEST 15 (task A2) -- ENVMIXER per-block ramp stepping + nead wet cascade + full-volume regression.
-// Two 8-sample blocks with nonzero L/R/reverb ramps: expected dl/dr/wetL/wetR are computed
-// PROGRAMMATICALLY per block (mirroring the interpreter's own block-stepped accumulator, all
-// power-of-two gains chosen so every intermediate >>16 is exact -- no rounding ambiguity), proving
-// (a) the ramps actually step once per 8-sample block and (b) wetL/wetR == f(dryL)/f(dryR)
-// (cascaded, per channel), not a shared mono value off the raw input. A second, separate case
-// regresses the >>16-vs->>12 dry-scale bug (see n64_audio_hle.c's ENVMIXER comment): near-unity
-// volume (0xFFF0, this port's own "full volume" convention) with reverb OFF must NOT drive the
-// dry output into rail-to-rail clipping, and wetL/wetR must be exactly 0.
+// TEST 15 -- ENVMIXER per-block ramp stepping, nead wet cascade, and the full-volume regression.
+// Part (a): two 8-sample blocks with nonzero L/R/reverb ramps, expectations computed
+// PROGRAMMATICALLY per block (all gains powers of two, so every intermediate >>16 is exact and no
+// rounding ambiguity remains), proving the ramps step once per 8-sample block and that wetL/wetR
+// are functions of dryL/dryR per channel rather than a shared mono value off the raw input.
+// Part (b): near-unity volume (0xFFF0, this port's "full volume" convention) with reverb off must
+// NOT drive the dry output into rail-to-rail clipping, and wet must be exactly 0 -- the
+// >>16-vs->>12 regression (see n64_audio_hle.c's ENVMIXER comment).
 // =================================================================================================
 static int TestEnvMixerNeadRampAndRegression(void) {
     /* --- Part (a): per-block ramp stepping + cascaded wet. --- */
@@ -1829,15 +1766,13 @@ static int TestEnvMixerNeadRampAndRegression(void) {
 }
 
 // =================================================================================================
-// TEST 16 (task A5) -- A_RESAMPLE count-rounding continuity. RunResample now rounds its requested
-// byte count up to a whole 8-sample (16-byte) granule (mupen64plus-rsp-hle alist.c#L621-639's
-// `(count+0xf)&~0xf`). A caller that requests a NON-16-byte-aligned count (a "non-16-aligned
-// boundary" split point) still gets the FULL rounded-up output written, and the persisted state
-// reflects that TRUE (rounded) consumption -- not the caller's nominal request. This splits a
-// stream at a nominal count of 5 samples (rounds up to 8 internally) then continues for the
-// remaining aligned 8 samples, asserting bit-identical output vs a single combined 16-sample run --
-// proving the state carry (and the delta a caller must apply to its own dmemIn base) is driven by
-// the ACTUAL rounded count, not the nominal one.
+// TEST 16 -- A_RESAMPLE count rounding. RunResample rounds its requested byte count up to a whole
+// 8-sample (16-byte) granule (mupen alist.c#L621-639's `(count+0xf)&~0xf`), so a caller requesting
+// a NON-16-byte-aligned count still gets the FULL rounded output written, and the persisted state
+// reflects that TRUE consumption rather than the nominal request. Splits a stream at a nominal 5
+// samples (rounding to 8 internally) then continues for the remaining aligned 8, asserting
+// bit-identical output against a single combined 16-sample run -- so the state carry, and the
+// dmemIn delta a caller must apply, follow the ACTUAL rounded count.
 // =================================================================================================
 static int TestResampleCountRoundingContinuity(void) {
     int16_t in[48];
@@ -1894,11 +1829,10 @@ static int TestResampleCountRoundingContinuity(void) {
 }
 
 // =================================================================================================
-// TEST 17 (task A6) -- A_ADDMIXER audit: gainless clamped unity add, matching mupen64plus-rsp-hle's
-// alist_add (alist.c#L595-609) -- `dst = clamp_s16(dst + src)`, no multiply. (a) a moderate case
-// confirms the sum is the exact arithmetic sum (a leftover gain read from w0's low 16 bits, which
-// this op no longer touches, would scale the result and fail this check); (b) a near-full-scale
-// case confirms saturation rather than wraparound.
+// TEST 17 -- A_ADDMIXER: gainless clamped unity add, matching mupen's alist_add (alist.c#L595-609)
+// -- `dst = clamp_s16(dst + src)`, no multiply. (a) a moderate case confirms the exact arithmetic
+// sum, which a leftover gain read from w0's low 16 bits would scale; (b) a near-full-scale case
+// confirms saturation rather than wraparound.
 // =================================================================================================
 static int TestAddMixerGainlessUnityAdd(void) {
     int16_t inBuf[8], outBuf[8], result[8], expected[8];
@@ -1945,16 +1879,14 @@ static int TestAddMixerGainlessUnityAdd(void) {
 }
 
 // =================================================================================================
-// TEST 18 (task A4) -- ADPCM deferred clamping, loud-transient parity. Crafts a frame using an
-// INTEGRATOR codebook (predicted == hist1 exactly, book[8]=Q11-unity, book[0]=0) with 5
-// consecutive strongly-positive residuals that push the running RAW sum past +32767 MID-FRAME,
-// followed by a negative residual that pulls it back down -- a value the OLD always-clamp
-// integrator (which permanently loses the overshoot the instant it first clips) can never reach,
-// since it keeps re-basing off the clamped ceiling instead of the true magnitude. Both an
-// OLD-style ("always clamp, even intra-frame") and the NEW-style (deferred) reference model are
-// computed independently in this test; the interpreter's real output is asserted to match the NEW
-// model AND to genuinely diverge from the OLD model (proving the crafted frame actually exercises
-// the fix, not just vacuously passing).
+// TEST 18 -- ADPCM deferred clamping, loud-transient parity. An INTEGRATOR codebook (predicted ==
+// hist1 exactly, book[8]=Q11-unity, book[0]=0) with 5 consecutive strongly-positive residuals
+// pushes the running RAW sum past +32767 MID-FRAME, then a negative residual pulls it back down --
+// to a value an always-clamp integrator can never reach, since it permanently re-bases off the
+// clamped ceiling the instant it first clips. Both an OLD-style (always clamp) and the NEW
+// (deferred) reference model are computed independently here; the interpreter must match NEW and
+// genuinely DIVERGE from OLD, so the crafted frame is proven to exercise the behavior rather than
+// pass vacuously.
 // =================================================================================================
 static int TestAdpcmDeferredClampingLoudTransient(void) {
     int16_t book[16];
@@ -2032,14 +1964,14 @@ static int TestAdpcmDeferredClampingLoudTransient(void) {
 }
 
 // =================================================================================================
-// TEST 19 -- ADPCM last-frame preamble contract (the 2026-07-11 sustained-note-garbage root cause).
-// The real aspMain ADPCM op writes its 16-sample persistent state to the output buffer BEFORE the
-// freshly decoded frames (output = [16 prev-tail samples][count/2 fresh samples]) and persists the
-// last 16 output samples ending at the TRUE count boundary. synthesis.c's skipInitialSamples=16 /
-// skipBytes window arithmetic depends on this layout; without it every continuing tick reads ~one
-// frame ahead of its true position ([rs-cap]-measured waveform cliffs at every tick boundary).
-// Asserts: (a) A_INIT emits a zero preamble; (b) A_CONTINUE emits the previous call's final 16
-// samples as the preamble; (c) the persisted state equals the last 16 fresh output samples.
+// TEST 19 -- ADPCM last-frame preamble contract. The real aspMain ADPCM op writes its 16-sample
+// persistent state to the output buffer BEFORE the freshly decoded frames (output = [16 prev-tail
+// samples][count/2 fresh]) and persists the last 16 output samples ending at the TRUE count
+// boundary. synthesis.c's skipInitialSamples=16 / skipBytes window arithmetic depends on that
+// layout; without it every continuing tick reads about a frame ahead of its true position, with a
+// waveform cliff at every tick boundary. Asserts (a) A_INIT emits a zero preamble, (b) A_CONTINUE
+// emits the previous call's final 16 samples, (c) the persisted state equals the last 16 fresh
+// output samples.
 // =================================================================================================
 static int TestAdpcmLastFramePreambleContract(void) {
     int16_t book[16];
@@ -2103,7 +2035,6 @@ static int TestAdpcmLastFramePreambleContract(void) {
     return 1;
 }
 
-// ---- Runner ----
 typedef int (*TestFn)(void);
 typedef struct {
     const char* name;
@@ -2111,9 +2042,7 @@ typedef struct {
 } TestCase;
 
 int main(void) {
-    /* Tests validate the real implementations; the game-runtime bisection
-       gate on A_FILTER (GDX_HLE_FILTER, see n64_audio_hle.c RunFilter) must
-       not apply here. */
+    /* The game-runtime bisection gate on A_FILTER must not apply to the tests. */
 #ifdef _MSC_VER
     _putenv("GDX_HLE_FILTER=1");
 #else

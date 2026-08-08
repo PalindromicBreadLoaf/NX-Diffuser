@@ -1,11 +1,10 @@
-// G-Diffuser developer gates — table + cache. See gdx_dev_gates.h for the design rationale, the
-// four-bucket policy, the Bucket D three-source precedence and the "0 always means stock"
-// invariant this file has to preserve.
+// G-Diffuser developer gates — table + cache. See gdx_dev_gates.h for the four-bucket policy, the
+// Bucket D three-source precedence and the "0 always means stock" invariant this file preserves.
 //
-// This translation unit is deliberately dependency-free: standard C only, no libultraship, no
-// decomp headers, no logging. The CVar entry points arrive as function pointers via
-// gdx_dev_gates_boot_seed() / gdx_dev_gates_bind_cvars(), so the standalone unit-test executables
-// (gdx_dsp_tests, gdx_pcm_capture_tests) link it without pulling in the console-variable bridge.
+// Deliberately dependency-free: standard C only, no libultraship, no decomp headers, no logging.
+// The CVar entry points arrive as function pointers via gdx_dev_gates_boot_seed() /
+// gdx_dev_gates_bind_cvars(), so the standalone unit-test executables (gdx_dsp_tests,
+// gdx_pcm_capture_tests) link it without pulling in the console-variable bridge.
 
 #include "gdx_dev_gates.h"
 
@@ -25,9 +24,8 @@ void (*gdx_port_log_tap)(const char* message) = NULL;
 #define GDX_GATE_TRACE_DEFAULT 1
 #endif
 
-// Per-gate static description. Kept as one positional table (no designated initializers: the port's
-// C sources are built by MSVC in its default C mode as well as by GCC/Clang), with the field order
-// matching the struct declaration below.
+// One positional table — no designated initializers, because the port's C sources are built by
+// MSVC in its default C mode as well as by GCC/Clang.
 typedef struct GdxGateDesc {
     const char* env;   // legacy environment variable
     const char* cvar;  // console variable that is now the persisted source of truth
@@ -82,9 +80,9 @@ static const char* const kGroupNames[GDX_GATE_GROUP_COUNT] = {
 };
 
 static unsigned char sFromEnv[GDX_GATE_COUNT]; // env var was exported at launch
-// What that env var RESOLVED to at init, kept separately from gGdxDevGateCache because the cache
-// moves as the user toggles. Pinning must key off the immutable launch decision -- deriving it from
-// the live cache would make a gate re-pin itself the moment it was switched on.
+// What that env var RESOLVED to at init. Kept separately from gGdxDevGateCache, which moves as the
+// user toggles: pinning must key off the immutable launch decision, or a gate would re-pin itself
+// the moment it was switched on.
 static unsigned char sEnvValue[GDX_GATE_COUNT];
 static int sEnvInitDone;
 
@@ -102,15 +100,12 @@ static int GateCompiledIn(int id) {
 #endif
 }
 
-// Safe environment read, matching the port's existing idiom (port/rom_buffer.cpp,
-// port/gdx_input_script.c): getenv_s under MSVC (plain getenv is deprecated there and this build
-// does not blanket-define _CRT_SECURE_NO_WARNINGS for the port target), plain getenv elsewhere.
-// Returns 1 and fills `buf` when the variable exists; returns 0 when it does not.
+// getenv_s under MSVC (plain getenv is deprecated there and this build does not blanket-define
+// _CRT_SECURE_NO_WARNINGS for the port target), plain getenv elsewhere. Returns 1 and fills `buf`
+// when the variable exists.
 //
-// A gate value is decided from at most the first character, so a 32-byte buffer is ample. A value
-// longer than the buffer is reported as PRESENT with an empty string: presence is what all four
-// env kinds key off first, and getenv_s having truncated a 32+ character value into one of these
-// booleans is not a case worth carrying extra code for.
+// A gate value is decided from at most the first character, so 32 bytes is ample. A longer value
+// is reported as PRESENT with an empty string: presence is what all four env kinds key off first.
 static int ReadEnv(const char* name, char* buf, size_t bufSize) {
     buf[0] = '\0';
 #ifdef _WIN32
@@ -140,7 +135,7 @@ static int ReadEnv(const char* name, char* buf, size_t bufSize) {
 #endif
 }
 
-// Applies the recorded env semantics. Returns the normalized gate value (1 = deviates from stock).
+// Returns the normalized gate value (1 = deviates from stock).
 static int EvaluateEnv(const GdxGateDesc* g, int* outPresent) {
     char v[32];
     *outPresent = ReadEnv(g->env, v, sizeof(v));
@@ -213,10 +208,9 @@ void gdx_dev_gates_bind_cvars(int (*cvarGetInteger)(const char*, int),
             if (!GateCompiledIn(i) || kGates[i].bucket == GDX_GATE_BUCKET_BOOT) {
                 continue;
             }
-            // Bucket A/B only: an env var that was actually exported seeds the CVar once, so
-            // existing scripts and the docs that reference them keep working and the menu then
-            // shows the true live state. Gates with no env var are left alone — an absent CVar
-            // reads as its default and a persisted user toggle survives untouched.
+            // Only an env var that was actually exported seeds the CVar. Gates with no env var
+            // are left alone: an absent CVar reads as its default and a persisted user toggle
+            // survives untouched.
             if (sFromEnv[i]) {
                 sCVarSetInteger(kGates[i].cvar, gGdxDevGateCache[i]);
             }
@@ -299,14 +293,11 @@ int gdx_dev_gate_from_env(int id) {
     return ValidId(id) ? (int) sFromEnv[id] : 0;
 }
 
-/* A gate is pinned only when the environment actively holds it ON for this run.
- *
- * Presence alone used to be enough, which locked people out of their own settings: an exported
- * GDX_LOG=0 (or GDX_PERF=0, or a set-but-empty GDX_TRACE) reads as PRESENT but resolves to OFF, so
- * the menu drew a greyed-out, unticked checkbox -- "locked even though I never enabled it". An env
- * var that resolves to off is indistinguishable in effect from the default, so there is nothing to
- * protect and no reason to refuse the toggle. Only a gate the environment actually turned ON needs
- * to say "the launch decided this, the menu cannot move it". */
+/* A gate is pinned only when the environment actively holds it ON for this run — presence alone
+ * is not enough. An exported GDX_LOG=0 (or a set-but-empty GDX_TRACE) reads as PRESENT but
+ * resolves to OFF, which is indistinguishable in effect from the default, so there is nothing to
+ * protect; keying on presence drew a greyed-out unticked checkbox and locked users out of their
+ * own settings. */
 int gdx_dev_gate_is_env_pinned(int id) {
     return ValidId(id) && sFromEnv[id] && sEnvValue[id] && kGates[id].bucket == GDX_GATE_BUCKET_BOOT;
 }

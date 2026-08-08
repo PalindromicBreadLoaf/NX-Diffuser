@@ -4,13 +4,10 @@
 // G-Diffuser developer gates — the single accessor layer behind every GDX_* diagnostic /
 // behavior / logging switch that the Dev Tools menu surfaces.
 //
-// WHY THIS EXISTS
-// ---------------
-// The port grew ~60 ad-hoc `static const bool sX = getenv("GDX_...") != nullptr;` gates scattered
-// across the bridge, the scheduler, the audio HLE and the decomp. They worked, but they were
-// invisible: nothing in the game told you they existed, several of them CHANGE RENDERING rather
-// than merely logging, and a shipped build still paid a getenv for every one of them. This layer
-// replaces that pattern with one table, one cache, and one UI surface (F1 > Dev Tools).
+// Replaces the ~60 ad-hoc `static const bool sX = getenv("GDX_...") != nullptr;` gates the port
+// grew across the bridge, the scheduler, the audio HLE and the decomp. Those were invisible in
+// game, several of them CHANGE RENDERING rather than merely logging, and a shipped build still
+// paid a getenv for every one.
 //
 // THE FOUR BUCKETS
 //   A  Diagnostic logging       -> in this table, CVar-backed, always compiled.
@@ -20,64 +17,48 @@
 //                                  FZEROX_ROM) or is a non-boolean value ("start:count").
 //   D  Boot-seeded CVar         -> in this table. The logging gates. See below.
 //
-// BUCKET D — "GDX_LOG makes the log appear; how does that work as a CVar?"
-// ----------------------------------------------------------------------
-// A boot-time gate is still meaningful as a CVar, as long as all three sources are honored in a
-// fixed precedence and the runtime limitation is stated instead of hidden:
-//
+// BUCKET D — three sources, fixed precedence
+// ------------------------------------------
 //   1. The CVar is the PERSISTED PREFERENCE and the authority. gdx_dev_gates_boot_seed() reads it
-//      immediately after Ship::Context::InitConsoleVariables(), which is the first moment the
-//      config exists and is still ahead of essentially all boot logging (ROM load, scheduler init,
-//      asset load, bootproc). Tick the box this run and the NEXT launch boots with the file sink
-//      already armed and captures boot output.
+//      immediately after Ship::Context::InitConsoleVariables(), the first moment the config exists
+//      and still ahead of essentially all boot logging (ROM load, scheduler init, asset load,
+//      bootproc), so ticking the box this run captures boot output on the NEXT launch.
 //   2. The ENVIRONMENT VARIABLE, when set, OVERRIDES the CVar FOR THAT RUN ONLY and is never
-//      written back. Scripted / CI / headless runs (GDX_LOG=1, GDX_TRACE=1) keep behaving exactly
-//      as they do today, and they do not silently rewrite the user's persisted preference.
-//      Such a gate is reported as "env-pinned" and its checkbox is disabled for the session.
-//   3. Toggling the CVar at runtime changes emission FROM THAT POINT FORWARD. It cannot
-//      retroactively produce lines for events that already happened this session — the file sink
-//      simply opens on the next log call. The UI carries that caveat verbatim.
+//      written back, so scripted / CI / headless runs cannot silently rewrite the user's persisted
+//      preference. Such a gate is reported as "env-pinned" and its checkbox is disabled.
+//   3. Toggling the CVar at runtime changes emission FROM THAT POINT FORWARD; the file sink opens
+//      on the next log call and cannot retroactively produce earlier lines. The UI says so.
 //
-// Buckets A and B use the simpler rule the port already wanted: an env var present at launch SEEDS
-// the CVar once at startup, and the CVar is the live source of truth from then on.
+// Buckets A and B use the simpler rule: an env var present at launch SEEDS the CVar once at
+// startup, and the CVar is the live source of truth from then on.
 //
 // THE LOAD-BEARING INVARIANT: **0 ALWAYS MEANS STOCK BEHAVIOR.**
-// Some original env vars are opt-in switches (a value of 1 turns something ON) and some are
-// default-ON kill switches (GDX_HLE_FILTER=0 turns something OFF). Every gate here is normalized so
-// 0 reproduces shipping behavior and 1 is the deviation — see GdxGateEnvKind. That is what makes
-// the Release compile-out provably safe: with GDX_DEV_TOOLS undefined every Bucket B gate is
-// hard-wired to 0 with no getenv and no CVar read, and the game behaves exactly as it does today
-// with none of the vars set. (The one documented exception is GDX_TRACE, whose stock value is 1 in
-// a Debug build; it is Bucket D and is never compiled out, so the invariant still holds where it
-// has to.)
+// Some original env vars are opt-in switches (1 turns something ON) and some are default-ON kill
+// switches (GDX_HLE_FILTER=0 turns something OFF). Every gate here is normalized so 0 reproduces
+// shipping behavior and 1 is the deviation — see GdxGateEnvKind. That is what makes the Release
+// compile-out provably safe: with GDX_DEV_TOOLS undefined every Bucket B gate is hard-wired to 0
+// with no getenv and no CVar read. (The one exception is GDX_TRACE, whose stock value is 1 in a
+// Debug build; it is Bucket D and is never compiled out, so the invariant holds where it has to.)
 //
 // HOT-PATH CONTRACT
 // -----------------
-// Several gates are queried per draw call, per display-list command, or per audio frame. So the
+// Several gates are queried per draw call, per display-list command, or per audio frame, so the
 // read is deliberately NOT a CVar lookup: gdx_dev_gate() is a static inline load from a plain int
-// array. The array is refreshed from the CVars ONCE PER FRAME at the top of the host loop
+// array. The array is refreshed from the CVars once per frame at the top of the host loop
 // (gdx_dev_gates_refresh() in main.cpp, before PerfFrameBegin) and again immediately after a menu
-// toggle so a click applies on the same frame. This is strictly cheaper than the `static const
-// bool` pattern it replaces (no first-use guard byte, no MSVC thread-safe-statics check) and it
-// never hashes a string in a hot path.
-//
-// The refresh itself costs one ConsoleVariable map lookup per gate — a few dozen hashed lookups
-// once per 16.6 ms frame, on the main thread, next to thousands of draw calls. It is deliberately
-// NOT throttled: the frame-loop refresh is what makes a change from the LUS console
-// (`set gDevTools.Diag.SetupDl 1`) take effect, and a divisor would trade that immediacy for
-// savings too small to measure.
+// toggle so a click applies on the same frame. That refresh is deliberately NOT throttled: it is
+// what makes a change from the LUS console (`set gDevTools.Diag.SetupDl 1`) take effect, and a
+// divisor would trade that immediacy for savings too small to measure.
 //
 // The cache is written on the main thread and read from the game fiber, the audio thread and the
 // render path without a lock. That is a deliberate benign int race: each slot is a naturally
-// aligned int holding a value that is self-consistent, so a reader sees either the old or the new
-// setting for at most one frame. Same pattern the port already documents for its live-CVar audio
-// toggles (n64_audio_hle.c, gdx_audio_lle.c, libultra/os.cpp).
+// aligned int holding a self-consistent value, so a reader sees either the old or the new setting
+// for at most one frame. Same pattern as the port's live-CVar audio toggles (n64_audio_hle.c,
+// gdx_audio_lle.c, libultra/os.cpp).
 //
-// BEFORE INIT
-// -----------
-// The cache is statically zero-initialized and 0 is stock for every gate, so a read that happens
-// before gdx_dev_gates_init_env() is safe. init_env() is the first statement in main(), ahead of
-// every log call the port makes.
+// The cache is statically zero-initialized and 0 is stock for every gate, so a read before
+// gdx_dev_gates_init_env() is safe. init_env() is the first statement in main(), ahead of every
+// log call the port makes.
 //
 // ADDING A GATE: add a row to kGates in gdx_dev_gates.c and an id to GdxGateId below. The Dev
 // Tools page is table-driven and needs no edit.
@@ -105,8 +86,8 @@ enum GdxGateBucket {
 };
 
 // How the legacy env var maps onto the normalized "1 = deviate from stock" gate value. Each entry
-// reproduces EXACTLY what the original call site tested, so a script that already exports one of
-// these keeps behaving identically.
+// reproduces EXACTLY what the original call site tested, so a script that exports one of these
+// keeps behaving identically.
 enum GdxGateEnvKind {
     GDX_GATE_ENV_PRESENCE = 0, // set at all (even to "0") -> 1.   Original: `getenv(x) != NULL`
     GDX_GATE_ENV_OPT_IN,       // set to a non-empty, non-"0" value -> 1
@@ -164,39 +145,36 @@ static inline int gdx_dev_gate(int id) {
     return gGdxDevGateCache[id];
 }
 
-// Samples the environment and applies each gate's compiled default. Call once, as the first
-// statement of main() — before the window, the Gui, the config or any log call — so the legacy env
-// vars keep working for everything that runs during boot. Idempotent. Bucket B gates are skipped
-// entirely (no getenv at all) when GDX_DEV_TOOLS is not defined.
+// Call once, as the first statement of main() — before the window, the Gui, the config or any log
+// call — so the legacy env vars keep working for everything that runs during boot. Idempotent.
+// Bucket B gates are skipped entirely (no getenv at all) when GDX_DEV_TOOLS is not defined.
 void gdx_dev_gates_init_env(void);
 
-// Bucket D step 1: adopt the PERSISTED CVar value for every boot-seeded gate whose env var was not
-// exported. Call immediately after Ship::Context::InitConsoleVariables(), which is the earliest
-// moment the config is readable — this is what lets "enable logging in the menu" survive a restart
-// and capture the next boot. Env-pinned gates are left alone.
+// Adopts the PERSISTED CVar value for every boot-seeded gate whose env var was not exported. Call
+// immediately after Ship::Context::InitConsoleVariables(), the earliest moment the config is
+// readable — that timing is what lets "enable logging in the menu" survive a restart and capture
+// the next boot. Env-pinned gates are left alone.
 void gdx_dev_gates_boot_seed(int (*cvarGetInteger)(const char* name, int defaultValue));
 
 // Hands the gate layer the console-variable entry points and takes over from the environment.
 // Called once from main.cpp after the Gui exists. Passing the functions as pointers keeps this
 // translation unit free of any libultraship link dependency, so the standalone unit-test
-// executables compile it unchanged (same minimal-boundary idiom as port/gdx_frame_pacer.c and
-// port/input_bridge.c).
+// executables compile it unchanged.
 //
-//   Buckets A/B: an env var present at launch SEEDS the CVar (written back once) so existing
-//                scripts and docs keep working; the CVar is the live source of truth afterwards.
+//   Buckets A/B: an env var present at launch SEEDS the CVar (written back once); the CVar is the
+//                live source of truth afterwards.
 //   Bucket  D  : the env var is NEVER written back. It pins the gate for this run and the CVar
 //                keeps whatever the user persisted.
 void gdx_dev_gates_bind_cvars(int (*cvarGetInteger)(const char* name, int defaultValue),
                               void (*cvarSetInteger)(const char* name, int value));
 
-// Re-reads every non-pinned gate's CVar into the cache. Call once per frame at a single
-// well-defined point (top of the host loop) and immediately after a menu toggle. No-op until
-// bind_cvars has run.
+// Call once per frame at a single well-defined point (top of the host loop) and immediately after
+// a menu toggle. No-op until bind_cvars has run.
 void gdx_dev_gates_refresh(void);
 
-// Overrides one gate for the rest of the process, bypassing env and CVar. Used by the command-line
-// forwarding in n64_gfx_bridge.cpp (`--diag-settimg`), which arms a probe after the env has already
-// been sampled. Ignored for Bucket B gates when GDX_DEV_TOOLS is not defined.
+// Overrides one gate for the rest of the process, bypassing env and CVar. Exists for the
+// command-line forwarding in n64_gfx_bridge.cpp (`--diag-settimg`), which arms a probe after the
+// env has already been sampled. Ignored for Bucket B gates when GDX_DEV_TOOLS is not defined.
 void gdx_dev_gate_force(int id, int value);
 
 // ── UI/description metadata (read by port/gdx_menu.cpp; no other consumer) ────────────────────
@@ -218,16 +196,15 @@ int gdx_dev_gate_is_env_pinned(int id);
 
 // ── Named accessors for translation units that cannot include this header ─────────────────────
 // The decomp game sources compile with the decomp include roots only (port/ is deliberately not on
-// their include path), so they declare the one accessor they need locally — exactly the way they
-// already declare gdx_diag_verbose(). Keep this list tiny.
+// their include path), so they declare the one accessor they need locally. Keep this list tiny.
 int gdx_dev_gate_no_reverb(void); // GDX_NO_REVERB — decomp/src/audio/disk/lib/synthesis.c
 int gdx_dev_gate_log_file(void);  // GDX_LOG      — port/decomp_port.c (avoids <stdio.h>/<stdlib.h>)
 int gdx_dev_gate_diag_texreg(void); // GDX_DIAG_TEXREG — decomp/src/game/object.c texture registry
 
-// Optional tap on every gdx_port_write_log line (port_log.h), installed by
-// GdxConsoleLogInstall() so the in-game console can show the port log. NULL until then. It lives
-// with the gates because gdx_dev_gates.c is the one dependency-free unit every port_log.h consumer
-// already links — including the standalone test executables.
+// Optional tap on every gdx_port_write_log line (port_log.h), installed by GdxConsoleLogInstall()
+// so the in-game console can show the port log. NULL until then. It lives with the gates because
+// gdx_dev_gates.c is the one dependency-free unit every port_log.h consumer already links —
+// including the standalone test executables.
 extern void (*gdx_port_log_tap)(const char* message);
 
 #ifdef __cplusplus

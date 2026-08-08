@@ -1,24 +1,23 @@
 // G-Diffuser — runtime O2R asset extraction launcher.
 //
 // Produces (or refreshes) <dataDir>/generic.o2r from the cartridge ROM by spawning the packaged
-// `gdx-extract` child process against the shipped `decomp-recipes` tree. This is the runtime
-// counterpart to the build-time archive: an installed/packaged build has NO generic.o2r until this
-// runs.
+// `gdx-extract` child against the shipped `decomp-recipes` tree. An installed/packaged build has NO
+// generic.o2r until this runs.
 //
 // Invariants:
-//   * ROM SHA-1 is validated BEFORE the child is spawned (expected hash read from
+//   * ROM SHA-1 is validated BEFORE the child is spawned (expected hash from
 //     decomp-recipes/config.yml).
-//   * Validation before install: exit code, zip entry count, archive SHA-256, version entry —
-//     then an atomic temp->rename install with a Windows sharing-violation retry loop.
+//   * Nothing installs before it validates: exit code, zip entry count, archive SHA-256, version
+//     entry — then an atomic temp->rename with a Windows sharing-violation retry loop.
 //   * Complete-or-absent: extraction NEVER blocks boot. On any failure the temp is deleted, any
-//     previous archive is preserved, and the proven raw-ROM fallback carries the session.
+//     previous archive is preserved, and the raw-ROM fallback carries the session.
 //   * State model: completion sidecar gdx_extract_state.cfg + warm-boot skip.
-//   * Integration point is main.cpp, before the archive mount list is built; progress UX is a
-//     Win32 modeless dialog on Windows and log-only on Linux.
+//   * Called from main.cpp before the archive mount list is built; progress UX is a Win32 modeless
+//     dialog on Windows and log-only on Linux.
 //
-// This TU is part of the G-Diffuser exe target (not the decomp game library), so it may freely use
-// the host CRT, <filesystem>, and (Windows) the Win32 process + common-controls APIs. It runs before
-// libultraship is constructed, so it logs through the port's own gdx_port_logf and touches no LUS state.
+// Part of the G-Diffuser exe target (not the decomp game library), so it may freely use the host CRT,
+// <filesystem>, and (Windows) the Win32 process + common-controls APIs. It runs before libultraship
+// is constructed, so it logs through the port's own gdx_port_logf and touches no LUS state.
 #pragma once
 
 #include <string>
@@ -26,9 +25,9 @@
 
 namespace gdx {
 
-// Outcome of GdxExtractEnsureArchive. The caller (main.cpp) only logs this; boot proceeds regardless
-// (C6). "FailedRawFallback" is deliberately the single catch-all failure value — the boot posture is
-// identical for every failure mode (no valid generic.o2r produced → raw-ROM fallback).
+// The caller (main.cpp) only logs this; boot proceeds regardless. FailedRawFallback is deliberately
+// the single catch-all failure value, because the boot posture is identical for every failure mode:
+// no valid generic.o2r produced → raw-ROM fallback.
 enum class ExtractOutcome {
     UpToDate,          // A valid (golden) generic.o2r is already present; nothing to do.
     Extracted,         // The extractor ran, its output validated, and it was atomically installed.
@@ -37,8 +36,8 @@ enum class ExtractOutcome {
 
 // Ensure a valid <dataDir>/generic.o2r exists, extracting it from the cartridge ROM if needed.
 //
-//   dataDir  Absolute path to the writable per-user data directory (the extractor's output dir and
-//            the sidecar location). MUST be passed explicitly — never rely on the inherited CWD (C2).
+//   dataDir  Absolute path to the writable data directory (the extractor's output dir and the sidecar
+//            location). MUST be passed explicitly — never rely on the inherited CWD.
 //   romPath  Absolute path to the validated cartridge ROM (as installed/injected by first-boot).
 //   exeDir   Absolute path to the executable's directory (where gdx-extract + decomp-recipes ship).
 //
@@ -51,9 +50,9 @@ ExtractOutcome GdxExtractEnsureArchive(const char* dataDir, const char* romPath,
 const char* GdxExtractOutcomeString(ExtractOutcome outcome);
 
 // ── Async driver for the in-window setup GUI ─────────────────────────────────────────────────────
-// GdxExtractEnsureArchive is blocking (normally ~2s, up to a 120s hang deadline). The ImGui setup
-// screen must keep pumping frames while it runs, so this thin wrapper runs it on a background thread
-// and exposes a pollable snapshot. Single-flight: only one async extraction may be in progress.
+// GdxExtractEnsureArchive blocks (normally ~2s, up to a 120s hang deadline), but the ImGui setup
+// screen must keep pumping frames, so this wrapper runs it on a background thread behind a pollable
+// snapshot. Single-flight: only one async extraction may be in progress.
 
 enum class ExtractPhase {
     Idle,     // No async extraction has been started (or it was reset).
@@ -71,18 +70,18 @@ struct ExtractProgress {
     std::vector<std::string> log; // ring-buffer snapshot of the extractor's last ~200 stdout lines
                                    // (oldest first). Reset to empty whenever a new async extraction
                                    // starts (GdxExtractStartAsync). May be shorter early in a run.
-    int entriesSeen = 0;          // count of "- [type] Processing <name>" lines seen so far in the
-                                   // CURRENT sub-stage (see `subStage`) -- Torch emits one such line per
-                                   // asset node it visits (torch/src/Companion.cpp ParseNode), so this
-                                   // tracks real per-entry progress against
-                                   // GdxExtractExpectedCartEntryCount() / GdxExtractExpectedIplEntryCount().
-                                   // Approximate (a node that finds no exporter still logs the line but
-                                   // writes no archive entry) but monotonic, and reaches the expected
-                                   // total on a successful run. Reset to 0 at the start of each sub-stage.
+    int entriesSeen = 0;          // "- [type] Processing <name>" lines seen so far in the CURRENT
+                                   // sub-stage. Torch emits one per asset node it visits
+                                   // (torch/src/Companion.cpp ParseNode), so this tracks progress
+                                   // against GdxExtractExpectedCartEntryCount() /
+                                   // GdxExtractExpectedIplEntryCount(). Approximate -- a node that
+                                   // finds no exporter still logs the line but writes no entry -- but
+                                   // monotonic, and it reaches the expected total on a successful run.
+                                   // Reset to 0 at the start of each sub-stage.
     int subStage = 0;             // 0 = extracting the cartridge archive, 1 = validating it (hash/entry
-                                   // count gates, after the extractor child has already exited), 2 =
-                                   // extracting the IPL font-block archive. Advances monotonically within
-                                   // one async run; stays 0 for a run that never reaches later stages.
+                                   // count gates, after the extractor child has exited), 2 = extracting
+                                   // the IPL font-block archive. Monotonic within one async run; stays
+                                   // 0 for a run that never reaches the later stages.
 };
 
 // Start GdxExtractEnsureArchive on a background thread. `suppressNativeDialog` (pass true from the
@@ -98,15 +97,14 @@ ExtractProgress GdxExtractPollStatus();
 // retry, or when leaving the setup flow). Safe to call when already Idle.
 void GdxExtractResetAsync();
 
-// Expected zip entry count for the cartridge archive (GDX_O2R_EXPECTED_ENTRY_COUNT, the US-rev0
-// golden's entry count) -- the denominator for a determinate progress bar during the cart sub-stage.
-// Returns 0 if the golden header was not generated yet (gen/gdx_o2r_expected.h missing, placeholder
-// build); callers should fall back to an indeterminate bar in that case.
+// The denominator for a determinate progress bar during the cart sub-stage
+// (GDX_O2R_EXPECTED_ENTRY_COUNT, the US-rev0 golden's entry count). Returns 0 when the golden header
+// was never generated (gen/gdx_o2r_expected.h missing, placeholder build), and callers must fall back
+// to an indeterminate bar.
 int GdxExtractExpectedCartEntryCount();
 
-// Expected zip entry count for the IPL font-block archive (frozen at 2 -- ipl/font_block +
-// ipl/identity). Always > 0. Exposed as a function rather than a header constant so
-// gdx_extract_launch.cpp stays the single source of truth for this value.
+// Frozen at 2 (ipl/font_block + ipl/identity), so always > 0. A function rather than a header
+// constant so gdx_extract_launch.cpp stays the single source of truth for the value.
 int GdxExtractExpectedIplEntryCount();
 
 // ── ROM identity helpers for the setup GUI ───────────────────────────────────────────────────────
@@ -126,26 +124,24 @@ std::string GdxExtractFileSha256(const char* path);
 
 // ── Managed disk copy bookkeeping (disk internalization) ──────────────────────────────────────
 // Records the managed Expansion Kit disk copy's identity (SHA-256 + size) into the same completion
-// sidecar (gdx_extract_state.cfg) the archive extraction gate already owns, so one file
-// documents everything this build verified about the installed inputs. Read-modify-write: any
-// existing sidecar fields (ROM/archive identity from extraction) are preserved untouched; only the
-// disk_* keys are set. A missing/unwritable sidecar is a log-only failure — the managed copy on disk
-// remains the source of truth; this call is diagnostic bookkeeping only, never gating.
+// sidecar (gdx_extract_state.cfg) the extraction gate owns, so one file documents everything this
+// build verified about the installed inputs. Read-modify-write: existing ROM/archive fields survive
+// untouched and only the disk_* keys are set. A missing/unwritable sidecar is a log-only failure --
+// the copy on disk stays the source of truth, and this call never gates anything.
 void GdxExtractRecordManagedDisk(const char* dataDir, const char* diskSha256, unsigned long long diskSize);
 
 // ── IPL identity bookkeeping (IPL extraction) ────────────────────────────────────────────────────
-// Records the acquire-time SHA-256 of the 64DD IPL ROM into the completion sidecar
-// (gdx_extract_state.cfg, key `ipl_sha256`), so one file documents every input this build verified.
-// Read-modify-write: existing cart/disk/archive fields are preserved. The dedicated IPL extraction
-// step (invoked from GdxExtractEnsureArchive) later refreshes this to the byte-order-NORMALIZED
-// identity and additionally records `ipl_archive_sha256` (the n64ddipl.o2r hash). Diagnostic only —
-// nothing gates boot on these fields; the archive carries its own ipl/identity entry.
+// Records the acquire-time SHA-256 of the 64DD IPL ROM into the completion sidecar (key
+// `ipl_sha256`). Read-modify-write: existing cart/disk/archive fields are preserved. The dedicated
+// IPL extraction step (from GdxExtractEnsureArchive) later refreshes this to the byte-order-NORMALIZED
+// identity and adds `ipl_archive_sha256` (the n64ddipl.o2r hash). Diagnostic only -- nothing gates
+// boot on these fields, and the archive carries its own ipl/identity entry.
 void GdxExtractRecordIpl(const char* dataDir, const char* iplSha256);
 
 // ── Disk deletion-gate helpers (disk internalization) ────────────────────────────────────────────
 // The boot-time deletion gate (port/disk_buffer.cpp) proves the disk archive is byte-identical to the
-// managed copy before the Data & Files panel ever marks the disk deletable. These two helpers let
-// that TU reuse the sidecar reader + the vendored SHA-256 without duplicating either.
+// managed copy before the Data & Files panel marks the disk deletable. These let that TU reuse the
+// sidecar reader and the vendored SHA-256 rather than duplicate either.
 
 // Lowercase-hex SHA-256 of the managed disk copy, as recorded in the completion sidecar
 // (gdx_extract_state.cfg key `disk_sha256`). Empty if the sidecar is missing or the key is unset.
@@ -153,45 +149,41 @@ std::string GdxExtractRecordedDiskSha256(const char* dataDir);
 
 // Lowercase-hex SHA-256 of the disk archive container (fzerox-disk.o2r) as recorded in the completion
 // sidecar (key `disk_archive_sha256`, authored by ensureDiskArchive). Empty if the sidecar is missing
-// or the key is unset. Used by first-boot's setup-required predicate to validate an installed
-// fzerox-disk.o2r against the identity this build recorded before accepting it as satisfying the disk
-// input (the raw .ndd and managed copy having been deleted).
+// or the key is unset. First-boot's setup-required predicate checks an installed fzerox-disk.o2r
+// against this before accepting it as the disk input once the raw .ndd and managed copy are gone.
 std::string GdxExtractRecordedDiskArchiveSha256(const char* dataDir);
 
 // Lowercase-hex SHA-256 of the cart archive container (fzerox.o2r) as recorded in the completion
 // sidecar (key `archive_sha256`, authored by ensureCartArchive/runExtraction). Empty if the sidecar is
-// missing or the key is unset. Used by first-boot's setup-required predicate to validate an installed
-// fzerox.o2r against the identity this build recorded before accepting it as satisfying the ROM input
-// (the original .z64 having been deleted). Mirrors GdxExtractRecordedDiskArchiveSha256.
+// missing or the key is unset. First-boot checks an installed fzerox.o2r against this before
+// accepting it as the ROM input once the original .z64 is gone. Mirrors the disk-archive helper above.
 std::string GdxExtractRecordedCartArchiveSha256(const char* dataDir);
 
 // Lowercase-hex SHA-256 of the IPL archive container (n64ddipl.o2r) as recorded in the completion
 // sidecar (key `ipl_archive_sha256`, authored by ensureIplArchive). Empty if the sidecar is missing or
-// the key is unset. Used by first-boot's setup-required predicate to validate an installed n64ddipl.o2r
-// against the recorded identity before accepting it as satisfying the IPL input.
+// the key is unset. First-boot checks an installed n64ddipl.o2r against this before accepting it as
+// the IPL input.
 std::string GdxExtractRecordedIplArchiveSha256(const char* dataDir);
 
-// Quarantine a port-generated archive that failed verification: rename <dataDir>/<archiveName> to
-// <archiveName>.bad so the mount path never picks it up, forcing first-boot's setup flow to rebuild it.
-// Only the port's own generated .o2r is touched -- user media (ROM/disk/IPL) is never affected. Returns
-// true when a file was quarantined; false when there was nothing to quarantine or the rename failed.
-// The allowlist is internal: `archiveName` must be one of the three port-generated archive names (cart
-// fzerox.o2r, IPL n64ddipl.o2r, disk fzerox-disk.o2r) or the call is refused (logged, returns false) --
-// this function must never be usable to rename an arbitrary/user file.
+// Rename <dataDir>/<archiveName> to <archiveName>.bad so the mount path can never pick up an archive
+// that failed verification, forcing first-boot's setup flow to rebuild it. Only the port's own
+// generated .o2r is touched; user media (ROM/disk/IPL) is never affected. True when a file was
+// quarantined, false when there was nothing to quarantine or the rename failed.
+//
+// `archiveName` MUST be one of the three port-generated names (fzerox.o2r, n64ddipl.o2r,
+// fzerox-disk.o2r); anything else is refused and logged. This must never become a way to rename an
+// arbitrary user file.
 bool GdxExtractQuarantineArchive(const char* dataDir, const char* archiveName);
 
 // ── Per-boot archive validation latch ────────────────────────────────────────────────────────────
-// FirstBootRun's *ArchiveSatisfies helpers (gdx_firstboot.cpp) hash each installed archive against its
-// recorded sidecar SHA-256 to decide whether the wizard can be skipped. GdxExtractEnsureArchive's own
-// warm-boot checks (ensureCartArchive/ensureIplArchive/ensureDiskArchive) independently re-hash the
-// SAME file moments later, in the same boot, once main() calls GdxExtractEnsureArchive. This latch lets
-// a PASSING firstboot check short-circuit that redundant re-hash. Plain function-local/file-static
-// state: main-thread only, never persisted, reset every process start.
+// FirstBootRun's *ArchiveSatisfies helpers hash each installed archive against its recorded sidecar
+// SHA-256 to decide whether the wizard can be skipped, and GdxExtractEnsureArchive's own warm-boot
+// checks re-hash the SAME file moments later in the same boot. This latch lets a PASSING firstboot
+// check short-circuit that. File-static, main-thread only, never persisted, reset every process start.
 enum class GdxExtractArchiveKind { Cart, Ipl, Disk };
 
-// Record that `kind`'s canonical archive was just hashed and matched its recorded sidecar SHA-256 this
-// boot. Call ONLY on a passing verification -- a failed check must never latch, so the ensure* warm-boot
-// step still sees reality and rebuilds/quarantines as needed.
+// Call ONLY on a passing verification. A failed check must never latch, or the ensure* warm-boot step
+// stops seeing reality and never rebuilds/quarantines.
 void GdxExtractMarkArchiveValidated(GdxExtractArchiveKind kind);
 
 // True when `kind`'s archive was already validated earlier this boot via GdxExtractMarkArchiveValidated.

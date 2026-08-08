@@ -1,21 +1,15 @@
-/* G-Diffuser -- streaming PCM capture. See gdx_audio_capture.h for the contract.
+/* Streaming PCM capture; see gdx_audio_capture.h for the contract.
  *
- * Writes <prefix>.pcm as headerless interleaved s16-LE stereo, streamed straight off the
- * audio tap (no full-capture RAM ring -- see the fixed-size write-behind buffer below), then
- * on finalize hashes the streamed bytes into <prefix>.pcm.sha256 (sha256sum-compatible:
- * "<hex>  <name>\n").
+ * FILE I/O CONVENTION (same as port_log.h's gdx_port_write_log / gdx_crash_report_write): no CRT
+ * FILE*. fopen's per-call buffering corrupts the Debug CRT heap when called from the GFX/audio
+ * fiber, whose stack may be mid-switch from the scheduler's point of view. So raw
+ * CreateFileA/WriteFile on Windows, open/write on POSIX. The .pcm handle opens once at arm and
+ * ticks append into the fixed-size write-behind buffer below, which flushes only when full or at
+ * finalize, instead of one syscall per tick. The tiny .sha256 sidecar is opened, written and
+ * closed once at finalize.
  *
- * FILE I/O CONVENTION (same as port_log.h's gdx_port_write_log / gdx_crash_report_write):
- * no CRT FILE-star / fopen. fopen's per-call buffering corrupts the Debug CRT heap when called from
- * the GFX/audio fiber, whose stack may be mid-switch from the scheduler's point of view. So:
- * raw CreateFileA/WriteFile on Windows, open/write on POSIX. The .pcm handle is opened once at
- * arm; ticks append into a fixed-size static buffer (gdx_pcm_buffer_append) that flushes to the
- * handle only when full or at finalize, instead of one syscall per tick. The tiny .sha256
- * sidecar is opened/written/closed once at finalize.
- *
- * SHA-256 is a vendored public-domain reference (mirrors the C++ one in gdx_extract_launch.cpp;
- * ported to C89 here because this TU is plain C and cannot include the C++ launcher). It is a
- * plain integrity digest, not security-sensitive.
+ * SHA-256 is a vendored public-domain reference (the C++ twin lives in gdx_extract_launch.cpp;
+ * ported to C89 here because this TU is plain C). It is an integrity digest, not security code.
  */
 #include "gdx_audio_capture.h"
 #include "port_log.h"
@@ -37,9 +31,7 @@
 #include <unistd.h>
 #endif
 
-/* ==========================================================================
- * Vendored SHA-256 (public domain reference).
- * ========================================================================== */
+/* Vendored SHA-256 (public-domain reference). */
 typedef struct {
     uint32_t state[8];
     uint64_t count; /* total bytes hashed */
@@ -137,13 +129,10 @@ static void gdx_sha256_final(GdxSha256* ctx, uint8_t out[32]) {
     }
 }
 
-/* ==========================================================================
- * Capture state (single translation-unit statics).
- * ========================================================================== */
 #define GDX_PCM_PATH_MAX 1024
 
 static int          sConfigured  = 0;   /* GDX_PCM_CAPTURE present */
-static volatile int sArmed       = 0;   /* capture window open (cross-thread read at :194) */
+static volatile int sArmed       = 0;   /* capture window open (cross-thread read) */
 static volatile int sFinished    = 0;   /* finalized (cross-thread read by host loop) */
 static int          sInitDone    = 0;   /* gdx_pcm_capture_init() ran once */
 
@@ -162,7 +151,7 @@ static HANDLE sFile = INVALID_HANDLE_VALUE;
 static int sFile = -1;
 #endif
 
-/* ---- raw byte writers (no CRT FILE*) --------------------------------------------------- */
+/* Raw byte writers, no CRT FILE* -- see the header comment. */
 static int gdx_pcm_open_output(void) {
 #ifdef _WIN32
     sFile = CreateFileA(sPcmPath, GENERIC_WRITE, FILE_SHARE_READ, NULL,
@@ -188,12 +177,9 @@ static void gdx_pcm_write_output(const void* data, size_t bytes) {
 #endif
 }
 
-/* ---- fixed-size write-behind buffer -----------------------------------------------------
- * feed() used to issue one raw WriteFile/write syscall per audio tick; that is one syscall per
- * ~few-hundred-frame chunk delivered by the tap, which is needlessly expensive on the audio
- * thread. Instead, append into this fixed-size static buffer and flush it to the file only when
- * full (or on finalize). The resulting .pcm bytes and .sha256 digest are unchanged -- this only
- * changes how many syscalls it takes to produce them. */
+/* Write-behind buffer: one syscall per audio tick is needlessly expensive on the audio thread,
+ * so ticks append here and flush only when full or at finalize. Produces byte-identical .pcm and
+ * .sha256 output either way. */
 #define GDX_PCM_WRITE_BUF_CAP (256u * 1024u)
 static uint8_t sWriteBuf[GDX_PCM_WRITE_BUF_CAP];
 static size_t  sWriteBufLen = 0;
@@ -250,9 +236,6 @@ static void gdx_pcm_basename(const char* full, char* out, size_t cap) {
     }
 }
 
-/* ==========================================================================
- * Public API.
- * ========================================================================== */
 void gdx_pcm_capture_init(void) {
     const char* prefix;
     const char* frames;
@@ -286,8 +269,8 @@ void gdx_pcm_capture_init(void) {
     }
 
     sConfigured = 1;
-    /* Arm immediately so gdx_pcm_capture_active() is already true when the audio thread
-       reaches thread.c:194 on the very first tick (RNG determinism pin). */
+    /* Arm now, so gdx_pcm_capture_active() is already true when the audio thread reaches the RNG
+       determinism pin at thread.c:194 on its very first tick. */
     gdx_pcm_capture_arm();
 }
 
@@ -368,10 +351,8 @@ void gdx_pcm_capture_feed(const int16_t* frames, unsigned int frameCount, unsign
         return;
     }
     if (!sArmed) {
-        /* Fail-closed: the threading contract (init/arm on the main thread BEFORE the audio
-           thread starts producing ticks) is the caller's responsibility. Silently self-arming
-           here from off the main thread would mask a contract violation instead of surfacing it.
-           Count skipped calls and emit a single one-time debug log rather than auto-arming. */
+        /* Fail-closed. Self-arming here would run off the main thread and silently mask a
+           violation of the init/arm threading contract; log once instead. */
         static unsigned sSkippedUnarmedFeeds = 0;
         sSkippedUnarmedFeeds++;
         if (sSkippedUnarmedFeeds == 1) {
@@ -414,10 +395,9 @@ void gdx_pcm_capture_shutdown(void) {
     }
 }
 
-/* Test-only: drop all module state back to first-boot so a single test process can drive several
-   independent capture sessions (each re-reads the environment via gdx_pcm_capture_init). Not
-   declared in gdx_audio_capture.h and never called in production -- the unit test declares it
-   extern. Closes any open output handle so no descriptor leaks between sessions. */
+/* Test-only: drop module state back to first-boot so one test process can drive several capture
+   sessions, each re-reading the environment. Deliberately absent from gdx_audio_capture.h -- the
+   unit test declares it extern. Closes any open handle so no descriptor leaks between sessions. */
 void gdx_pcm_capture_reset_for_test(void) {
     gdx_pcm_flush_output();
     gdx_pcm_close_output();

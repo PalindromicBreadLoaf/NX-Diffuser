@@ -331,6 +331,10 @@ def generate(profile, out_override, force_overwrite=False, lint_only=False):
         for key, val in data.items():
             if not isinstance(val, dict) or str(key).startswith(":"):
                 continue
+            # Flat BLOB recipes outside BLOB_RECIPE_FILENAMES (e.g. rsp_blob.yaml) are loaded
+            # by archive key at runtime; their entries need no placeholder symbol.
+            if rom_base is None and val.get("type") == "BLOB":
+                continue
             sym = val.get("symbol", key)
             ctype, count = asset_definition_type_and_count(val)
             defs.append("{} {}[{}];".format(ctype, sym, count))

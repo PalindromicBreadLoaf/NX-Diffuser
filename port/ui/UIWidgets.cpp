@@ -1,22 +1,21 @@
 // port/ui/UIWidgets.cpp — implementation of the CVar-bound ImGui widget library.
 //
 // Ported from HarbourMasters/Lighthouse src/port/UI/UIWidgets.cpp (branch `develop`), CC0 1.0.
-// See port/ui/UIWidgets.hpp for provenance, what this replaces, and the full list of API
-// adaptations made for G-Diffuser's libultraship fork and ImGui 1.91.9b.
+// See port/ui/UIWidgets.hpp for provenance and the full list of API adaptations made for
+// G-Diffuser's libultraship fork and ImGui 1.91.9b.
 
-// Must precede every include: this TU uses the ImVec2/ImVec4 math operators (operator+, operator*
-// and operator== on ImVec2), which imgui.h only emits when this macro is set before it is first
-// included. imgui_internal.h hard-#errors if the macro appears after imgui.h has already been
-// processed (build/x64/_deps/imgui-src/imgui_internal.h:112-113).
+// Must precede every include: this TU uses the ImVec2/ImVec4 math operators, which imgui.h only
+// emits when this macro is set before it is first included, and imgui_internal.h hard-#errors if
+// the macro appears after imgui.h was already processed
+// (build/x64/_deps/imgui-src/imgui_internal.h:112-113).
 #define IMGUI_DEFINE_MATH_OPERATORS
 
 #include "UIWidgets.hpp"
 
 #include <imgui.h>
-#include <imgui_internal.h> // ImGuiWindow, ItemAdd/ItemSize/ButtonBehavior, RenderFrame,
-                            // RenderCheckMark, RenderNavCursor, GImGui — the custom Checkbox,
-                            // RadioButton and StateButton are re-implementations of ImGui's own
-                            // widgets with extra label placement, so they need the internal API.
+#include <imgui_internal.h> // the custom Checkbox, RadioButton and StateButton re-implement ImGui's
+                            // own widgets with extra label placement, so they need ItemAdd/ItemSize/
+                            // ButtonBehavior/RenderFrame/RenderCheckMark/RenderNavCursor/GImGui.
 
 #include <cmath>
 #include <cstdlib> // strtol (CVarInputInt default parsing)
@@ -31,12 +30,9 @@
 
 namespace UIWidgets {
 
-// Lighthouse spelled this inline at every CVar write site as
-//   Ship::Context::GetRawInstance()->GetWindow()->GetGui()->SaveConsoleVariablesNextFrame();
-// GetRawInstance() does not exist in this fork (ship/Context.h only exposes the shared_ptr
-// GetInstance(), line 50) and the Window/Gui are not guaranteed to be constructed when a widget
-// is exercised from a tool or a test, so the whole chain is null-checked. Same shape as
-// port/gdx_menu.cpp:143 (GdxSaveCvars).
+// Lighthouse spelled this inline at every CVar write site through GetRawInstance(), which this fork
+// does not have. The Window/Gui are also not guaranteed to be constructed when a widget is
+// exercised from a tool or a test, so the whole chain is null-checked.
 void SaveCVars() {
     auto context = Ship::Context::GetInstance();
     if (context == nullptr) {
@@ -241,10 +237,9 @@ bool WindowButton(const char* label, const char* cvarName, std::shared_ptr<Ship:
                                      options.padding,
                                      options.color })) {
         // Not a bare CVarSetInteger on the visibility CVar: an already-constructed GuiWindow reads
-        // its CVar only once at construction and consults its in-memory mIsVisible every frame
-        // afterwards, so writing the CVar alone is a no-op. ToggleVisibility() flips mIsVisible AND
-        // mirrors + persists the CVar (libultraship GuiElement.cpp:40 / GuiWindow.cpp:61). Same
-        // reasoning is documented at port/gdx_menu.cpp:150.
+        // that CVar only at construction and consults its in-memory mIsVisible every frame after,
+        // so writing the CVar alone is a no-op. ToggleVisibility() flips mIsVisible AND mirrors +
+        // persists the CVar (libultraship GuiElement.cpp:40 / GuiWindow.cpp:61).
         if (windowPtr != nullptr) {
             windowPtr->ToggleVisibility();
             dirty = true;
@@ -475,7 +470,6 @@ bool StateButton(const char* str_id, const char* label, ImVec2 size, ButtonOptio
         ImGui::PopItemFlag(); // ImGuiItemFlags_ButtonRepeat;
     }
     PushStyleButton(options.color);
-    // Render
     const ImU32 bg_col = ImGui::GetColorU32((held && hovered) ? ImGuiCol_ButtonActive
                                             : hovered         ? ImGuiCol_ButtonHovered
                                                               : ImGuiCol_Button);
@@ -981,9 +975,8 @@ bool CVarColorPicker(const char* label, const char* cvarName, Color_RGBA8 defaul
         if (Button(uniqueTag.c_str(), ButtonOptions({ { .tooltip = "Resets this color to its default value" } })
                                           .Color(themeColor)
                                           .Size(Sizes::Inline))) {
-            // Upstream also cleared "<cvar>.R/.G/.B/.A/.Type" here, flagged in its own comment as a
-            // temporary shim for SoH configs migrated before the packed-colour format landed.
-            // G-Diffuser has no such legacy config layout, so only the current key is cleared.
+            // Upstream also cleared "<cvar>.R/.G/.B/.A/.Type" here, a shim for SoH configs written
+            // before the packed-colour format. G-Diffuser has no such legacy layout.
             CVarClearBlock(valueCVar.c_str());
             SaveCVars();
         }
@@ -1050,10 +1043,9 @@ bool CVarColorPicker(const char* label, const char* cvarName, const ColorPickerO
     return CVarColorPicker(label, cvarName, options.defaultValue, options.useAlpha, modifiers, options.color);
 }
 
-// Standalone radio button. `options` is accepted for signature symmetry with CVarRadioButton and
-// forward compatibility, but is deliberately unread: upstream drew this one with the ambient
-// style, and honouring options.color here would need a Push/PopStyleCheckbox pair that the
-// early-return paths above would leave unbalanced.
+// `options` is accepted for symmetry with CVarRadioButton but deliberately unread: honouring
+// options.color would need a Push/PopStyleCheckbox pair that the early-return paths below would
+// leave unbalanced. Upstream drew this one with the ambient style too.
 bool RadioButton(const char* label, bool active, const RadioButtonsOptions& options) {
     (void)options;
 
@@ -1138,9 +1130,8 @@ bool CVarRadioButton(const char* text, const char* cvarName, int32_t id, const R
     return ret;
 }
 
-// Debug/developer helper: exposes a bitfield as a row of checkboxes, eight per line.
-// fmt::format is unavailable on the port target (spdlog is not on its include path), hence the
-// plain string concatenation for the per-bit ImGui IDs.
+// Exposes a bitfield as a row of checkboxes, eight per line. fmt::format is unavailable on the port
+// target (ADAPTATION #4), hence the plain string concatenation for the per-bit ImGui IDs.
 void DrawFlagArray32(const std::string& name, uint32_t& flags, Colors color) {
     ImGui::PushID(name.c_str());
     for (int32_t flagIndex = 0; flagIndex < 32; flagIndex++) {

@@ -2,37 +2,21 @@
 //
 // PROVENANCE
 // ----------
-// Ported from HarbourMasters/Lighthouse, files src/port/UI/UIWidgets.hpp and
-// src/port/UI/UIWidgets.cpp on branch `develop`. Lighthouse is published under
-// CC0 1.0 Universal (Creative Commons Public Domain Dedication) — copy, modify and
-// redistribute freely, no attribution required; this notice is courtesy, not obligation.
+// Ported from HarbourMasters/Lighthouse, src/port/UI/UIWidgets.{hpp,cpp} on branch `develop`,
+// published under CC0 1.0 Universal (Creative Commons Public Domain Dedication) — copy, modify and
+// redistribute freely, no attribution required.
 //
-// Lighthouse builds against the same upstream libultraship (Kenix3/libultraship) that
-// G-Diffuser forks, and the whole framework is port-local: it only touches ImGui and the
-// public CVar bridge. No libultraship change was needed to land it. Every API delta between
-// Lighthouse's expectations and this repo is listed under ADAPTATIONS below and was verified
-// against the actual headers in this tree, not assumed.
+// Lighthouse builds against the same upstream libultraship (Kenix3/libultraship) that G-Diffuser
+// forks, and the framework is port-local: it touches only ImGui and the public CVar bridge, so it
+// needed no libultraship change. Every API delta is listed under ADAPTATIONS below.
 //
-// WHAT THIS REPLACES
-// ------------------
-// port/gdx_menu.cpp currently hand-writes the same four-call sequence for every single option:
-//
-//     int v = CVarGetInteger("gFoo", 0);          // read
-//     if (ImGui::Checkbox("Foo", &v)) {           // draw
-//         CVarSetInteger("gFoo", v);              // write
-//         GdxSaveCvars();                         // persist
-//     }
-//     if (ImGui::IsItemHovered()) ImGui::SetTooltip("..."); // explain
-//
-// Measured in port/gdx_menu.cpp: 47 CVarGetInteger, 54 CVarSetInteger, 47 GdxSaveCvars and
-// 61 SetTooltip calls — the same get/set/save/tooltip quadruple spelled out ~47 times. The
-// CVar-bound widgets here (CVarCheckbox, CVarCombobox, CVarSliderInt, CVarSliderFloat,
+// The CVar-bound widgets (CVarCheckbox, CVarCombobox, CVarSliderInt, CVarSliderFloat,
 // CVarInputString, CVarInputInt, CVarColorPicker, CVarRadioButton) fold read + draw + write +
 // persist + tooltip into one call:
 //
 //     UIWidgets::CVarCheckbox("Foo", "gFoo", { .tooltip = "..." });
 //
-// STATUS: port/gdx_menu.cpp is migrated onto this library. What deliberately did NOT move, and why:
+// What deliberately does NOT go through this library:
 //   - DrawDevGates()'s per-gate rows. Their tooltip is a four-argument runtime format
 //     ("<help>\n\nEnvironment: %s\nSetting: %s"), which no Options struct can carry, and the value
 //     is a gdx_dev_gate() call rather than a CVar read.
@@ -40,7 +24,8 @@
 //     Checkbox()'s unconditional ItemInnerSpacing.x * 2 label gutter would overflow.
 //   - The ghost-export button's tooltip, which interpolates a filesystem path that WrappedText
 //     would break across lines at the spaces inside it.
-// Gaps found during that migration, listed here so the next caller does not rediscover them:
+//
+// Known gaps:
 //   - IntSliderOptions / FloatSliderOptions expose no Flags() setter, so ImGuiSliderFlags (e.g.
 //     AlwaysClamp) can only be set through a designated initialiser.
 //   - IntSliderOptions / FloatSliderOptions / ComboboxOptions do not re-declare Disabled() or
@@ -53,40 +38,29 @@
 //
 // ADAPTATIONS vs Lighthouse
 // -------------------------
-//  1. Ship_IsCStringEmpty() — lives in Lighthouse's own src/port/ShipUtils.h and does NOT exist
-//     anywhere in this fork (no hit under libultraship/include or libultraship/src). Replaced by
-//     UIWidgets::IsCStringEmpty() below, same semantics, so this library needs no ShipUtils.
+//  1. Ship_IsCStringEmpty() lives in Lighthouse's own src/port/ShipUtils.h and does not exist
+//     anywhere in this fork. Replaced by UIWidgets::IsCStringEmpty() below, same semantics.
 //  2. ShipInit::Init(cvarName) — Lighthouse's "run the registered side effect for this CVar"
-//     dispatch table (src/port/ShipInit.hpp). No equivalent exists here; G-Diffuser applies side
-//     effects at the call site instead (see gdx_menu.cpp's per-widget apply blocks). Dropped from
-//     every CVar* widget.
-//  3. Ship::Context::GetRawInstance() — not present in this fork's ship/Context.h; it only has
-//     the shared_ptr GetInstance() (ship/Context.h:50). Every save call is routed through
-//     UIWidgets::SaveCVars(), which uses GetInstance() and null-guards the whole chain, matching
-//     what port/gdx_menu.cpp:143 (GdxSaveCvars) already does.
-//  4. fmt::format via <spdlog/fmt/fmt.h> — reachable, but only implicitly: it comes from vcpkg's
-//     MSBuild integration (build/x64/libultraship/vcpkg/installed/x64-windows-static/include),
-//     which lands in %(AdditionalIncludeDirectories) rather than in any include path this repo's
-//     CMake spells out. The two fmt::format uses (both in DrawFlagArray*) were trivial ID strings,
-//     so they became plain std::string concatenation and this file carries no fmt dependency.
-//  5. ImGui::RenderNavHighlight() -> ImGui::RenderNavCursor(). Renamed in ImGui 1.91.4; our
-//     vendored ImGui is 1.91.9b (build/x64/_deps/imgui-src/imgui.h:31) where the old name only
-//     survives as an obsolete-API inline alias. Upstream inconsistently used both spellings.
+//     dispatch table (src/port/ShipInit.hpp). No equivalent here; G-Diffuser applies side effects
+//     at the call site, so it is dropped from every CVar* widget.
+//  3. Ship::Context::GetRawInstance() is not present in this fork's ship/Context.h, which only has
+//     the shared_ptr GetInstance() (ship/Context.h:50). Every save call routes through
+//     UIWidgets::SaveCVars(), which null-guards the whole chain.
+//  4. fmt::format via <spdlog/fmt/fmt.h> is reachable only implicitly, through vcpkg's MSBuild
+//     integration rather than any include path this repo's CMake spells out. The two uses (both in
+//     DrawFlagArray*) became plain std::string concatenation, so this file has no fmt dependency.
+//  5. ImGui::RenderNavHighlight() -> ImGui::RenderNavCursor(). Renamed in ImGui 1.91.4; the
+//     vendored ImGui is 1.91.9b (build/x64/_deps/imgui-src/imgui.h:31), where the old name only
+//     survives as an obsolete-API inline alias.
 //  6. ImGuiCol_TabActive -> ImGuiCol_TabSelected (renamed in 1.90.9; old name is obsolete-only).
 //  7. ImGuiColorEditFlags_AlphaPreview — removed in ImGui 1.91.8 and now the default behaviour
 //     (imgui.h:1869 keeps it as a `= 0` obsolete stub). Dropped from CVarColorPicker's flags.
 //  8. InputOptions::addedFlags was typed ImGuiInputFlags upstream but is passed to InputText /
 //     InputScalar, which take ImGuiInputTextFlags. Both are `typedef int` so it compiled by
 //     accident; retyped to ImGuiInputTextFlags.
-//  9. <span> include dropped (unused upstream).
-// 10. GetRandomValue / RGBA8FromVec / VecFromRGBA8 were declared at global scope upstream. Moved
-//     inside namespace UIWidgets so this library adds no unqualified global symbols to a port
-//     that already has plenty.
-// 11. DrawFlagArray8Mask dropped: upstream's body is a byte-for-byte copy of DrawFlagArray8 with
-//     no masking behaviour of any kind, so it is a dead duplicate.
-// 12. SectionFunc typedef dropped: it belongs to Lighthouse's menu-section registry, which we do
-//     not port.
-// 13. Upstream defects fixed in place (each marked "FIX:" at the site):
+//  9. GetRandomValue / RGBA8FromVec / VecFromRGBA8 moved inside namespace UIWidgets so this library
+//     adds no unqualified global symbols (upstream declared them at global scope).
+// 10. Upstream defects fixed in place (each marked "FIX:" at the site):
 //       - `const char* longest;` left uninitialised in all four Combobox overloads, then read
 //         when the container is empty.
 //       - ColorPickerOptions' five bool members left uninitialised.
@@ -109,13 +83,12 @@
 #include <unordered_map>
 #include <vector>
 
-// ImGui's courtesy ImVec2/ImVec4 math operators are opt-in. Guard the define on imgui.h not
-// having been pulled in yet: if a translation unit includes imgui.h first (GuiWindow.h does,
-// libultraship/include/ship/window/gui/GuiWindow.h:4) and then this header defined the macro
-// unconditionally, imgui.h would already be include-guarded, IMGUI_DEFINE_MATH_OPERATORS_IMPLEMENTED
-// would never be set, and any later imgui_internal.h include would hard-#error
-// (build/x64/_deps/imgui-src/imgui_internal.h:112-113). The templates in this header do not need
-// the operators; only UIWidgets.cpp does, and it defines the macro before any include.
+// ImGui's ImVec2/ImVec4 math operators are opt-in. The define is guarded on imgui.h not having been
+// pulled in yet: setting it after imgui.h is already include-guarded leaves
+// IMGUI_DEFINE_MATH_OPERATORS_IMPLEMENTED unset, and any later imgui_internal.h include then
+// hard-#errors (build/x64/_deps/imgui-src/imgui_internal.h:112-113). That ordering is reachable —
+// GuiWindow.h includes imgui.h (libultraship/include/ship/window/gui/GuiWindow.h:4). Nothing in
+// this header needs the operators; UIWidgets.cpp does, and defines the macro before any include.
 #if !defined(IMGUI_VERSION) && !defined(IMGUI_DEFINE_MATH_OPERATORS)
 #define IMGUI_DEFINE_MATH_OPERATORS
 #endif
@@ -133,17 +106,14 @@ class GuiWindow;
 
 namespace UIWidgets {
 
-// Replacement for Lighthouse's Ship_IsCStringEmpty() (src/port/ShipUtils.h), which this fork of
-// libultraship does not provide. Every tooltip site treats "no tooltip" as the empty string
-// rather than nullptr, so both cases must be handled.
+// Replacement for Lighthouse's Ship_IsCStringEmpty() (ADAPTATION #1). Tooltip sites spell "no
+// tooltip" as the empty string as often as nullptr, so both cases must be handled.
 inline bool IsCStringEmpty(const char* str) {
     return str == nullptr || str[0] == '\0';
 }
 
-// Queues a CVar flush to disk on the next frame. Wraps the chain Lighthouse spelled inline as
-// Ship::Context::GetRawInstance()->GetWindow()->GetGui()->SaveConsoleVariablesNextFrame(); our
-// Context has no GetRawInstance(), and the Window/Gui may not exist yet during early startup,
-// so this is null-guarded end to end (same shape as port/gdx_menu.cpp:143).
+// Queues a CVar flush to disk on the next frame. Null-guarded end to end: the Window/Gui may not
+// exist yet during early startup (same shape as port/gdx_menu.cpp's GdxSaveCvars).
 void SaveCVars();
 
 struct TextFilters {
@@ -205,8 +175,8 @@ enum Colors {
 
 enum InputTypes { String, Scalar };
 
-// `inline` (upstream had a bare `const`, which has internal linkage in a header and therefore
-// built one private copy of this map per translation unit that includes it).
+// `inline`: upstream had a bare `const`, which has internal linkage in a header and therefore built
+// one private copy of this map per translation unit that includes it.
 inline const std::unordered_map<Colors, ImVec4> ColorValues = {
     { Colors::Pink, ImVec4(0.87f, 0.3f, 0.87f, 1.0f) },     { Colors::Red, ImVec4(0.55f, 0.0f, 0.0f, 1.0f) },
     { Colors::DarkRed, ImVec4(0.3f, 0.0f, 0.0f, 1.0f) },    { Colors::Orange, ImVec4(0.85f, 0.55f, 0.0f, 1.0f) },
@@ -1151,10 +1121,9 @@ bool Combobox(const char* label, T* value, const char* (&comboArray)[N], const C
     return dirty;
 }
 
-// The CVar* wrappers are the whole point of the library: read the CVar, draw the widget, and on
-// change write it back and queue the config flush. Lighthouse additionally called
-// ShipInit::Init(cvarName) here to fire the CVar's registered side effect; we have no such
-// registry (see ADAPTATIONS #2), so callers apply side effects themselves.
+// The CVar* wrappers read the CVar, draw the widget, and on change write it back and queue the
+// config flush. Lighthouse also called ShipInit::Init(cvarName) here to fire the CVar's registered
+// side effect; we have no such registry (ADAPTATIONS #2), so callers apply side effects themselves.
 template <typename T = int32_t>
 bool CVarCombobox(const char* label, const char* cvarName, const std::unordered_map<T, const char*>& comboMap,
                   const ComboboxOptions& options = {}) {
@@ -1223,8 +1192,8 @@ bool CVarInputInt(const char* label, const char* cvarName, const InputOptions& o
 // which of the reset/random/rainbow/lock affordances are drawn.
 bool CVarColorPicker(const char* label, const char* cvarName, Color_RGBA8 defaultColor, bool hasAlpha = false,
                      uint8_t modifiers = 0, Colors themeColor = Colors::LightBlue);
-// Options-struct overload. Upstream declared ColorPickerOptions but never wired it to anything,
-// leaving the struct dead; this forwards it onto the modifier bitmask above.
+// Options-struct overload, forwarding onto the modifier bitmask above. Upstream declared
+// ColorPickerOptions but never wired it to anything.
 bool CVarColorPicker(const char* label, const char* cvarName, const ColorPickerOptions& options);
 
 // FIX: upstream declared `RadioButton(const char*, bool)` in the header but defined the 3-argument
@@ -1240,7 +1209,6 @@ void DrawFlagArray8(const std::string& name, uint8_t& flags, Colors color = Colo
 void InsertHelpHoverText(const std::string& text);
 void InsertHelpHoverText(const char* text);
 
-// Moved inside the namespace (upstream left these three at global scope).
 ImVec4 GetRandomValue();
 Color_RGBA8 RGBA8FromVec(ImVec4 vec);
 ImVec4 VecFromRGBA8(Color_RGBA8 color);

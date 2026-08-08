@@ -1,15 +1,13 @@
-// port/gdx_workshop.h — Workshop texture-pack + dump support.
+// port/gdx_workshop.h — Workshop texture-pack + dump support (docs/MODDING_GUIDE.md).
 //
-// Central seam for the community-content "Workshop" tab's texture-pack feature (see
-// docs/MODDING_GUIDE.md). All behavior is opt-in via
-// CVars that default OFF, so a fresh gdiffuser.cfg.json renders byte-identically to stock:
+// Every behavior is opt-in through CVars that default OFF, so a fresh gdiffuser.cfg.json renders
+// byte-identically to stock:
 //   - gEnhancements.Workshop.TexturePacks (int, 0): master switch for the Tier-B override shim.
 //   - gEnhancements.Workshop.TextureDump  (int, 0): dump every decoded texture to dump/<key>.png.
 //   - gEnhancements.Workshop.DisabledPacks (string, ""): comma-joined mods/*.o2r basenames to skip.
 //
-// The mounting of mods/*.o2r archives lives in main.cpp::findArchivePaths (a mounted pack with no
-// matching keys is inert); this module owns the runtime override lookup, the decoded-texture dump,
-// and the hot reload.
+// main.cpp::findArchivePaths mounts mods/*.o2r (a pack with no matching keys is inert); this module
+// owns the runtime override lookup, the decoded-texture dump, and the hot reload.
 
 #pragma once
 

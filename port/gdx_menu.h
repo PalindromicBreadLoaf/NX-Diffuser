@@ -8,29 +8,20 @@
 #include "ui/MenuTypes.h" // GdxUI::{MainMenuEntry, SidebarEntry, WidgetInfo, DisabledInfo, ...}
 
 /**
- * Full-screen modern settings menu inspired by Ship of Harkinian's 9.2.3 menu shell.
+ * Full-screen settings menu, modelled on Ship of Harkinian's 9.2.3 menu shell.
  *
- * The menu remains port-owned: all existing G-Diffuser CVars and callbacks are preserved, while
- * the presentation changes from a row of ImGui dropdowns to header navigation, a sidebar, search,
- * responsive scrolling, embedded tool windows, and confirmation modals.
- *
- * STRUCTURE: DECLARATIVE REGISTRY (see port/ui/MenuTypes.h)
- * --------------------------------------------------------
- * The menu's contents are DATA, not code. port/gdx_menu_registry.cpp builds the tree
+ * The menu's contents are DATA, not code: port/gdx_menu_registry.cpp builds the tree
  *
  *     MainMenuEntry (header tab) -> SidebarEntry (sidebar page) -> WidgetInfo[column]
  *
- * once at InitElement(), and this file only walks it. That is what makes widget-level search
- * possible: DrawSearchResults() iterates the exact same registry MenuDrawItem() draws from, so a
- * query can name an INDIVIDUAL control, say which page it lives on, and jump the menu to it. The
- * previous design could not — its search matched a hand-typed, hand-maintained table of page
- * keywords and could only ever offer you a page.
+ * once at InitElement(), and this class only walks it. That is what makes widget-level search
+ * possible — DrawSearchResults() iterates the exact registry MenuDrawItem() draws from, so a query
+ * can name an INDIVIDUAL control, say which page it lives on, and jump the menu to it.
  *
- * What is deliberately NOT ported from Lighthouse's Menu.cpp shell: its window chrome (popout
- * window, theme picker, its own header/sidebar hit-testing, Fast3dWindow-specific backend pickers).
- * This port keeps its own shell — the gamepad-nav tuning, L1/R1 tab cycling, quit modal, embedded
- * tool windows and focus seeding below are G-Diffuser behaviour that Lighthouse has no equivalent
- * for, and replacing working chrome was never the point. Only the CONTENT model moved.
+ * Only the CONTENT model comes from Lighthouse. The shell is the port's own: the gamepad-nav
+ * tuning, L1/R1 tab cycling, quit modal, embedded tool windows and focus seeding below have no
+ * Lighthouse equivalent, and its window chrome (popout window, theme picker, its own header/sidebar
+ * hit-testing, Fast3dWindow-specific backend pickers) is deliberately not ported.
  */
 class GdxMenu final : public Ship::GuiWindow {
   public:
@@ -45,9 +36,8 @@ class GdxMenu final : public Ship::GuiWindow {
 
   private:
     // ── Registry construction (port/gdx_menu_registry.cpp) ───────────────────────────────────
-    // Called once from InitElement(). Split into its own translation unit because it is a long,
-    // flat declaration of every control in the menu and has no logic worth reading alongside the
-    // shell.
+    // Called once from InitElement(). In its own translation unit because it is a long flat
+    // declaration of every control, with no logic worth reading alongside the shell.
     void RegisterMenu();
     void RegisterDisableReasons();
 
@@ -74,18 +64,16 @@ class GdxMenu final : public Ship::GuiWindow {
     void DrawAssetDump();
     void DrawDdSave();
     void DrawDevToolButtons();
-    // Developer gates (port/gdx_dev_gates.{h,c}): the checkbox surface that replaced ~25 invisible
-    // GDX_* environment variables. Stays a custom block: its per-gate tooltip is a four-argument
-    // runtime format and its value is a gdx_dev_gate() call, not a CVar read.
+    // Developer gates (port/gdx_dev_gates.{h,c}). Stays a custom block: the per-gate tooltip is a
+    // four-argument runtime format and the value is a gdx_dev_gate() call, not a CVar read.
     void DrawDevGates();
     void DrawInterpStats();
     void DrawToolWindowPage(const char* name, const char* description);
     void DrawAboutMenu();
 
     // ── Section / sidebar selection ─────────────────────────────────────────────────────────
-    // Both are addressed BY NAME and persisted as strings, so reordering pages can no longer make
-    // a stored selection point at a different page (which is why the old integer-index scheme
-    // needed a layout-version reset).
+    // Both are addressed BY NAME and persisted as strings, so reordering pages cannot make a
+    // stored selection point at a different page.
     void SelectSection(const std::string& section);
     void SelectSidebar(const std::string& sidebar);
     const std::string& ActiveSidebar();
@@ -99,8 +87,7 @@ class GdxMenu final : public Ship::GuiWindow {
     std::unordered_map<std::string, GdxUI::MainMenuEntry> mMenuEntries;
     std::vector<std::string> mMenuOrder;
     // Indexed by GdxUI::DisableOption. A dense vector rather than upstream's unordered_map: the
-    // enum is contiguous and every entry is touched every frame, so a hash lookup per widget per
-    // reason buys nothing.
+    // enum is contiguous and every entry is touched every frame.
     std::vector<GdxUI::DisabledInfo> mDisabledInfo;
     // Scratch for the "This setting is disabled because:" tooltip. Must outlive the widget draw,
     // because UIWidgets' Options structs hold a borrowed const char*.

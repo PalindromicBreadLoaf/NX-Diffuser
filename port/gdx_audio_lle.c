@@ -1,126 +1,104 @@
-/* LLE audio dispatch (branch lle-audio).
+/* LLE audio dispatch: the seam between the game's audio scheduler and the audio RSP. Each
+ * M_AUDTASK goes either to the REAL aspMain microcode running on the vendored cxd4 RSP
+ * interpreter, through the per-tick memory-model bridge below, or falls back to the software HLE
+ * interpreter (gdx_audio_hle_run). LLE is the default -- it is the grain-free path.
  *
- * This is the seam between the game's audio scheduler and the audio RSP. It routes
- * each M_AUDTASK either to the REAL audio microcode (aspMain) running on the vendored
- * cxd4 RSP interpreter -- via a per-tick memory-model bridge that marshals the Acmd
- * command list and every buffer it references into a flat physical RDRAM window the
- * RSP can DMA (Option B: flat-physical-RDRAM, realized as a bounded per-tick scratch
- * arena rather than a full heap relocation, which cannot fit under cxd4's 24-bit DMA
- * addressing alongside the 12-13MB GFX working set) -- or falls back to the existing
- * software HLE interpreter (gdx_audio_hle_run).
+ * The microcode itself never ships: it is Nintendo-copyrighted, so decomp/assets/yaml/us/rev0/
+ * rsp_blob.yaml extracts it from the user's own ROM into the locally-generated archive and
+ * gdx_lle_load_ucode_blob below reads it back from there. No archive entry, no LLE.
  *
- * Toggle is FILE-based (env vars proved unreliable in the target shell): LLE is ON by
- * default -- it is the grain-free path -- and a file `gdx-audio-lle.txt` whose first
- * byte is '0' forces the HLE fallback. Read once and cached.
- *
- * ============================================================================
  * THE MEMORY-MODEL BRIDGE (gdx_audio_lle_bridge_run)
- * ============================================================================
- * The real aspMain microcode DMAs its command list and every buffer that list
- * references (compressed sample data, ADPCM codebooks, per-note decode/resample
- * state, reverb rings, the AI output PCM, ...) straight out of RDRAM by *physical
- * offset*. On this host port those buffers live scattered across (a) the 16MB
- * gdx_rdram arena and (b) the exe's static image (gAudioCtx and its embedded
- * arrays). The Acmd `w1` fields that name them only carry the *low 32 bits* of a
- * host pointer (see n64_audio_hle.c's pointer-truncation essay), so the bridge
- * reconstructs each full host pointer with the same resolvers the HLE uses
- * (gdx_resolve_registered_host_address, then gdx_resolve_module_host_address),
- * copies the referenced buffer into a contiguous physical scratch window the RSP
- * *can* reach, rewrites the command's `w1` to that scratch offset, runs one task,
- * then copies RSP-written buffers back out to their host homes.
+ * aspMain DMAs its command list and every buffer that list references (compressed sample data,
+ * ADPCM codebooks, per-note decode/resample state, reverb rings, the AI output PCM) straight out
+ * of RDRAM by PHYSICAL OFFSET. On this host those buffers are scattered across the 16MB gdx_rdram
+ * arena and the exe's static image, and an Acmd w1 field carries only the low 32 bits of a host
+ * pointer (see n64_audio_hle.c's truncation note). So the bridge reconstructs each full host
+ * pointer with the same resolvers the HLE uses, copies the referenced buffer into a contiguous
+ * physical scratch window the RSP can reach, rewrites the command's w1 to that scratch offset,
+ * runs one task, then copies RSP-written buffers back out to their host homes. The scratch is a
+ * bounded per-tick arena rather than a full heap relocation: a relocated heap cannot fit under
+ * cxd4's 24-bit DMA addressing alongside the 12-13MB GFX working set.
  *
- * ----------------------------------------------------------------------------
- * THE ENDIANNESS RULE (critical -- see per-transform notes below)
- * ----------------------------------------------------------------------------
- * cxd4 stores ALL of RDRAM/DMEM/IMEM as HOST-NATIVE LITTLE-ENDIAN 32-BIT WORDS.
- * It models N64 (big-endian) memory as "byte-swap each aligned 32-bit word of the
- * N64-big-endian content". Since our scratch IS a region of gdx_rdram (cxd4's RDRAM
- * base is pointed straight at gdx_rdram by gdx_rsp_lle_init), a host-native u32 we
- * store at gdx_rdram+P is exactly the word cxd4 reads as RDRAM word P. So to place a
- * buffer for the RSP we transform each aligned 32-bit HOST word according to how the
- * host stores that buffer's element type:
+ * THE ENDIANNESS RULE. cxd4 stores ALL of RDRAM/DMEM/IMEM as HOST-NATIVE LITTLE-ENDIAN 32-BIT
+ * WORDS, modelling N64 big-endian memory as "byte-swap each aligned 32-bit word". Our scratch IS
+ * a region of gdx_rdram (cxd4's RDRAM base is pointed straight at it by gdx_rsp_lle_init), so a
+ * host-native u32 stored at gdx_rdram+P is exactly the word cxd4 reads as RDRAM word P. Placing a
+ * buffer for the RSP therefore means transforming each aligned 32-bit HOST word according to how
+ * the host stores that buffer's element type:
  *
- *   GDX_XFORM_CMD  (identity)  -- Acmd words. The game already built w0/w1 as
- *       host-native u32; a host-native u32 == (N64-BE u32 then word-swapped), so no
- *       transform is needed beyond rewriting address-bearing w1 fields. Copying the
- *       raw command bytes verbatim is therefore already correct.
+ *   GDX_XFORM_CMD (identity) -- Acmd words. The game already built w0/w1 as host-native u32, and
+ *       a host-native u32 IS an N64-BE u32 word-swapped, so copying the raw command bytes verbatim
+ *       is already correct; only address-bearing w1 fields need rewriting.
  *
- *   GDX_XFORM_S16  (rotate-16) -- buffers the host stores as an array of NATIVE s16
- *       (decomp reads them with plain `short` / gdx_rd_s16, so predictorState /
- *       adpcmdecState / finalResampleState / filter state+coefs / reverb-ring PCM /
- *       AI output PCM are all native s16 in host memory). N64-BE of a native s16 pair
- *       [s0 s1] is bytes [s0hi s0lo s1hi s1lo]; word-swapping that yields, expressed as
- *       an op on the host word W = (s1<<16)|s0, exactly (W>>16)|(W<<16): swap the two
- *       16-bit halves. (Involution.)
+ *   GDX_XFORM_S16 (rotate-16) -- arrays the host stores as NATIVE s16 (decomp reads them with
+ *       plain `short`/gdx_rd_s16: predictorState, adpcmdecState, finalResampleState, filter state
+ *       and coefficients, reverb-ring PCM, AI output PCM). Word-swapping the N64-BE form of a
+ *       native s16 pair reduces, on the host word W, to exactly (W>>16)|(W<<16).
  *
- *   GDX_XFORM_BYTESTREAM (bswap32) -- buffers the host stores as a RAW big-endian byte
- *       stream in N64 linear order (compressed ADPCM sample data loaded straight from
- *       cart/disk; the HLE copies these bytes 1:1 into DMEM and decodes them correctly,
- *       which proves host order == N64 linear byte order). N64-BE of a linear byte run
- *       [b0 b1 b2 b3] is itself; word-swapping is a plain 32-bit byte reversal. (Involution.)
+ *   GDX_XFORM_BYTESTREAM (bswap32) -- buffers the host stores as a RAW big-endian byte stream in
+ *       N64 linear order (compressed ADPCM sample data loaded straight from cart/disk; the HLE
+ *       copies those bytes 1:1 into DMEM and decodes them correctly, which proves host order ==
+ *       N64 linear byte order). Word-swapping a linear byte run is a plain 32-bit byte reversal.
  *
- * All three transforms are their own inverse, so COPY-BACK (RSP-written buffers) uses
- * the SAME transform as copy-in.
+ * All three transforms are their own inverse, so COPY-BACK uses the SAME transform as copy-in.
  *
- * BEST-GUESS / TUNING KNOBS (flagged so a future tuner can flip one byte order without
- * touching the machinery): the transforms live in gdx_copy_in/gdx_copy_out keyed by a
- * per-buffer-type GdxXform, chosen per opcode in the marshal switch. The two that rest
- * on inference rather than a hard ABI field are:
- *   (1) A_LOADBUFF compressed-vs-PCM classification (GDX_XFORM_BYTESTREAM only for the
- *       single compressed-ADPCM load, identified by the DMEM signature dmemDest+size ==
- *       DMEM_COMPRESSED_ADPCM_DATA; everything else treated as S16 PCM). If uncompressed
- *       (CODEC_S16) samples come out wrong, revisit this classifier.
- *   (2) Whether the host actually stores compressed sample data big-endian. The HLE's
- *       correctness says yes; if LLE ADPCM is noise while HLE is clean, flip A_LOADBUFF's
- *       compressed branch from BYTESTREAM to S16 (or identity) here.
+ * Two choices rest on inference rather than a hard ABI field, and are flagged TUNING KNOB at
+ * their sites: (1) the A_LOADBUFF compressed-vs-PCM classifier (BYTESTREAM only for the single
+ * compressed-ADPCM load, identified by its DMEM window ending at DMEM_COMPRESSED_ADPCM_DATA) --
+ * revisit if uncompressed CODEC_S16 samples come out wrong; (2) whether the host really stores
+ * compressed sample data big-endian -- if LLE ADPCM is noise while HLE is clean, flip that branch.
  *
- * ----------------------------------------------------------------------------
- * SAFETY NET
- * ----------------------------------------------------------------------------
- * If ANY opcode/address cannot be confidently marshalled (unresolved w1 token, a
- * truly-unknown opcode, or scratch overflow) the bridge ABORTS this tick and defers to
- * gdx_audio_hle_run() -- no host buffer is mutated before a successful RSP run, so the
- * fall-through is clean. LLE-enabled therefore never crashes; worst case it silently
- * degrades to HLE for a tick. Cross-tick state stays consistent across LLE<->HLE ticks
- * because the HOST buffers are the source of truth: every input is copied host->scratch
- * before the run and every RSP output is copied scratch->host after it.
+ * SAFETY NET. If any opcode or address cannot be confidently marshalled (unresolved w1 token,
+ * truly unknown opcode, scratch overflow) the bridge ABORTS the tick and defers to
+ * gdx_audio_hle_run. No host buffer is mutated before a successful RSP run, so the fall-through is
+ * clean: LLE never crashes, worst case it silently degrades to HLE for one tick. Cross-tick state
+ * stays consistent across mixed LLE/HLE ticks because the HOST buffers are the source of truth --
+ * every input is copied host->scratch before the run and every output scratch->host after it.
  */
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "rsp/cxd4/gdx_rsp_driver.h"
-#include "rsp/aspmain_ucode.h"
 #include "n64_rdram.h"
 
 extern void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes);
 extern int gdx_unlock_diag_enabled(void);
 extern void gdx_unlock_diagf(const char* fmt, ...);
 
-/* Low-32 -> full host pointer resolvers (defined in port/n64_gfx_bridge.cpp; the same
- * ones the HLE uses). Deliberately `unsigned int` (unambiguous 32 bits in every TU). */
+/* Raw archive-entry loader (port/AssetLoader.cpp). */
+extern int GDiffuser_LoadArchiveFileBytes(const char* key, void* out, size_t outSize, size_t* copiedSize);
+
+/* US rev0 aspMain slices, extracted into the archive by rsp_blob.yaml. */
+#define GDX_UCODE_TEXT_BYTES 0xD30u /* ROM 0x66270..0x66FA0 */
+#define GDX_UCODE_DATA_BYTES 0x2E0u /* ROM 0x71CA0..0x71F80 */
+
+/* Archive entry layout: 64-byte Torch header, u32 LE payload size, then the raw ROM bytes. */
+#define GDX_O2R_HEADER_BYTES 0x40u
+#define GDX_O2R_PAYLOAD_OFF (GDX_O2R_HEADER_BYTES + 4u)
+
+static uint8_t* sUcodeText; /* aspMain text, payload of rsp_blob/aspmain_text */
+static uint8_t* sUcodeData; /* aspMain data, payload of rsp_blob/aspmain_data */
+
+/* Low-32 -> full host pointer resolvers (port/n64_gfx_bridge.cpp; the same ones the HLE uses).
+ * Deliberately `unsigned int`: unambiguously 32 bits in every TU, unlike uintptr_t here. */
 extern void* gdx_resolve_registered_host_address(unsigned int addr);
 extern void* gdx_resolve_module_host_address(unsigned int addr);
 
 /* Verbose-diagnostics gate (defined in port/n64_sched.c). */
 extern int gdx_diag_verbose(void);
 
-/* ==========================================================================
- * Toggle (UNCHANGED -- keep the HLE fallback exactly as it was)
- * ========================================================================== */
-/* LUS console-variable read (C ABI, defined in libultraship). Declared here so this C TU
- * doesn't pull the C++ bridge header. */
+/* Defined in libultraship (C ABI). Declared here so this C TU need not pull the C++ bridge
+ * header. */
 extern int CVarGetInteger(const char* name, int defaultValue);
 
 static int gdx_audio_lle_enabled(void) {
-    /* Live from the ImGui Audio tab (F1 > Audio > Engine): gEnhancements.Audio.LLE
-     * (1 = LLE, 0 = HLE). Read each tick on the audio thread; the CVar is pre-registered at
-     * boot so a concurrent menu write is a benign int-value race (worst case one tick sees the
-     * old value). Default 1 = LLE on -- the shipping audio path -- so behavior is
-     * unchanged if the menu is never touched. */
+    /* Read each tick on the audio thread. The CVar is pre-registered at boot, so a concurrent
+     * menu write is a benign int-value race -- worst case one tick sees the old value. */
     return CVarGetInteger("gEnhancements.Audio.LLE", 1) != 0;
 }
 
@@ -344,9 +322,6 @@ void gdx_unlock_audio_capture_ai_buffer(const int16_t* buffer, unsigned int fram
     }
 }
 
-/* ==========================================================================
- * Diagnostics
- * ========================================================================== */
 static void gdx_lle_logf(const char* fmt, ...) {
     va_list ap;
     FILE* f;
@@ -363,9 +338,7 @@ static void gdx_lle_logf(const char* fmt, ...) {
     fclose(f);
 }
 
-/* ==========================================================================
- * Opcode numbers (mirror n64_audio_hle.c / PR/abi.h, EXPANSION_KIT build)
- * ========================================================================== */
+/* Mirrors n64_audio_hle.c / PR/abi.h. EXPANSION_KIT build, hence A_HILOGAIN == 14. */
 enum {
     GDX_A_SPNOOP       = 0,
     GDX_A_ADPCM        = 1,
@@ -380,7 +353,7 @@ enum {
     GDX_A_LOADADPCM    = 11,
     GDX_A_MIXER        = 12,
     GDX_A_INTERLEAVE   = 13,
-    GDX_A_HILOGAIN     = 14, /* EXPANSION_KIT build */
+    GDX_A_HILOGAIN     = 14,
     GDX_A_SETLOOP      = 15,
     GDX_A_INTERL       = 17,
     GDX_A_ENVSETUP1    = 18,
@@ -393,15 +366,14 @@ enum {
     GDX_A_DUPLICATE    = 26
 };
 
-/* DMEM landmark used to classify A_LOADBUFF (compressed sample chunk vs PCM). The one
- * compressed-ADPCM load in disk/lib/synthesis.c is `aLoadBuffer(.., addr, aligned)` with
- * addr = DMEM_COMPRESSED_ADPCM_DATA - aligned, so it is the unique load whose DMEM window
- * ENDS exactly at DMEM_COMPRESSED_ADPCM_DATA (mod 0x10000 -- robust to the u16 wrap when
- * aligned > addr). Reverb-ring / PCM loads target other DMEM addresses. */
+/* Classifies A_LOADBUFF as a compressed sample chunk vs PCM. The one compressed-ADPCM load in
+ * disk/lib/synthesis.c passes addr = DMEM_COMPRESSED_ADPCM_DATA - aligned, so it is the unique
+ * load whose DMEM window ENDS exactly here (mod 0x10000, which absorbs the u16 wrap when
+ * aligned > addr). Reverb-ring and PCM loads target other DMEM addresses. */
 #define GDX_DMEM_COMPRESSED_ADPCM_DATA 0x940u
 
-/* State-buffer DMA sizes (bytes), sized to what the real aspMain DMAs, cross-checked
- * against the decomp struct fields the ucode author matched to the ucode:
+/* State-buffer DMA sizes in bytes, matching what the real aspMain DMAs and cross-checked against
+ * the decomp struct fields:
  *   adpcmdecState[16]       -> 32  (A_ADPCM / A_S8DEC persistent decode history)
  *   finalResampleState[16]  -> 32  (A_RESAMPLE persistent 4-tap window + frac + pitch)
  *   predictorState[16]      -> 32  (A_SETLOOP loop-restart history; ROM-constant, read-only)
@@ -415,9 +387,7 @@ enum {
 /* A_LOADADPCM codebook DMA cap (matches the HLE's private book scratch bound). */
 #define GDX_ADPCM_BOOK_MAX_BYTES  4096u
 
-/* ==========================================================================
- * Endianness transforms (all involutions; see the file header essay)
- * ========================================================================== */
+/* Endianness transforms; all involutions, see the file header. */
 typedef enum {
     GDX_XFORM_CMD = 0,      /* identity -- Acmd words */
     GDX_XFORM_S16,          /* rotate-16 -- native s16 arrays */
@@ -440,19 +410,15 @@ static uint32_t gdx_xform_word(uint32_t w, GdxXform xf) {
     }
 }
 
-/* ==========================================================================
- * Scratch arena layout (all offsets are RELATIVE to sScratchPhys)
- * --------------------------------------------------------------------------
- *   [0 .. DATA_END)        aspMain data section (fixed; written once at init)
- *   [PERSIST_OFF .. PERSIST_END)  persistent state slots (never reset): in/out
- *                          decode/resample/filter state keyed by host pointer so a
- *                          given note's state always maps to the same scratch slot.
- *   [TICK_OFF .. SCRATCH_SIZE)   per-tick bump arena (reset every tick): command list,
- *                          compressed sample data, codebooks, filter coefs, reverb-ring
- *                          and AI-output DMA windows, and any input-only buffer.
- * The scratch is carved from the TOP of RDRAM (gdx_rdram_persist_alloc_raw), above the
- * ~12-13MB GFX working set, and is never reclaimed.
- * ========================================================================== */
+/* Scratch arena layout; all offsets are RELATIVE to sScratchPhys.
+ *   [0 .. DATA_END)              aspMain data section, written once at init.
+ *   [PERSIST_OFF .. PERSIST_END) persistent state slots, never reset: in/out decode/resample/
+ *                                filter state keyed by host pointer, so a given note's state
+ *                                always maps to the same scratch slot.
+ *   [TICK_OFF .. SCRATCH_SIZE)   per-tick bump arena, reset every tick: command list, compressed
+ *                                sample data, codebooks, filter coefs, reverb-ring and AI-output
+ *                                DMA windows, and any input-only buffer.
+ * Carved from the TOP of RDRAM, above the ~12-13MB GFX working set, and never reclaimed. */
 #define GDX_LLE_SCRATCH_SIZE   0x200000u   /* 2 MB (well over any observed audio tick) */
 #define GDX_LLE_DATA_OFF       0x000000u
 #define GDX_LLE_PERSIST_OFF    0x000300u   /* after the 0x2E0-byte data section, 16-aligned */
@@ -488,11 +454,9 @@ static GdxMap sMap[GDX_MAP_MAX];
 static int    sMapCount = 0;
 static uint32_t sTickBump = GDX_LLE_TICK_OFF;
 
-/* ==========================================================================
- * Copy helpers -- move `bytes` between a host buffer and the scratch (which is itself
- * host-addressable memory inside gdx_rdram), transforming each aligned 32-bit word.
- * Both handle a ragged 1-3 byte tail without reading/writing past either endpoint.
- * ========================================================================== */
+/* Move `bytes` between a host buffer and the scratch (itself host-addressable memory inside
+ * gdx_rdram), transforming each aligned 32-bit word. Both handle a ragged 1-3 byte tail without
+ * reading or writing past either endpoint. */
 static void gdx_copy_in(uint32_t dstPhys, const void* src, uint32_t bytes, GdxXform xf) {
     const uint8_t* s = (const uint8_t*)src;
     uint8_t* d = gdx_rdram + dstPhys;
@@ -504,11 +468,11 @@ static void gdx_copy_in(uint32_t dstPhys, const void* src, uint32_t bytes, GdxXf
         w = gdx_xform_word(w, xf);
         memcpy(d + i, &w, 4);
     }
-    /* Ragged 1-3 byte tail: DEAD for every real buffer (all DMA sizes here are >=4-byte
-     * multiples -- states 32/64/16B, LOAD/SAVE sizes are (n<<4), codebooks 32B multiples,
-     * the data section 736B). A word-transform can't straddle a sub-word boundary, so for
-     * a pathological unaligned size fall back to a raw byte copy: never out-of-bounds,
-     * never corrupts neighbours (vs. a transformed partial word, which could zero it). */
+    /* Dead for every real buffer -- every DMA size here is a multiple of 4 (states 32/64/16B,
+     * LOAD/SAVE sizes are (n<<4), codebooks 32B multiples, the data section 736B). A word
+     * transform cannot straddle a sub-word boundary, so a pathological unaligned size falls back
+     * to a raw byte copy: never out of bounds, and never zeroes a neighbouring byte the way a
+     * transformed partial word would. */
     if (bytes & 3u) {
         memcpy(d + full, s + full, bytes & 3u);
     }
@@ -529,10 +493,33 @@ static void gdx_copy_out(void* dst, uint32_t srcPhys, uint32_t bytes, GdxXform x
     }
 }
 
-/* ==========================================================================
- * One-time init: wire cxd4, reserve the scratch, seed the data section.
- * Returns 1 if the bridge is usable, 0 if it must permanently defer to HLE.
- * ========================================================================== */
+/* Load one microcode blob from the archive. Returns a pointer to the payload (process-lifetime
+ * allocation, never freed -- the RSP driver keeps using it), or NULL if the entry is missing or
+ * its size is wrong. */
+static uint8_t* gdx_lle_load_ucode_blob(const char* key, uint32_t expectBytes) {
+    const size_t cap = (size_t)GDX_O2R_PAYLOAD_OFF + expectBytes;
+    uint8_t* buf = (uint8_t*)malloc(cap);
+    size_t copied = 0;
+    uint32_t payloadSize;
+
+    if (buf == NULL) {
+        return NULL;
+    }
+    if (!GDiffuser_LoadArchiveFileBytes(key, buf, cap, &copied) || copied < cap) {
+        free(buf);
+        return NULL;
+    }
+    payloadSize = (uint32_t)buf[GDX_O2R_HEADER_BYTES] | ((uint32_t)buf[GDX_O2R_HEADER_BYTES + 1] << 8) |
+                  ((uint32_t)buf[GDX_O2R_HEADER_BYTES + 2] << 16) | ((uint32_t)buf[GDX_O2R_HEADER_BYTES + 3] << 24);
+    if (payloadSize != expectBytes) {
+        free(buf);
+        return NULL;
+    }
+    return buf + GDX_O2R_PAYLOAD_OFF;
+}
+
+/* One-time init: wire cxd4, reserve the scratch, seed the data section. Returns 1 if the bridge
+ * is usable, 0 if it must permanently defer to HLE. */
 static int gdx_lle_init_once(void) {
     void* scratch;
     uintptr_t rel;
@@ -547,10 +534,23 @@ static int gdx_lle_init_once(void) {
         return 0;
     }
 
+    if (sUcodeText == NULL) {
+        sUcodeText = gdx_lle_load_ucode_blob("rsp_blob/aspmain_text", GDX_UCODE_TEXT_BYTES);
+    }
+    if (sUcodeData == NULL) {
+        sUcodeData = gdx_lle_load_ucode_blob("rsp_blob/aspmain_data", GDX_UCODE_DATA_BYTES);
+    }
+    if (sUcodeText == NULL || sUcodeData == NULL) {
+        /* Stale dev archive or a profile without rsp_blob entries: HLE keeps audio working. */
+        fprintf(stderr, "[audio-lle] bridge DISABLED: aspMain microcode missing from the archive\n");
+        sInitState = -1;
+        return 0;
+    }
+
     gdx_rsp_lle_init(gdx_rdram);
 
-    /* Session-lifetime scratch from the TOP of RDRAM, downward. Fatal on exhaustion
-     * inside the allocator, so a non-NULL return is guaranteed on success. */
+    /* Session-lifetime scratch from the TOP of RDRAM, downward. The allocator is fatal on
+     * exhaustion, so a non-NULL return is guaranteed. */
     scratch = gdx_rdram_persist_alloc_raw((size_t)GDX_LLE_SCRATCH_SIZE, (size_t)16);
     rel = (uintptr_t)((unsigned char*)scratch - gdx_rdram);
 
@@ -563,18 +563,18 @@ static int gdx_lle_init_once(void) {
     }
     sScratchPhys = (uint32_t)rel;
 
-    /* Seed the aspMain data section (raw big-endian ROM blob) at a fixed spot. The RSP
-     * DMAs ucode_data from here into DMEM at boot; the driver also byte-swaps the same
-     * blob into DMEM[0] as a fallback, so this must match: bswap32 per word. */
+    /* Seed the aspMain data section (raw big-endian ROM blob). The RSP DMAs ucode_data from here
+     * into DMEM at boot, and the driver byte-swaps the same blob into DMEM[0] as a fallback, so
+     * the two must agree: bswap32 per word. */
     sDataSecPhys = sScratchPhys + GDX_LLE_DATA_OFF;
-    gdx_copy_in(sDataSecPhys, gdx_aspmain_data, (uint32_t)gdx_aspmain_data_len, GDX_XFORM_BYTESTREAM);
+    gdx_copy_in(sDataSecPhys, sUcodeData, GDX_UCODE_DATA_BYTES, GDX_XFORM_BYTESTREAM);
 
     sPersistBump  = GDX_LLE_PERSIST_OFF;
     sPersistCount = 0;
 
     fprintf(stderr, "[audio-lle] bridge init OK: scratchPhys=%06X size=%X dataSec=%06X (len=%X)\n",
             (unsigned)sScratchPhys, (unsigned)GDX_LLE_SCRATCH_SIZE,
-            (unsigned)sDataSecPhys, (unsigned)gdx_aspmain_data_len);
+            (unsigned)sDataSecPhys, (unsigned)GDX_UCODE_DATA_BYTES);
 
     sInitState = 1;
     return 1;
@@ -588,7 +588,7 @@ static int gdx_persist_slot(const void* host, uint32_t size, uint32_t* outPhys) 
     for (i = 0; i < sPersistCount; i++) {
         if (sPersist[i].host == host) {
             if (sPersist[i].size < rounded) {
-                return 0;   /* Finding 7: a grown request must never overflow a fixed slot -> HLE */
+                return 0;   /* a grown request must never overflow a fixed slot */
             }
             *outPhys = sPersist[i].phys;
             return 1;
@@ -683,9 +683,6 @@ static void* gdx_lle_resolve(uint32_t raw) {
     return gdx_resolve_module_host_address((unsigned int)raw);
 }
 
-/* ==========================================================================
- * The bridge.
- * ========================================================================== */
 static void gdx_audio_lle_bridge_run(const void* dataPtr, unsigned int dataSizeBytes) {
     const uint32_t* cmds;       /* host command list, {w0,w1} pairs of host-native u32 */
     uint32_t count;
@@ -698,8 +695,8 @@ static void gdx_audio_lle_bridge_run(const void* dataPtr, unsigned int dataSizeB
     uint32_t pcmLoads = 0;
     static int sBailLogs = 0;
 
-    /* --- BAIL macro: never mutate host state before a successful run, so a mid-marshal
-     * abort simply hands the untouched tick to the HLE. --- */
+    /* Never mutate host state before a successful run, so a mid-marshal abort hands the
+     * untouched tick to the HLE. */
     #define GDX_LLE_BAIL(reasonfmt, ...)                                              \
         do {                                                                          \
             if (gdx_unlock_audio_trace_dsp_active()) {                                \
@@ -735,27 +732,25 @@ static void gdx_audio_lle_bridge_run(const void* dataPtr, unsigned int dataSizeB
         return;
     }
 
-    /* --- Reset the per-tick arena and mapping list. Persistent slots survive. --- */
+    /* Reset the per-tick arena and mapping list; persistent slots survive. */
     sTickBump = GDX_LLE_TICK_OFF;
     sMapCount = 0;
 
-    /* Persistent-state region recycling (Finding 3): slots are keyed by host pointer and
-     * never individually evicted, so over a long session with audio-heap churn (bank/scene
-     * changes reallocate note state to fresh pointers) the 512-slot table would fill and then
-     * bail every state-bearing tick to HLE for the rest of the run. Recycle the whole region
-     * BETWEEN ticks when nearly full -- never mid-marshal, which would invalidate slots already
-     * placed this tick. Safe because host buffers are authoritative: each tick copies state
-     * host->scratch before the run, so live slots are re-established next tick with correct
-     * data (a dead reverb tail may glitch for one tick at most). One tick uses <~32 slots. */
+    /* Slots are keyed by host pointer and never individually evicted, so audio-heap churn
+     * (bank/scene changes reallocate note state to fresh pointers) would eventually fill the
+     * table and bail every state-bearing tick to HLE for the rest of the run. Recycle the whole
+     * region BETWEEN ticks when nearly full -- never mid-marshal, which would invalidate slots
+     * already placed this tick. Safe because host buffers are authoritative: each tick copies
+     * state host->scratch before the run, so live slots are re-established next tick with correct
+     * data, and at worst a dead reverb tail glitches for one tick. One tick uses under ~32. */
     if (sPersistCount > GDX_PERSIST_MAX - 32) {
         sPersistCount = 0;
         sPersistBump  = GDX_LLE_PERSIST_OFF;
     }
 
-    /* --- Copy the command list into scratch verbatim (host-native u32 == cxd4 word,
-     * GDX_XFORM_CMD is identity, so a raw byte copy is correct). We rewrite the
-     * address-bearing w1 fields IN THIS COPY, leaving the game's original list pristine
-     * (so the HLE fallback and the game itself are unaffected). --- */
+    /* Copy the command list into scratch verbatim (host-native u32 == cxd4 word). The
+     * address-bearing w1 fields are rewritten IN THIS COPY, leaving the game's original list
+     * pristine so the HLE fallback and the game itself are unaffected. */
     cmdBytes = count * 8u;
     {
         uint32_t rounded = (cmdBytes + 15u) & ~15u;
@@ -768,8 +763,7 @@ static void gdx_audio_lle_bridge_run(const void* dataPtr, unsigned int dataSizeB
         scratchCmds = (uint32_t*)(void*)(gdx_rdram + cmdListPhys);
     }
 
-    /* --- Marshal pass: for each address-bearing command, resolve w1, stage the buffer,
-     * and rewrite the scratch copy's w1 to the scratch physical offset. --- */
+    /* Marshal pass: resolve w1, stage the buffer, rewrite the scratch copy's w1. */
     for (i = 0; i < count; i++) {
         uint32_t w0 = cmds[i * 2u + 0u];
         uint32_t w1 = cmds[i * 2u + 1u];
@@ -777,15 +771,13 @@ static void gdx_audio_lle_bridge_run(const void* dataPtr, unsigned int dataSizeB
 
         switch (op) {
 
-            /* ---- Address-bearing opcodes (w1 = an RDRAM address) ---------------- */
+            /* Address-bearing opcodes: w1 is an RDRAM address. */
 
             case GDX_A_LOADBUFF: {
-                /* Load `size` bytes of sample data from RDRAM into DMEM. INPUT only.
-                 * size = (w0>>16 & 0xFF) << 4, dmemDest = w0 & 0xFFFF (see HLE). The
-                 * compressed-ADPCM chunk load is the unique one whose DMEM window ends
-                 * at DMEM_COMPRESSED_ADPCM_DATA -> treat as a raw BE byte stream; every
-                 * other load (reverb ring / uncompressed PCM) is native s16.
-                 * [TUNING KNOB #1/#2: this classifier + the BYTESTREAM choice.] */
+                /* INPUT only. The compressed-ADPCM chunk load is the unique one whose DMEM
+                 * window ends at DMEM_COMPRESSED_ADPCM_DATA, so it is a raw BE byte stream;
+                 * every other load (reverb ring, uncompressed PCM) is native s16.
+                 * TUNING KNOB: this classifier and the BYTESTREAM choice. */
                 uint32_t size     = ((w0 >> 16) & 0xFFu) << 4;
                 uint32_t dmemDest = w0 & 0xFFFFu;
                 GdxXform xf = (((dmemDest + size) & 0xFFFFu) == GDX_DMEM_COMPRESSED_ADPCM_DATA)
@@ -811,11 +803,10 @@ static void gdx_audio_lle_bridge_run(const void* dataPtr, unsigned int dataSizeB
             }
 
             case GDX_A_SAVEBUFF: {
-                /* Store `size` bytes of RSP-produced PCM from DMEM to RDRAM. OUTPUT.
-                 * Destinations are reverb rings and the AI output buffer -- all native
-                 * s16. No copy-in (the RSP fills the DMA window); copy scratch->host
-                 * after the run. If the same host ptr was already loaded this tick, the
-                 * dedup in gdx_stage reuses that window (load->process->save round-trip). */
+                /* OUTPUT. Destinations are reverb rings and the AI output buffer, all native
+                 * s16. No copy-in -- the RSP fills the DMA window. If the same host pointer was
+                 * already loaded this tick, gdx_stage's dedup reuses that window, which is what
+                 * makes a load->process->save round-trip work. */
                 uint32_t size    = ((w0 >> 16) & 0xFFu) << 4;
                 uint32_t dmemSrc = w0 & 0xFFFFu;
                 void* host = gdx_lle_resolve(w1);
@@ -857,9 +848,8 @@ static void gdx_audio_lle_bridge_run(const void* dataPtr, unsigned int dataSizeB
             }
 
             case GDX_A_SETLOOP: {
-                /* Load the loop-restart predictor history (predictorState[16], host s16).
-                 * INPUT only and ROM-constant, so a per-tick slot is fine (nothing to
-                 * retain across ticks -- the RSP never writes it back). */
+                /* Loop-restart predictor history (predictorState[16], host s16). INPUT only and
+                 * ROM-constant, so a per-tick slot is fine: the RSP never writes it back. */
                 void* host = gdx_lle_resolve(w1);
                 uint32_t phys;
                 if (host == NULL) {
@@ -875,10 +865,10 @@ static void gdx_audio_lle_bridge_run(const void* dataPtr, unsigned int dataSizeB
 
             case GDX_A_ADPCM:
             case GDX_A_S8DEC: {
-                /* Persistent per-note decode state (adpcmdecState[16], host s16). IN/OUT:
-                 * the RSP reads last tick's tail and writes this tick's tail back. Stable
-                 * scratch slot keyed by the state pointer + copy-in/out each tick keeps
-                 * decode continuity correct even across LLE<->HLE ticks. */
+                /* Persistent per-note decode state (adpcmdecState[16], host s16). IN/OUT: the
+                 * RSP reads last tick's tail and writes this tick's back. A stable slot keyed by
+                 * the state pointer, plus copy in/out each tick, keeps decode continuity correct
+                 * even across mixed LLE/HLE ticks. */
                 void* host = gdx_lle_resolve(w1);
                 uint32_t phys;
                 if (host == NULL) {
@@ -893,8 +883,8 @@ static void gdx_audio_lle_bridge_run(const void* dataPtr, unsigned int dataSizeB
             }
 
             case GDX_A_RESAMPLE: {
-                /* Persistent per-note resample state (finalResampleState[16], host s16).
-                 * IN/OUT: 4-sample history + fractional accumulator carried tick to tick. */
+                /* Persistent per-note resample state (finalResampleState[16], host s16). IN/OUT:
+                 * 4-sample history plus fractional accumulator, carried tick to tick. */
                 void* host = gdx_lle_resolve(w1);
                 uint32_t phys;
                 if (host == NULL) {
@@ -909,10 +899,10 @@ static void gdx_audio_lle_bridge_run(const void* dataPtr, unsigned int dataSizeB
             }
 
             case GDX_A_FILTER: {
-                /* Two-step reverb low-pass op (see HLE's RunFilter header):
-                 *   prime (f==2): w1 = coefficient table (FILTER_SIZE=16 host s16). INPUT.
-                 *   apply (else):  w1 = filter delay-line state (64 bytes host s16). IN/OUT,
-                 *                  persistent (history carried across command lists). */
+                /* Two-step op, see the HLE's RunFilter header:
+                 *   prime (f==2): w1 = coefficient table (FILTER_SIZE=16 host s16), INPUT.
+                 *   apply (else): w1 = filter delay-line state (64 bytes host s16), IN/OUT and
+                 *                 persistent -- history carries across command lists. */
                 uint32_t f = (w0 >> 16) & 0xFFu;
                 void* host = gdx_lle_resolve(w1);
                 uint32_t phys;
@@ -934,14 +924,12 @@ static void gdx_audio_lle_bridge_run(const void* dataPtr, unsigned int dataSizeB
                 break;
             }
 
-            /* ---- Non-address opcodes: w1 is packed DMEM offsets / immediates, NEVER a
-             * pointer (verified against n64_audio_hle.c -- none of these call the address
-             * resolvers). Nothing to marshal; the ucode runs them straight from the list.
-             * NOTE: A_ENVSETUP2's w1 is TWO immediate volume words here (EXPANSION_KIT
-             * ABI), NOT a state address -- the HLE decodes it as `(w1>>16)&0xFFFF` /
-             * `w1&0xFFFF`, so despite the general N64 lore it is not address-bearing in
-             * this build. A_ENVMIXER's w1 is a packed DMEM-dest word (union field named
-             * `addr` but not a pointer). A_HILOGAIN's w1 high half is a DMEM offset. ---- */
+            /* Non-address opcodes: w1 is packed DMEM offsets or immediates, NEVER a pointer, so
+             * there is nothing to marshal. Two that read as address-bearing but are not:
+             * A_ENVSETUP2's w1 is TWO immediate volume words under the EXPANSION_KIT ABI, not a
+             * state address (contrary to the general N64 lore), and A_ENVMIXER's w1 is a packed
+             * DMEM-dest word despite the union field being named `addr`. A_HILOGAIN's w1 high
+             * half is a DMEM offset. */
             case GDX_A_SPNOOP:
             case GDX_A_CLEARBUFF:
             case GDX_A_SETBUFF:
@@ -954,49 +942,45 @@ static void gdx_audio_lle_bridge_run(const void* dataPtr, unsigned int dataSizeB
             case GDX_A_ENVSETUP2:
             case GDX_A_ENVMIXER:
             case GDX_A_HILOGAIN:
-            /* SDK-unknown / unused-by-this-decomp opcodes: carry no RDRAM address (all
-             * DMEM-internal or no-ops in synthesis.c). The real ucode implements them;
-             * we pass them through untouched. */
+            /* SDK-unknown or unused by this decomp: DMEM-internal or no-ops in synthesis.c, so
+             * they carry no RDRAM address and pass through untouched. */
             case GDX_A_UNK3:
             case GDX_A_RESAMPLE_ZOH:
             case GDX_A_UNK19:
             case GDX_A_DUPLICATE:
                 break;
 
-            /* ---- Genuinely unknown opcode: we cannot prove w1 isn't an address we'd
-             * fail to marshal, so degrade this tick to the HLE rather than risk feeding
-             * the RSP a bad DMA source. ---- */
+            /* Genuinely unknown opcode: w1 cannot be proven not to be an address, so degrade
+             * this tick to the HLE rather than feed the RSP a bad DMA source. */
             default:
                 GDX_LLE_BAIL("unknown opcode=%u w0=%08X w1=%08X", (unsigned)op,
                              (unsigned)w0, (unsigned)w1);
         }
     }
 
-    /* --- Build the 64-byte OSTask (host-native little-endian). aspMain's boot reads
-     * exactly these four fields (verified in the ucode text disasm: lw at +0x18/+0x1C
-     * off the task header, and +0x30/+0x34); everything else is zero.
+    /* 64-byte OSTask, host-native little-endian. aspMain's boot reads exactly these four fields
+     * (ucode text disasm: lw at +0x18/+0x1C and +0x30/+0x34); everything else is zero.
      *   +0x00 type            = 2 (M_AUDTASK)
      *   +0x18 ucode_data      = scratch offset of the data section
-     *   +0x1C ucode_data_size = gdx_aspmain_data_len (0x2E0)
+     *   +0x1C ucode_data_size = GDX_UCODE_DATA_BYTES (0x2E0)
      *   +0x30 data_ptr        = scratch offset of the rewritten command list
-     *   +0x34 data_size       = dataSizeBytes --- */
+     *   +0x34 data_size       = dataSizeBytes */
     memset(ostask, 0, sizeof(ostask));
     ostask[0x00u / 4u] = 2u;
     ostask[0x18u / 4u] = sDataSecPhys;
-    ostask[0x1Cu / 4u] = (uint32_t)gdx_aspmain_data_len;
+    ostask[0x1Cu / 4u] = GDX_UCODE_DATA_BYTES;
     ostask[0x30u / 4u] = cmdListPhys;
     ostask[0x34u / 4u] = dataSizeBytes;
 
-    /* --- Run one aspMain task to the task-complete BREAK. --- */
-    gdx_rsp_lle_run_task(gdx_aspmain_text, (unsigned)gdx_aspmain_text_len,
-                         gdx_aspmain_data, (unsigned)gdx_aspmain_data_len,
+    /* Run one aspMain task to the task-complete BREAK. */
+    gdx_rsp_lle_run_task(sUcodeText, GDX_UCODE_TEXT_BYTES,
+                         sUcodeData, GDX_UCODE_DATA_BYTES,
                          ostask);
 
-    /* Watchdog: if the ucode never reached BREAK (mis-marshalled/runaway task), the
-     * driver longjmp'd out after the instruction cap. Discard the (partial) scratch
-     * output -- no host buffer has been mutated yet, copy-out is below -- and fall back
-     * to the HLE for this tick so a marshalling bug degrades gracefully instead of
-     * spinning the audio thread. */
+    /* If the ucode never reached BREAK (mis-marshalled or runaway task) the driver longjmp'd out
+     * after its instruction cap. Copy-out is below, so no host buffer has been mutated yet:
+     * discard the partial scratch output and fall back to the HLE for this tick rather than spin
+     * the audio thread. */
     if (!gdx_rsp_lle_completed()) {
         if (gdx_unlock_audio_trace_dsp_active()) {
             gdx_unlock_diagf("[unlock-audio] dsp task selected=LLE outcome=fallback reason=watchdog cmds=%u bytes=%u\n",
@@ -1011,9 +995,8 @@ static void gdx_audio_lle_bridge_run(const void* dataPtr, unsigned int dataSizeB
         return;
     }
 
-    /* --- Copy back every RSP-written buffer (reverb rings + AI output PCM + in/out
-     * state) to its host home, applying the inverse (== same) transform. The AI PCM
-     * especially must land back in host memory so the existing AI pipeline plays it. --- */
+    /* Copy every RSP-written buffer back to its host home under the inverse (== same) transform.
+     * The AI PCM especially must land back in host memory for the existing AI pipeline to play. */
     for (i = 0; i < (uint32_t)sMapCount; i++) {
         if (sMap[i].isOutput) {
             gdx_copy_out((void*)sMap[i].host, sMap[i].phys, sMap[i].size, sMap[i].xf);
@@ -1037,10 +1020,8 @@ static void gdx_audio_lle_bridge_run(const void* dataPtr, unsigned int dataSizeB
     #undef GDX_LLE_BAIL
 }
 
-/* ==========================================================================
- * Entry point (UNCHANGED toggle + HLE fallback contract). When LLE is enabled the
- * bridge takes over; the bridge itself defers to gdx_audio_hle_run on any trouble.
- * ========================================================================== */
+/* Entry point. When LLE is enabled the bridge takes over; the bridge itself defers to
+ * gdx_audio_hle_run on any trouble. */
 void gdx_audio_lle_run(const void* dataPtr, unsigned int dataSizeBytes) {
     if (!gdx_audio_lle_enabled()) {
         if (gdx_unlock_audio_trace_dsp_active()) {

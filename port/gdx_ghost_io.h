@@ -11,26 +11,19 @@
  * location: every distinct validated player replay can coexist under `ghosts/` and up to three
  * entries per exact encoded course can be selected as Time Attack opponents.
  *
- * SCOPE: base-course player ghosts (courses 0..23). This intentionally does NOT touch the
- * 64DD/Expansion-Kit per-course ghost cache (COURSE_CONTEXT()->ghostSave[i], DDSave_*
- * in decomp/src/overlays/ovl_i2/dd_save.c). That path is LIVE on the default build --
+ * SCOPE: base-course player ghosts (courses 0..23). This deliberately does NOT touch the
+ * 64DD/Expansion-Kit per-course ghost cache (COURSE_CONTEXT()->ghostSave[i], DDSave_* in
+ * decomp/src/overlays/ovl_i2/dd_save.c). That path is LIVE on the default build --
  * GDX_EXPANSION_KIT compiles dd_save.c in, the drive is emulated (port/n64_leo.c over the
  * disk image in port/disk_buffer.cpp), and its writes are made durable by the .gdd journal
- * sidecar (port/disk_savefile.cpp) -- so this library deliberately stays out of it rather
- * than adding a second owner for the same records. A fuller ".gdg" container (JSON metadata,
- * optional input-replay chunks, a ghost registry) is possible later; this header implements just
- * the "GDG1" magic +
- * verbatim-payload core of that design, which is forward-compatible with it (a v1 file
- * is a strict prefix of what a later version could still call "GDG1" data, but this
- * loader intentionally rejects anything that isn't byte-for-byte the v1 shape below --
- * see "Format versioning").
+ * sidecar (port/disk_savefile.cpp) -- so staying out of it avoids a second owner for the
+ * same records.
  *
  * .gdg FILE FORMAT (v1)
  * ----------------------
  * All integers in the 20-byte header are little-endian, hand-packed (2/4-byte fields
- * written LSB-first), independent of host struct layout -- this is a NEW container
- * format invented for this feature, so its byte order is defined explicitly rather than
- * left to "whatever the compiler does":
+ * written LSB-first), independent of host struct layout. This container format is new,
+ * so its byte order is defined explicitly rather than left to the compiler:
  *
  *   offset  size  field
  *   0       4     magic       ASCII "GDG1" (no NUL terminator)
@@ -54,19 +47,14 @@
  * Total v1 file size: 20 + 0x3FC0 = 0x3FD4 (16340) bytes, always (fixed-size payload;
  * there is no variable-length data in a base-course ghost).
  *
- * ENDIANNESS of the payload: this port persists gSaveContext (and therefore the ghost
- * SRAM slot) to fzerox.sav as a raw, un-byteswapped memcpy of the in-memory struct --
- * see port/sram_buffer.cpp's gdx_sram_read/gdx_sram_write, which never touch the byte
- * order of what they copy. The port currently only targets little-endian hosts (x86/
- * x64; port/sram_buffer.cpp's own comment notes persistence is Windows-only so far), so
- * "the payload's native byte order" and "little-endian" are the same thing today. The
- * .gdg payload therefore intentionally matches fzerox.sav's own convention -- GhostSave is
- * 0x3FC0 native bytes, GhostRecord + GhostData verbatim -- rather than re-encoding every
- * u16/s32 field by
- * hand, which would just be a second, independent place that byte order could get out of
- * sync with the SRAM path it mirrors. If this port ever grows a big-endian host target,
- * the payload would need an explicit per-field re-encode at that point -- this is called
- * out here so it is not a silent trap.
+ * ENDIANNESS of the payload: the port persists gSaveContext (and therefore the ghost SRAM
+ * slot) to fzerox.sav as a raw, un-byteswapped memcpy of the in-memory struct -- see
+ * port/sram_buffer.cpp's gdx_sram_read/gdx_sram_write, which never touch the byte order of
+ * what they copy. Only little-endian hosts are targeted, so "native byte order" and
+ * "little-endian" are the same thing here. The .gdg payload matches fzerox.sav's convention
+ * verbatim rather than re-encoding every u16/s32 by hand, which would be a second,
+ * independent place for the byte order to drift out of sync with the SRAM path it mirrors.
+ * A big-endian host target would require an explicit per-field re-encode at that point.
  *
  * VALIDATION on import (gdx_ghost_import), in order -- any failure leaves the current
  * SRAM ghost slot and fzerox.sav completely untouched:
@@ -90,31 +78,27 @@
  * Non-player containers retain the legacy SRAM-only behavior and never enter the player library.
  *
  * SRAM MIRRORING: when compatible, import writes through Save_WriteGhostRecord /
- * Save_WriteGhostData -- the same two calls Save_SaveGhost makes and therefore the same
- * port/sram_buffer.cpp write-through path to fzerox.sav. Import deliberately writes the raw
- * record/data verbatim instead of routing through a runtime
- * Ghost struct the way Save_SaveGhost(courseIndex, Ghost*) does: Save_SaveGhostRecord
- * (save.c:1283-1328) always zeroes GhostRecord.trackName/unk_12 when building a record
- * from a Ghost, so round-tripping through that path would not reproduce the exact
- * original bytes. Writing the parsed record/data directly keeps export -> import ->
- * export byte-identical for every field, not just the ones a live gameplay save bothers
- * to preserve.
+ * Save_WriteGhostData -- the same two calls Save_SaveGhost makes, and therefore the same
+ * port/sram_buffer.cpp write-through path to fzerox.sav. It writes the raw record/data
+ * verbatim instead of routing through a runtime Ghost struct the way
+ * Save_SaveGhost(courseIndex, Ghost*) does, because Save_SaveGhostRecord (save.c:1283-1328)
+ * always zeroes GhostRecord.trackName/unk_12 when building a record from a Ghost. Writing
+ * the parsed record/data directly keeps export -> import -> export byte-identical for every
+ * field, not just the ones a live gameplay save bothers to preserve.
  *
- * ROUND TRIP: exporting the current SRAM ghost and re-importing it preserves the exact GDG1
- * payload byte-for-byte. The SRAM slot is reproduced too when it is empty or already represents
- * that encoded course; otherwise the import remains library-only so another course is not evicted.
+ * ROUND TRIP: exporting the current SRAM ghost and re-importing it preserves the GDG1 payload
+ * byte-for-byte. The SRAM slot is reproduced too when it is empty or already holds that encoded
+ * course; otherwise the import stays library-only so another course is not evicted.
  */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Pass to gdx_ghost_export() to export whatever course the single SRAM ghost slot
- * currently holds, regardless of which course that is. Any other value must match the
- * slot's actual course (see Save_LoadGhostInfo's GhostInfo.courseIndex) or the export
- * fails with GDX_GHOST_ERR_COURSE_MISMATCH -- this lets course-scoped UI (e.g. a
- * Practice-tab "export this course's ghost" button) fail safely instead of silently
- * exporting a different course's ghost when the player didn't realize the slot held one.
+/* Pass to gdx_ghost_export() to export whatever course the single SRAM ghost slot holds.
+ * Any other value must match the slot's actual course (Save_LoadGhostInfo's
+ * GhostInfo.courseIndex) or the export fails with GDX_GHOST_ERR_COURSE_MISMATCH, so
+ * course-scoped UI fails safely rather than silently exporting a different course's ghost.
  */
 #define GDX_GHOST_ANY_COURSE (-1)
 
@@ -135,21 +119,19 @@ extern "C" {
 #define GDX_GHOST_ERR_SELECTION_FULL (-12)   /* three opponents are already selected for this course */
 #define GDX_GHOST_ERR_NOT_FOUND (-13)        /* requested library fingerprint is absent */
 
-/* Suggested default file name for the Practice tab's Export/Import buttons (matches the
- * "ghost_export.gdg next to the exe" default from the feature's design notes). Callers
- * are free to use any path (e.g. from a save-file dialog); this is only a convenience
- * default, not a requirement -- gdx_ghost_export/gdx_ghost_import accept any path. */
+/* Convenience default for the Practice tab's Export/Import buttons only;
+ * gdx_ghost_export/gdx_ghost_import accept any path. */
 #define GDX_GHOST_DEFAULT_FILENAME "ghost_export.gdg"
 
-/* The PC port keeps multiple player ghosts per exact encoded course in a host-side library. The
- * full encodedCourseIndex is part of every key, so replays recorded against different course
- * geometry can never be selected accidentally. A 64-bit payload fingerprint gives every distinct
- * replay a stable local identity. The original SRAM slot remains intact for save compatibility;
- * it is archived before any vanilla overwrite and continues to be read by the base game.
+/* Multiple player ghosts per exact encoded course, kept in a host-side library. The full
+ * encodedCourseIndex is part of every key, so replays recorded against different course geometry
+ * can never be selected accidentally, and a 64-bit payload fingerprint gives every distinct replay
+ * a stable local identity. The SRAM slot stays intact for save compatibility: it is archived before
+ * any vanilla overwrite and continues to be read by the base game.
  *
- * Library files are ordinary validated GDG1 containers stored under `ghosts/` next to the
- * executable. Staff ghosts are deliberately not staged from this library: their ROM/EK unlock and
- * loading paths remain the base game's source of truth.
+ * Library files are ordinary validated GDG1 containers under `ghosts/` next to the executable.
+ * Staff ghosts are deliberately not staged from here -- their ROM/EK unlock and loading paths
+ * remain the base game's source of truth.
  */
 #define GDX_GHOST_LIBRARY_MAX_ENTRIES 128
 
@@ -220,17 +202,13 @@ int gdx_ghost_library_load_selected(int32_t encodedCourseIndex, void* outGhosts,
 /* Exports one exact fingerprinted library entry to an arbitrary GDG1 path. */
 int gdx_ghost_library_export(int32_t encodedCourseIndex, uint64_t ghostId, const char* path);
 
-/* Convenience helper: fills `outPath` (a UTF-8/ANSI, NUL-terminated path, at most
- * `outCap` bytes including the terminator) with a default .gdg path -- on Windows, the
- * executable's own directory plus GDX_GHOST_DEFAULT_FILENAME (mirrors port/sram_buffer.
- * cpp's gdx_sram_path pattern for fzerox.sav); on other hosts, just the bare relative
- * filename (a CWD-relative fallback -- this port's persistence is Windows-only so far,
- * matching sram_buffer.cpp's own caveat).
+/* Fills `outPath` (NUL-terminated, at most `outCap` bytes including the terminator) with a
+ * default .gdg path: on Windows the executable's own directory plus
+ * GDX_GHOST_DEFAULT_FILENAME, mirroring port/sram_buffer.cpp's gdx_sram_path pattern; on
+ * other hosts the bare relative filename.
  *
- * Returns 1 on success, 0 if `outPath`/`outCap` are invalid or the path would not fit.
- * This is purely a convenience for callers (e.g. the Practice tab's default Export/
- * Import path) -- gdx_ghost_export/gdx_ghost_import never call it themselves and work
- * with any caller-supplied path.
+ * Returns 1 on success, 0 if the arguments are invalid or the path would not fit.
+ * gdx_ghost_export/gdx_ghost_import never call this themselves.
  */
 int gdx_ghost_default_path(char* outPath, size_t outCap);
 

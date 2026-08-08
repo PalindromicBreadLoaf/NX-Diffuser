@@ -2,11 +2,10 @@
  *
  * The port's 64DD "drive" is a linear disk image loaded into gdx_disk_buffer
  * (port/disk_buffer.cpp). Game writes (Course Edit saves, MFS RAM-area formats,
- * ghost autosaves that land on disk) update that in-memory image but were
- * previously lost on exit. This module makes them durable WITHOUT ever mutating
- * the user's pristine .ndd file: it records only the dirty byte ranges into a
- * small sidecar next to the executable ("saves/<diskFileName>.gdd") and replays
- * them over a freshly loaded pristine image at the next boot.
+ * ghost autosaves that land on disk) update that in-memory image; this module
+ * makes them durable WITHOUT ever mutating the user's pristine .ndd, by recording
+ * only the dirty byte ranges into a sidecar next to the executable
+ * ("saves/<diskFileName>.gdd") and replaying them at the next boot.
  *
  * Design: copy-on-write journal. The pristine .ndd is the immutable base; the
  * sidecar is a coalesced list of {byteOffset, length, data} records covering
@@ -14,13 +13,11 @@
  * CRC64 fingerprint of the pristine image is stored in the sidecar header so a
  * sidecar is NEVER applied to a disk it was not created against.
  *
- * This is a host-CRT translation unit (part of the G-Diffuser executable target,
- * like port/sram_buffer.cpp and port/gdx_ghost_io.c), so it can freely use the
- * standard C/C++ file API. The decomp game object library never sees fopen/FILE;
- * it only reaches the two decomp-facing entry points (gdx_disk_save_mark_dirty
- * from port/n64_leo.c's write path, and the format guard below) through raw C
- * externs, the same boundary idiom sram_buffer.cpp uses. The path discipline and
- * the _WIN32 / POSIX split mirror port/gdx_ghost_io.c so this stays Linux-ready.
+ * Host-CRT translation unit (G-Diffuser executable target, like port/sram_buffer.cpp
+ * and port/gdx_ghost_io.c), so the standard file API is available here. The decomp
+ * game object library never sees fopen/FILE; it reaches the two decomp-facing entry
+ * points (gdx_disk_save_mark_dirty from port/n64_leo.c's write path, and the format
+ * guard below) through raw C externs, the same boundary idiom sram_buffer.cpp uses.
  */
 #ifndef GDX_DISK_SAVEFILE_H
 #define GDX_DISK_SAVEFILE_H
@@ -29,20 +26,18 @@
 extern "C" {
 #endif
 
-/* CRC-64/XZ (ECMA-182 polynomial, reflected 0xC96C5795D7870F42) of an arbitrary byte buffer --
- * the SAME table-based implementation gdx_disk_save_init below uses internally to fingerprint the
- * pristine disk. Exposed so other host TUs (port/disk_buffer.cpp's EK translated-disk variant
- * detection, EK reconciliation Phase 3) can compute the identical fingerprint without duplicating
- * the CRC-64 table generation/implementation in a second place. */
+/* CRC-64/XZ (ECMA-182 polynomial, reflected 0xC96C5795D7870F42), the same implementation
+ * gdx_disk_save_init uses internally to fingerprint the pristine disk. Exposed so other host
+ * TUs (port/disk_buffer.cpp's EK disk-variant detection) get an identical fingerprint without
+ * a second copy of the table. */
 unsigned long long gdx_disk_crc64(const unsigned char* data, unsigned long long length);
 
-/* Compute the pristine disk fingerprint, resolve the sidecar path
- * (saves/<diskName>.gdd next to the exe) and load + validate any existing
- * sidecar into the in-memory journal. `pristine` must point at the freshly
- * loaded, UNMODIFIED disk bytes (the CRC64 fingerprint is taken from them).
- * `diskName` is the base file name of the loaded .ndd; the sidecar mirrors it.
- * On any validation failure the loader falls back .gdd then .gdd.bak then
- * pristine-only, logging one line per outcome. A mismatched sidecar is ignored. */
+/* Fingerprints the pristine disk, resolves the sidecar path (saves/<diskName>.gdd next
+ * to the exe) and loads any existing sidecar into the in-memory journal. `pristine` must
+ * point at the freshly loaded, UNMODIFIED disk bytes -- the fingerprint is taken from
+ * them. `diskName` is the base file name of the loaded .ndd; the sidecar mirrors it. On
+ * validation failure the loader falls back .gdd then .gdd.bak then pristine-only; a
+ * mismatched sidecar is ignored. */
 void gdx_disk_save_init(const char* diskName, const unsigned char* pristine, unsigned int size);
 
 /* Replay the loaded journal records over `buffer` (the freshly loaded pristine
@@ -63,33 +58,31 @@ void gdx_disk_save_flush(void);
  * one atomic sidecar write. Call once per frame from the host loop. */
 void gdx_disk_save_tick(void);
 
-/* Host format guard (D6). Returns non-zero only when a disk-formatting write is
- * permitted. Default FALSE: the port refuses to auto-format an uninitialized or
- * foreign MFS RAM area on its own, which would fire unprompted and overwrite the
- * user's prior sidecar content. Called from the decomp EK format sites. */
+/* Host format guard. Non-zero only when a disk-formatting write is permitted; default
+ * FALSE, because an unprompted auto-format of an uninitialized or foreign MFS RAM area
+ * would overwrite the user's prior sidecar content. Called from the decomp EK format
+ * sites -- see the terminal-only-consumption rule in disk_savefile.cpp. */
 int gdx_disk_allow_format(void);
 
 /* Always-on, rate-limited refusal log for the D6 format guard. Callable from the
  * decomp EK translation units (which cannot include the host logging header). */
 void gdx_disk_log_format_refused(void);
 
-/* ── Workshop menu status getters (read-only introspection of the sidecar) ──
- * These back the "DD Save" subsection of the Workshop tab. All are cheap and
- * safe to call every frame from the ImGui draw. */
+/* Workshop-menu status getters. All are cheap and safe to call every frame from the
+ * ImGui draw. */
 
 /* Non-zero when a valid sidecar (.gdd or its .bak) was loaded this boot. */
 int gdx_disk_sidecar_present(void);
 
-/* Number of coalesced dirty-range records currently in the journal. */
 int gdx_disk_sidecar_record_count(void);
 
-/* Non-zero when the most recent flush attempt succeeded (1 initially, since a
- * fresh journal with nothing to flush is "not failed"). */
+/* Non-zero when the most recent flush attempt succeeded; 1 initially, since a fresh
+ * journal with nothing to flush is "not failed". */
 int gdx_disk_last_flush_ok(void);
 
-/* Non-zero when the MFS RAM area was found uninitialized AND the D6 guard
- * refused an auto-format at least once this boot -- i.e. the "Initialize DD
- * save area" button should be offered. */
+/* Non-zero when the MFS RAM area was found uninitialized AND the format guard refused
+ * at least once this boot -- i.e. the "Initialize DD save area" button should be
+ * offered. */
 int gdx_disk_format_refused_this_boot(void);
 
 #ifdef __cplusplus

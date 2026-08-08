@@ -1,10 +1,8 @@
 /* port/gdx_fiber.h -- cooperative context (fiber) abstraction.
  *
  * The cooperative scheduler (port/n64_sched.c) runs the decomp's real N64 threads as
- * cooperative contexts on a single OS thread. On Windows those are Win32 fibers
- * (CreateFiber/SwitchToFiber/ConvertThreadToFiber); on POSIX they are ucontext_t
- * contexts (getcontext/makecontext/swapcontext). This header is the seam that
- * lets n64_sched.c stay platform-neutral.
+ * cooperative contexts on a single OS thread. Win32 fibers and POSIX ucontext_t have no
+ * common API, so this header is the seam that lets n64_sched.c stay platform-neutral.
  *
  * INVARIANTS (both backends):
  *   - Every call here must happen on the scheduler-owning thread -- the one that
@@ -29,21 +27,19 @@ extern "C" {
 typedef struct GdxFiber GdxFiber; /* opaque */
 typedef void (*GdxFiberEntry)(void* arg);
 
-/* Convert the calling OS thread into the host context. Call once, before any
- * gdx_fiber_create/gdx_fiber_switch. Returns the host GdxFiber (the target to
- * switch back to when the run queue drains). */
+/* Call once, before any gdx_fiber_create/gdx_fiber_switch. Returns the host GdxFiber — the
+ * target to switch back to when the run queue drains. */
 GdxFiber* gdx_fiber_convert_thread(void);
 
-/* Create a new cooperative context that will run entry(arg) on first switch.
- * stackSize==0 selects a 1 MB default. Returns NULL on allocation failure. */
+/* Runs entry(arg) on the first switch, not here. stackSize==0 selects a 1 MB default.
+ * Returns NULL on allocation failure. */
 GdxFiber* gdx_fiber_create(GdxFiberEntry entry, void* arg, size_t stackSize);
 
 /* Save the currently running context and resume `to`. */
 void gdx_fiber_switch(GdxFiber* to);
 
-/* Identifier of the calling OS thread (Win32: GetCurrentThreadId; POSIX: the
- * kernel tid or a pthread_self cast). Used only by the scheduler's audio-thread
- * affinity guard, so an opaque-but-stable-per-thread value is sufficient. */
+/* Used only by the scheduler's audio-thread affinity guard, so an opaque-but-stable-per-thread
+ * value is sufficient — the backends return whatever their platform makes cheap. */
 unsigned long gdx_fiber_current_thread_id(void);
 
 #ifdef __cplusplus

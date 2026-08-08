@@ -33,6 +33,10 @@ VERSION_ENTRY_LEN = 5                  # 1 endianness byte + 4 CRC bytes
 # 4240-records / 664-duplicates / 3576-unique split described the pre-2026-07-18 archive (Windows
 # double-emit bug) and no longer applies after the Torch parity fix.
 #
+# 3610 = 3608 prior census + 2 rsp_blob families (aspmain_text, aspmain_data; 2026-08-08). The
+# RSP microcode moved out of the source tree (it is Nintendo-copyrighted) into the
+# locally-generated archive; strictly additive, no existing payload touched.
+#
 # 3608 = 3604 prior census + 4 create_machine_textures records (2026-07-25).
 #
 # 3604 = 3576 pre-R1 base + 22 R1 segment_blob families + 3 R2 audio_blob families + 3 R4
@@ -48,7 +52,7 @@ VERSION_ENTRY_LEN = 5                  # 1 endianness byte + 4 CRC bytes
 # segment offsets. Blessed only after checking the shape of the change: the new archive is a
 # strict SUPERSET of the old one -- 4 records added, 0 removed, 0 payloads altered, each new
 # record a real 656-byte texture rather than the blank a half-populated family would produce.
-EXPECTED_ENTRY_COUNT = 3608
+EXPECTED_ENTRY_COUNT = 3610
 
 # Macro names are a frozen code-level contract with agent 1-B (C3).
 MACRO_SHA256 = "GDX_O2R_EXPECTED_SHA256"

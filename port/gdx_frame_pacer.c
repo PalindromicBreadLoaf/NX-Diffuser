@@ -1,55 +1,39 @@
 // gdx_frame_pacer.c -- wall-clock frame pacer for the host loop.
 //
-// GROUND TRUTH (default is platform-specific)
-// -------------------------------------------
-// The host loop in main.cpp advances the simulation by exactly one VI tick per
-// iteration, and the loop's cadence is set by w->EndFrame(). On this port that
-// resolves to Interpreter::EndFrame() -> GfxWindowBackend*::SwapBuffersBegin(),
-// and both shipped backends contain a software frame limiter targeting mTargetFps
-// (initialised to 60). They are NOT equally reliable, which is why the default
-// differs by OS (the default is set in port/main.cpp via CVarRegisterInteger,
-// before the menu registers this CVar, so a persisted user toggle still wins):
+// WHY THE DEFAULT IS PLATFORM-SPECIFIC
+// ------------------------------------
+// The host loop advances the simulation by exactly one VI tick per iteration and its cadence
+// comes from w->EndFrame() -> Interpreter::EndFrame() -> GfxWindowBackend*::SwapBuffersBegin().
+// Both shipped backends contain a software limiter targeting mTargetFps (60), but they are NOT
+// equally reliable (the default is set in port/main.cpp via CVarRegisterInteger before the menu
+// registers this CVar, so a persisted user toggle still wins):
 //
-//   - Windows / DXGI-DX11 : gfx_dxgi.cpp SwapBuffersBegin() -- SetWaitableTimer
-//       coarse sleep to ~1.5 ms before a 1e9/60 ns deadline, then a YieldProcessor
-//       spin, then Present(vsync). This holds 60 fps reliably, VSync on or off, so
-//       this pacer stays OFF on Windows and is a strict no-op there (stock config is
-//       byte-for-byte unchanged).
+//   - Windows / DXGI-DX11 : gfx_dxgi.cpp SwapBuffersBegin() -- SetWaitableTimer coarse sleep to
+//       ~1.5 ms before a 1e9/60 ns deadline, then a YieldProcessor spin, then Present(vsync).
+//       Holds 60 fps reliably with VSync on or off, so this pacer stays OFF on Windows.
 //
-//   - Linux / SDL2-GL : gfx_sdl2.cpp SyncFramerateWithTime() -- computes the time
-//       left to the next 60 Hz boundary and, on the non-Windows path, sleeps with a
-//       *relative* nanosleep(left) that (a) has no busy-wait backstop and, critically,
-//       (b) is NOT retried on EINTR. A single signal delivered during the sleep makes
-//       nanosleep return early having slept only part of `left`, so the frame is barely
-//       paced; when that happens every frame the loop free-runs at whatever the panel /
-//       VSync provides -- 144 Hz on the ROG Ally, i.e. ~2.4x game speed. This pacer is
-//       therefore ON by default on Linux: its absolute-deadline, EINTR-retrying wait
-//       (clock_nanosleep TIMER_ABSTIME below) holds the true 59.94 Hz field rate
-//       regardless of signals, VSync, or the display refresh rate.
+//   - Linux / SDL2-GL : gfx_sdl2.cpp SyncFramerateWithTime() sleeps with a *relative*
+//       nanosleep(left) that has no busy-wait backstop and is NOT retried on EINTR. A single
+//       signal makes it return early having slept only part of `left`; when that happens every
+//       frame the loop free-runs at whatever the panel / VSync provides -- 144 Hz on the ROG
+//       Ally, i.e. ~2.4x game speed. This pacer is therefore ON by default there: its absolute-
+//       deadline, EINTR-retrying wait holds the true 59.94 Hz field rate regardless.
 //
 // WHEN ENABLED
 // ------------
-// This enforces the true N64 NTSC field rate (60 / 1.001 ~= 59.94 Hz), which is
-// marginally slower than the built-in 60.00 Hz limiter, so THIS pacer becomes
-// the binding constraint and the built-in one turns into a no-op for the frame
-// (its deadline has already passed). The two therefore do not fight in the
-// VSync-off case; the slower schedule simply wins.
+// Targets the true N64 NTSC field rate (60 / 1.001 ~= 59.94 Hz), which is marginally slower than
+// the built-in 60.00 Hz limiter, so THIS pacer becomes the binding constraint and the built-in one
+// turns into a no-op for the frame. The two do not fight; the slower schedule simply wins.
 //
-// VSYNC INTERACTION -- keep VSync OFF when this is ON.
-// With VSync on, EndFrame()'s Present() also blocks on the display refresh. On a
-// non-60 Hz panel that rounds each present onto the refresh grid (e.g. 2.4
-// refreshes per frame at 144 Hz), which beats against this fixed 59.94 Hz
-// schedule and produces judder. That judder is a property of VSync at a
-// non-integer-multiple refresh and exists for 60 fps content regardless of this
-// module; stacking a wall-clock pacer on top only makes it more visible. The
-// recommended configuration for this pacer is VSync OFF (tear-free is then the
-// built-in limiter's job, which still runs).
+// VSYNC INTERACTION -- keep VSync OFF when this is ON. With VSync on, Present() also blocks on the
+// display refresh, rounding each present onto the refresh grid (2.4 refreshes per frame at 144 Hz)
+// and beating against this fixed 59.94 Hz schedule. That judder is a property of VSync at a
+// non-integer-multiple refresh and exists for 60 fps content regardless of this module; a
+// wall-clock pacer on top only makes it more visible.
 //
-// Timing primitives: QueryPerformanceCounter/Frequency for the deadline, a
-// high-resolution waitable timer for the coarse sleep, and YieldProcessor() for
-// the final spin. timeBeginPeriod() is deliberately NOT used so no winmm link
-// dependency is added; the high-resolution timer plus the spin backstop already
-// hit the deadline accurately, matching libultraship's own approach.
+// timeBeginPeriod() is deliberately NOT used, so no winmm link dependency is added; the
+// high-resolution waitable timer plus the spin backstop already hit the deadline accurately,
+// matching libultraship's own approach.
 
 #include "gdx_frame_pacer.h"
 
@@ -61,23 +45,20 @@
 #include <time.h> // clock_gettime / clock_nanosleep (POSIX monotonic pacer backend)
 #endif
 
-#include "port_log.h" // gdx_port_logf (single diagnostic line on first arm)
+#include "port_log.h"
 
-// libultraship consolevariablebridge.h is extern "C"/API_EXPORT. Declared locally
-// here -- the same minimal-include boundary idiom port/input_bridge.c uses -- so
-// this C TU does not pull the C++ bridge header.
+// Declared locally -- the same minimal-include boundary idiom port/input_bridge.c uses -- so this
+// C TU does not pull libultraship's C++ console-variable header.
 extern int CVarGetInteger(const char* name, int defaultValue);
 
-// Read port/n64_gfx_bridge.cpp's per-tick truth, NOT the raw
+// Per-tick truth from port/n64_gfx_bridge.cpp, NOT the raw
 // gEnhancements.Graphics.FrameInterpolation CVar. main.cpp's per-tick interpOn also forces the
 // classic single-present branch (which calls gdx_frame_pacer_tick()) while an EK editor (Course
-// Edit / Create Machine) is active, even though the FrameInterpolation CVar itself stays 1. Reading
-// the raw CVar here made those editor ticks self-unarm this pacer AND get no interpolation pacing
-// either -- neither pacing mechanism ran (free-run). gdx_gfx_interp_tick_active() returns the
-// active flag main.cpp already committed for THIS tick via gdx_gfx_interp_tick_config, so editor
-// ticks (active=0) correctly fall through to normal FramePacing, and genuine interpolation ticks
-// (active=1) still no-op this pacer. Declared locally -- same minimal-include idiom as
-// CVarGetInteger above -- so this C TU does not pull the C++ bridge header.
+// Edit / Create Machine) is active, even though the CVar itself stays 1. Reading the raw CVar here
+// made those editor ticks self-unarm this pacer AND get no interpolation pacing either -- neither
+// mechanism ran, so the loop free-ran. This returns the active flag main.cpp already committed for
+// THIS tick via gdx_gfx_interp_tick_config, so editor ticks (active=0) fall through to normal
+// FramePacing and genuine interpolation ticks (active=1) still no-op this pacer.
 extern int gdx_gfx_interp_tick_active(void);
 
 // Target: N64 NTSC field rate = 60 / 1.001 Hz. Frame interval = 1.001 / 60 s.
@@ -90,10 +71,8 @@ extern int gdx_gfx_interp_tick_active(void);
 // of replaying the missed frames. This clamps catch-up bursts.
 #define GDX_PACER_MAX_LAG_FRAMES 4
 
-// Fallback default used only if the CVar was never registered (it normally is: port/main.cpp
-// pre-registers it on Linux and the menu ctor registers it everywhere, both before the frame
-// loop first ticks). Mirrors the platform default set in main.cpp: OFF on Windows (the DXGI
-// limiter suffices), ON elsewhere (the SDL2 limiter is signal-fragile -- see the header comment).
+// Fallback used only if the CVar was never registered (it normally is, before the frame loop first
+// ticks). Mirrors the platform default set in main.cpp.
 #ifdef _WIN32
 #define GDX_PACER_CVAR_DEFAULT 0
 #else
@@ -132,21 +111,19 @@ static void gdx_frame_pacer_init(void) {
     // ~1.5 ms expressed in QPC ticks (freq * 0.0015 = freq * 3 / 2000).
     sSpinMarginTicks = sFreq * 3 / 2000;
 
-    // Prefer a high-resolution auto-reset timer; fall back to a normal one.
     sTimer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (sTimer == NULL) {
         sTimer = CreateWaitableTimerW(NULL, FALSE, NULL); // auto-reset
     }
-    // sTimer may legitimately be NULL here; the tick path then relies on the spin
-    // loop alone (correct, just busier). Not a fatal condition.
+    // A NULL sTimer is not fatal: the tick path then relies on the spin loop alone (correct, just
+    // busier).
 
     sUsable = 1;
 }
 
-// Convert QPC ticks to the 100 ns units SetWaitableTimer expects.
+// QPC ticks -> the 100 ns units SetWaitableTimer expects. `ticks` is at most a few frame intervals
+// (~1.7e5 at 10 MHz), so ticks * 1e7 stays well within int64 range.
 static LONGLONG gdx_ticks_to_100ns(LONGLONG ticks) {
-    // ticks is at most a few frame intervals (~1.7e5 at 10 MHz), so ticks * 1e7
-    // stays well within int64 range.
     return ticks * 10000000LL / sFreq;
 }
 
@@ -154,23 +131,19 @@ void gdx_frame_pacer_tick(void) {
     LARGE_INTEGER now;
     LONGLONG remaining;
 
-    // Mutual exclusion: frame interpolation and frame pacing are opposed pacing owners. When
-    // interpolation actually drove THIS tick, the host paces the SIM to the logic deadline
-    // (port/main.cpp) and presents run VSync-paced inside the sub-frame loop; this fixed 59.94 Hz
-    // pacer must NOT also throttle the loop (it would fight the accumulator and starve the
-    // sub-frame budget). No-op + unarm so a later disable re-baselines cleanly. Per-tick read (not
-    // the raw CVar -- see gdx_gfx_interp_tick_active's comment above) so an EK editor tick, which
-    // forces the classic branch even while the CVar stays on, is not mistaken for an interp tick.
+    // Frame interpolation and frame pacing are opposed pacing owners. When interpolation drove
+    // THIS tick, the host paces the SIM to the logic deadline (port/main.cpp) and presents run
+    // VSync-paced inside the sub-frame loop; throttling here as well would fight the accumulator
+    // and starve the sub-frame budget. Unarm so a later disable re-baselines cleanly.
     if (gdx_gfx_interp_tick_active() != 0) {
         sNextDeadline = 0;
         return;
     }
 
-    // Live read every frame so the menu toggle takes effect immediately. Default is
-    // platform-specific (GDX_PACER_CVAR_DEFAULT): OFF on Windows, ON on Linux.
+    // Live read every frame so the menu toggle takes effect immediately.
     if (CVarGetInteger("gEnhancements.Graphics.FramePacing", GDX_PACER_CVAR_DEFAULT) == 0) {
-        // Disabled: strict no-op. Unarm the schedule so a later enable starts from a
-        // fresh baseline rather than firing a burst of catch-up frames.
+        // Unarm the schedule so a later enable starts from a fresh baseline rather than firing a
+        // burst of catch-up frames.
         sNextDeadline = 0;
         return;
     }
@@ -185,9 +158,8 @@ void gdx_frame_pacer_tick(void) {
     QueryPerformanceCounter(&now);
 
     if (sNextDeadline == 0) {
-        // First paced frame (fresh, or first after a re-enable): set the baseline and
-        // do not sleep. This handles the "first frame" case with no special-casing of
-        // an uninitialised previous timestamp.
+        // First paced frame (fresh, or first after a re-enable): set the baseline and do not
+        // sleep, so no special-casing of an uninitialised previous timestamp is needed.
         sNextDeadline = now.QuadPart + sIntervalTicks;
         gdx_port_logf("[pacer] FramePacing ON: target ~59.94 Hz (N64 NTSC 60/1.001), "
                       "interval %lld QPC ticks. Recommend VSync OFF.\n",
@@ -203,9 +175,9 @@ void gdx_frame_pacer_tick(void) {
         return;
     }
 
-    // At or slightly past the deadline: this frame's own work already spent the
-    // budget, so do not sleep. Advance the schedule by whole intervals until it is
-    // back in the future, keeping the long-run average locked to the target rate.
+    // At or past the deadline: this frame's own work already spent the budget. Advance by whole
+    // intervals until the schedule is back in the future, keeping the long-run average locked to
+    // the target rate.
     if (remaining <= 0) {
         do {
             sNextDeadline += sIntervalTicks;
@@ -213,7 +185,7 @@ void gdx_frame_pacer_tick(void) {
         return;
     }
 
-    // Normal case: wait to the deadline. Coarse sleep to ~1.5 ms short, then spin.
+    // Coarse sleep to ~1.5 ms short of the deadline, then spin the remainder.
     {
         LONGLONG sleep_ticks = remaining - sSpinMarginTicks;
         if (sleep_ticks > 0 && sTimer != NULL) {
@@ -223,8 +195,7 @@ void gdx_frame_pacer_tick(void) {
                 WaitForSingleObject(sTimer, INFINITE);
             }
         }
-        // Spin the remainder to the exact deadline (also covers a coarse-sleep
-        // overshoot, in which case the loop exits immediately).
+        // Also covers a coarse-sleep overshoot, in which case this exits immediately.
         for (;;) {
             QueryPerformanceCounter(&now);
             if (now.QuadPart >= sNextDeadline) {
@@ -234,8 +205,7 @@ void gdx_frame_pacer_tick(void) {
         }
     }
 
-    // Schedule the next boundary from the absolute schedule (not from "now"), so
-    // per-frame jitter averages out over time.
+    // Advance from the absolute schedule, not from "now", so per-frame jitter averages out.
     sNextDeadline += sIntervalTicks;
 
     // Guard against unbounded drift if a spin somehow overshot by many frames.
@@ -248,9 +218,8 @@ void gdx_frame_pacer_tick(void) {
 
 // ---------------------------------------------------------------------------------------------
 // POSIX backend. Same schedule shape as the Windows path (absolute deadlines advanced by whole
-// frame intervals, re-anchor on a big stall) but built on CLOCK_MONOTONIC and an absolute
-// clock_nanosleep(TIMER_ABSTIME) sleep -- no coarse-sleep-plus-spin needed, since
-// clock_nanosleep sleeps to the exact deadline and auto-resumes across signal interrupts.
+// frame intervals, re-anchor on a big stall), but no coarse-sleep-plus-spin is needed: an
+// absolute clock_nanosleep(TIMER_ABSTIME) sleeps to the exact deadline and is re-armed on EINTR.
 // ---------------------------------------------------------------------------------------------
 
 #define GDX_PACER_NS_PER_SEC 1000000000LL
@@ -272,7 +241,7 @@ static void gdx_frame_pacer_init_posix(void) {
     struct timespec res;
     sPosixInitDone = 1;
 
-    // Require a working monotonic clock; without it, degrade to a no-op like the Windows path.
+    // No monotonic clock -> degrade to a no-op, like the Windows path.
     if (clock_gettime(CLOCK_MONOTONIC, &res) != 0) {
         sPosixUsable = 0;
         return;
@@ -290,8 +259,8 @@ static void gdx_sleep_until_ns(int64_t deadlineNs) {
     struct timespec abs;
     abs.tv_sec = (time_t)(deadlineNs / GDX_PACER_NS_PER_SEC);
     abs.tv_nsec = (long)(deadlineNs % GDX_PACER_NS_PER_SEC);
-    // TIMER_ABSTIME: sleep to the absolute deadline. Re-arm on EINTR so a signal cannot cut the
-    // wait short (matching the Windows path's "hold to the deadline" guarantee).
+    // Re-arm on EINTR so a signal cannot cut the wait short -- the whole reason this pacer exists
+    // on Linux (see the file header).
     for (;;) {
         int rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &abs, NULL);
         if (rc == 0) {
@@ -307,15 +276,14 @@ void gdx_frame_pacer_tick(void) {
     int64_t now;
     int64_t remaining;
 
-    // Mutual exclusion (POSIX): see the Windows path above. Interpolation owns pacing only on
-    // the ticks it actually drove (per-tick truth, not the raw CVar -- see the comment above).
+    // See the Windows path above: interpolation owns pacing only on the ticks it actually drove.
     if (gdx_gfx_interp_tick_active() != 0) {
         sPosixNextDeadlineNs = 0;
         return;
     }
 
     if (CVarGetInteger("gEnhancements.Graphics.FramePacing", GDX_PACER_CVAR_DEFAULT) == 0) {
-        sPosixNextDeadlineNs = 0; // disabled: strict no-op, re-anchor on a later enable
+        sPosixNextDeadlineNs = 0; // re-anchor on a later enable
         return;
     }
 
@@ -344,8 +312,8 @@ void gdx_frame_pacer_tick(void) {
         return;
     }
 
-    // At or past the deadline: this frame already spent the budget. Advance the schedule by whole
-    // intervals until it is back in the future, keeping the long-run average locked to the target.
+    // At or past the deadline: this frame already spent the budget. Advance by whole intervals
+    // until the schedule is back in the future, keeping the long-run average on target.
     if (remaining <= 0) {
         do {
             sPosixNextDeadlineNs += sPosixIntervalNs;

@@ -2,24 +2,6 @@
 // display-list boundary converter (port/n64_gfx_convert.{h,cpp}).
 //
 // Standalone console exe: no libultraship, no game objects, no decomp headers.
-// It drives the converter's public API directly with synthetic 8-byte N64
-// display lists and verifies, word-by-word:
-//
-//   1. WideGfx layout (16 bytes, w0 @0, w1 @8) matches the bridge wide reader.
-//   2. ClassifyW1 marks the right opcodes as pointers per dialect (and, crucially,
-//      leaves value words -- colors, indices -- as values so they are never
-//      resolved and corrupted).
-//   3. ConvertList byteswaps a big-endian source, copies value words verbatim,
-//      keeps segmented pointers as 32-bit tokens (high32 == 0), and resolves
-//      physical pointers to real host addresses (high32 != 0) via the context.
-//   4. A value word that numerically looks like a KSEG0 address is NOT resolved.
-//   5. Nested G_DL recursion targets: segmented sub-DL kept as token, physical
-//      sub-DL resolved to a host pointer.
-//   6. ENDDL handling: the walk stops after the first terminator, and an
-//      unterminated list gets a terminator appended.
-//   7. GfxWideCache: same source + same stamp -> same buffer (stable address and
-//      contents); a new stamp rebuilds; Invalidate drops the entry.
-//
 // Returns 0 iff every check passes; non-zero (and prints [FAIL]) otherwise.
 
 #include "n64_gfx_convert.h"
@@ -77,8 +59,7 @@ static void check_sz(const char* name, size_t got, size_t want) {
 
 // ---- synthetic N64 command builders ------------------------------------------
 
-// Append an 8-byte command to `buf` in BIG-ENDIAN byte order (as it would arrive
-// from a .ndd / ROM blob). ConvertList(is_big=true) byteswaps it back.
+// BIG-ENDIAN, as a command arrives from a .ndd / ROM blob. ConvertList(is_big=true) swaps it back.
 static void PushBE(std::vector<uint8_t>& buf, uint32_t w0, uint32_t w1) {
     buf.push_back((uint8_t)(w0 >> 24));
     buf.push_back((uint8_t)(w0 >> 16));
@@ -90,8 +71,7 @@ static void PushBE(std::vector<uint8_t>& buf, uint32_t w0, uint32_t w1) {
     buf.push_back((uint8_t)(w1));
 }
 
-// Append an 8-byte command in host (little-endian) order (a host-built N64
-// command range). ConvertList(is_big=false) does not swap it.
+// Host (little-endian) order, as a host-built N64 command range. Not swapped by ConvertList.
 static void PushLE(std::vector<uint8_t>& buf, uint32_t w0, uint32_t w1) {
     uint8_t tmp[8];
     std::memcpy(tmp + 0, &w0, 4);
@@ -99,8 +79,8 @@ static void PushLE(std::vector<uint8_t>& buf, uint32_t w0, uint32_t w1) {
     for (int i = 0; i < 8; ++i) buf.push_back(tmp[i]);
 }
 
-// Deterministic mock resolver: maps KSEG0 addresses (0x80000000-0x9FFFFFFF) to a
-// fabricated > 4 GB host address; everything else is unresolvable (stays a token).
+// Maps KSEG0 addresses (0x80000000-0x9FFFFFFF) to a fabricated > 4 GB host address; everything
+// else is unresolvable and must stay a token.
 static const uintptr_t kMockArenaHigh = (uintptr_t)0x00007FF600000000ull;
 static bool MockResolvePhysical(void* /*user*/, uint32_t raw, size_t /*req*/, uintptr_t* out) {
     if (raw >= 0x80000000u && raw <= 0x9FFFFFFFu) {
@@ -110,9 +90,8 @@ static bool MockResolvePhysical(void* /*user*/, uint32_t raw, size_t /*req*/, ui
     return false;
 }
 
-// A resolver that (wrongly) resolves 32-bit addresses too, to prove that on a
-// 32-bit-style host (high32 == 0) the converter keeps the token instead of
-// committing a non->4GB "pointer".
+// Resolves to a low (high32 == 0) address, to prove the converter keeps the token rather than
+// committing a non->4GB "pointer" that the bridge would misread as already resolved.
 static bool MockResolveLow32(void* /*user*/, uint32_t raw, size_t /*req*/, uintptr_t* out) {
     if (raw >= 0x80000000u && raw <= 0x9FFFFFFFu) {
         *out = (uintptr_t)(raw & 0x1FFFFFFFu);  // high32 == 0
@@ -145,15 +124,12 @@ static void TestLayout() {
 }
 
 static void TestClassify() {
-    // F3DEX2 pointer opcodes.
     check_bool("EX2 0x01 G_VTX is DataPtr", ClassifyW1(0x01, false) == W1Kind::DataPtr, true);
     check_bool("EX2 0xDA G_MTX is DataPtr", ClassifyW1(0xDA, false) == W1Kind::DataPtr, true);
     check_bool("EX2 0xDC G_MOVEMEM is DataPtr", ClassifyW1(0xDC, false) == W1Kind::DataPtr, true);
     check_bool("EX2 0xDE G_DL is SubDlPtr", ClassifyW1(0xDE, false) == W1Kind::SubDlPtr, true);
-    // F3DEX2 value opcodes (must NOT be pointers).
     check_bool("EX2 0x06 G_TRI2 is Value", ClassifyW1(0x06, false) == W1Kind::Value, true);
     check_bool("EX2 0xFA SETPRIMCOLOR is Value", ClassifyW1(0xFA, false) == W1Kind::Value, true);
-    // F3D dialect overloads.
     check_bool("F3D 0x01 G_MTX is DataPtr", ClassifyW1(0x01, true) == W1Kind::DataPtr, true);
     check_bool("F3D 0x03 G_MOVEMEM is DataPtr", ClassifyW1(0x03, true) == W1Kind::DataPtr, true);
     check_bool("F3D 0x04 G_VTX is DataPtr", ClassifyW1(0x04, true) == W1Kind::DataPtr, true);
@@ -164,8 +140,6 @@ static void TestClassify() {
 }
 
 static void TestConvertBigEndian() {
-    // Big-endian F3DEX2 list: vtx(segmented), mtx(physical), tri2(value that looks
-    // like KSEG0), setprimcolor(value), enddl.
     std::vector<uint8_t> src;
     PushBE(src, MakeW0(OP_VTX_EX2, 0x001020), 0x06001000u);      // segmented ptr
     PushBE(src, MakeW0(OP_MTX_EX2, 0x000038), 0x80123450u);      // physical ptr (KSEG0)
@@ -179,30 +153,25 @@ static void TestConvertBigEndian() {
 
     check_sz("BE convert count", out.size(), 5);
 
-    // w0 byteswapped back to host order.
     check_u32("BE cmd0 w0 (VTX)", out[0].w0, MakeW0(OP_VTX_EX2, 0x001020));
-    // Segmented pointer kept as 32-bit token, high32 == 0.
     check_u64("BE cmd0 w1 (segmented kept)", out[0].w1, 0x0000000006001000ull);
 
-    // Physical pointer resolved to > 4 GB host address, high32 != 0.
     check_u32("BE cmd1 w0 (MTX)", out[1].w0, MakeW0(OP_MTX_EX2, 0x000038));
     check_u64("BE cmd1 w1 (physical resolved)", out[1].w1,
               (uint64_t)(kMockArenaHigh | 0x00123450u));
 
-    // TRI2 is a value in EX2: w1 copied verbatim even though it looks like KSEG0.
+    // TRI2 is a value word in EX2, so w1 must be copied verbatim even though it looks like KSEG0.
     check_u32("BE cmd2 w0 (TRI2)", out[2].w0, MakeW0(OP_TRI2, 0x040608));
     check_u64("BE cmd2 w1 (value NOT resolved)", out[2].w1, 0x00000000800A0C0Eull);
 
-    // Value color copied verbatim.
     check_u64("BE cmd3 w1 (color value)", out[3].w1, 0x00000000FF80FFFFull);
 
-    // Terminator.
     check_u32("BE cmd4 w0 (ENDDL)", out[4].w0 >> 24, OP_ENDDL);
 }
 
 static void TestValueSafetyAndLow32() {
-    // A DataPtr op whose deterministic host address is NOT > 4 GB (32-bit-style
-    // host) must keep the token so the draw-time path resolves it identically.
+    // A DataPtr op whose deterministic host address is NOT > 4 GB must keep the token, so the
+    // draw-time path resolves it to the same address.
     std::vector<uint8_t> src;
     PushLE(src, MakeW0(OP_VTX_EX2, 0x001020), 0x80123450u);
     PushLE(src, MakeW0(OP_ENDDL, 0x000000), 0x00000000u);
@@ -214,7 +183,6 @@ static void TestValueSafetyAndLow32() {
 }
 
 static void TestSubDlPolicy() {
-    // Nested G_DL: one segmented target (kept token), one physical target (resolved).
     std::vector<uint8_t> src;
     PushBE(src, MakeW0(OP_DL, 0x000000), 0x0A002000u);  // segmented sub-DL
     PushBE(src, MakeW0(OP_DL, 0x000000), 0x80005000u);  // physical sub-DL
@@ -230,8 +198,8 @@ static void TestSubDlPolicy() {
 
 static void TestTermination() {
     ConvertContext ctx;  // no resolver
-    // Unterminated list (walk hits the command cap without an ENDDL): terminator
-    // appended so the interpreter cannot run off the end.
+    // Walk hits the command cap without an ENDDL: a terminator must be appended so the interpreter
+    // cannot run off the end.
     std::vector<uint8_t> a;
     PushLE(a, MakeW0(OP_SETPRIMCOLOR, 0), 0x11223344u);
     PushLE(a, MakeW0(OP_SETPRIMCOLOR, 0), 0x55667788u);
@@ -239,14 +207,12 @@ static void TestTermination() {
     check_sz("unterminated -> +1 appended ENDDL", outA.size(), 3);
     check_u32("appended terminator opcode", outA.back().w0 >> 24, OP_ENDDL);
 
-    // Early ENDDL: walk stops immediately, trailing garbage ignored.
     std::vector<uint8_t> b;
     PushLE(b, MakeW0(OP_ENDDL, 0), 0);
     PushLE(b, MakeW0(OP_SETPRIMCOLOR, 0), 0xDEADBEEFu);
     std::vector<WideGfx> outB = ConvertList(b.data(), 2, false, false, ctx);
     check_sz("early ENDDL stops walk", outB.size(), 1);
 
-    // F3D terminator (0xB8) also stops the walk.
     std::vector<uint8_t> c;
     PushLE(c, MakeW0(OP_ENDDL_F3D, 0), 0);
     PushLE(c, MakeW0(OP_SETPRIMCOLOR, 0), 0xCAFEBABEu);
@@ -269,22 +235,20 @@ static void TestCache() {
     const WideGfx* firstData = first.data();
     check_sz("cache size after first build", cache.CachedCount(), 1);
 
-    // Same source + same stamp -> same buffer (stable address, same content).
+    // Address stability is the contract the bridge relies on, so check the pointer, not just the
+    // contents.
     const std::vector<WideGfx>& second = cache.GetOrBuild(src.data(), 2, false, false, /*stamp=*/1);
     check_bool("same stamp -> same buffer address", second.data() == firstData, true);
     check_bool("cache Contains(src)", cache.Contains(src.data()), true);
 
-    // New stamp -> rebuilt entry (content re-derived; still one entry for the key).
     const std::vector<WideGfx>& third = cache.GetOrBuild(src.data(), 2, false, false, /*stamp=*/2);
     check_sz("cache still one entry after restamp", cache.CachedCount(), 1);
     check_u32("rebuilt content matches", third[0].w0, MakeW0(OP_VTX_EX2, 0x001020));
 
-    // Invalidate drops it.
     cache.Invalidate(src.data());
     check_bool("Invalidate drops entry", cache.Contains(src.data()), false);
     check_sz("cache empty after invalidate", cache.CachedCount(), 0);
 
-    // Rebuilds cleanly after invalidation.
     cache.GetOrBuild(src.data(), 2, false, false, /*stamp=*/3);
     check_sz("cache repopulates after invalidate", cache.CachedCount(), 1);
     cache.Clear();

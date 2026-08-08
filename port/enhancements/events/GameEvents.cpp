@@ -3,15 +3,14 @@
  * @brief The one translation unit that OWNS the EventID storage, plus the fire helpers the
  *        PORT-gated decomp one-liners call.
  *
- * See GameEvents.h for the architecture rationale. This file is deliberately thin: it holds no
- * enhancement policy of its own, only the plumbing that lets policy live in port/enhancements/.
+ * See GameEvents.h for the architecture rationale. Deliberately thin: no enhancement policy of its
+ * own, only the plumbing that lets policy live in port/enhancements/.
  */
 
-/* MUST precede the GameEvents.h include and MUST NOT be defined in any other translation unit.
-   It flips DECLARE_EVENT (libultraship/include/ship/events/EventTypes.h:78-88) from "extern
-   declaration" to "definition initialised to -1", so this .cpp is where `OnBoostStartID` actually
-   lives. Defining it twice would be a duplicate-symbol link error; defining it nowhere would be an
-   unresolved external. */
+/* MUST precede the GameEvents.h include and MUST NOT be defined in any other translation unit. It
+   flips DECLARE_EVENT (libultraship/include/ship/events/EventTypes.h:78-88) from "extern
+   declaration" to "definition initialised to -1", so this .cpp is where `OnBoostStartID` lives.
+   Twice is a duplicate-symbol link error; nowhere is an unresolved external. */
 #define INIT_EVENT_IDS
 #include "GameEvents.h"
 
@@ -22,27 +21,26 @@
 // =================================================================================================
 // Enhancement modules cannot subscribe at static-initialisation time: REGISTER_LISTENER routes
 // through Ship::Context::GetInstance() (eventsbridge.cpp:13) and the Context does not exist until
-// port/main.cpp:1033 runs InitEventSystem(). So they hand us a function pointer during static init
-// and we call it back once the IDs are live.
+// port/main.cpp runs InitEventSystem(). So they hand over a function pointer during static init
+// and it is called back once the IDs are live.
 //
-// Storage is a plain fixed array rather than std::vector on purpose. A namespace-scope array of
-// pointers is CONSTANT-initialised (zeroed) before any dynamic initialiser anywhere in the program
-// executes, so GameEvents_AddInstaller is safe to call from another TU's static constructor
-// regardless of link order. A std::vector would itself need dynamic initialisation and could
-// legally be constructed *after* the first caller — the classic static-init-order fiasco.
+// A plain fixed array rather than std::vector, deliberately: a namespace-scope array of pointers
+// is CONSTANT-initialised (zeroed) before any dynamic initialiser anywhere in the program executes,
+// so GameEvents_AddInstaller is safe to call from another TU's static constructor regardless of
+// link order. A std::vector needs dynamic initialisation and could legally be constructed *after*
+// the first caller.
 static constexpr int kMaxInstallers = 32;
 static GameEventsInstaller sInstallers[kMaxInstallers];
 static int sInstallerCount = 0;
 
-// Set once GameEvents_Init has registered the event IDs. Guards against the re-registration hazard
-// documented on GameEvents_Init in the header (EventSystemRegisterEvent hands out a new ID every
-// call), and tells GameEvents_AddInstaller whether it must run a late arrival immediately.
+// Guards the re-registration hazard documented on GameEvents_Init in the header
+// (EventSystemRegisterEvent hands out a new ID every call), and tells GameEvents_AddInstaller
+// whether it must run a late arrival immediately.
 static bool sInitialised = false;
 
-// Not atomic, and that is correct here rather than lazy: everything that touches this state runs on
-// the single cooperatively-scheduled thread that owns both the decomp game fibers and the port
-// glue (the same invariant port/gdx_interp.cpp relies on for its cut epoch), and installers only
-// arrive during single-threaded static initialisation before main().
+// None of this state is atomic, deliberately: everything that touches it runs on the single
+// cooperatively-scheduled thread that owns both the decomp game fibers and the port glue, and
+// installers only arrive during single-threaded static initialisation before main().
 
 void GameEvents_AddInstaller(GameEventsInstaller installer) {
     if (installer == nullptr) {
@@ -50,15 +48,15 @@ void GameEvents_AddInstaller(GameEventsInstaller installer) {
     }
 
     if (sInitialised) {
-        // Late arrival: the bus is already up, so there is nothing to defer — subscribe now.
-        // Cannot happen for a statically-linked enhancement (all static init completes before
-        // main), but a future dynamically-loaded module would land here.
+        // Late arrival: the bus is already up, so there is nothing to defer. Unreachable for a
+        // statically-linked enhancement (all static init completes before main); a future
+        // dynamically-loaded module would land here.
         installer();
         return;
     }
 
     if (sInstallerCount >= kMaxInstallers) {
-        // Deliberately loud rather than silently dropping an enhancement the user enabled. Raising
+        // Loud rather than silently dropping an enhancement the user enabled. Raising
         // kMaxInstallers is the fix; there is no reason to grow this dynamically.
         gdx_port_logf("[events] installer registry full (%d); enhancement dropped\n", kMaxInstallers);
         return;
@@ -90,14 +88,13 @@ void GameEvents_Init(void) {
 // =================================================================================================
 
 void GameEvents_FireOnBoostStart(int32_t racerId, int32_t* frames) {
-    // Self-initialise on first fire. This is what keeps the whole layer out of port/main.cpp: the
+    // Self-initialising on first fire is what keeps the whole layer out of port/main.cpp: the
     // first boost of a session can only happen long after Ship::Context is built, so the bridge's
-    // Ship::Context::GetInstance() dereference is always safe by the time we get here. Calling
-    // GameEvents_Init() explicitly from startup instead is equally valid — it is idempotent.
+    // Ship::Context::GetInstance() dereference is always safe by the time we get here.
     GameEvents_Init();
 
-    // Defensive: the current fire site always passes &racer->boostTimer, but a listener
-    // dereferencing null would be a crash in third-party .o2r mod code with no useful backtrace.
+    // The current fire site always passes &racer->boostTimer, but a listener dereferencing null
+    // would be a crash in third-party .o2r mod code with no useful backtrace.
     if (frames == nullptr) {
         return;
     }

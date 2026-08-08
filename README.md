@@ -17,7 +17,8 @@
 G-Diffuser runs F-Zero X natively on your PC — no emulator at runtime. It is a fully decompiled source port
 built on top of the [inspectredc/fzerox](https://github.com/inspectredc/fzerox)
 matching decompilation and the [Kenix3/libultraship](https://github.com/Kenix3/libultraship)
-runtime (the same engine that powers Ship of Harkinian and Starship, alongside other PC Ports like Battleship). On top of the original
+runtime (the same engine behind Ship of Harkinian and Starship, along with other PC ports like
+Battleship). On top of the original
 game it adds true widescreen rendering, an in-game enhancement menu, quality-of-life features,
 texture-pack modding, and full support for the **64DD Expansion Kit** — Course Edit and the DD
 cups included.
@@ -31,6 +32,19 @@ legally obtained dumps; game data is extracted or loaded locally from the files 
 - **True widescreen** — the game renders in 16:9 (`gEnhancements.Graphics.Widescreen`), with an
   optional **widescreen-anchored HUD** so on-screen elements sit at the screen edges instead of
   being stretched from 4:3 (`gEnhancements.Graphics.WidescreenUI`).
+- **Ultrawide support (21:9 and wider)** — an opt-in mode widens the game's own culling so track
+  pieces, machines, fireworks and background stars stop popping at the edges of ultrawide
+  windows; the HUD anchors to the true corners (`gEnhancements.Graphics.UltrawideMode`).
+- **Black border removal** — the original game framed every screen inside the CRT overscan-safe
+  area, which shows as a black border on modern displays. An opt-in toggle opens the picture to
+  the true edges on every screen (`gEnhancements.Graphics.RemoveBorders`), with a companion
+  toggle to hide the race-intro wipe curtain (`gEnhancements.Graphics.HideRaceCurtain`).
+- **High-refresh frame interpolation** — the simulation runs at its true 60 Hz while rendering
+  interpolates smoothly up to your monitor's refresh rate (144 Hz and beyond), covering the
+  camera, racers, effects and UI. WARNING: NOT PERFECT: While I did my best efforts to implement this in full capacity, it might get some slowdowns rarely, especially after screen transitions. I will do my best to keep optimizing this feature in future releases.
+- **Discord Rich Presence** — off by default; when enabled it shows your mode, course, lap and
+  position on your Discord profile, with per-field privacy toggles so you choose exactly what is
+  visible (`gEnhancements.Online.DiscordPresence`).
 - **In-game enhancement menu** — a full ImGui menu opened with **F1** (also Escape or Gamepad
   Back). Graphics, audio, gameplay, practice, ghosts and workshop tabs, keyboard- and
   controller-navigable.
@@ -54,6 +68,21 @@ legally obtained dumps; game data is extracted or loaded locally from the files 
   on-screen **N64 input viewer** overlay.
 - **Developer tools** — live Stats, an optional top-right FPS/frame-time overlay, a command
   Console, and the Fast3D graphics debugger under **Dev Tools**.
+
+## Planned features
+
+All of the vanilla content — cartridge and Expansion Kit — is playable from start to finish
+today. These are the next things planned for G-Diffuser:
+
+- **Mouse control in Course Edit** — point-and-click track editing instead of driving the cursor
+  with a pad.
+- **Content export and import** — share a custom track or a Create Machine vehicle as a single
+  file another player can drop in and race, author ghosts included.
+- **Better modding support** — per-tile font/atlas overrides and paletted (CI4/CI8) texture
+  encoding, the two big gaps in what packs can replace today.
+- **Players 2–4 on gamepads** — full multi-controller support for VS and split-screen.
+- **Full controller navigation** of the enhancement menu.
+- **Japanese version support** — the original JP ROM and disk as a selectable profile.
 
 ## Quick Start
 
@@ -116,9 +145,10 @@ using the built-in **texture dump** feature. A numeric filename prefix (for exam
 
 ## Building
 
-G-Diffuser is a CMake project. It pulls in three components: `libultraship/`
+G-Diffuser is a CMake project. It pulls in four components: `libultraship/`
 (Kenix3/libultraship — runtime + Fast3D renderer), `torch/` (HarbourMasters/Torch — build-time
-asset extraction), and `decomp/` (inspectredc/fzerox — the F-Zero X C source). Clone with
+asset extraction), `decomp/` (inspectredc/fzerox — the F-Zero X C source), and
+`fzerox-expansion-kit/` (the Expansion Kit decompilation reference). Clone with
 submodules:
 
 ```sh
@@ -203,9 +233,10 @@ rejected at load time.
 **Will my disk file get corrupted?** No. Disk writes go to a separate save sidecar; your original
 `.ndd` image is never modified.
 
-**Is the `docs/` folder part of the release?** No. `docs/` holds internal design notes and
-investigation material used during development; it is not required to build, run, or use
-G-Diffuser and is not part of the release.
+**Is the `docs/` folder part of the release?** Yes. `docs/` holds the maintained user-facing
+documentation that ships with releases — the architecture overview, the diagnostics reference,
+the modding guide, and the status ledger. Internal design notes and investigation material live
+outside the repository.
 
 ## Troubleshooting
 
@@ -225,7 +256,7 @@ on:
 > **`GDX_TRACE` is off by default in release builds** (it is on by default in Debug builds). That is
 > usually why a log has none of the interesting per-frame lines in it. Set it explicitly.
 
-Those two are what a bug report needs. The full set of 29 developer gates is reference material: it
+Those two are what a bug report needs. The full set of 28 developer gates is reference material: it
 lives on that same Dev Tools page, and in `port/gdx_dev_gates.c` in the source, each with its own
 description.
 

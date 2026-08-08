@@ -25,9 +25,9 @@ extern unsigned char* gdx_disk_buffer;
 extern unsigned int gdx_disk_size;
 extern int gdx_disk_load(void);
 
-/* Durable disk-save sidecar (port/disk_savefile.cpp). Raw extern -- this decomp
-   TU cannot include the host header. Records the exact dirty byte range of every
-   disk write so it survives to the next boot without mutating the pristine .ndd. */
+/* Durable disk-save sidecar (port/disk_savefile.cpp): records the exact dirty byte
+   range of every disk write so it survives to the next boot without mutating the
+   pristine .ndd. Raw extern -- this decomp TU cannot include the host header. */
 extern void gdx_disk_save_mark_dirty(unsigned int offset, const void* data, unsigned int len);
 
 /* leo/lib internals: the pure translation files (leotranslat.c, leoutil.c,
@@ -62,11 +62,10 @@ void gdx_leo_on_disk_loaded(const unsigned char* disk) {
     }
 }
 
-/* Completion for async-shaped commands: work is done synchronously, so post
- * completion immediately, matching what the drive manager thread would
- * eventually do. The message VALUE is the LEOError — consumers do
- * `osRecvMesg(mq, &sSLLeoError, ...)` and switch on it (sys_leo_dd.c), so
- * success must be posted as 0/NULL (LEO_ERROR_GOOD), never a pointer. */
+/* Completion for async-shaped commands: the work is already done synchronously, so post
+ * immediately, as the drive manager thread eventually would. The message VALUE is the
+ * LEOError -- consumers do `osRecvMesg(mq, &sSLLeoError, ...)` and switch on it
+ * (sys_leo_dd.c), so success must be posted as 0/NULL (LEO_ERROR_GOOD), never a pointer. */
 static void LeoPostDone(LEOCmd* cmdBlock, OSMesgQueue* mq) {
     if (cmdBlock != NULL) {
         cmdBlock->header.status = LEO_STATUS_GOOD;
@@ -98,10 +97,10 @@ static void LeoPostError(LEOCmd* cmdBlock, OSMesgQueue* mq, s32 error, u32 lba, 
 }
 
 u32 LeoDriveExist(void) {
-    /* The EK boot probes the drive BEFORE creating any leo manager
-       (sys_main.c: gLeoDriveConnectionState = LeoDriveExist()), so this is
-       the first disk touch — attempt the (idempotent) image load here.
-       "A drive with a disk exists" == "a disk image is available". */
+    /* The EK boot probes the drive BEFORE creating any leo manager (sys_main.c:
+       gLeoDriveConnectionState = LeoDriveExist()), so this is the first disk touch and
+       has to drive the idempotent image load. "A drive with a disk exists" here means
+       "a disk image is available". */
     return gdx_disk_load() ? 1u : 0u;
 }
 
@@ -132,13 +131,12 @@ s32 LeoTestUnitReady(LEOStatus* status) {
     return (gdx_disk_buffer != NULL) ? LEO_ERROR_GOOD : LEO_ERROR_DRIVE_NOT_READY;
 }
 
-/* System-area size at the front of an SDK-format .ndd: the first 0x18 physical
-   LBAs (0..0x17) precede the user data, each a full zone-0 block (0x4D08). The
-   image is block-linear, so physical byte offset = system area + user-area
-   offset. Disk-type independent (vzone 0 -> pzone 0 -> 0x4D08 for every type).
-   Validated: 0x18*0x4D08 = 0x738C0, and LeoLBAToByte total + 0x738C0 == the
-   64,931,840-byte .ndd size exactly, with all DD course records landing on LBA
-   boundaries (see tools/scratchpad sdk_map). */
+/* System-area size at the front of an SDK-format .ndd: the first 0x18 physical LBAs
+   (0..0x17) precede the user data, each a full zone-0 block (0x4D08). The image is
+   block-linear, so physical byte offset = system area + user-area offset. Disk-type
+   independent (vzone 0 -> pzone 0 -> 0x4D08 for every type). 0x18*0x4D08 = 0x738C0, and
+   LeoLBAToByte total + 0x738C0 == the 64,931,840-byte .ndd size exactly, with all DD
+   course records landing on LBA boundaries. */
 #define GDX_NDD_SYSTEM_AREA_BYTES 0x738C0
 
 s32 LeoReadWrite(LEOCmd* cmdBlock, s32 direction, u32 LBA, void* buffer, u32 nLBAs, OSMesgQueue* mq) {
@@ -171,12 +169,9 @@ s32 LeoReadWrite(LEOCmd* cmdBlock, s32 direction, u32 LBA, void* buffer, u32 nLB
     if (direction == OS_READ) {
         bcopy(gdx_disk_buffer + offset, buffer, bytes);
     } else {
-        /* Writes (saves to disk) update the in-memory image, then record the
-           exact dirty byte range in the durable sidecar (port/disk_savefile.cpp).
-           The pristine .ndd is never touched; the recorded ranges are replayed
-           over a freshly loaded pristine image at the next boot. The debounced
-           flush (gdx_disk_save_tick, host loop) coalesces one save burst into one
-           atomic sidecar write. */
+        /* Writes land in the in-memory image only; the dirty range goes to the durable
+           sidecar (port/disk_savefile.cpp) so it can be replayed over a freshly loaded
+           pristine image next boot. The user's .ndd is never touched. */
         bcopy(buffer, gdx_disk_buffer + offset, bytes);
         gdx_disk_save_mark_dirty((unsigned int) offset, buffer, (unsigned int) bytes);
     }
@@ -268,18 +263,16 @@ s32 LeoReadCapacity(LEOCapacity* cmdBlock, s32 dir) {
 }
 
 void LeoBootGame(void* entry) {
-    /* On hardware this jumps into the disk's boot program. In the source
-       port every disk-side function is compiled in, so booting reduces to
-       making sure the disk image (and its asset fills) are loaded. */
+    /* On hardware this jumps into the disk's boot program. Here every disk-side function
+       is compiled in, so booting reduces to making sure the image is loaded. */
     (void)entry;
     gdx_disk_load();
 }
 
-/* ---- Drive-ROM font address helpers -------------------------------------
- * The decomp ships LeoGetKAdr/LeoGetAAdr only as incbin'd MIPS blobs, so these
- * are C ports of the exact routines disassembled from the US rev0 ROM
- * (leo overlay, text at ROM 0x80870 / 0x813B0). Both index tables live in the
- * same overlay's data section and are read from the loaded ROM image:
+/* Drive-ROM font address helpers. The decomp ships LeoGetKAdr/LeoGetAAdr only as incbin'd
+ * MIPS blobs, so these are C ports of the routines disassembled from the US rev0 ROM (leo
+ * overlay, text at ROM 0x80870 / 0x813B0). Both index tables live in that overlay's data
+ * section and are read from the loaded ROM image:
  *   kanji index table (s16): VRAM 0x80411850 -> ROM 0x80960 (0xA48 bytes)
  *   ANK metrics table (4B):  VRAM 0x8041231C -> ROM 0x8142C (0x908 entries)
  * Returned offsets are relative to the drive ROM's font block; callers add
@@ -294,24 +287,21 @@ static s16 gdx_rom_s16(u32 off) {
     return (s16)((gdx_rom_buffer[off] << 8) | gdx_rom_buffer[off + 1]);
 }
 
-/* The kanji index table and the ANK metrics table are contiguous in
- * the cart ROM and covered by a single `kanji_tables` blob [0x80960, +0x2EEC) =
- * [0x80960, 0x8384C) -- the index table (0xA48 B), a small gap, and the ANK table
- * (0x908 entries x 4 B, last entry ending at 0x83848). LeoGetKAdr/LeoGetAAdr are
- * per-glyph HOT paths, so we must NOT call the byte-source shim per glyph: preload
- * the whole blob ONCE into a static buffer via GdxSegmentSourceRead (archive-first,
- * byte-identical raw fallback) and serve every glyph read from it. If the one-shot
- * preload fails (archive absent AND raw ROM absent/too small for the full span) we
- * fall back to reading gdx_rom_buffer per glyph exactly as before. */
+/* The kanji index table and the ANK metrics table are contiguous in the cart ROM and covered
+ * by a single `kanji_tables` blob [0x80960, 0x8384C) -- the index table (0xA48 B), a small
+ * gap, then the ANK table (0x908 entries x 4 B, last entry ending at 0x83848).
+ * LeoGetKAdr/LeoGetAAdr are per-glyph HOT paths, so the byte-source shim must NOT be called
+ * per glyph: the whole blob is preloaded ONCE into a static buffer and every glyph read is
+ * served from it. If that preload fails (no archive AND no/short raw ROM), reads fall back
+ * to gdx_rom_buffer per glyph. */
 extern int GdxSegmentSourceRead(unsigned int romBase, unsigned int size, void* dst);
 #define GDX_KANJI_BLOB_BASE 0x80960u
 #define GDX_KANJI_BLOB_SPAN 0x2EECu /* [0x80960, 0x8384C): kanji index + ANK metrics */
 
 /* Same publish discipline as gdx_segment_source.c's SEG_*_FENCE (fill buffer, release-fence,
- * THEN publish the state; readers acquire-load the state before touching the buffer), sized down
- * for this TU's single first-use blob instead of the shim's per-family slot table. Forward-declared
- * rather than including <intrin.h>/<windows.h>: this TU is decomp-headers-only (see file header
- * comment) -- MSVC recognizes _ReadWriteBarrier as an intrinsic once pragma'd, no header needed. */
+ * THEN publish the state; readers acquire-load the state before touching the buffer), sized
+ * down for this TU's single blob. Forward-declared rather than including <intrin.h>: this TU
+ * is decomp-headers-only, and MSVC recognizes _ReadWriteBarrier once pragma'd. */
 #if defined(_MSC_VER)
 extern void _ReadWriteBarrier(void);
 #pragma intrinsic(_ReadWriteBarrier)
@@ -325,13 +315,12 @@ extern void _ReadWriteBarrier(void);
 static u8 sKanjiBlob[GDX_KANJI_BLOB_SPAN];
 static volatile int sKanjiBlobState = 0; /* 0 = unattempted, 1 = loaded, 2 = failed */
 
-/* Returns the resident blob buffer, or NULL if the one-shot preload failed (caller
- * then reads raw ROM per glyph). Benign first-use race: concurrent callers copy the
- * same bytes and settle on the same monotonic state; GdxSegmentSourceRead is itself
- * internally locked. The acquire fence orders the state load before any buffer read
- * below; the writer mirrors it with a release fence between filling sKanjiBlob and
- * publishing sKanjiBlobState, so a reader that observes state==1 always observes the
- * fully written buffer, never a torn one. */
+/* Returns the resident blob buffer, or NULL when the one-shot preload failed (the caller
+ * then reads raw ROM per glyph). The first-use race is benign: concurrent callers copy the
+ * same bytes and settle on the same monotonic state, and GdxSegmentSourceRead is itself
+ * locked. The acquire fence orders the state load before any buffer read; the release fence
+ * between filling sKanjiBlob and publishing sKanjiBlobState is its counterpart, so a reader
+ * observing state==1 never sees a torn buffer. */
 static const u8* gdx_kanji_blob(void) {
     int state = sKanjiBlobState;
     GDX_KANJI_ACQUIRE_FENCE();
@@ -409,8 +398,8 @@ s32 LeoGetAAdr(s32 code, s32* dx, s32* dy, s32* cy) {
             b3 = (s8)gdx_rom_buffer[entry + 3];
         }
     }
-    /* MFS warm-up calls pass NULL metric pointers; the MIPS original stored
-       blindly (harmless on the N64 null page), so guard here. */
+    /* MFS warm-up calls pass NULL metric pointers. The MIPS original stored blindly, which
+       was harmless on the N64 null page but is not here. */
     if (dy != NULL) {
         *dy = (b2 & 0xF) + 1;
     }

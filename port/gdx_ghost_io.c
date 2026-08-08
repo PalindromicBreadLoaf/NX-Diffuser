@@ -1,29 +1,20 @@
 /* port/gdx_ghost_io.c -- .gdg ghost replay import/export implementation.
  *
  * See gdx_ghost_io.h for the file format, endianness policy, validation rules, and
- * overwrite policy. This file lives in the G-Diffuser host-CRT target (add_executable
- * (G-Diffuser ...) in port/CMakeLists.txt), the same target as port/sram_buffer.cpp and
- * port/gdx_menu.cpp -- NOT the gdiffuser_game decomp object library -- so it can freely
- * use the standard C file API (fopen/fread/fwrite), matching sram_buffer.cpp's own
- * "host .cpp/.c TU, not decomp-target" split.
+ * overwrite policy. This TU belongs to the G-Diffuser host-CRT target, not the
+ * gdiffuser_game decomp object library, so the standard file API is available here --
+ * the same split port/sram_buffer.cpp uses.
  *
- * PORT/DECOMP BOUNDARY: this file needs the exact GhostRecord/GhostData/GhostInfo
- * layouts (decomp/include/fzx_save.h, decomp/include/unk_structs.h) and calls straight
- * into decomp/src/overlays/ovl_i2/save.c's real Save_Read*, Save_Write*, and Save_Calculate*
- * functions -- but it deliberately does NOT #include the decomp headers. Pulling in
- * fzx_save.h here would also pull in unk_structs.h and the PORT/EXPANSION_KIT/
- * NON_MATCHING/VERSION_US macro-gated declarations the gdiffuser_game object library is
- * compiled with (see port/CMakeLists.txt's target_compile_definitions(gdiffuser_game...)
- * ), none of which are (or should be) defined for this G-Diffuser-target file. Instead,
- * this file declares its OWN byte-for-byte mirror structs below and raw `extern`
- * prototypes for the handful of save.c entry points it calls -- the exact same
- * boundary-crossing idiom port/sram_buffer.cpp already uses for Sram_ReadWrite ("Raw
- * extern declarations only (no header include) -- decomp-target C files can't include
- * the MSVC CRT headers port/sram_buffer.cpp uses"). A C function call only needs the
- * pointee's SIZE and FIELD OFFSETS to agree across the two translation units (the
- * pointer itself is just an address); it does not need the struct tag name to match.
- * The gdx_ghost_*_size_check typedefs below turn any future drift between this mirror
- * and the real structs into a compile error here, not silent SRAM corruption.
+ * PORT/DECOMP BOUNDARY: this file needs the exact GhostRecord/GhostData/GhostInfo layouts
+ * (decomp/include/fzx_save.h, decomp/include/unk_structs.h) and calls straight into
+ * decomp/src/overlays/ovl_i2/save.c -- but it deliberately does NOT include the decomp
+ * headers. fzx_save.h drags in unk_structs.h and the PORT/EXPANSION_KIT/NON_MATCHING/
+ * VERSION_US macro-gated declarations that only the gdiffuser_game target is compiled with.
+ * It declares byte-for-byte mirror structs and raw `extern` prototypes instead: a C call
+ * only needs the pointee's SIZE and FIELD OFFSETS to agree across the two translation
+ * units, never the struct tag name. The gdx_ghost_*_size_check typedefs below turn any
+ * future drift between mirror and original into a compile error here rather than silent
+ * SRAM corruption.
  */
 
 #define _CRT_SECURE_NO_WARNINGS /* plain fopen/fread/fwrite below; harmless on non-MSVC */
@@ -49,17 +40,13 @@
 /* ---------------------------------------------------------------------------------
  * Mirrored decomp ghost structs.
  *
- * Field names/comments cite the real declarations so this stays easy to audit against
- * decomp/include/fzx_save.h and decomp/include/unk_structs.h if either ever changes.
- * All fields are u8/s8/u16/s16/u32/s32-equivalent (fixed-width <stdint.h> types here).
- * Using the fixed-width <stdint.h> types -- NOT bare long -- is what makes these mirrors
- * data-model-independent: uint32_t/int32_t are exactly 4 bytes on BOTH of the port's
- * targets, so the layouts hold identically whether the underlying decomp u32/s32 resolve
- * to unsigned long/long (Windows MSVC, LLP64: long == 4 bytes) or to unsigned int/int
- * (Linux GCC/Clang, LP64: long == 8 bytes but int == 4). Natural alignment only -- no
- * #pragma pack is needed because every struct below already lands on the same offsets/
- * total sizes as the "// size = 0x.." comments in the real headers (verified by hand, and
- * enforced at compile time on every target by the static size checks below).
+ * Each one cites the real declaration so this stays auditable against
+ * decomp/include/fzx_save.h and decomp/include/unk_structs.h. Fixed-width <stdint.h>
+ * types -- NOT bare long -- are what make the mirrors data-model-independent: the layouts
+ * hold identically whether the decomp's u32/s32 resolve to unsigned long/long (MSVC,
+ * LLP64) or unsigned int/int (GCC/Clang, LP64). Natural alignment only; no #pragma pack
+ * is needed because every struct below already lands on the offsets and total sizes the
+ * real headers document, enforced by the static size checks at the end of this block.
  * ------------------------------------------------------------------------------- */
 
 /* Mirrors MachineInfo, decomp/include/unk_structs.h:43-64. 20 fields, all u8 -> no
@@ -95,8 +82,8 @@ typedef struct GdxMachineInfoPadded {
 } GdxMachineInfoPadded;
 
 /* Mirrors GhostRecord, decomp/include/fzx_save.h:74-84. Size 0x40 (64) bytes: the s32
- * fields at offsets 4/8/12 are already 4-byte aligned with no gaps, and the struct's
- * total size (64) is already a multiple of 4, so no trailing padding is inserted. */
+ * fields at offsets 4/8/12 are 4-byte aligned with no gaps and the total is a multiple
+ * of 4, so no trailing padding is inserted. */
 typedef struct GdxGhostRecord {
     uint16_t checksum;
     uint16_t ghostType;
@@ -136,8 +123,8 @@ typedef struct GdxGhostSave {
     GdxGhostData data;
 } GdxGhostSave;
 
-/* Mirrors Ghost, decomp/include/unk_structs.h:369-379. This runtime form is converted to/from the
- * persistent GhostRecord + GhostData representation by the same field rules as save.c. */
+/* Mirrors Ghost, decomp/include/unk_structs.h:369-379. The runtime form, converted to and
+ * from the persistent GhostRecord + GhostData pair by the same field rules as save.c. */
 typedef struct GdxRuntimeGhost {
     int32_t encodedCourseIndex;
     int32_t raceTime;
@@ -150,11 +137,10 @@ typedef struct GdxRuntimeGhost {
     GdxMachineInfo machineInfo;
 } GdxRuntimeGhost;
 
-/* Mirrors GhostInfo, decomp/include/unk_structs.h:450-459. Real size is 0x40 (64)
- * bytes: the field layout only sums to 0x3D (61) bytes, but GhostInfo contains s32
- * members, so the compiler pads the overall struct size up to the next multiple of 4
- * (61 -> 64). This mirror only needs the leading `courseIndex` field for the overwrite-
- * safety check below, but the full field list is kept for clarity/future use. */
+/* Mirrors GhostInfo, decomp/include/unk_structs.h:450-459. Real size is 0x40 (64) bytes:
+ * the fields sum to 0x3D (61), but the s32 members force the struct size up to the next
+ * multiple of 4. Only the leading `courseIndex` is used below; the rest is kept so the
+ * mirror stays a faithful copy. */
 typedef struct GdxGhostInfo {
     int32_t courseIndex;
     int32_t encodedCourseIndex;
@@ -166,9 +152,8 @@ typedef struct GdxGhostInfo {
     GdxMachineInfoPadded unk1D;
 } GdxGhostInfo;
 
-/* Defensive compile-time size checks: a negative array size is a compile error, so any
- * future drift between these mirrors and the real decomp structs fails loudly here
- * instead of silently corrupting SRAM through a mis-sized extern call. */
+/* A negative array size is a compile error, so drift between these mirrors and the real
+ * decomp structs fails loudly here instead of corrupting SRAM through a mis-sized call. */
 typedef char gdx_ghost_record_size_check[(sizeof(GdxGhostRecord) == 0x40) ? 1 : -1];
 typedef char gdx_ghost_data_size_check[(sizeof(GdxGhostData) == 0x3F80) ? 1 : -1];
 typedef char gdx_ghost_save_size_check[(sizeof(GdxGhostSave) == 0x3FC0) ? 1 : -1];
@@ -182,26 +167,20 @@ typedef char gdx_ghost_info_size_check[(sizeof(GdxGhostInfo) == 0x40) ? 1 : -1];
 #define GDX_GHOST_TYPE_CELEBRITY 3
 #define GDX_GHOST_TYPE_CHAMP 4
 
-/* COURSE_EDIT_1, decomp/include/fzx_course.h:74 -- the base-course range is [0, 24);
- * this is the same bound Gdx_AutosaveGhostOnRecord and Menus_AttemptSaveGhost use to
- * gate Save_SaveGhost (decomp/src/overlays/ovl_i3/menus.c). */
+/* COURSE_EDIT_1, decomp/include/fzx_course.h:74 -- the base-course range is [0, 24), the
+ * same bound Gdx_AutosaveGhostOnRecord and Menus_AttemptSaveGhost use to gate
+ * Save_SaveGhost (decomp/src/overlays/ovl_i3/menus.c). */
 #define GDX_GHOST_MAX_COURSE_INDEX 24
 
 /* ---------------------------------------------------------------------------------
- * Real decomp entry points (decomp/src/overlays/ovl_i2/save.c). Raw extern
- * declarations, no header include -- see the file header comment above for why. All
- * seven are plain (non-static) C functions, unconditionally compiled (EXPANSION_KIT is
- * always on for this port -- port/CMakeLists.txt's GDX_EXPANSION_KIT option defaults
- * ON), so the EXPANSION_KIT branch inside each of them is always the one in effect:
- * they operate on the single live gSaveContext.ghostSave (record/data) whenever their
- * argument happens to point at it (Save_LoadGhostInfo, via Save_ReadGhostRecord
- * internally), or on whatever buffer the caller passes (Save_Read/WriteGhostRecord/
- * Data, Save_CalculateGhost*Checksum -- these four never touch gSaveContext directly,
- * only through the pointer given to them, which is why this file can round-trip a
- * local GdxGhostSave buffer without ever needing to see gSaveContext itself). s32/u16
- * return types are declared here as int/unsigned short -- on this port's only current
- * target (MSVC/LLP64) that is byte-identical to decomp's s32 (long, 4 bytes)/u16
- * (unsigned short, 2 bytes).
+ * Real decomp entry points (decomp/src/overlays/ovl_i2/save.c). Raw extern declarations,
+ * no header include -- see the file header above for why. EXPANSION_KIT is always on for
+ * this port (port/CMakeLists.txt's GDX_EXPANSION_KIT defaults ON), so the EXPANSION_KIT
+ * branch inside each is the one in effect. Save_Read/WriteGhostRecord/Data and
+ * Save_CalculateGhost*Checksum never touch gSaveContext directly, only the pointer handed
+ * to them, which is what lets this file round-trip a local GdxGhostSave buffer without
+ * ever seeing gSaveContext. s32/u16 returns are spelled int/unsigned short here, which is
+ * byte-identical to the decomp's types on this port's targets.
  */
 extern int Save_LoadGhostInfo(GdxGhostInfo* ghostInfo);
 extern void Save_ReadGhostRecord(GdxGhostRecord* ghostRecord);
@@ -249,8 +228,8 @@ static void gdx_ghost_pack_header(unsigned char* header, int32_t courseId, uint3
 }
 
 /* ---------------------------------------------------------------------------------
- * CRC-32 (IEEE 802.3 / zlib polynomial 0xEDB88320), reflected, table-based. Standard,
- * public-domain algorithm, computed lazily into a static table on first use.
+ * CRC-32 (IEEE 802.3 / zlib polynomial 0xEDB88320), reflected, table-based. Same
+ * algorithm as disk_savefile.cpp's container CRC.
  * ------------------------------------------------------------------------------- */
 
 static uint32_t gdx_crc32(const unsigned char* data, size_t length) {
@@ -777,9 +756,9 @@ int gdx_ghost_export(int courseIndex, const char* path) {
     memset(&info, 0, sizeof(info));
     loadResult = Save_LoadGhostInfo(&info);
     if (loadResult != 0) {
-        /* Non-zero: the slot was empty, or had a bad checksum and Save_LoadGhostInfo
-         * just self-healed it back to empty (this mirrors how Gdx_AutosaveGhostOnRecord
-         * reads occupancy). Either way there is nothing valid to export. */
+        /* Non-zero means the slot was empty, or had a bad checksum and Save_LoadGhostInfo
+         * self-healed it back to empty -- the same occupancy test Gdx_AutosaveGhostOnRecord
+         * uses. Either way there is nothing valid to export. */
         return GDX_GHOST_ERR_NO_GHOST;
     }
     if (courseIndex != GDX_GHOST_ANY_COURSE && courseIndex != info.courseIndex) {
@@ -795,8 +774,8 @@ int gdx_ghost_export(int courseIndex, const char* path) {
     Save_ReadGhostRecord(&save->record);
     recordCk = Save_CalculateGhostRecordChecksum(&save->record);
     if (recordCk != save->record.checksum) {
-        /* Should not happen right after a successful Save_LoadGhostInfo, but never
-         * export a record this port cannot itself validate. */
+        /* Should not happen right after a successful Save_LoadGhostInfo, but never export
+         * a record this port cannot itself validate. */
         free(save);
         return GDX_GHOST_ERR_BAD_CHECKSUM;
     }
@@ -894,9 +873,9 @@ int gdx_ghost_import(const char* path) {
         return validationRc;
     }
 
-    /* Player imports always enter the per-course host library first. This is the operation that
-     * removes the cartridge's one-total-ghost limit; the SRAM mirror below is now compatibility
-     * state, not the only durable copy. */
+    /* Player imports enter the per-course host library first. That is what removes the
+     * cartridge's one-total-ghost limit; the SRAM mirror below is compatibility state, not
+     * the only durable copy. */
     if (save->record.ghostType == GDX_GHOST_TYPE_PLAYER) {
         int libraryRc = gdx_ghost_library_store_player(save);
         if (libraryRc != GDX_GHOST_OK) {
@@ -915,15 +894,12 @@ int gdx_ghost_import(const char* path) {
         return playerImport ? GDX_GHOST_OK : GDX_GHOST_ERR_COURSE_MISMATCH;
     }
 
-    /* Install: write through the game's own SRAM helpers -- the same two calls
-     * Save_SaveGhost makes, and therefore the same port/sram_buffer.cpp write-through
-     * path to fzerox.sav the autosave-on-record feature uses. Writing the parsed
-     * record/data directly (instead of routing through a runtime Ghost struct the way
-     * Save_SaveGhost(courseIndex, Ghost*) does) keeps trackName/unk_12 byte-identical to
-     * what was exported -- see the header comment for why. Both calls recompute the
-     * checksum fields themselves; since step 3 above already confirmed those checksums
-     * are correct for this exact payload, the recomputation is a no-op check, not a
-     * behavior change. */
+    /* Install through the game's own SRAM helpers -- the same two calls Save_SaveGhost
+     * makes, and therefore the same write-through path to fzerox.sav. Writing the parsed
+     * record/data directly, rather than routing through a runtime Ghost struct the way
+     * Save_SaveGhost(courseIndex, Ghost*) does, is what keeps trackName/unk_12
+     * byte-identical to what was exported; see the header comment. Both calls recompute
+     * the checksums, which the validation above already confirmed, so that is a no-op. */
     Save_WriteGhostRecord(&save->record);
     Save_WriteGhostData(&save->data);
 

@@ -1,9 +1,9 @@
 #pragma once
 /* Single byte-source shim for venue/geometry blob migration.
  *
- * All chokepoints that used to read the cartridge image directly
- * (`memcpy(dst, gdx_rom_buffer + romBase, size)`) route through this shim so a
- * single place decides where the bytes come from:
+ * Every chokepoint that reads the cartridge image routes through here rather than
+ * doing `memcpy(dst, gdx_rom_buffer + romBase, size)` itself, so one place decides
+ * where the bytes come from:
  *   1. archive-first  -- the generated segment_blob table (containment lookup),
  *   2. raw-ROM fallback -- gdx_rom_buffer, byte-identical to the old direct read.
  *
@@ -40,24 +40,19 @@ int GdxSegmentSourceContainingSpan(uint32_t romBase, uint32_t* outSpan);
  * bucket. Target 0 once the archive is complete. */
 unsigned int gdx_segment_source_fallback_total(void);
 
-/* Per-family telemetry iterator. Walks the
- * dynamically-discovered blob families in order: call with index 0,1,2,... until
- * it returns 0 (one past the last populated family). On a hit it writes the
- * family's archive key to *outKey and its raw-ROM fallback count to
- * *outFallbackReads (either out-pointer may be NULL) and returns 1. The unmapped
- * bucket is NOT a family and is reflected only in gdx_segment_source_fallback_total().
- * A snapshot per index: the returned counts may advance between calls under
- * concurrent reads -- fine for periodic diagnostics. */
+/* Per-family telemetry iterator: call with index 0,1,2,... until it returns 0 (one past
+ * the last populated family). On a hit it writes the family's archive key to *outKey and
+ * its raw-ROM fallback count to *outFallbackReads (either may be NULL) and returns 1. The
+ * unmapped bucket is NOT a family and shows up only in gdx_segment_source_fallback_total().
+ * Each index is a snapshot; counts may advance between calls under concurrent reads. */
 int GdxSegmentSourceFamilyStats(unsigned int index, const char** outKey,
                                 unsigned int* outFallbackReads);
 
-/* Boot-time preload. Forces the lazy archive load of the blob family
- * whose verbatim ROM slice contains `romBase`, so the family payload is resident
- * before the first audio DMA instead of loading lazily on a game/audio tick.
- * Returns 1 when the payload is resident from the archive, 0 when the family is
- * absent or the archive load failed (in which case reads degrade silently to the
- * raw-ROM fallback -- zero behavior change from today). Idempotent: a second call
- * for an already-resident (or already-failed) family returns the cached state. */
+/* Boot-time preload: forces the lazy archive load of the blob family whose verbatim ROM
+ * slice contains `romBase`, so the payload is resident before the first audio DMA rather
+ * than loading on a game/audio tick. Returns 1 when the payload is resident from the
+ * archive, 0 when the family is absent or the load failed -- reads then degrade silently
+ * to the raw-ROM fallback. Idempotent: a second call returns the cached state. */
 int GdxSegmentSourcePreload(uint32_t romBase);
 
 /* Companion getter to GdxSegmentSourcePreload: hands back the resident,

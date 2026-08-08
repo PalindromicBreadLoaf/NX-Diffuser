@@ -62,11 +62,10 @@ extern const GdxSegmentBlobEntry* gdx_lookup_segment_blob(unsigned int rom_base,
 extern unsigned char* gdx_rom_buffer;
 extern size_t gdx_rom_size;
 
-/* Raw archive-file reader (port/AssetLoader.cpp): copies min(fileSize, outSize)
- * bytes of the o2r file INCLUDING its 0x40 Torch resource header, returns 1 on
- * success. NOTE the real definition uses size_t; match it exactly so the C
- * prototype agrees with the C++
- * extern "C" definition. */
+/* Raw archive-file reader (port/AssetLoader.cpp): copies min(fileSize, outSize) bytes
+ * of the o2r file INCLUDING its 0x40 Torch resource header, returns 1 on success. The
+ * size_t parameters must stay spelled exactly as in the C++ definition, or this C
+ * prototype disagrees with it across the extern "C" boundary. */
 extern int GDiffuser_LoadArchiveFileBytes(const char* key, void* out, size_t outSize,
                                           size_t* copiedSize);
 
@@ -76,12 +75,11 @@ extern int GDiffuser_LoadArchiveFileBytes(const char* key, void* out, size_t out
 #define GDX_ARCHIVE_SIZE_FIELD_BYTES 0x04u
 #define GDX_ARCHIVE_PAYLOAD_OFFSET (GDX_ARCHIVE_HEADER_BYTES + GDX_ARCHIVE_SIZE_FIELD_BYTES) /* 0x44 */
 
-/* Per-family cache + telemetry slots, discovered lazily by blob-entry identity
- * (the generated table is static, so entry pointers are stable). The table holds
- * the 22 venue/geometry families plus the audio_blob families appended by the
- * audio_blob families this same shim also serves; 128 leaves ample
- * headroom for the full launch set. A family beyond the cap still serves correct
- * bytes via the raw-ROM fallback -- it just is not cached or tracked. */
+/* Per-family cache + telemetry slots, discovered lazily by blob-entry identity -- the
+ * generated table is static, so entry pointers are stable identities. 128 leaves ample
+ * headroom over the 22 venue/geometry families plus the audio_blob families this shim
+ * also serves. A family beyond the cap still serves correct bytes through the raw-ROM
+ * fallback; it is just not cached or tracked. */
 #define GDX_SEG_FAMILY_MAX 128
 
 typedef struct {
@@ -202,12 +200,11 @@ static int seg_ensure_loaded(GdxSegFamilySlot* slot) {
         return 0;
     }
 
-    /* Keep the whole file buffer alive (never freed -- process-lifetime cache);
-     * serve the payload view at +0x44. Publish for the lock-free read fast path:
-     * store payloadSize (and, earlier, the fully-copied buffer bytes) BEFORE the
-     * release fence, then publish `payload` last. A reader that acquire-loads a
-     * non-NULL payload is therefore guaranteed to also see the matching size and
-     * the settled buffer contents -- no torn publication. */
+    /* The whole file buffer stays alive (process-lifetime cache, never freed); the payload
+     * view starts at +0x44. Publication order matters for the lock-free read fast path:
+     * payloadSize and the copied bytes must settle BEFORE the release fence, with `payload`
+     * published last, so a reader that acquire-loads a non-NULL payload also sees the
+     * matching size and buffer contents. */
     slot->payloadSize = payloadSize;
     slot->loadState = 1;
     SEG_RELEASE_FENCE();
@@ -226,12 +223,10 @@ int GdxSegmentSourceRead(uint32_t romBase, uint32_t size, void* dst) {
 
     entry = gdx_lookup_segment_blob((unsigned int)romBase, (unsigned int)size);
     if (entry != NULL) {
-        /* Lock-free read fast path: once a family's payload is published it is
-         * immutable for the process lifetime, so a read that hits an already-loaded
-         * family serves the copy without touching the lock. This keeps the game and
-         * graphics threads from serializing on the per-cache-miss bridge path (each
-         * family loads once, then every later read is lock-free). Only first-load
-         * and sticky-fail families fall through to the lock below. */
+        /* Lock-free fast path: a published payload is immutable for the process lifetime,
+         * so a read into an already-loaded family serves the copy without the lock and the
+         * game and graphics threads never serialize on it. Only first-load and sticky-fail
+         * families fall through to the lock below. */
         unsigned int count = sFamilyCount; /* aligned u32 load is atomic on the targets */
         unsigned int i;
         SEG_ACQUIRE_FENCE(); /* order the count load before the slot reads */
@@ -259,7 +254,6 @@ int GdxSegmentSourceRead(uint32_t romBase, uint32_t size, void* dst) {
             } else if (slot != NULL) {
                 slot->fallbackReads++;
                 if (seg_strict_mode()) {
-                    /* Strict: log every fallback, rate-limited to 1/100 with count. */
                     if ((slot->fallbackReads % 100u) == 1u) {
                         gdx_port_logf("[seg-src] STRICT: fallback family=%s rom=%X count=%u",
                                       entry->o2r_key, (unsigned int)romBase, slot->fallbackReads);

@@ -1,100 +1,34 @@
-// G-Diffuser -- software (HLE) implementation of the N64 audio RSP microcode ("aspMain").
+// Software (HLE) implementation of the N64 audio RSP microcode ("aspMain").
 //
-// THE GAP THIS FILE FILLS
-// ------------------------------------------------------------------------------------------
-// The decomp's CPU-side audio driver (decomp/src/audio/disk/lib/synthesis.c) only ever BUILDS
-// an RSP command list (the "Acmd" ABI documented in decomp/include/PR/abi.h) -- on real
-// hardware the RSP's aspMain microcode (decomp/src/rsp/aspmain.s, an un-decompiled .incbin
-// blob) executes that list to actually VADPCM-decode / resample / envelope-mix / interleave
-// samples into the AI output buffer. On this host port nothing ever ran that list
-// (port/n64_sched.c acked M_AUDTASK without executing it, same as the GFX task path acks
-// unknown ucodes), so AudioSynth_Update produced command lists that nobody consumed: the
-// sequencer ticked, tasks were created, osAiSetNextBuffer was wired to the real SDL player --
-// but the buffers handed to it were never filled with real PCM. This file is that missing
-// DSP stage.
+// The decomp's CPU-side driver (decomp/src/audio/disk/lib/synthesis.c) only BUILDS the RSP
+// command list (the "Acmd" ABI in decomp/include/PR/abi.h); on hardware the aspMain microcode
+// (decomp/src/rsp/aspmain.s, an un-decompiled .incbin blob) is what executes it. Nothing on this
+// host ever ran that list, so the AI buffers handed to the SDL player were never filled with real
+// PCM. This file is that missing DSP stage.
 //
-// It is an ORIGINAL implementation written from the ABI's public field layouts (abi.h) and
-// the well known, widely documented N64 "ABI2" audio semantics (the same command set/algorithm
-// family independently reimplemented by e.g. the SM64 PC port's mixer.c and the vgmstream
-// project's N64 VADPCM decoders) -- no code was copied from any GPL source.
+// Original implementation, written from abi.h's public field layouts and the publicly documented
+// N64 "ABI2" audio semantics. No code was copied from any GPL source; where a reference
+// implementation's BEHAVIOR was followed, the citation sits on the function that follows it.
 //
-// ------------------------------------------------------------------------------------------
-// THE POINTER-TRUNCATION HAZARD (why this can't just dereference Acmd words as host pointers)
-// ------------------------------------------------------------------------------------------
-// Acmd's `Awords { u32 w0; u32 w1; }` (PR/abi.h) can only hold a 32-bit value. On real N64
-// hardware the values synthesis.c packs into `w1` for LOADBUFF/SAVEBUFF/ADPCM/LOADADPCM/
-// SETLOOP/RESAMPLE/FILTER are already 32-bit physical/KSEG0/KSEG1 addresses, so nothing is
-// lost. On this x64 host the values passed to those macros are REAL C POINTERS -- e.g.
-// disk/lib/synthesis.c: `aLoadBuffer(aList++, sampleData - sampleDataStartPad, addr, aligned)`,
-// `aSaveBuffer(aList++, dmem, &reverb->leftRingBuf[startPos], size)`,
-// `aLoadADPCM(aList++, nEntries, gAudioCtx.curLoadedBook)`,
-// `aADPCMdec(aList++, flags, synthState->synthesisBuffers->adpcmdecState)` -- and every one of
-// those macros casts the pointer through (uintptr_t)/(u32) before assigning it to a u32 field
-// (see PR/abi.h aLoadBuffer/aSaveBuffer/aADPCMdec/aLoadADPCM/aSetLoop/aResample/aFilter), so the
-// TOP 32 BITS OF THE HOST POINTER ARE SILENTLY DISCARDED the instant the command is packed. By
-// the time this interpreter reads an Acmd back out of the task's data_ptr, all it has is the
-// low 32 bits of the original pointer.
+// POINTER TRUNCATION -- why a w1 word must never be dereferenced directly. Acmd's
+// `Awords { u32 w0; u32 w1; }` holds 32 bits. On hardware the values synthesis.c packs into w1
+// for LOADBUFF/SAVEBUFF/ADPCM/LOADADPCM/SETLOOP/RESAMPLE/FILTER are already 32-bit physical
+// addresses; here they are real host pointers, and abi.h's macros cast them through (u32), so the
+// top 32 bits are gone before this interpreter ever reads the command back. Every pointer that
+// reaches an audio command lives either in the 16MB gdx_rdram arena or in the exe's static image,
+// so the low 32 bits are reconstructed through n64_gfx_bridge.cpp's existing resolvers -- the
+// same mechanism it already uses for GBI display-list words.
 //
-// This is the exact same hazard port/n64_gfx_bridge.cpp already solved for GBI display-list
-// command words, via gdx_register_host_range()-backed low32 reconstruction. Every pointer that
-// ever gets packed into an audio command lives in one of two already-registered places:
-//   - the 16MB gdx_rdram arena (Arena_Allocate-backed sample/reverb-ringbuffer/note-state
-//     buffers) -- covered by gdx_resolve_registered_host_address(), or
-//   - the exe's static/BSS image (gAudioCtx itself is a plain global, so its embedded arrays --
-//     e.g. SynthesisReverb fields, NoteSynthesisBuffers -- resolve through the module range)
-//     -- covered by gdx_resolve_module_host_address().
-// Both resolvers are already exported (extern "C") from n64_gfx_bridge.cpp for exactly this
-// purpose; this file reuses them unchanged instead of reimplementing address reconstruction.
-// (This file does NOT modify n64_gfx_bridge.cpp -- only calls its existing exported API.)
+// Deliberate no-ops and approximations, both on rare paths: A_UNK19 (SDK-unknown, reached only by
+// the bookOffset==3 note path) leaves DMEM unchanged; A_INTERL is a best-guess decimation
+// (out[k] = in[2k]) for the "two-part" note split.
 //
-// Note on OSMesg width (the OTHER half of the uintptr32 hazard class): that hazard is about
-// osRecvMesg writing a pointer-width OSMesg into a narrower C
-// local. It does not apply here -- this file never calls osRecvMesg/osSendMesg; the task's
-// `data_ptr`/`data_size` (PR/sptask.h: `u64* data_ptr; u32 data_size;`) are already pointer-width
-// fields read directly out of the OSTask by n64_sched.c, so no message-queue narrowing occurs
-// on that path.
-//
-// ------------------------------------------------------------------------------------------
-// SCOPE / CONFIDENCE NOTES (read this before debugging distorted audio)
-// ------------------------------------------------------------------------------------------
-// High confidence (mechanical, directly derived from PR/abi.h's macros + synthesis.c's actual
-// call sites, no ambiguity): A_CLEARBUFF, A_SETBUFF, A_DMEMMOVE, A_LOADBUFF, A_SAVEBUFF,
-// A_LOADADPCM (byte count + DMA into a private codebook buffer), A_SETLOOP (file-scope persistent
-// pointer, see sPendingLoopState -- revamp v2 task A1), A_MIXER, A_INTERLEAVE, A_ADDMIXER
-// (gainless clamped unity add, per mupen64plus-rsp-hle alist_add -- revamp v2 task A6),
-// A_ENVSETUP1/A_ENVSETUP2/A_ENVMIXER (block-ramped volume envelope, wet cascaded off the
-// dry-scaled sample per channel -- nead alist.c#L512-562 envmix_nead semantics, revamp v2 task
-// A2 -- the block-of-8-samples ramp granularity is derived directly from
-// AudioSynth_ProcessEnvelope's `aiBufLen >> 3` math, not guessed), A_HILOGAIN, A_S8DEC.
-//
-// Medium confidence (standard, publicly documented algorithms, implemented from memory of the
-// widely mirrored N64/GC "VADPCM" order-2 fixed-point predictor scheme -- codebook layout
-// verified against this repo's own AdpcmBook comment "size 8*order*numPredictors"): A_ADPCM
-// decode math (coefficient indexing / Q11 shift; deferred intra-frame clamping per
-// mupen64plus-rsp-hle audio.c#L109-127, revamp v2 task A4); A_RESAMPLE (4-tap polyphase FIR using
-// the EXACT 64-phase Q15 ROM coefficient table transcribed from the canonical RSP audio-HLE
-// RESAMPLE_LUT -- bit-exact to the ucode, see RunResample's table comment -- now with a 4-sample
-// persisted pre-roll history and zero-primed A_INIT plus rounded-up-to-8-samples output count,
-// per mupen64plus-rsp-hle alist.c#L621-639, revamp v2 task A5); A_FILTER (two-averaged-LUT,
-// cross-block-windowed FIR reimplemented from alist_filter's documented BEHAVIOR -- see
-// RunFilter's header comment for exactly what was and wasn't adopted from the GPLv2 reference,
-// still gated by GDX_HLE_FILTER).
-//
-// Deliberately a safe no-op (left the DMEM buffer unchanged) because the semantics are under-
-// documented and it's a secondary/rare path, NOT required for primary note audibility:
-// A_UNK19 (an SDK-unknown opcode, only triggered for the rare bookOffset==3 note path).
-// A_INTERL is implemented as a best-guess decimation (out[k] = in[2k]) for the rare
-// "two-part" note split path.
-//
-// KNOWN OPEN QUESTION: whether
-// ROM-sourced 16-bit audio data (ADPCM codebooks, loop predictor-history) is byte-swapped
-// anywhere in this port's asset/DMA pipeline before decomp C code reads it as host `s16`.
-// decomp code reads these fields as ordinary native shorts everywhere (not just here), so this
-// file follows that same existing assumption for consistency. If BGM comes out as harsh/
-// structured static rather than recognizable (if mistuned) music, ROM audio byte order is the
-// first thing to check -- it would be a pre-existing, pipeline-wide issue, not specific to this
-// interpreter.
-// ------------------------------------------------------------------------------------------
+// OPEN QUESTION: whether ROM-sourced 16-bit audio data (ADPCM codebooks, loop predictor history)
+// is byte-swapped anywhere in the asset/DMA pipeline before decomp C reads it as host s16. Decomp
+// reads these as ordinary native shorts everywhere, and this file follows that same assumption.
+// If BGM comes out as structured static rather than recognizable (if mistuned) music, ROM audio
+// byte order is the first thing to check -- that would be a pipeline-wide issue, not specific to
+// this interpreter.
 
 #include <stdint.h>
 #include <stdio.h>
@@ -103,20 +37,16 @@
 #include <math.h>
 
 #include "port_log.h"
-#include "gdx_dev_gates.h" /* Dev Tools gate layer: GDX_SEQ_ADPCM / GDX_HLE_FILTER / GDX_NO_REVERB */
+#include "gdx_dev_gates.h"
 
-// ---- Cross-TU pointer resolvers (defined in port/n64_gfx_bridge.cpp; NOT modified here) ----
-// Deliberately `unsigned int`, matching how these are already declared on both sides of the TU
-// boundary elsewhere in the port (see port/decomp_port.c's extern decls) -- NOT uintptr_t, which
-// the decomp's own stdint shim typedefs as a 32-bit type inside gdiffuser_game TUs (see engram
-// discovery/uintptr32_hazard). `unsigned int` is unambiguous 32 bits on every TU in this project.
+// Defined in port/n64_gfx_bridge.cpp. Deliberately `unsigned int`, not uintptr_t: the decomp's
+// own stdint shim typedefs uintptr_t as a 32-bit type inside gdiffuser_game TUs, so only
+// `unsigned int` is unambiguously 32 bits on both sides of this TU boundary.
 extern void* gdx_resolve_registered_host_address(unsigned int addr);
 extern void* gdx_resolve_module_host_address(unsigned int addr);
 
-/* ---- LUS console-variable read (C ABI, defined in libultraship) ----
- * Declared here so this C TU need not pull the C++ bridge header -- the exact same pattern
- * gdx_audio_lle.c uses for the LLE engine toggle. Backs the live reverb kill switch below
- * (gEnhancements.Audio.Reverb). */
+/* Defined in libultraship (C ABI). Declared here so this C TU need not pull the C++ bridge
+ * header. Backs the live reverb kill switch below. */
 extern int CVarGetInteger(const char* name, int defaultValue);
 
 static void* GdxAudioResolveAddr(uint32_t raw, const char* what) {
@@ -143,8 +73,8 @@ static void* GdxAudioResolveAddr(uint32_t raw, const char* what) {
     return NULL;
 }
 
-// ---- Opcode numbers (mirror decomp/include/PR/abi.h; EXPANSION_KIT=1 for this build, which
-// is why A_HILOGAIN=14 here rather than 24 -- see abi.h's #ifdef EXPANSION_KIT). ----
+// Mirrors decomp/include/PR/abi.h. This build is EXPANSION_KIT=1, which is why A_HILOGAIN is 14
+// here and not 24 (see abi.h's #ifdef EXPANSION_KIT).
 enum {
     GDX_A_SPNOOP       = 0,
     GDX_A_ADPCM        = 1,
@@ -159,7 +89,7 @@ enum {
     GDX_A_LOADADPCM    = 11,
     GDX_A_MIXER        = 12,
     GDX_A_INTERLEAVE   = 13,
-    GDX_A_HILOGAIN     = 14, /* EXPANSION_KIT build */
+    GDX_A_HILOGAIN     = 14,
     GDX_A_SETLOOP      = 15,
     GDX_A_INTERL       = 17,
     GDX_A_ENVSETUP1    = 18,
@@ -172,25 +102,21 @@ enum {
     GDX_A_DUPLICATE    = 26
 };
 
-// ---- DMEM scratch (real N64 RSP DMEM is 4KB; decomp/src/audio/disk/lib/audio.h's DMEM_*
-// offsets are all < 0x1000 and assume this size). All offsets are masked to this size before
-// use, defensively -- a malformed/edge-case command can never corrupt memory outside sDmem. ----
+// Real RSP DMEM is 4KB, and decomp/src/audio/disk/lib/audio.h's DMEM_* offsets all assume that
+// size. Every offset is masked before use so a malformed command can never write outside sDmem.
 #define GDX_DMEM_SIZE 0x1000u
 #define GDX_DMEM_MASK (GDX_DMEM_SIZE - 1u)
 static uint8_t sDmem[GDX_DMEM_SIZE];
-/* [spike] last-writer tracker: every DMEM write records the opcode
-   that made it, per 16-byte block, so a spike found at interleave time can NAME its
-   writer instead of us inferring one. 0xFF = never written this session. */
+/* [spike] diagnostic: per 16-byte block, the opcode that last wrote it. 0xFF = never written. */
 static uint8_t sDmemLastOp[GDX_DMEM_SIZE >> 4];
 static uint8_t sDmemCurOp = 0xFF;
 
-/* File-based audio-stage bypass toggles (stage localization by ear). Env vars proved
-   unreliable in the target shell, so read flags ONCE from gdx-audio-debug.txt next
-   to the exe. Space/newline-separated keywords, any subset:
-     nofilter  -- skip the per-voice A_FILTER (8-tap FIR)
-     flatvol   -- envmixer applies constant volume per tick (no 8-block ramp staircase)
+/* Stage-bypass flags, read once from gdx-audio-debug.txt next to the exe (env vars proved
+   unreliable in the target shell). Space/newline-separated keywords, any subset:
+     nofilter  -- skip the per-voice A_FILTER
+     flatvol   -- envmixer holds one volume for the whole tick (no 8-block ramp staircase)
      noreverb  -- skip the reverb wet->dry return
-     nointerl  -- skip the nParts==2 "best-guess decimation" path
+     nointerl  -- skip the nParts==2 decimation path
    Enable ONE at a time to attribute an artifact to a stage. */
 static int GdxAudioDbg(void) {
     static int sFlags = -1;
@@ -212,9 +138,8 @@ static int GdxAudioDbg(void) {
     return sFlags;
 }
 
-// Private ADPCM codebook scratch. aLoadADPCM's DMA target is a fixed *internal* ucode location
-// never exposed through the C ABI (the command carries no DMEM parameter), so this interpreter
-// is free to keep it anywhere -- a side buffer, entirely private to this file, is simplest.
+// aLoadADPCM's DMA target is a ucode-internal location never exposed through the C ABI (the
+// command carries no DMEM parameter), so the book can live in a private side buffer.
 #define GDX_ADPCM_BOOK_MAX_BYTES 4096u
 static uint8_t sAdpcmBook[GDX_ADPCM_BOOK_MAX_BYTES];
 static uint32_t sAdpcmBookLen = 0;
@@ -257,25 +182,15 @@ typedef struct GdxBufDesc {
     uint32_t count;
 } GdxBufDesc;
 
-// ---- Unlock-jingle HLE stage capture -----------------------------------------
+// Unlock-jingle stage capture. synthesis.c registers the exact Acmd range and persistent state
+// addresses of each target note, so this file can attribute commands to voices without touching
+// the command list or guessing from sample contents. Four timeline-aligned WAVs (resample,
+// pre-envelope, envelope, mix) are written after two seconds.
 //
-// GDX_DIAG_UNLOCK already identifies the sequence-channel notes on the CPU side.
-// synthesis.c registers the exact Acmd range and persistent state addresses for
-// each target note before the command list is submitted. Range attribution lets
-// the HLE capture only the unlock voices without changing the command list or
-// guessing from sample contents.
-//
-// Four timeline-aligned WAVs are produced after exactly two seconds:
-//   resample      target voices immediately after A_RESAMPLE
-//   pre-envelope  target voices after optional gain/filter, at A_ENVMIXER input
-//   envelope      target-only dry L/R contributions after envelope/pan
-//   mix           complete dry L/R buses immediately before A_INTERLEAVE
-//
-// Decode and resampler-input samples are summarized in the diagnostic log rather
-// than emitted as WAVs: those buffers run in source-sample space and contain
-// per-call overlap/preamble, so concatenating them would create artificial seams
-// that could be mistaken for the defect under investigation. The capture is
-// dormant until a target note is registered and has no file I/O in normal play.
+// Decode and resampler-input buffers are only summarized in the log, never emitted as WAVs: they
+// run in source-sample space and carry per-call overlap, so concatenating them would create
+// seams that look exactly like the defect under investigation. Dormant until a target note is
+// registered; no file I/O in normal play.
 #define GDX_UNLOCK_STAGE_FRAMES 64000u
 #define GDX_UNLOCK_STAGE_MAX_CHUNK 256u
 #define GDX_UNLOCK_STAGE_MAX_TARGETS 32u
@@ -816,12 +731,11 @@ static void GdxUnlockStageAppendChunk(uint32_t dmemLeft, uint32_t dmemRight, uin
     }
 }
 
-// ---- ADPCM codebook access: per-predictor block is `8 * order` shorts (verified against
-// decomp/src/audio/disk/lib/audio.h's AdpcmBook comment "size (8 * order * numPredictors)").
-// The real aspMain ucode's ADPCM decode is fixed-function order-2 (well documented N64 SDK
-// fact), so `order` is hardcoded to 2 here regardless of what a book's header.order says. ----
+// A codebook's per-predictor block is `8 * order` shorts (audio.h's AdpcmBook: "size (8 * order *
+// numPredictors)"). aspMain's ADPCM decode is fixed-function order-2, so order is hardcoded to 2
+// here regardless of what a book header's own `order` says.
 static int16_t BookCoef(uint32_t predictorIndex, uint32_t tap /* 0 or 1 */, uint32_t col /* 0..7 */) {
-    uint32_t idx = (predictorIndex * 16u) + (tap * 8u) + col; /* 8*order(2) = 16 shorts/predictor */
+    uint32_t idx = (predictorIndex * 16u) + (tap * 8u) + col;
     uint32_t byteOff = idx * 2u;
     int16_t v;
     if (byteOff + 1u >= sAdpcmBookLen) {
@@ -831,24 +745,12 @@ static int16_t BookCoef(uint32_t predictorIndex, uint32_t tap /* 0 or 1 */, uint
     return v;
 }
 
-// ---- Pending "buffer descriptor" set by A_SETBUFF, consumed by the following A_ADPCM /
-// A_S8DEC / A_RESAMPLE (mirrors the real RSP's internal input/output/count registers). ----
-// ---- A_SETLOOP persistence (revamp v2 task A1). Real hardware's aspMain keeps the loop-restart
-// pointer in ucode-internal state that is NEVER cleared between command lists -- it is only ever
-// REPLACED by a new A_SETLOOP (mirrors mupen64plus-rsp-hle's alist_nead.c: `hle->alist_nead.loop`
-// lives on the persistent `hle_t` struct, set once by SETLOOP and read by every later ADPCM call
-// that carries A_LOOP, across as many command lists as the ucode task runs). This port's own
-// disk/lib/synthesis.c comment (at the ADPCM dispatch) claims synthesis.c re-emits aSetLoop before
-// every list that needs it -- FALSE: synthesis.c:886-890 emits aSetLoop only under
-// `synthState->restart`, i.e. only when a note (re)starts its loop, not on every subsequent list
-// that decodes a later wrap of the SAME already-looping note. A function-local pendingLoopState
-// (reset to NULL at the top of every gdx_audio_hle_run call) therefore went NULL on every list
-// that didn't happen to restart, so any loop wrap decoded in a LATER list had no loop history to
-// read from -- wrong predictor state at every wrap of a sustained looped voice (engine drones,
-// looped SFX), heard as periodic clicks. File-scope static below fixes this: it is set by
-// GDX_A_SETLOOP and never reset elsewhere, exactly like the real ucode's persistent register.
-// RunAdpcm's existing NULL-safe fallback (falls back to the note's own state[]/[1] when no loop
-// has ever been set) is kept unchanged. ----
+// A_SETLOOP's target persists for the life of the process, exactly like the ucode's own internal
+// loop register: it is only ever REPLACED by a later A_SETLOOP, never cleared. synthesis.c's own
+// comment claims it re-emits aSetLoop before every list that needs one -- it does not
+// (synthesis.c:886-890 emits it only under `synthState->restart`), so resetting this per call left
+// every later loop wrap of a sustained note with no history to read from, clicking at each wrap.
+// RunAdpcm's NULL-safe fallback to the note's own state[] covers the never-set case.
 static const int16_t* sPendingLoopState = NULL;
 /* [pcm-cap] plumbing: identity of the most recent A_LOADBUFF source, so the
    A_ADPCM capture can attribute its decode to a sample. */
@@ -856,19 +758,10 @@ static uintptr_t sPcmCapLastSrc = 0;
 static uint32_t sPcmCapLastRaw = 0;
 static int sDecCapCount = 0; /* [dec-cap] per-frame VADPCM capture budget */
 
-/* ---- [rs-cap] probe (garbage-sounding gained notes: booster / low-health).
-   Offline census proved all 53 cart-streamed SE samples are valid ADPCM at rest and
-   RunAdpcm is bit-exact, so the remaining suspect is per-tick continuity through the
-   resampler (these notes are pitch-swept; a broken fractional-state carry garbles
-   exactly them while constant-pitch BGM survives). Every A_RESAMPLE call is recorded
-   speculatively (pre/post state, full input and output windows) and dumped on two
-   triggers so the resampler can be replayed offline sample-for-sample:
-     T1 = A_HILOGAIN fires. Gained notes (noteSubEu->gain != 0) are exactly the
-          booster/low-health set, and per synthesis.c command order the record at that
-          moment IS that note's FinalResample. Cap 8.
-     T2 = an A_CONTINUE resample whose pitch changed vs the previous call on the SAME
-          state address (pitch-swept note). Consecutive triggers capture consecutive
-          ticks of one note -- the tick-boundary continuity evidence. Cap 16. ---- */
+/* [rs-cap] diagnostic: every A_RESAMPLE call is recorded speculatively (pre/post state, full
+   input and output windows) and dumped on two triggers -- an A_HILOGAIN (marks a gained note) and
+   an A_CONTINUE whose pitch changed against the previous call on the same state address (a
+   pitch-swept note) -- so the resampler can be replayed offline sample for sample. */
 #define GDX_RSCAP_MAXSAMPS 192
 static struct {
     int valid;
@@ -893,12 +786,9 @@ static int sRsCapT2 = 0;
 static uint32_t sRsCapLockTok = 0; /* chain mode: state token locked by first swept race call */
 static int sRsCapChain = 0;
 static int sRsCapInterlPending = 0;
-/* Upstream-stage identity for each chain dump (run-3 upgrade): run 2 proved the resample
-   input STREAM breaks at every tick boundary while resample state chains perfectly, so the
-   fault is upstream -- either the CPU-side source-window advance or the ADPCM decode state.
-   Recording the last A_LOADBUFF source address and last A_ADPCM parameters that fed this
-   resample discriminates: wrong/jumping chunk address = windowing bug; clean 9-byte-frame
-   advance with broken PCM = decode-state bug (loop restore). */
+/* Upstream identity for each chain dump: the last A_LOADBUFF source and A_ADPCM parameters that
+   fed this resample. A jumping chunk address means a source-windowing bug; a clean 9-byte-frame
+   advance with broken PCM means a decode-state (loop restore) bug. */
 static uint32_t sRsCapAdpcmRaw = 0;   /* LOADBUFF raw src token at the last A_ADPCM */
 static uint32_t sRsCapAdpcmFlags = 0;
 static uint32_t sRsCapAdpcmIn = 0, sRsCapAdpcmOut = 0, sRsCapAdpcmCnt = 0;
@@ -906,18 +796,12 @@ static int sRsCapSetloopSince = 0;    /* an A_SETLOOP ran since the previous res
 static struct { uint32_t token; uint32_t pitch; } sRsCapPrev[8];
 static int sRsCapPrevN = 0;
 
-/* [spike] stage-bisection detector (film-grain investigation): the AI tap shows
-   ~40/s isolated single-sample outliers that are pre-pan (same glitch on L and R
-   scaled by the pan difference), i.e. injected somewhere in the per-voice DSP
-   chain -- but the engine note's captured resample output is clean. Scanning at
-   successive pipeline stages attributes the first corrupted stage directly.
-   A "spike" is a sample deviating >3000 from BOTH neighbors in the same
-   direction -- rare in legitimate music, characteristic of a stray sample. */
+/* [spike] stage-bisection detector: scanning at successive pipeline stages names the first
+   stage that carries a stray sample. */
 static int GdxSpikeScan(uint32_t dmem, uint32_t nSamples) {
-    /* STRICT criterion (v2): the naive both-neighbors test fires on legitimate
-       near-Nyquist percussion content. A true stray sample has NEIGHBORS THAT
-       AGREE with each other (|prev-next| small) while the center is far from
-       their mean -- interpolation would remove it. */
+    /* A stray sample has NEIGHBOURS THAT AGREE with each other while the centre sits far from
+       their mean. The naive "deviates from both neighbours" test was rejected: it fires on
+       legitimate near-Nyquist percussion. */
     uint32_t i;
     for (i = 1; i + 1 < nSamples; i++) {
         int32_t prev = DmemGetS16(dmem + (i - 1u) * 2u);
@@ -970,52 +854,39 @@ static void GdxRsCapDump(const char* tag) {
     GdxRsCapDumpWindow("o", sRsCapLast.out, sRsCapLast.outN);
 }
 
-// ---- A_ADPCM: standard order-2 N64/GC-style VADPCM decode (16 samples per frame: 1 header
-// byte + 8 data bytes of 4-bit nibbles, or 5 bytes total -- 4 data bytes of 2-bit nibbles --
-// for the "small ADPCM" flags|4 variant). state is the persistent history pointer (real host
-// memory -- NoteSynthesisBuffers.adpcmdecState[16] or SynthesisReverb-embedded AdpcmLoop).
-// state[0..15] is the FULL last output frame, temporal order, newest at [15] -- this is NOT a
-// free layout choice: it is observable through the DMEM output preamble contract (see the
-// last-frame comment inside the function body). loopStatePtr is the most recent
-// A_SETLOOP target (already resolved), used as the input history source instead of `state` when
-// flags has A_LOOP set (matches the real ucode: SETLOOP overrides where history is READ from;
-// the running state is still always WRITTEN to `state` afterwards). ----
+// A_ADPCM: order-2 VADPCM decode, 16 samples per frame (1 header byte + 8 data bytes of 4-bit
+// nibbles, or 4 data bytes of 2-bit nibbles for the "small ADPCM" flags|4 variant).
+//
+// `state` is the persistent history (NoteSynthesisBuffers.adpcmdecState[16], or a
+// SynthesisReverb-embedded AdpcmLoop): state[0..15] is the FULL last output frame in temporal
+// order, newest at [15]. That is not a free layout choice -- it is observable through the DMEM
+// output preamble contract below.
+//
+// `loopState` is the most recent A_SETLOOP target. A_LOOP reads history from it instead of
+// `state`, matching the ucode: SETLOOP overrides where history is READ from, but the running
+// state is still always WRITTEN back to `state`.
 static void RunAdpcm(const GdxBufDesc* buf, uint32_t flags, int16_t* state, const int16_t* loopState) {
     int smallAdpcm = (flags & 4) != 0;
     int isInit = (flags & 1) != 0;   /* A_INIT */
     int isLoop = (flags & 2) != 0;   /* A_LOOP */
-    /* RAW (unclamped) running history -- the predictor recursion WITHIN a 16-sample frame reads
-       these. int32_t, not int16_t: real hardware's recursion happens in the wide RSP accumulator
-       the whole way through a half-frame and is never narrowed to 16 bits until output, so an
-       unclamped int16_t local here would just add a spurious extra wraparound this file doesn't
-       need -- int32_t is plenty (predicted is already reduced by the >>11 codebook shift before
-       residual is added, see predAcc below, so it never approaches int32 range). */
+    /* RAW (unclamped) running history, read by the predictor recursion WITHIN a 16-sample frame.
+       int32_t because hardware keeps this in the wide RSP accumulator until output; an int16_t
+       local would add a wraparound the real ucode does not have. */
     int32_t hist1, hist2;
-    /* CLAMPED shadow of hist1/hist2, updated in lockstep every sample from the same value written
-       to DMEM. This is what actually crosses a 16-sample FRAME boundary (deferred-clamping task
-       A4, per mupen64plus-rsp-hle audio.c#L109-127 adpcm_compute_residuals: the intra-half-frame
-       recursive term `rdot(i, book2, src)` sums the RAW predict_frame output `src`, never the
-       clamped `dst` -- but the boundary history fed into the NEXT half/frame (`last_samples`,
-       taken from the previous half's already-written `last_frame` buffer) IS the clamped output.
-       Concretely: "clamp only the stored output sample; clamped history propagates only ACROSS
-       frames" (this file's own frame unit is one 16-sample VADPCM frame, i.e. one header+data
-       block -- our sequential per-sample decoder doesn't have mupen's internal 8-sample half-frame
-       split, so the natural boundary here is once per 16-sample frame). Previously EVERY sample
-       clamped hist1 before feeding it back (`hist1 = ClampS16(sampleOut)` unconditionally), so a
-       loud transient that overshot mid-frame got its overshoot silently discarded from every later
-       sample's prediction in that same frame -- audibly different (softer/duller) attack shape on
-       loud percussive/transient content vs. the real ucode, which only loses the overshoot at the
-       output tap, not from the running prediction. */
+    /* CLAMPED shadow, updated in lockstep from the value written to DMEM. Only this crosses a
+       16-sample FRAME boundary (mupen64plus-rsp-hle audio.c#L109-127 adpcm_compute_residuals: the
+       intra-frame recursion sums the RAW predict_frame output, while the history fed into the next
+       frame is the clamped output). Clamping hist1 every sample instead discards a loud
+       transient's mid-frame overshoot from every later prediction in that frame -- a duller attack
+       than the real ucode, which loses the overshoot only at the output tap. */
     int16_t clHist1, clHist2;
     int16_t lastFrame[16]; /* persistent state: the previous call's final 16 output samples */
     uint32_t numOutSamples = buf->count / 2u;
-    /* Round UP to whole 16-sample frames like the real ucode (it always
-       decodes complete frames; downstream consumes only `count` samples).
-       Truncating left the chunk's last 1-15 samples unwritten — zeros from
-       the buffer clear — producing hundreds of 4-9-sample micro-dropouts
-       per second: the crackle/"static" layered over otherwise-correct music
-       (measured directly in the AI output tap). */
-    uint32_t numFrames = (numOutSamples + 15u) / 16u; /* SAMPLES_PER_FRAME, ceil */
+    /* Round UP to whole 16-sample frames like the real ucode, which always decodes complete
+       frames; downstream consumes only `count`. Truncating left a chunk's last 1-15 samples
+       unwritten -- hundreds of micro-dropouts a second, heard as crackle over otherwise-correct
+       music. */
+    uint32_t numFrames = (numOutSamples + 15u) / 16u;
     uint32_t inCursor = buf->dmemIn;
     uint32_t outCursor = buf->dmemOut;
     uint32_t f;
@@ -1024,25 +895,16 @@ static void RunAdpcm(const GdxBufDesc* buf, uint32_t flags, int16_t* state, cons
         return;
     }
 
-    /* THE LAST-FRAME PREAMBLE CONTRACT (root cause of the sustained-note
-       "garbage/buzz": booster, low-health, engine drones). The real aspMain ADPCM op --
-       and mupen64plus-rsp-hle's alist_adpcm verbatim -- does three things this function
-       previously did not:
-         1. keeps its persistent state as the FULL LAST 16-SAMPLE FRAME (which is why
-            adpcmdecState and AdpcmLoop.predictorState are both s16[16]);
-         2. WRITES THAT FRAME TO THE OUTPUT BUFFER FIRST -- output layout is
-            [16 previous-tail samples][count/2 freshly decoded samples];
-         3. decodes the new frames AFTER that 32-byte preamble.
-       synthesis.c's window arithmetic is built on that layout: skipInitialSamples=16
-       makes frameIndex start one frame PAST samplePosInt, and skipBytes (up to 32
-       bytes) indexes into the preamble to serve the current frame's remaining samples
-       from the PREVIOUS tick's decode. Without the preamble every continuing tick read
-       ~one frame ahead with a per-tick wobbling offset and a stale tail: the [rs-cap]
-       chain capture measured a full waveform discontinuity at EVERY tick boundary
-       (output +2957 -> -14312) while resample state chained perfectly. Kernel math was
-       already bit-exact ([pcm-cap] 8/8); only this DMEM layout contract was wrong.
-       state[0..15] = the last frame, temporal order, newest at [15]. The A_LOOP path
-       seeds from the ROM-captured loop predictorState (same shape, same reason). */
+    /* OUTPUT LAYOUT CONTRACT. The real op keeps its persistent state as the FULL last 16-sample
+       frame (which is why adpcmdecState and AdpcmLoop.predictorState are both s16[16]), WRITES
+       THAT FRAME TO THE OUTPUT BUFFER FIRST, and decodes the new frames after it -- the layout is
+       [16 previous-tail samples][count/2 freshly decoded samples].
+       synthesis.c's window arithmetic is built on that: skipInitialSamples=16 makes frameIndex
+       start one frame PAST samplePosInt, and skipBytes indexes into the preamble to serve the
+       current frame's remaining samples from the previous tick's decode. Without the preamble
+       every continuing tick reads a frame ahead with a wobbling offset and a stale tail -- a full
+       waveform discontinuity at every tick boundary, with bit-exact kernel math. The A_LOOP path
+       seeds from the ROM-captured loop predictorState, same shape, same reason. */
     {
         uint32_t i;
         if (isInit) {
@@ -1068,14 +930,10 @@ static void RunAdpcm(const GdxBufDesc* buf, uint32_t flags, int16_t* state, cons
 
     for (f = 0; f < numFrames; f++) {
         uint8_t header = DmemGetU8(inCursor);
-        /* VADPCM frame header: SCALE in the high nibble, PREDICTOR in the low
-           nibble. These were swapped, so every frame decoded with a garbage
-           predictor row and a wrong scale — the loud-static bug. Verified
-           offline against the real title-BGM sample from this ROM: header
-           0x30 with a 2-predictor book can only be scale=3/pred=0, and the
-           corrected decode produces a clean musical waveform (rms 5006,
-           smoothness 0.57, zero clipping) identical to the SDK matrix
-           reference decode. */
+        /* VADPCM frame header: SCALE in the high nibble, PREDICTOR in the low nibble. Swapping
+           them decodes every frame with a garbage predictor row and a wrong scale (loud static).
+           Verified against this ROM's title BGM: header 0x30 with a 2-predictor book can only be
+           scale=3/pred=0, and that decode matches the SDK reference. */
         uint32_t shift = (header >> 4) & 0xF;
         uint32_t predIdx = header & 0xF;
         uint32_t dataBytes = smallAdpcm ? 4u : 8u;
@@ -1083,37 +941,26 @@ static void RunAdpcm(const GdxBufDesc* buf, uint32_t flags, int16_t* state, cons
         uint32_t nibblesPerByte = smallAdpcm ? 4u : 2u; /* 2-bit vs 4-bit nibbles */
         uint32_t s;
 
-        /* Frame-boundary carry (task A4): every NEW frame's prediction starts from the CLAMPED
-           shadow left by the previous frame (or by the isInit/isLoop/state seed above, for f==0
-           -- hist1/hist2 already equal clHist1/clHist2 there, so this is a no-op on the first
-           iteration). Within the frame body below, hist1/hist2 float as RAW (unclamped) values;
-           only clHist1/clHist2 gets clamped every sample. */
+        /* Every NEW frame's prediction starts from the CLAMPED shadow left by the previous frame
+           (a no-op on f==0, where the seed above already put the same values in both). Within the
+           frame body hist1/hist2 float as RAW values; only clHist1/clHist2 is clamped per sample. */
         hist1 = (int32_t)clHist1;
         hist2 = (int32_t)clHist2;
 
-        /* [dec-cap] history entering this frame (newer, older) -- seeds the offline
-           BLOCK-form VADPCM decode identically. */
+        /* [dec-cap] history entering this frame, so an offline block-form decode starts alike. */
         int16_t capPreNewer = clHist1;
         int16_t capPreOlder = clHist2;
 
-        /* GDX_BLOCK_ADPCM=1: hardware-accurate BLOCK-convolution VADPCM decode (grain
-           root cause A/B). The default sequential form below truncates (>>11) every
-           sample and feeds the truncated value back, accumulating signal-correlated
-           quantization noise the real RSP does not -- measured ~-55dB, present on
-           every frame (the "film grain"). This path instead computes each 8-sample
-           sub-block from its ENTRY history using the full book columns + intra-block
-           residual convolution, truncating ONCE per output, matching the block form.
-           Only the standard 4-bit codec; small-ADPCM keeps the sequential path. */
+        /* Hardware-accurate BLOCK-convolution decode: each 8-sample sub-block is computed from
+           its ENTRY history using the full book columns plus the intra-block residual
+           convolution, truncating ONCE per output. The sequential form below truncates (>>11)
+           every sample and feeds the truncated value back, accumulating signal-correlated
+           quantization noise (~-55dB on every frame -- the "film grain") that the real RSP does
+           not. Standard 4-bit codec only; small-ADPCM stays on the sequential path. */
         {
-            /* DEFAULT ON: block-convolution is the hardware-correct decode.
-               The old env-var A/B silently no-op'd (the var never reached the process),
-               so the grain test was never actually run — which is precisely the failure
-               the developer-gate layer exists to prevent. The switch now lives in
-               Dev Tools > Behavior overrides > "Legacy sequential VADPCM" (or
-               GDX_SEQ_ADPCM=1 at launch), read live as a single int load. Bucket B, so
-               it is a compile-time 0 in a build without GDX_DEV_TOOLS and the sequential
-               path is unreachable there. The log line still fires once and PROVES which
-               path the current setting selected. */
+            /* Read through the dev-gate layer so it is a compile-time 0 without GDX_DEV_TOOLS,
+               making the sequential path unreachable in Release. The one-shot log proves which
+               path the current setting actually selected. */
             const int blockAdpcm = !gdx_dev_gate(GDX_GATE_SEQ_ADPCM);
             {
                 static int sAdpcmLogged = 0;
@@ -1154,7 +1001,7 @@ static void RunAdpcm(const GdxBufDesc* buf, uint32_t flags, int16_t* state, cons
                 }
                 clHist2 = (int16_t)eH2;
                 clHist1 = (int16_t)eH1;
-                goto frame_done; /* skip the sequential path */
+                goto frame_done;
             }
         }
 
@@ -1176,30 +1023,17 @@ static void RunAdpcm(const GdxBufDesc* buf, uint32_t flags, int16_t* state, cons
             }
 
             residual = nibble << shift;
-            /* Sequential (per-sample) VADPCM: with a true two-sample history the
-               order-2 IIR needs only COLUMN 0 of the codebook — row 0 weights the
-               OLDER sample, row 1 the NEWER (SDK vadpcm decodeframe: total =
-               c[p][0][j]*in_vec[0] + c[p][1][j]*in_vec[1] with in_vec[0] = out[-2];
-               at j = 0 the intra-block residual sum is empty, so the per-sample
-               form is exact). The previous code walked the matrix columns (s&7)
-               while ALSO sliding history each sample — those columns already
-               encode the recursion, so the feedback was double-counted, with
-               swapped history pairing on top: the loud-static bug. */
-            /* 64-bit accumulator: the real RSP does this multiply-accumulate in a wide
-               (48-bit) vector accumulator, never a 32-bit int. Two products of two s16
-               values (max magnitude 32768 each) can each reach 2^30, and their SUM can
-               reach 2^31 -- one bit past INT32_MAX -- for the theoretical extreme case of
-               both codebook coefficients and both history samples simultaneously at
-               -32768 (loudest possible signal on both feedback taps at once). That is
-               signed-integer-overflow UB in C, and in practice (2's-complement wraparound)
-               it flips the sign of `predicted` for exactly that extreme case: a huge
-               positive prediction becomes a huge negative one, i.e. a polarity-inverted
-               spike instead of a clean saturate-to-max sample -- an audible pop/bang on
-               the loudest possible frame instead of clipping gracefully. Using int64_t
-               for the accumulation removes the UB and matches the RSP's wide-accumulator
-               semantics exactly; the final >>11 result is always back in a small range
-               (bounded by the codebook's realistic magnitude), so truncating to int32_t
-               after the shift is safe. */
+            /* Sequential per-sample VADPCM needs only COLUMN 0 of the codebook: with a true
+               two-sample history, row 0 weights the OLDER sample and row 1 the NEWER (SDK vadpcm
+               decodeframe, at j==0 the intra-block residual sum is empty, so the per-sample form
+               is exact). Walking the matrix columns while ALSO sliding history each sample
+               double-counts the feedback -- those columns already encode the recursion. */
+            /* int64 accumulator: two s16*s16 products can each reach 2^30 and their sum 2^31, one
+               bit past INT32_MAX, when both coefficients and both history samples sit at -32768.
+               In int32 that is overflow UB, and in practice it flips the sign -- a
+               polarity-inverted spike instead of a clean saturate. Hardware accumulates this in a
+               wide vector accumulator; after the >>11 the result is small again, so narrowing to
+               int32_t there is safe. */
             {
                 int64_t predAcc = (int64_t)BookCoef(predIdx, 0, 0) * (int64_t)hist2 +
                                    (int64_t)BookCoef(predIdx, 1, 0) * (int64_t)hist1;
@@ -1208,16 +1042,9 @@ static void RunAdpcm(const GdxBufDesc* buf, uint32_t flags, int16_t* state, cons
             sampleOut = predicted + residual;
 
             {
-                /* Deferred clamping (task A4, mupen64plus-rsp-hle audio.c#L109-127
-                   adpcm_compute_residuals): the STORED output sample is clamped, but the
-                   value fed back into hist1/hist2 for the NEXT sample's prediction (still
-                   within this same 16-sample frame) is the RAW, unclamped sampleOut -- only
-                   clHist1/clHist2 (used at the NEXT frame's boundary, and as the eventual
-                   state[]/loop-restore write-back) is clamped every sample. A loud transient
-                   that overshoots mid-frame keeps its true (unclamped) magnitude feeding the
-                   predictor for the rest of that frame, matching the real ucode's parity;
-                   only the ClampS16'd copy actually written to DMEM/state is ever silently
-                   capped. */
+                /* Deferred clamping: DMEM gets the clamped sample, but hist1/hist2 -- this
+                   frame's remaining predictions -- carry the RAW value. Only clHist1/clHist2,
+                   used at the next frame boundary and for the state write-back, is clamped. */
                 int16_t clampedOut = ClampS16(sampleOut);
                 DmemSetS16(outCursor + s * 2u, clampedOut);
 
@@ -1231,14 +1058,8 @@ static void RunAdpcm(const GdxBufDesc* buf, uint32_t flags, int16_t* state, cons
             decoded++;
         }
 
-        /* [dec-cap] full per-frame capture (grain root cause: sequential-IIR vs
-           block-convolution VADPCM). Dumps everything an offline decoder needs to
-           reproduce this exact frame with the CORRECT block form and compare to the
-           port's sequential output: predictor+scale, the 8 compressed data bytes,
-           the pre-frame history (older/newer), the full 16-coef book for this
-           predictor, and the 16 samples the port produced. Race-gated, capped.
-           Only full (4-bit) ADPCM; raw source id lets offline filter the grain
-           sample (65134-byte one-shot BGM). */
+        /* [dec-cap] per-frame capture: everything an offline decoder needs to reproduce this
+           exact frame and diff it against the port's output. Race-gated, capped, 4-bit only. */
         {
             extern int gGdxRaceActive;
             if (gGdxRaceActive && !smallAdpcm && sDecCapCount < 12) {
@@ -1267,19 +1088,16 @@ static void RunAdpcm(const GdxBufDesc* buf, uint32_t flags, int16_t* state, cons
             }
         }
 
-    frame_done: /* block-convolution path (GDX_BLOCK_ADPCM) rejoins here */
+    frame_done: /* the block-convolution path rejoins here */
         inCursor += frameBytes;
-        outCursor += 32u; /* 16 samples * 2 bytes */
+        outCursor += 32u;
     }
     (void)decoded;
 
-    /* Persist the last frame: the 16 samples ending at the chunk's TRUE boundary
-       (count), not the scratch tail of the final rounded-up frame (the old 2-short
-       write-back already learned that lesson on unaligned cart-streamed chunks).
-       The full output stream in DMEM is [16-sample preamble][numOutSamples fresh],
-       so stream index (numOutSamples + i) for i in 0..15 is exactly the window of
-       the last 16 TRUE samples -- and when numOutSamples == 0 it degenerates to
-       re-reading the unchanged preamble, i.e. state passes through untouched. */
+    /* Persist the 16 samples ending at the chunk's TRUE boundary (count), not the scratch tail
+       of the final rounded-up frame. The DMEM stream is [16-sample preamble][numOutSamples
+       fresh], so index numOutSamples+i is exactly the last 16 true samples; at numOutSamples == 0
+       it re-reads the unchanged preamble and state passes through untouched. */
     {
         uint32_t i;
         for (i = 0; i < 16u; i++) {
@@ -1289,11 +1107,9 @@ static void RunAdpcm(const GdxBufDesc* buf, uint32_t flags, int16_t* state, cons
     }
 }
 
-// ---- A_S8DEC: signed 8-bit PCM -> 16-bit (sign-extend + scale). The codec itself is
-// non-predictive, but the OUTPUT LAYOUT contract is the same as A_ADPCM's (see the
-// last-frame preamble comment in RunAdpcm): synthesis.c uses skipInitialSamples=16 for
-// CODEC_S8 too, so the ucode writes the 16-sample state preamble before the fresh
-// samples and persists the last 16 output samples as state. ----
+// A_S8DEC: signed 8-bit PCM -> 16-bit. The codec is non-predictive, but the OUTPUT LAYOUT is
+// A_ADPCM's (see RunAdpcm's contract): synthesis.c uses skipInitialSamples=16 for CODEC_S8 too,
+// so the 16-sample state preamble precedes the fresh samples and the last 16 outputs persist.
 static void RunS8Dec(const GdxBufDesc* buf, uint32_t flags, int16_t* state) {
     int isInit = (flags & 1) != 0;
     uint32_t numSamples = buf->count / 2u;
@@ -1313,32 +1129,23 @@ static void RunS8Dec(const GdxBufDesc* buf, uint32_t flags, int16_t* state) {
     }
 }
 
-// ---- A_RESAMPLE 4-tap polyphase FIR table -------------------------------------------------
-// The real RSP A_RESAMPLE is NOT linear interpolation: it convolves 4 neighbouring source
-// samples per output sample against a fixed 64-phase table of 4-tap Q15 coefficient sets
-// (one set per fractional sub-position between two source samples).
+// A_RESAMPLE 4-tap polyphase FIR table. The real op is NOT linear interpolation: it convolves 4
+// neighbouring source samples against a fixed 64-phase table of 4-tap Q15 coefficient sets, one
+// per fractional sub-position between two source samples.
 //
-// EXACT ROM-BAKED CONSTANTS (bit-exact to the aspMain ucode's resample coefficient table).
-// Source: the canonical RSP audio-HLE resample LUT reproduced verbatim across the widely
-// mirrored N64 HLE lineage -- mupen64plus-rsp-hle (src/alist.c `RESAMPLE_LUT`), and its
-// byte-identical copy in Project64/AziAudio (AziAudio/Mupen64plusHLE/audio.c, `RESAMPLE_LUT
-// [64 * 4]`, from which these values were transcribed). Those projects extracted the values
-// directly from the RSP microcode's data section, so this is the same table the real hardware
-// convolves, not an approximation. (This replaces the earlier runtime-generated windowed-sinc
-// table, which was audibly close but not bit-exact.)
+// These are the ROM-baked constants, transcribed from the canonical RSP audio-HLE resample LUT
+// (mupen64plus-rsp-hle src/alist.c `RESAMPLE_LUT`, byte-identical in Project64/AziAudio's
+// Mupen64plusHLE/audio.c). Those projects extracted the values from the microcode's own data
+// section, so this is the table hardware convolves, not an approximation -- it replaced an earlier
+// runtime-generated windowed-sinc table that was audibly close but not bit-exact.
 //
-// TAP / PHASE LAYOUT (verified 1:1 against this port's RunResample below and mupen's
-// alist_resample): for phase index `p` = top 6 bits of the Q16 fractional accumulator
-// (fracQ16 >> 10), the 4 coefficients sResampleTable[p][0..3] weight the source samples
-// {x[-1], x[0], x[+1], x[+2]} respectively (i.e. tap 0 = the one-sample history `lastSample`,
-// tap 1 = the current sample, taps 2/3 = the two-sample lookahead). This is identical to
-// mupen's `src[0..3] * lut[0..3]` with `lut = RESAMPLE_LUT + ((accu & 0xfc00) >> 8)`.
+// Layout: for phase p = fracQ16 >> 10, sResampleTable[p][0..3] weight the source samples
+// {x[-1], x[0], x[+1], x[+2]} -- tap 0 is the persisted one-sample history, taps 2/3 the
+// two-sample lookahead. Identical to mupen's `src[0..3] * lut[0..3]`.
 //
-// NOTE (authentic behavior, not a bug): phase 0 is {0x0c39,0x66ad,0x0d46,0xffdf}, NOT an
-// identity {0,0x8000,0,0}. The real N64 resampler therefore applies a mild band-limiting
-// low-pass EVEN at unity pitch (0x8000) -- integer-ratio playback is not a bit-exact
-// passthrough on hardware. This is the well-known slightly "soft" character of N64 sample
-// playback and is reproduced faithfully here.
+// Phase 0 is {0x0c39,0x66ad,0x0d46,0xffdf}, NOT an identity {0,0x8000,0,0}: the real resampler
+// band-limits even at unity pitch (0x8000), so integer-ratio playback is not a bit-exact
+// passthrough on hardware. That mild softness is authentic, not a defect to "simplify" away.
 #define GDX_RESAMPLE_PHASE_BITS 6
 #define GDX_RESAMPLE_PHASES (1u << GDX_RESAMPLE_PHASE_BITS) /* 64 */
 #define GDX_S16(x) ((int16_t)(x)) /* sign-truncate a 16-bit hex constant, MSVC /W3-clean */
@@ -1409,31 +1216,23 @@ static const int16_t sResampleTable[GDX_RESAMPLE_PHASES][4] = {
     { GDX_S16(0xffdf), GDX_S16(0x0d46), GDX_S16(0x66ad), GDX_S16(0x0c39) },
 };
 
-// ---- A_RESAMPLE: 4-tap polyphase FIR resampler (see table comment above). pitch is Q15
-// (UNITY_PITCH=0x8000 == 1.0x, per PR/abi.h).
+// A_RESAMPLE: 4-tap polyphase FIR resampler (table above). pitch is Q15, UNITY_PITCH=0x8000 ==
+// 1.0x per PR/abi.h.
 //
-// State layout (16 shorts, private convention, revised for task A5): state[0..3] = the 4 source
-// samples immediately BEFORE this call's dmemIn[0] (persisted across calls, oldest at [0], most
-// recent -- i.e. tap -1 -- at [3]); state[4] = fractional position (Q16, low 16 bits only);
-// state[15] = pitch, stashed by the caller (see the A_RESAMPLE case in the main dispatch loop).
-// Widened from a single history sample (state[1]) to a full 4-sample window per
-// mupen64plus-rsp-hle alist.c#L621-639 (alist_resample_reset/alist_resample_load/
-// alist_resample_save): the reference keeps its virtual read cursor `ipos` starting 4 WHOLE
-// samples before dmemi and restores/saves that entire 4-sample window every call, not just one
-// tap -- this file's own taps 0/+1/+2 still read straight out of the current call's buffer
-// (synthesis.c's trailing SAMPLES_PER_FRAME padding makes that safe), but the persisted state is
-// now shaped the same way as the reference's for parity and headroom against future tap changes.
+// State layout (16 shorts, this file's own convention -- decomp C never reads this buffer):
+// state[0..3] = the 4 source samples immediately BEFORE this call's dmemIn[0], oldest at [0],
+// tap -1 at [3]; state[4] = fractional position (Q16, low 16 bits only); state[15] = pitch,
+// stashed by the caller (see the A_RESAMPLE case in the dispatch loop). The 4-sample window
+// mirrors mupen64plus-rsp-hle's alist_resample_load/save, whose read cursor starts 4 whole samples
+// before dmemi; taps 0/+1/+2 still read straight out of the current call's buffer, which
+// synthesis.c's trailing SAMPLES_PER_FRAME padding makes safe.
 //
-// A_INIT now ZERO-PRIMES the history window (previously this file duplicated dmemIn[0] into the
-// tap -1 slot as a "closest available" guess). The reference's alist_resample_reset explicitly
-// memsets the 4 pre-roll samples to 0 and resets pitch_accu to 0 on init -- it does NOT seed from
-// the incoming buffer. A freshly triggered note therefore ramps in from silence on its first few
-// (sub-sample-window) output ticks rather than smearing its first real sample backward in time;
-// this is what real hardware actually does. ----
+// A_INIT ZERO-primes that window and the accumulator, as alist_resample_reset does; it does NOT
+// seed from the incoming buffer. A freshly triggered note therefore ramps in from silence instead
+// of smearing its first real sample backward in time.
 static int16_t GdxResampleSampleAt(const GdxBufDesc* buf, const int16_t hist[4], uint32_t virtIdx) {
-    /* virtIdx 0..3 -> persisted pre-roll history; virtIdx >= 4 -> this call's own DMEM buffer,
-       with virtIdx==4 aliasing dmemIn[0] (i.e. dmemIn is logically "to the right of" the 4
-       history slots, matching the reference's `ipos = (dmemi>>1) - 4` starting offset). */
+    /* virtIdx 0..3 index the persisted pre-roll; >= 4 index this call's own DMEM buffer, with 4
+       aliasing dmemIn[0] -- the reference's `ipos = (dmemi>>1) - 4` starting offset. */
     if (virtIdx < 4u) {
         return hist[virtIdx];
     }
@@ -1445,14 +1244,10 @@ static void RunResample(const GdxBufDesc* buf, uint32_t flags, int16_t* state) {
     uint32_t pitchQ15;
     uint32_t fracQ16;
     int16_t hist[4];
-    /* Byte count rounded UP to a whole 16-byte (8-sample) granule, mirroring
-       mupen64plus-rsp-hle's RESAMPLE handler: `(hle->alist_nead.count + 0xf) & ~0xf` before the
-       byte->sample halving -- the same "always finish the whole processing granule, never leave
-       a ragged tail" convention already applied to A_ADPCM's frame rounding in this file (see
-       RunAdpcm's numFrames comment). A non-16-byte-aligned SETBUFF count previously produced
-       exactly `count/2` samples and left anything past that byte-truncated; this can now write a
-       few extra (harmless -- always real, in-window FIR output, never garbage) trailing samples
-       into DMEM past the caller's nominal count, matching what the real ucode always does. */
+    /* Byte count rounded UP to a whole 16-byte (8-sample) granule, mirroring mupen's RESAMPLE
+       handler (`(count + 0xf) & ~0xf`) and RunAdpcm's frame rounding: always finish the whole
+       processing granule. This can write a few trailing samples past the caller's nominal count,
+       always real in-window FIR output, never garbage. */
     uint32_t roundedByteCount = (buf->count + 0xFu) & ~0xFu;
     uint32_t numOutSamples = roundedByteCount / 2u;
     uint32_t virtIdx = 4u; /* logical cursor; 4..(4+n) walk this call's own buffer, see above */
@@ -1462,8 +1257,7 @@ static void RunResample(const GdxBufDesc* buf, uint32_t flags, int16_t* state) {
         return;
     }
 
-    /* pitch is threaded in via the caller, which stashes it into state[15] before calling --
-       see the A_RESAMPLE case in the main dispatch loop below. */
+    /* The caller stashes pitch into state[15]; see the A_RESAMPLE case in the dispatch loop. */
     pitchQ15 = (uint32_t)(uint16_t)state[15];
 
     if (isInit) {
@@ -1495,9 +1289,8 @@ static void RunResample(const GdxBufDesc* buf, uint32_t flags, int16_t* state) {
         }
     }
 
-    /* Persist the 4-sample window ending at this call's final cursor position (virtIdx-1) --
-       becomes the next call's pre-roll history, exactly mirroring alist_resample_save saving the
-       ucode's own 4-sample working window back to DRAM at end of call. */
+    /* Persist the 4-sample window ending at this call's final cursor: the next call's pre-roll
+       history, mirroring alist_resample_save. */
     state[0] = GdxResampleSampleAt(buf, hist, virtIdx - 4u);
     state[1] = GdxResampleSampleAt(buf, hist, virtIdx - 3u);
     state[2] = GdxResampleSampleAt(buf, hist, virtIdx - 2u);
@@ -1505,50 +1298,38 @@ static void RunResample(const GdxBufDesc* buf, uint32_t flags, int16_t* state) {
     state[4] = (int16_t)(uint16_t)fracQ16;
 }
 
-// ---- A_FILTER (task A3, reimplemented per alist_filter BEHAVIOR -- mupen64plus-rsp-hle
-// alist.c#L794-907 -- SEMANTICS only, no code copied; mupen is GPLv2). A_FILTER is a TWO-STEP
-// protocol, exactly like A_LOADADPCM+A_ADPCM or A_SETLOOP+A_ADPCM (see AudioSynth_FilterReverb /
-// LoadFilterSize+LoadFilterBuffer in disk/lib/synthesis.c, always emitted as an immediate pair):
-//   1) aFilter(f=2, countOrBuf=<byte size of the buffer the NEXT call will filter>, addr=
-//      <coefficient table pointer>) -- "prime": load 8 Q15 coefficients, remember the size. Our
-//      existing pendingFilterCoef plumbing (main dispatch loop below) is UNCHANGED by this task.
-//   2) aFilter(f=<A_INIT/A_CONTINUE>, countOrBuf=<DMEM buffer address>, addr=<state pointer>)
-//      -- "apply": filter that DMEM buffer IN PLACE for the primed size, carrying/continuing
-//      history via state.
+// A_FILTER is a TWO-STEP protocol, like A_LOADADPCM+A_ADPCM or A_SETLOOP+A_ADPCM
+// (AudioSynth_FilterReverb / LoadFilterSize+LoadFilterBuffer always emit the pair back to back):
+//   1) f==2 "prime": w1 = coefficient table (8 Q15 coefficients), countOrBuf = the byte size the
+//      next call will filter.
+//   2) f==A_INIT/A_CONTINUE "apply": countOrBuf = DMEM buffer, w1 = state pointer. Filter that
+//      buffer in place for the primed size, carrying history through state.
 //
-// STRUCTURE (documented behavior only -- the reference's literal per-lane index arithmetic is its
-// own reverse-engineered expression of the RSP's vector-lane shuffles and is NOT reproduced here):
-//   * The 8 primed Q15 coefficients are applied DIRECTLY as a fixed 8-tap symmetric FIR -- there is
-//     NO per-call averaging of two LUTs. (An earlier revision averaged a "carried" LUT with the
-//     fresh coefficients, lut[x]=(carried[x]+coef[x])>>1; that HALVED gLowPassFilterData's identity
-//     row {0,0,0,32767,0,0,0,0} to -6 dB on the very first apply and made the reverb-filter gain
-//     depend on how many consecutive A_CONTINUE calls had run -- a fabrication that broke the
-//     documented "cutoff 0 == unity passthrough" case AudioHeap_LoadFilter relies on. Removed: the
-//     primed coef IS the FIR directly. The two-LUT averaging was this port's own invention, not a
-//     reference behavior -- the real nead FILTER's "second table" is the delay-line state, not a
-//     second coefficient set.)
-//   * The filter runs per 8-sample BLOCK; each block's 8 outputs come from a 16-sample WINDOW =
-//     [previous block's 8-sample tail] ++ [this block's 8 samples], the tap window sliding one
-//     sample at a time (out[k] = sum_t coef[t]*win[k+t], k=0..7). A straightforward transversal FIR
-//     with continuous history, not a transcription of the reference's lane pattern.
-//   * State carry: the previous call's final 8 INPUT samples become the next call's "previous tail",
-//     so the FIR is continuous across command lists. A_INIT zeroes the tail history.
+// Reimplemented from alist_filter's documented BEHAVIOR (mupen64plus-rsp-hle alist.c#L794-907);
+// its literal per-lane index arithmetic is that project's own expression of the RSP's vector-lane
+// shuffles and is deliberately not reproduced here (mupen is GPLv2).
 //
-// BYTE ORDER (RULED OUT: the coefficient table is NOT big-endian):
-// the coefficient table is NEVER byte-swapped here and MUST NOT be. It originates as the
-// compile-time host-order s16 array gLowPassFilterData[] (disk/lib/filter_data.c), is copied
-// element-by-element into reverb->filterLeft/Right by AudioHeap_LoadLowPassFilter (heap.c: a plain
-// host-order `filter[i]=ptr[i]`), and reaches this file as a host pointer -- so the prime memcpy
-// below (host->host) is already correct, exactly like BookCoef reading the ADPCM codebook that
-// gdx_audio_convert_font wrote host-order (the endianness swap lives in the load pipeline's
-// gdx_rd_s16, never in this interpreter). Corollary: the "riff silence when gated ON" is NOT this
-// op zeroing output -- valid host-order coefs yield attenuated-but-nonzero WET output; that riff
-// defect is the silence-prefill/wet path (port-layer F3), not RunFilter.
+// The 8 primed coefficients ARE the FIR, applied directly. There is NO per-call averaging of two
+// LUTs: averaging a carried LUT with the fresh coefficients halves gLowPassFilterData's identity
+// row {0,0,0,32767,0,0,0,0} to -6 dB on the very first apply and makes the filter's gain depend on
+// how many consecutive A_CONTINUE calls have run, breaking the "cutoff 0 == unity passthrough"
+// case AudioHeap_LoadFilter relies on. The nead FILTER's "second table" is the delay-line state,
+// not a second coefficient set.
 //
-// state buffer layout (private convention; the real filterLeftState/filterRightState buffers are
-// 32 shorts each and never read by decomp C, so -- like adpcmdecState -- this file chooses its own
-// layout): state[0..7] = previous call's final 8-sample INPUT tail (oldest at [0], newest at [7]);
-// the remaining 24 shorts are unused. ----
+// Per 8-sample BLOCK, the 8 outputs come from a 16-sample WINDOW = [previous block's 8-sample
+// tail] ++ [this block's 8 samples], the tap window sliding one sample at a time
+// (out[k] = sum_t coef[t]*win[k+t]). The previous call's final 8 INPUT samples become the next
+// call's tail, so the FIR stays continuous across command lists; A_INIT zeroes it.
+//
+// The coefficient table is host-order and MUST NOT be byte-swapped here. It originates as the
+// compile-time s16 array gLowPassFilterData[] (disk/lib/filter_data.c), is copied element by
+// element into reverb->filterLeft/Right by AudioHeap_LoadLowPassFilter, and arrives here as a host
+// pointer -- the endianness swap lives in the load pipeline's gdx_rd_s16, never in this
+// interpreter.
+//
+// state[0..7] = the previous call's final 8-sample INPUT tail, oldest at [0]; the remaining 24
+// shorts are unused. The real filterLeftState/filterRightState buffers are 32 shorts and never
+// read by decomp C, so, like adpcmdecState, the layout is this file's choice.
 static void RunFilter(uint32_t dmemBuf, uint32_t sizeBytes, uint32_t flags, int16_t* state,
                       const int16_t* coef) {
     uint32_t numSamples = sizeBytes / 2u;
@@ -1558,16 +1339,10 @@ static void RunFilter(uint32_t dmemBuf, uint32_t sizeBytes, uint32_t flags, int1
     uint32_t blk;
     int t;
 
-    /* Gate lifted: default ON. An A/B run confirmed the
-       corrected direct-FIR path is healthy (boot riff plays, tunnel boom
-       gone with GDX_HLE_FILTER=1). This low-pass is the only thing bleeding
-       high-frequency energy out of the engine-echo reverb feedback loop
-       (SynthesisReverb routes to SFX channels only); running with it OFF
-       lets that loop slowly diverge -- the progressive race static. The
-       pre-revamp build ran this FIR unconditionally. GDX_HLE_FILTER=0
-       remains as the kill switch. */
-    /* Live gate read: the switch is normalized to "disable the filter" (0 = stock = filter on),
-       which is what lets Bucket B compile out of Release without silencing the FIR. */
+    /* This low-pass is the only thing bleeding high-frequency energy out of the engine-echo
+       reverb feedback loop; with it off, that loop slowly diverges into progressive race static.
+       The gate is normalized to "disable the filter" (0 = stock = filter on) so it can compile
+       out of Release without silencing the FIR. */
     if (gdx_dev_gate(GDX_GATE_NO_HLE_FILTER)) {
         return;
     }
@@ -1591,8 +1366,8 @@ static void RunFilter(uint32_t dmemBuf, uint32_t sizeBytes, uint32_t flags, int1
         int16_t outBlk[8];
         int k;
 
-        /* Read the block's INPUT before any write-back -- output overwrites DMEM in place, but the
-           tail carried to the next block must be this block's INPUT samples, not its output. */
+        /* Read the block's INPUT before any write-back: output overwrites DMEM in place, but the
+           tail carried forward must be this block's input samples, not its output. */
         for (t = 0; t < 8; t++) {
             cur[t] = DmemGetS16(base + (uint32_t)t * 2u);
         }
@@ -1601,10 +1376,9 @@ static void RunFilter(uint32_t dmemBuf, uint32_t sizeBytes, uint32_t flags, int1
         for (k = 0; k < 8; k++) {
             int32_t acc = 0;
             for (t = 0; t < 8; t++) {
-                acc += (int32_t)coef[t] * (int32_t)win[k + t]; /* primed coefs applied directly */
+                acc += (int32_t)coef[t] * (int32_t)win[k + t];
             }
-            /* Round-to-nearest before the Q15 reduction (half-LSB `+0x4000` bias) rather than a
-               plain truncating shift -- a standard fixed-point rounding convention. */
+            /* Half-LSB bias before the Q15 reduction: round to nearest, not truncate. */
             outBlk[k] = ClampS16((acc + 0x4000) >> 15);
         }
 
@@ -1618,11 +1392,9 @@ static void RunFilter(uint32_t dmemBuf, uint32_t sizeBytes, uint32_t flags, int1
     for (t = 0; t < 8; t++) state[t] = tail[t];
 }
 
-// ---- Main interpreter entry point. Called from port/n64_sched.c's osSpTaskStartGo when an
-// M_AUDTASK is submitted (the same place M_GFXTASK is routed to gdx_gfx_run). `dataPtr`/
-// `dataSizeBytes` come directly from the OSTask's `t.data_ptr`/`t.data_size` -- already real,
-// full-width host values (PR/sptask.h: `u64* data_ptr;`), NOT subject to the Acmd-word
-// truncation hazard described above (that hazard is only inside the command payload itself). --
+// Entry point, called from port/n64_sched.c's osSpTaskStartGo for an M_AUDTASK. dataPtr and
+// dataSizeBytes come straight off the OSTask (PR/sptask.h: `u64* data_ptr;`), so they are
+// full-width host values -- the truncation hazard above applies only inside the command payload.
 void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
     const GdxAcmd* cmds = (const GdxAcmd*)dataPtr;
     uint32_t count = dataSizeBytes / (uint32_t)sizeof(GdxAcmd);
@@ -1631,16 +1403,14 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
     /* Pending A_SETBUFF descriptor, consumed by the following A_ADPCM/A_S8DEC/A_RESAMPLE. */
     GdxBufDesc pendingBuf = { 0, 0, 0 };
 
-    /* Pending A_FILTER "prime" (f==2) payload, consumed by the following A_FILTER apply call
-       (f==A_INIT/A_CONTINUE). Reset every call, same rationale as pendingLoopState above:
-       AudioSynth_FilterReverb / LoadFilterSize+LoadFilterBuffer always emit the prime+apply
-       pair back-to-back with nothing unrelated interleaved between them. */
+    /* Pending A_FILTER prime (f==2), consumed by the following apply. Safe to reset every call:
+       AudioSynth_FilterReverb always emits the prime+apply pair back to back. */
     int16_t pendingFilterCoef[8] = { 0 };
     uint32_t pendingFilterSizeBytes = 0;
     int pendingFilterHaveCoef = 0;
 
-    /* Pending A_ENVSETUP1/A_ENVSETUP2 state, consumed by the following A_ENVMIXER (mirrors the
-       real RSP's internal envelope-mixer registers). */
+    /* A_ENVSETUP1/2 state, consumed by the following A_ENVMIXER (the RSP's internal envelope
+       registers). */
     int32_t envRampReverb = 0, envRampLeft = 0, envRampRight = 0;
     int32_t envCurVolLeft = 0, envCurVolRight = 0, envReverbVol2 = 0;
 
@@ -1724,18 +1494,11 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                        source so the ADPCM capture below can name its input. */
                     sPcmCapLastSrc = (uintptr_t)src;
                     sPcmCapLastRaw = w1;
-                    /* [spike] mix-stage bisection: scan the LOADED region -- a spike
-                       here means the corruption arrived FROM RDRAM (reverb ring
-                       content, resample state area, etc.), i.e. it was created on a
-                       PREVIOUS tick's save side, not by this tick's mixing.
-                       Gate LOWERED to >=0x20: the reverb ring wrap
-                       splits a tick into pieces as small as 0x10, and the old >=0x100
-                       gate left every wrap tick's small piece UNSCANNED -- the one
-                       proven route for unscanned wet content to reach the dry buses.
-                       0x20 (16 samples) is the floor for a meaningful strict-spike
-                       scan; compressed ADPCM chunk loads land at dmemDest < 0x580
-                       (staging grows down from 0x940), so gate on the wet range too
-                       to avoid false positives from compressed bytes. */
+                    /* [spike] a spike in the LOADED region means the corruption arrived from
+                       RDRAM, i.e. it was written on a previous tick's save side. The 0x20 floor
+                       is the smallest window a strict-spike scan can mean anything on (reverb
+                       ring wraps split a tick into pieces as small as 0x10); the dmemDest gate
+                       skips compressed ADPCM chunk loads, which land below 0x580. */
                     if (size >= 0x20u && dmemDest >= 0xC80u) {
                         static int sSpikeLogsLoadbuff = 0;
                         if (sSpikeLogsLoadbuff < 16) {
@@ -1786,10 +1549,8 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 uint32_t flags = (w0 >> 16) & 0xFFu;
                 int16_t* state = (int16_t*)GdxAudioResolveAddr(w1, "ADPCM-state");
                 int stageTarget = GdxUnlockStageFindCommandTarget(&cmds[i]);
-                /* [pcm-cap] carry-in snapshot BEFORE the decode overwrites it:
-                   offline verification of A_CONTINUE frames needs the pre-call
-                   history. Under the last-frame state layout the newest two
-                   samples live at the tail: [15]=newer, [14]=older. */
+                /* [pcm-cap] carry-in snapshot, taken before the decode overwrites it. Under the
+                   last-frame state layout the newest two samples are at [15] and [14]. */
                 int16_t preSt0 = (state != NULL) ? state[15] : 0;
                 int16_t preSt1 = (state != NULL) ? state[14] : 0;
                 /* [rs-cap] upstream identity for the next resample's chain dump */
@@ -1800,13 +1561,10 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 sRsCapAdpcmCnt = pendingBuf.count;
                 RunAdpcm(&pendingBuf, flags, state, sPendingLoopState);
                 GdxUnlockStageCaptureDecode(stageTarget, &pendingBuf, flags);
-                /* [pcm-cap] (audio decode ground-truth capture):
-                   one block per UNIQUE sample source. Logs the input identity
-                   (resolved src + raw), the book head, the first compressed
-                   bytes, and the first 8 DECODED s16 samples from DMEM. The
-                   offline check decodes the same ROM bytes with the same book
-                   and diffs: equal => kernels innocent, defect is per-note
-                   setup/gain; different => the guilty op is caught here. */
+                /* [pcm-cap] decode ground truth, one block per UNIQUE sample source: input
+                   identity, book, first compressed bytes, first 8 decoded samples. An offline
+                   decode of the same ROM bytes with the same book either matches (kernels
+                   innocent, look at per-note setup/gain) or does not. */
                 {
                     static uintptr_t sPcmCapSeen[24];
                     static int sPcmCapCount = 0;
@@ -1817,9 +1575,7 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                     {
                         extern int gGdxRaceActive;
                         if (!gGdxRaceActive) {
-                            /* Retargeted: boot/menu samples burned
-                               the budget before any garbage race SFX played.
-                               Race sounds are the open investigation. */
+                            /* Race-gated: boot/menu samples would burn the budget first. */
                             break;
                         }
                     }
@@ -1830,15 +1586,11 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                                       sPcmCapLastRaw, (void*)sPcmCapLastSrc, (unsigned)flags,
                                       pendingBuf.dmemIn, pendingBuf.dmemOut, pendingBuf.count,
                                       (uint16_t)preSt0, (uint16_t)preSt1);
-                        /* Full 32-short book: the offline order-2 decode needs
-                           all 16 coefficients of BOTH predictors (the first
-                           probe iteration logged only 4 and the verdict
-                           stalled). Two lines of 16. */
+                        /* Both predictors' full 16 coefficients: an offline order-2 decode needs
+                           all of them. */
                         {
-                            /* sAdpcmBook holds raw BYTES of host-order s16
-                               coefficients (see BookCoef's memcpy access) --
-                               read pairs, not single bytes. 32 shorts = both
-                               predictors of an order-2 book. */
+                            /* sAdpcmBook holds raw BYTES of host-order s16 coefficients (see
+                               BookCoef's memcpy) -- read pairs, not single bytes. */
                             const int16_t* bk = (const int16_t*)(const void*)sAdpcmBook;
                             int bl;
                             for (bl = 0; bl < 2; bl++) {
@@ -1862,8 +1614,7 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                                       DmemGetU8(pendingBuf.dmemIn + 2u), DmemGetU8(pendingBuf.dmemIn + 3u),
                                       DmemGetU8(pendingBuf.dmemIn + 4u), DmemGetU8(pendingBuf.dmemIn + 5u),
                                       DmemGetU8(pendingBuf.dmemIn + 6u), DmemGetU8(pendingBuf.dmemIn + 7u));
-                        /* +32: fresh decode output starts after the 16-sample last-frame
-                           preamble (see RunAdpcm's layout contract comment). */
+                        /* +32: fresh output starts after the 16-sample preamble (RunAdpcm). */
                         gdx_port_logf("[pcm-cap]  pcm8=%04X %04X %04X %04X %04X %04X %04X %04X\n",
                                       (uint16_t)DmemGetS16(pendingBuf.dmemOut + 32u),
                                       (uint16_t)DmemGetS16(pendingBuf.dmemOut + 34u),
@@ -1892,10 +1643,9 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 int stageTarget = GdxUnlockStageFindCommandTarget(&cmds[i]);
                 sGdxUnlockStage.currentTarget = stageTarget;
                 if (state != NULL) {
-                    /* [rs-cap] speculative record: dumped only if a trigger fires (see the
-                       probe comment at the sRsCapLast definition). Input window is snapshotted
-                       BEFORE the run because the two-part path's output overlaps its input
-                       (DMEM_TEMP vs DMEM_TEMP+0x20) and would clobber it. */
+                    /* [rs-cap] speculative record, dumped only if a trigger fires. The input
+                       window is snapshotted BEFORE the run: on the two-part path the output
+                       overlaps its input (DMEM_TEMP vs DMEM_TEMP+0x20) and would clobber it. */
                     uint32_t numOut = ((pendingBuf.count + 0xFu) & ~0xFu) / 2u;
                     uint32_t needIn = ((numOut * pitch) >> 15) + 8u;
                     uint32_t prevPitch = 0xFFFFFFFFu;
@@ -1946,12 +1696,10 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                     }
                     sRsCapLast.prevPitch = (prevPitch == 0xFFFFFFFFu) ? pitch : prevPitch;
                     swept = ((flags & 1u) == 0u) && (prevPitch != 0xFFFFFFFFu) && (prevPitch != pitch);
-                    /* Chain mode (run-2 upgrade): swept T2 dumps from run 1 could not be
-                       continuity-checked because the same note resamples several times per
-                       frame and only the swept calls were dumped -- no adjacent pairs. Now the
-                       first swept call DURING A RACE locks its state token and EVERY subsequent
-                       call on that token is dumped ("C" tag), giving directly adjacent
-                       pre/post-state pairs across tick boundaries. */
+                    /* Chain mode: the first swept call during a race locks its state token and
+                       every later call on that token is dumped, giving directly adjacent
+                       pre/post-state pairs across tick boundaries. Dumping only swept calls left
+                       no adjacent pairs to continuity-check. */
                     {
                         extern int gGdxRaceActive;
                         if (sRsCapLockTok == 0u && swept && gGdxRaceActive) {
@@ -1959,9 +1707,8 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                         }
                     }
 
-                    /* Stash pitch in the otherwise-unused last slot of the 16-short state
-                       buffer for RunResample to pick up (keeps RunResample's signature simple;
-                       this slot is never read by decomp C code, only by this interpreter). */
+                    /* Stash pitch in the otherwise-unused last slot of the state buffer for
+                       RunResample. Decomp C never reads that slot, only this interpreter. */
                     state[15] = (int16_t)(uint16_t)pitch;
                     RunResample(&pendingBuf, flags, state);
                     GdxUnlockStageCaptureResample(stageTarget, &pendingBuf, pitch, numOut);
@@ -2002,28 +1749,15 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 uint32_t dmemOut = w1 & 0xFFFFu;
                 uint32_t numSamples = count8 * 8u;
                 uint32_t k;
-                /* Reverb kill switch. Skip ONLY the reverb wet->dry return (dmemOut==LEFT_CH
-                   0x940); the decay mix 0xC80->0xC80 and all note mixes are untouched. Reverb is
-                   turned OFF by ANY of three independent sources:
-                     (1) gEnhancements.Audio.Reverb CVar (ImGui Audio tab, F1 > Audio > Reverb):
-                         reverb OFF when the CVar is 0. Default 1 = ON, so behavior is unchanged if
-                         the menu is never touched (bit-exact default). Read LIVE each call (benign
-                         int race with the main-thread menu write -- same live-CVar pattern as
-                         gdx_audio_lle.c's engine toggle and os.cpp's low-pass), so a menu toggle
-                         applies without a restart. NOTE: this is the HLE reverb only. Under the
-                         default LLE engine the reverb is the ucode's own and this A_MIXER path is
-                         not taken, so the toggle has no audible effect there -- it is still wired
-                         correctly for the HLE fallback path.
-                     (2) The GDX_NO_REVERB dev gate (Dev Tools > Behavior overrides > "Disable
-                         reverb wet return", or GDX_NO_REVERB=1 at launch): the RELIABLE A/B dev
-                         fallback, since the decomp-side toggle in synthesis.c used to silently
-                         no-op when that TU's getenv returned NULL. Now both sides read the same
-                         gate cache, so they can no longer disagree. Bucket B: a compile-time 0
-                         in a build without GDX_DEV_TOOLS.
-                     (3) The GdxAudioDbg()&4 debug bit, exactly as before. */
+                /* Reverb kill switch. Skips ONLY the reverb wet->dry return (dmemOut ==
+                   LEFT_CH 0x940); the decay mix 0xC80->0xC80 and all note mixes are untouched.
+                   Three independent sources turn it off: the gEnhancements.Audio.Reverb CVar
+                   (default 1, read live each call -- a benign int race with the menu write, so a
+                   toggle applies without a restart), the GDX_NO_REVERB dev gate, and the
+                   GdxAudioDbg()&4 debug bit. This is the HLE reverb only: under the default LLE
+                   engine the reverb is the ucode's own and this path is never taken. */
                 {
-                    int reverbOff; /* declared at block top (project C style; see gdx_audio_lle.c) */
-                    /* Both reads are live (one int load + one CVar read). */
+                    int reverbOff;
                     reverbOff = gdx_dev_gate(GDX_GATE_NO_REVERB) ||
                                 !CVarGetInteger("gEnhancements.Audio.Reverb", 1);
                     if ((reverbOff || (GdxAudioDbg() & 4)) && dmemOut == 0x940u) {
@@ -2036,17 +1770,11 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                     out = out + ((in * gain) >> 15);
                     DmemSetS16(dmemOut + k * 2u, ClampS16(out));
                 }
-                /* [spike] bisection: scan the dry bus
-                   immediately after the reverb wet->dry return (dmemOut==LEFT_CH 0x940,
-                   the only A_MIXER writing a dry bus; the decay mix is 0xC80->0xC80).
-                   The two surviving candidates split HERE:
-                     - spike present now  => reverb TRANSPORTED a pre-existing spike
-                       (RANK 2: unscanned wrap-tick wet content) -- it entered before
-                       any note ran. Also scan the mixer's INPUT to prove it arrived
-                       already-bad vs was created by this op's clamp.
-                     - clean now, spiked at interleave => injected DURING note mixing
-                       (RANK 5 op-19 path: envmixer scan-window vs interleave-read
-                       mismatch). Names which branch to chase without a second run. */
+                /* [spike] scan the dry bus right after the reverb wet->dry return (the only
+                   A_MIXER that writes a dry bus). A spike here means reverb transported a
+                   pre-existing one; clean here but spiked at interleave means note mixing
+                   injected it. Scanning the input too separates "arrived bad" from "made by this
+                   op's clamp". */
                 if (dmemOut == 0x940u) {
                     static int sSpikeLogsRvbRet = 0;
                     if (sSpikeLogsRvbRet < 12) {
@@ -2064,18 +1792,12 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
             }
 
             case GDX_A_ADDMIXER: {
-                /* mupen64plus-rsp-hle's alist_add (alist.c#L595-609) is a
-                   GAINLESS clamped unity add -- `*dst = clamp_s16(*dst + *src)`, no multiply at
-                   all. This op is not called anywhere in decomp/src/audio/disk/lib/synthesis.c
-                   (checked: no aAddMixer call sites exist in this decomp), so there is no real
-                   call site to inspect for what abi.h's aAddMixer `a4` parameter would carry --
-                   but abi.h's own macro (`aAddMixer(pkt, count, dmemi, dmemo, a4)`) packs a4 into
-                   the low 16 bits of w0 as a generic, undocumented ucode field, not something this
-                   port has any evidence is a gain. Previously this treated those low 16 bits as a
-                   signed Q15 gain (mirroring A_MIXER) -- per the spec's directive ("if the
-                   reference is gainless and a4 is not a gain, drop ours"), dropped: this now
-                   matches the reference's gainless unity add exactly. count>>4 packing (bits
-                   16..23 of w0) is unchanged, matching abi.h's `count >> 4` field. */
+                /* Gainless clamped unity add -- `dst = clamp_s16(dst + src)`, no multiply --
+                   matching mupen64plus-rsp-hle's alist_add (alist.c#L595-609). This op has no call
+                   site in disk/lib/synthesis.c, so there is no evidence that abi.h's aAddMixer
+                   `a4` field (packed into w0's low 16 bits as a generic undocumented ucode field)
+                   is a gain; treating it as a Q15 gain was this port's own invention. The count>>4
+                   packing in bits 16..23 is abi.h's and is unchanged. */
                 uint32_t count8 = (w0 >> 16) & 0xFFu;
                 uint32_t dmemIn = (w1 >> 16) & 0xFFFFu;
                 uint32_t dmemOut = w1 & 0xFFFFu;
@@ -2096,9 +1818,8 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 uint32_t byteCount = ((w0 >> 16) & 0xFFu) << 4; /* per-channel bytes, c>>4 packed */
                 uint32_t numSamples = byteCount / 2u;
                 GdxUnlockStageAppendChunk(dmemL, dmemR, numSamples);
-                /* [spike] stage scan: the interleave inputs are the fully mixed dry L/R
-                   buses -- a spike here but not post-resample means the mixing stages
-                   (envmixer/mixer/reverb return) injected it. */
+                /* [spike] the interleave inputs are the fully mixed dry L/R buses: a spike here
+                   but not post-resample means a mixing stage injected it. */
                 if (sSpikeLogsInterleave < 16) {
                     int sl = GdxSpikeScan(dmemL, numSamples);
                     int sr = GdxSpikeScan(dmemR, numSamples);
@@ -2122,8 +1843,7 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
             }
 
             case GDX_A_INTERL: {
-                /* Rare "two-part" note-splitting path (nParts==2). Best-guess decimation:
-                   extract every other sample. See file header scope notes. */
+                /* Rare nParts==2 note-split path. Best-guess decimation: every other sample. */
                 uint32_t numSamples = w0 & 0xFFFFu;
                 uint32_t dmemIn = (w1 >> 16) & 0xFFFFu;
                 uint32_t dmemOut = w1 & 0xFFFFu;
@@ -2146,25 +1866,14 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 int32_t b = (int32_t)(int16_t)(w0 & 0xFFFFu);
                 int32_t c = (int32_t)(int16_t)((w1 >> 16) & 0xFFFFu);
                 int32_t d = (int32_t)(int16_t)(w1 & 0xFFFFu);
-                /* Task A2's env2 base/step scale resolution: mupen64plus-rsp-hle's nead
-                   ENVSETUP1 handler (alist_nead.c ENVSETUP1/ENVSETUP1_MK, ~L175-189) computes
-                   `env_values[2] = (w1 >> 8) & 0xff00` -- given this file's w0 layout
-                   (`a` in bits[23:16], per the driver contract comment above the ENVMIXER case),
-                   that expression reduces to exactly `a << 8`. env_values[2] is later used by
-                   envmix_nead in the SAME `(x * env_values[N]) >> 16` formula as env_values[0]/[1]
-                   (the dry L/R volumes from ENVSETUP2, which are already full Q16 words --
-                   targetVol<<4 per this port's own driver contract). So env_values[2]=a<<8 lives
-                   in that SAME Q16 numeric space, NOT a separate Q8 space -- confirming `a` (an
-                   8-bit reverb-volume base, 0..254) and the ramp step share ONE scale once `a` is
-                   left-shifted by 8. env_steps[2] in the reference is `w1` truncated to its low 16
-                   bits, i.e. exactly our `rampReverb` (b) here, ADDED DIRECTLY every block with no
-                   further scaling -- which only lines up with the a<<8 base because this port's
-                   own driver-contract comment already derives rampReverb as
-                   `(Δ(reverb&0x7F)<<9)/blocks`, i.e. pre-scaled into the SAME reverb<<9 == a<<8
-                   units (a = reverb*2, so a<<8 == reverb<<9). Storing `a<<8` here (instead of the
-                   previous bare `a`) makes envReverbVol2 directly summable with envRampReverb and
-                   directly usable in the same >>16 formula as curVolL/curVolR below -- resolving
-                   the ambiguity the spec flagged without introducing a second scale factor. */
+                /* env_values[2] = a << 8, in the SAME Q16 space as the dry L/R volumes, not a
+                   separate Q8 one. mupen's nead ENVSETUP1 computes `(w1 >> 8) & 0xff00`, which
+                   with this file's w0 layout is exactly `a << 8`, and envmix_nead then feeds it
+                   through the same `(x * env) >> 16` formula as env_values[0]/[1] (already full
+                   Q16 -- targetVol<<4). env_steps[2] is w1's low 16 bits, i.e. `b` here, added
+                   directly each block with no further scaling; that only lines up because this
+                   port derives rampReverb as (delta(reverb & 0x7F) << 9) / blocks, the same
+                   reverb<<9 == a<<8 units. */
                 envReverbVol2 = a << 8;
                 envRampReverb = b;
                 envRampLeft = c;
@@ -2201,9 +1910,8 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
 
                 sGdxUnlockStage.currentTarget = GdxUnlockStageFindCommandTarget(&cmds[i]);
 
-                /* flatvol bypass: zero the per-block ramp so the whole tick uses one
-                   constant volume -- tests whether the 8-block volume staircase is the
-                   grain (grain A/B). */
+                /* flatvol bypass: one constant volume for the whole tick, to test whether the
+                   8-block volume staircase is the grain. */
                 if (GdxAudioDbg() & 2) {
                     envRampLeft = envRampRight = envRampReverb = 0;
                 }
@@ -2218,28 +1926,17 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                     uint32_t n;
                     for (n = 0; n < 8u && sIdx < sampleCount; n++, sIdx++) {
                         int32_t s = DmemGetS16(dmemSrc + sIdx * 2u);
-                        /* Volumes here are Q16, NOT Q12: synthesis.c's
-                           AudioSynth_ProcessEnvelope does `targetVol <<= 4`
-                           before packing ENVSETUP1/2 (playback.c's Q12 value
-                           times 16, full volume = 0xFFF0). >>16 is correct; a
-                           >>12 experiment overdrove every normal-volume voice
-                           16x into rail-to-rail clipping (41% clipped samples
-                           in the AI tap) while quiet voices stayed clean —
-                           heard as music buried under loud static. */
+                        /* Volumes are Q16, NOT Q12: AudioSynth_ProcessEnvelope does
+                           `targetVol <<= 4` before packing ENVSETUP1/2 (playback.c's Q12 value
+                           times 16, full volume 0xFFF0). A >>12 here overdrives every
+                           normal-volume voice 16x into rail-to-rail clipping. */
                         int32_t dl = (s * curVolL) >> 16;
                         int32_t dr = (s * curVolR) >> 16;
-                        /* Task A2, nead semantics (mupen64plus-rsp-hle alist.c#L512-562
-                           envmix_nead): wet CASCADES the DRY-SCALED sample, not the raw input --
-                           `l2 = (l * env_values[2]) >> 16` where `l` is ITSELF already
-                           `(in*env_values[0])>>16` (our `dl`). Previously this computed
-                           `wet = (s*curReverb)>>8` directly off the raw input `s`, sharing one
-                           mono value across both wet channels -- wrong-family model per the
-                           emulator-comparison research. The reference cascades PER CHANNEL: wetL
-                           off dl, wetR off dr (each channel's own dry-scaled sample), both through
-                           envReverbVol2 which is now already in the a<<8 (Q16-shared) space set up
-                           in GDX_A_ENVSETUP1 above, so the formula is the same >>16 shift used for
-                           dl/dr -- no separate Q8 scale. (xors/headset-pan flags remain out of
-                           scope, per file header.) */
+                        /* nead semantics (mupen64plus-rsp-hle alist.c#L512-562 envmix_nead): wet
+                           CASCADES the DRY-SCALED sample per channel -- wetL off dl, wetR off dr
+                           -- not the raw input shared across both. curReverb is already in the
+                           a<<8 (Q16) space set up by ENVSETUP1, so it uses the same >>16 shift as
+                           dl/dr. */
                         int32_t wetL = (dl * curReverb) >> 16;
                         int32_t wetR = (dr * curReverb) >> 16;
 
@@ -2258,12 +1955,9 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                     curVolR += envRampRight;
                     curReverb += envRampReverb;
                 }
-                /* [spike] mix-stage bisection: post-resample is now
-                   clean but pre-interleave still spikes -- scan this op's own INPUT and
-                   all four output buses so one run says whether the corruption arrives
-                   WITH the source (upstream, e.g. DMEM_TEMP after filter/comb), is
-                   injected by this op, or was already sitting on a bus (reverb return /
-                   earlier voice accumulation). */
+                /* [spike] scan this op's own input and all four output buses, so one run says
+                   whether the corruption arrives with the source, is injected here, or was
+                   already sitting on a bus. */
                 {
                     static int sSpikeLogsEnvmix = 0;
                     if (sSpikeLogsEnvmix < 12) {
@@ -2274,11 +1968,8 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                         int swr = GdxSpikeScan(wetRightDmem, sampleCount);
                         if (si >= 0 || sdl >= 0 || sdr >= 0 || swl >= 0 || swr >= 0) {
                             sSpikeLogsEnvmix++;
-                            /* NOTE-PATH BISECTION: when the envmixer's SOURCE (DMEM_TEMP)
-                               carries the spike, name the op that last wrote that sample
-                               via the last-writer tracker: 5=A_RESAMPLE, 7=A_FILTER,
-                               14=A_HILOGAIN. Resample-clean-but-src-spiked was the whole
-                               puzzle; this says whether filter or hilogain injects it. */
+                            /* When the source carries the spike, the last-writer tracker names
+                               the op that wrote it: 5=A_RESAMPLE, 7=A_FILTER, 14=A_HILOGAIN. */
                             uint8_t srcWriter = (si >= 0)
                                 ? sDmemLastOp[((dmemSrc + (uint32_t)si * 2u) & GDX_DMEM_MASK) >> 4]
                                 : 0xFF;
@@ -2293,17 +1984,10 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
             }
 
             case GDX_A_HILOGAIN: {
-                /* IN-PLACE op (missing booster/low-health root
-                   cause): the real ucode scales the buffer at w1>>16 IN PLACE;
-                   w1's low 16 bits are unused padding -- synthesis.c:1069
-                   emits AudioSynth_HiLoGain(..., DMEM_TEMP, /out=/ 0, ...).
-                   This case previously honored that 0 as a destination:
-                   every gain-carrying note (boost, low-energy warning --
-                   noteSubEu->gain != 0) wrote its scaled audio over DMEM 0
-                   (clobbering scratch state consumed later in the tick) while
-                   the real note path at DMEM_TEMP flowed on UNSCALED --
-                   sounds missing plus collateral garbage, once per tick per
-                   gained note. */
+                /* IN-PLACE: the ucode scales the buffer at w1>>16, and w1's low 16 bits are
+                   unused padding. synthesis.c:1069 passes 0 for that out field; honouring it as a
+                   destination writes every gain-carrying note over DMEM 0 (clobbering scratch
+                   consumed later in the tick) while the real note path flows on unscaled. */
                 int32_t gain = (int32_t)((w0 >> 16) & 0xFFu); /* Q4, 0x10 == 1.0x */
                 uint32_t size = w0 & 0xFFFFu;
                 uint32_t dmem = (w1 >> 16) & 0xFFFFu;
@@ -2325,12 +2009,10 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
             }
 
             case GDX_A_FILTER: {
-                /* Two-step protocol -- see RunFilter's header comment. f (bits 16..23 of w0)
-                   distinguishes "prime" (f==2: load coefficients, remember the upcoming
-                   buffer size) from "apply" (any other f: A_INIT/A_CONTINUE, actually filter
-                   DMEM in place). countOrBuf (bits 0..15 of w0) is a coefficient-table BYTE
-                   SIZE on the prime call, but a DMEM ADDRESS on the apply call -- it is never
-                   itself resolved as a host pointer either way (unlike w1). */
+                /* Two-step protocol, see RunFilter's header. f (w0 bits 16..23) selects prime
+                   (f==2) or apply. countOrBuf (w0 bits 0..15) is a coefficient-table BYTE SIZE on
+                   the prime call but a DMEM ADDRESS on the apply call -- never a host pointer
+                   either way, unlike w1. */
                 uint32_t f = (w0 >> 16) & 0xFFu;
                 uint32_t countOrBuf = w0 & 0xFFFFu;
                 if (f == 2u) {
@@ -2341,12 +2023,12 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                     }
                     pendingFilterSizeBytes = countOrBuf;
                 } else if (GdxAudioDbg() & 1) {
-                    /* nofilter bypass: leave the note buffer unfiltered (grain A/B). */
+                    /* nofilter bypass: leave the note buffer unfiltered. */
                 } else {
                     int16_t* state = (int16_t*)GdxAudioResolveAddr(w1, "FILTER-state");
                     RunFilter(countOrBuf, pendingFilterSizeBytes, f, state,
                               pendingFilterHaveCoef ? pendingFilterCoef : NULL);
-                    /* [spike] stage scan: filter runs in place on the note buffer. */
+                    /* [spike] the filter runs in place on the note buffer. */
                     if (sSpikeLogsFilter < 16) {
                         int si = GdxSpikeScan(countOrBuf, pendingFilterSizeBytes / 2u);
                         if (si >= 0) {
@@ -2360,9 +2042,8 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
             }
 
             case GDX_A_UNK19:
-                /* SDK-unknown opcode; only used for the rare bookOffset==3 note path. Safe
-                   no-op (src==dst in the one call site, so leaving DMEM untouched cannot drop
-                   samples that another op still needs). */
+                /* SDK-unknown, reached only by the rare bookOffset==3 note path. Safe no-op:
+                   src==dst at the one call site, so leaving DMEM untouched drops nothing. */
                 break;
 
             case GDX_A_UNK3:

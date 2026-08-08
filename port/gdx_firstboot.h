@@ -13,10 +13,10 @@
 namespace gdx {
 
 enum class FirstBootStatus {
-    DevLayout,      // A true development tree supplies generic.o2r, a ROM, AND a valid EK disk + IPL
-                    // (G-Diffuser is Expansion-Kit-mandatory — the game crashes/degrades without the
-                    // 64DD disk, so a dev tree missing either input falls through to NeedsSetup instead
-                    // of bypassing the wizard). Boot without the wizard.
+    DevLayout,      // A development tree supplies generic.o2r, a ROM, AND a valid EK disk + IPL, so
+                    // boot skips the wizard. G-Diffuser is Expansion-Kit-mandatory (the game
+                    // crashes/degrades without the 64DD disk), so a dev tree missing either of those
+                    // falls through to NeedsSetup rather than bypassing the wizard.
     SetupComplete,  // Setup verified or freshly completed. Boot with the configured paths.
     NeedsSetup,     // No dev/completed layout. exeDir/dataDir are resolved and the working directory is
                     // set, but the ROM/EK disk/IPL are missing: the caller must run the IN-WINDOW setup
@@ -64,29 +64,27 @@ const char* SetupIplFileName();   // "N64DDIPLROM.n64"
 // Accepted alternate names for the Japanese dumps: the wizard probes these when the canonical name
 // is absent, so a JP test folder needs no renaming. A JP ROM boots RAW (experimental; no archives).
 //
-// These keep returning their real names even when the build does NOT accept Japanese inputs (CMake
-// GDX_ALLOW_JP_INPUTS=OFF, the release default). That is deliberate: the probe is what lets the
-// wizard FIND the file and then refuse it by name — "this is the Japanese release, not enabled in
-// this build" — instead of leaving the row on a bare "Missing" that explains nothing. The refusal
-// itself is decided in GdxRecognizeInput, by hash and by ROM-header country code, never by filename.
+// They keep returning their real names even when the build does NOT accept Japanese inputs (CMake
+// GDX_ALLOW_JP_INPUTS=OFF, the release default), because the probe is what lets the wizard FIND the
+// file and then refuse it by name — "this is the Japanese release, not enabled in this build" —
+// instead of leaving the row on a bare "Missing". The refusal itself is decided in GdxRecognizeInput,
+// by hash and by ROM-header country code, never by filename.
 const char* SetupRomFileNameJp();  // "baserom.jp.rev0.z64"
 const char* SetupDiskFileNameJp(); // "baserom.jp.ek.ndd"
-// Accepted alternate name for the US prototype 64DD IPL dump: the wizard probes this when
-// N64DDIPLROM.n64 is absent, so a folder holding the dump under its original filename needs no
-// renaming. See kKnownIplDumps in gdx_firstboot.cpp for the recognized SHA-1/label.
+// Accepted alternate name for the US prototype 64DD IPL dump, probed when N64DDIPLROM.n64 is absent
+// so a folder holding it under its original filename needs no renaming. See kKnownIplDumps in
+// gdx_firstboot.cpp for the recognized SHA-1/label.
 const char* SetupIplFileNameUsProto(); // "64DD_IPL_US_MJR.n64"
 
-// Resolve the 64DD IPL ROM source file inside `dir`: probes the canonical name (N64DDIPLROM.n64)
-// first, then the accepted US-prototype alternate name (64DD_IPL_US_MJR.n64) if the canonical name is
-// absent. Pure existence probe -- does not validate structure/size (callers that need that still call
-// ValidateIplFile/the internal validateIpl themselves). Returns the resolved absolute-or-as-given path
-// (whichever name matched), or an empty string when NEITHER name exists in `dir`.
+// Resolve the 64DD IPL ROM source inside `dir`: the canonical name (N64DDIPLROM.n64) first, then the
+// accepted US-prototype alternate (64DD_IPL_US_MJR.n64). Existence probe only -- callers that need
+// structure/size still call ValidateIplFile themselves. Returns whichever name matched, or empty when
+// neither exists.
 //
-// Shared by the in-window setup GUI's Recheck(), FirstBootRun's dev-layout and SetupComplete-fast-path
-// probes (gdx_firstboot.cpp), and the boot-time archive builder (gdx_extract_launch.cpp's
-// ensureIplArchive) so the accepted alternate name can never drift between the three surfaces again.
-// (This exists because the boot-time path once probed only the canonical name and silently booted
-// with no IPL archive and no warning when just the alt-named dump was present in the data dir.)
+// Shared by the setup GUI's Recheck(), FirstBootRun's dev-layout and SetupComplete probes, and
+// gdx_extract_launch.cpp's ensureIplArchive, so the accepted alternate name cannot drift between the
+// three surfaces -- a boot-time probe that knows only the canonical name boots with no IPL archive
+// and no warning.
 std::string GdxFindIplSourceInDir(const std::string& dir);
 
 // Structural validators. Return true if the file at `path` is a plausible input; on false, `why`
@@ -100,9 +98,9 @@ bool ValidateIplFile(const std::string& path, std::string& why);
 bool CopyInputInto(const std::string& srcPath, const std::string& dataDir, const char* dstName);
 
 // ── SHA-1 identity recognition (region/dump labelling for the setup rows) ──────────────────────────
-// The known-good SHA-1 sets for each input live as named tables in gdx_firstboot.cpp so the future JP
-// build can reuse them. GdxRecognizeInput hashes a file that has ALREADY passed its structural
-// Validate*File check and classifies it:
+// The known-good SHA-1 sets live as named tables in gdx_firstboot.cpp so the future JP build can
+// reuse them. GdxRecognizeInput hashes a file that has ALREADY passed its structural Validate*File
+// check and classifies it:
 //   * ROM  — the US-rev0 dump is VerifiedKnown; the Japan dump is ACCEPTED (AcceptedUnknownWarn with
 //            `jpRom` set) for the experimental raw-ROM boot — setup then SKIPS archive extraction for
 //            it. Any other hash is Rejected with the generic mismatch message.
@@ -121,10 +119,10 @@ bool CopyInputInto(const std::string& srcPath, const std::string& dataDir, const
 //   * disk — the retail Japanese Expansion Kit disk is Rejected by SHA-1. Unrecognised images are
 //            unaffected (a 64DD image carries no region marker that separates the fan-translated
 //            disk from the Japanese one it was built from).
-//   * IPL  — NOT gated in either state. The 64DD drive firmware is Japanese by existence (the 64DD
-//            shipped only in Japan), the JP retail dump is the canonical one, and it carries no
-//            game audio — refusing it would break essentially every user for no safety benefit.
-// With the option ON, every verdict above is exactly what it was before the gate existed.
+//   * IPL  — NOT gated in either state. The 64DD shipped only in Japan, so the JP retail dump IS the
+//            canonical firmware, and it carries no game audio — refusing it would break every user
+//            for no safety benefit.
+// With the option ON, none of the refusals above apply.
 enum class GdxInputVerdict {
     VerifiedKnown,        // recognized known-good dump — OK/green; `message` is a confirmation label
     AcceptedUnknownWarn,  // structurally valid but unrecognized — OK/green; `message` is a visible warning
@@ -156,28 +154,24 @@ const char* SetupIplArchiveFileName();   // "n64ddipl.o2r"  — satisfies the 64
 const char* SetupDiskArchiveFileName();  // "fzerox-disk.o2r" — satisfies the EK disk input
 
 // ── Managed disk copy (disk internalization) ───────────────────────────────────────────────────
-// A byte-identical copy of the validated Expansion Kit disk, held under <dataDir>/media/<canonical
-// disk name> so the user's original .ndd becomes deletable after setup, exactly like the ROM/IPL
-// (which the port only ever reads back from their installed copies). Kept in a subdirectory SEPARATE
-// from dataDir's root so a genuine second copy exists even when the root-level file (the wizard's
-// CopyInputInto destination, or the DevLayout candidate itself) is the user's only other copy.
-// port/disk_savefile.cpp keys its .gdd journal off the disk's LEAF NAME ONLY, never a path (see
-// gdx_disk_load in disk_buffer.cpp, which passes the bare canonical name), so storing the managed
-// copy under this same leaf name preserves the existing save key untouched regardless of directory.
+// A byte-identical copy of the validated Expansion Kit disk under <dataDir>/media/<canonical disk
+// name>, so the user's original .ndd becomes deletable after setup like the ROM/IPL. It lives in a
+// subdirectory SEPARATE from dataDir's root so a genuine second copy exists even when the root-level
+// file (the wizard's CopyInputInto destination, or the DevLayout candidate itself) is the user's only
+// other copy. port/disk_savefile.cpp keys its .gdd journal off the disk's LEAF NAME ONLY, never a
+// path (gdx_disk_load passes the bare canonical name), so the managed copy must keep that same leaf
+// name or the existing save key changes.
 
 // Absolute path of the managed disk copy inside `dataDir` (<dataDir>/media/<disk name>). Pure path
 // computation -- does not touch the filesystem.
 std::string ManagedDiskPath(const std::string& dataDir);
 
-// Ensure a valid managed copy of the disk exists under `dataDir`/media, copying it from
-// `validatedDiskPath` if needed. `validatedDiskPath` MUST already have passed ValidateDiskFile.
-// Idempotent: a managed copy already present and correctly sized is left untouched -- never
-// re-copied, never overwritten. The copy is atomic-ish (temp name in the same directory, size
-// verified, then renamed into place) and, on success, its SHA-256 is best-effort recorded in the
-// extraction sidecar (gdx_extract_state.cfg) via GdxExtractRecordManagedDisk. Returns true iff a
-// valid managed copy exists at `outManagedPath` when this returns (pre-existing or freshly created);
-// on false, `outManagedPath` is still set to the computed managed path but the file may be
-// missing/incomplete -- callers must not treat it as usable.
+// `validatedDiskPath` MUST already have passed ValidateDiskFile. Idempotent: a managed copy already
+// present and correctly sized is left untouched, never re-copied or overwritten. The copy is
+// atomic-ish (temp name in the same directory, size verified, then renamed into place) and its
+// SHA-256 is best-effort recorded in gdx_extract_state.cfg via GdxExtractRecordManagedDisk. True iff
+// a valid managed copy exists at `outManagedPath` on return; on false `outManagedPath` still holds
+// the computed path, but the file may be missing or incomplete and callers must not use it.
 bool EnsureManagedDiskCopy(const std::string& dataDir, const std::string& validatedDiskPath,
                            std::string& outManagedPath);
 
@@ -187,23 +181,21 @@ bool WriteSetupComplete(const std::string& dataDir, const std::string& romPath,
                         const std::string& diskPath, const std::string& iplPath);
 
 // ── Missing-input diagnostic ───────────────────────────────────────────────────────────────────
-// Conservative, read-only summary of which of the three canonical inputs (ROM / 64DD IPL ROM /
-// Expansion Kit disk) and which game archive are missing or invalid under `dataDir`. Built entirely
-// from the same file-existence + structural-validator helpers this header already exports, so it
-// never opens a new probe surface and never throws. Returns an empty string when everything needed
-// to boot is present and valid.
+// Read-only summary of which canonical inputs (ROM / 64DD IPL ROM / Expansion Kit disk) and which
+// game archive are missing or invalid under `dataDir`, built from the same helpers this header
+// already exports so it opens no new probe surface and never throws. Empty string when everything
+// needed to boot is present and valid.
 //
-// NO CALLER TODAY. Intended consumer: main.cpp's no-ROM boot error path. It produces only the
-// user-presentable text; the decision to fail the boot and the surface that displays it are not
-// wired up.
+// NO CALLER TODAY. Intended consumer is main.cpp's no-ROM boot error path; this produces only the
+// user-presentable text, and neither the decision to fail the boot nor the surface that shows it
+// exists yet.
 std::string GdxFirstBootDescribeMissing(const std::string& dataDir);
 
 // ── Exported archive-satisfied checks (shared with the in-window wizard's Recheck) ────────────────
-// The wizard's Recheck() (gdx_firstboot_gui.cpp) needs to know whether a requirement is satisfied by
-// its INSTALLED ARCHIVE using the exact same hash-validated acceptance chain FirstBootRun's
-// SetupComplete fast path uses -- not a bare existence probe, which would accept a corrupt/foreign
-// archive as satisfying. The underlying gameArchiveSatisfies / iplArchiveSatisfies / diskArchiveSatisfies
-// checks stay file-local statics in gdx_firstboot.cpp; this is a thin exported wrapper around them.
+// The wizard's Recheck() must judge "satisfied by its INSTALLED ARCHIVE" through the same
+// hash-validated chain FirstBootRun's SetupComplete fast path uses, not a bare existence probe that
+// would accept a corrupt/foreign archive. gameArchiveSatisfies / iplArchiveSatisfies /
+// diskArchiveSatisfies stay file-local in gdx_firstboot.cpp; this is a thin wrapper around them.
 enum class GdxFirstbootArchiveKind { Game, Ipl, Disk };
 
 // True when the canonical archive for `kind` is installed under `dataDir` and, when this build
@@ -211,14 +203,12 @@ enum class GdxFirstbootArchiveKind { Game, Ipl, Disk };
 // FirstBootRun's SetupComplete fast path uses. A failing hash quarantines the archive exactly like the
 // fast path does (renamed <name>.bad).
 //
-// Caching: a PASSING result latches gdx_extract_launch's per-boot archive-validation latch (see
-// GdxExtractMarkArchiveValidated in gdx_extract_launch.h), so a later same-boot re-check of the same
-// kind -- either another call to this wrapper, or GdxExtractEnsureArchive's own warm-boot check --
-// skips the redundant re-hash of a multi-MB/multi-ten-MB file. This wrapper does NOT itself cache
-// short of that latch: Recheck() in gdx_firstboot_gui.cpp is event-driven (constructor + file-drop +
-// Browse click), never called per-frame, so a per-(kind, mtime+size) cache is not required for that
-// caller. A future per-frame caller MUST add its own memoization keyed on (kind, mtime, size) before
-// calling this in a hot loop -- the underlying hash is not free.
+// A PASSING result latches gdx_extract_launch's per-boot archive-validation latch
+// (GdxExtractMarkArchiveValidated), so a later same-boot re-check of the same kind -- another call
+// here, or GdxExtractEnsureArchive's own warm-boot check -- skips the re-hash of a multi-MB file.
+// There is no caching short of that latch: Recheck() is event-driven (constructor + file-drop +
+// Browse click), never per-frame. A future per-frame caller MUST memoize on (kind, mtime, size)
+// first -- the underlying hash is not free.
 bool GdxFirstbootArchiveSatisfies(GdxFirstbootArchiveKind kind, const std::string& dataDir);
 
 // True when a native "Browse…" file picker is available on this platform (Windows only). On other

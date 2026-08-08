@@ -54,15 +54,11 @@ static GdxThreadFiber sThreads[GDX_MAX_THREADS];
 static int            sThreadCount = 0;
 static GdxFiber*      sHostFiber = NULL;
 
-// Phase 3 (port/gdx_audio_thread.cpp): the OS thread ID that called gdx_sched_init() (i.e. the
-// one that converted itself to a fiber via gdx_fiber_convert_thread and therefore owns every
-// fiber in sThreads[]/sHostFiber). Cooperative contexts are only valid on the thread that
-// created/converted them -- switching from any OTHER real OS thread corrupts or crashes. Recorded
-// so __osEnqueueAndYield (below) can detect the dedicated audio thread ever reaching a blocking
-// osRecvMesg/osSendMesg wait and refuse to touch the fiber scheduler instead of crashing. See
-// gdx_audio_thread.cpp's header comment ("A SECOND, SEPARATE HAZARD...") for the full analysis
-// of why/when this could theoretically happen and why it is not expected to in practice.
-// Sourced from gdx_fiber_current_thread_id() so the guard survives on both backends.
+// The OS thread that called gdx_sched_init(), and therefore owns every fiber in
+// sThreads[]/sHostFiber. Cooperative contexts are only valid on the thread that created them, so
+// switching from any OTHER real OS thread corrupts or crashes. Recorded so __osEnqueueAndYield
+// below can detect the dedicated audio thread reaching a blocking osRecvMesg/osSendMesg wait and
+// refuse to touch the scheduler. See gdx_audio_thread.cpp's header for the full analysis.
 static unsigned long sHostThreadId = 0;
 
 // ---------------------------------------------------------------------------------------------
@@ -256,15 +252,10 @@ void __osDispatchThread(void) {
 
 // Enqueue the running thread onto `queue` (if any), then switch to the next runnable thread.
 void __osEnqueueAndYield(OSThread** queue) {
-    // Phase 3 safety net (see sHostThreadId's comment above): a blocking osRecvMesg/osSendMesg
-    // wait reached from the dedicated audio thread (port/gdx_audio_thread.cpp) must NOT touch
-    // __osRunningThread/__osRunQueue or gdx_fiber_switch -- all are host-context-thread-affine
-    // and doing so from here would corrupt or crash the scheduler. Log once (rate-limited) and
-    // spin-yield instead: safe, if inefficient, until whatever this call was waiting on shows
-    // up (expected in practice -- this port's DMA completions are synchronous, so the queue
-    // this call is waiting on should never actually be empty when reached from the audio
-    // thread; see gdx_audio_thread.cpp for the full reasoning). Portable across both fiber
-    // backends via gdx_fiber_current_thread_id().
+    // Safety net (see sHostThreadId above): a blocking wait reached from the dedicated audio
+    // thread must NOT touch __osRunningThread/__osRunQueue or gdx_fiber_switch — all are affine to
+    // the host context thread. Spin-yield instead: inefficient but safe, and this port's DMA
+    // completions are synchronous, so the queue should never actually be empty here.
     if (sHostThreadId != 0 && gdx_fiber_current_thread_id() != sHostThreadId) {
         static int sForeignYieldLogs = 0;
         if (sForeignYieldLogs < 8) {
@@ -357,15 +348,11 @@ static LONG WINAPI gdx_crash_vectored_handler(EXCEPTION_POINTERS* info) {
             return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    // Re-entry guard: everything below (dbghelp symbol lookup, file I/O) can itself fault on a
-    // sufficiently corrupted process. Without this a fault-while-handling-a-fault would re-enter
-    // this same handler and recurse until the stack (or the crash report) is exhausted. A second,
-    // unrelated top-level crash later in the process lifetime is still reported -- the flag is
-    // released once this invocation finishes, it is not a permanent kill switch. The release is
-    // wrapped in __finally so it runs even if the guarded body itself faults (e.g. dbghelp or
-    // gdx_crash_report_write raising inside this handler): otherwise the nested exception would
-    // hit the guard above, never reach the InterlockedExchange release below, and leave the flag
-    // latched for the rest of the process, silently dropping every later crash report.
+    // Re-entry guard: the dbghelp lookup and file I/O below can themselves fault on a sufficiently
+    // corrupted process, and without this a fault-while-handling-a-fault recurses until the stack
+    // is exhausted. The release MUST stay inside __finally — if the guarded body faults, the
+    // nested exception hits the guard above and never reaches the release, latching the flag for
+    // the rest of the process and silently dropping every later crash report.
     {
         static volatile LONG sInHandler = 0;
         if (InterlockedCompareExchange(&sInHandler, 1, 0) != 0) {
@@ -378,12 +365,10 @@ static LONG WINAPI gdx_crash_vectored_handler(EXCEPTION_POINTERS* info) {
             faultAddr = (void*) rec->ExceptionInformation[1];
         }
 
-        // Always-on crash artifact (course-edit first-release blocker): field testers run a plain
-        // double-clicked build with none of GDX_LOG/GDX_TRACE/GDX_DIAG_VERBOSE/GDX_DIAG_UNLOCK set,
-        // so gdx_port_logf's file sink below never opens and a crash leaves nothing on disk. Mirror
-        // every line already sent to gdx_port_logf into gdiffuser-crash.txt via gdx_crash_report_write,
-        // which bypasses that opt-in gate entirely. gdx_port_logf's own output is unchanged, so an
-        // opted-in run log still captures the same crash inline.
+        // Every gdx_port_logf line below is mirrored into gdiffuser-crash.txt: field testers run a
+        // plain double-clicked build with no diagnostic gate set, so gdx_port_logf's file sink
+        // never opens and a crash would leave nothing on disk. gdx_crash_report_write bypasses
+        // that opt-in gate.
         {
             SYSTEMTIME st;
             int n;
@@ -408,10 +393,27 @@ static LONG WINAPI gdx_crash_vectored_handler(EXCEPTION_POINTERS* info) {
             gdx_crash_report_write(reportLine);
         }
 
-        /* Best-effort symbolization (course-edit 80%-crash investigation): Debug builds
-           ship the PDB next to the exe, so a raw pc can be named right here instead of
-           hand-mapping ASLR'd addresses across runs. Everything below is optional
-           diagnostics -- any failure just leaves the raw-pc line above as before. */
+        /* Microsoft C++ exception (0xE06D7363): the pc above is KERNELBASE!RaiseException, which
+           names neither the throw site nor the message, so such a report is undiagnosable without
+           this. Pull the mangled type name and, for a std::exception, its what() string out of the
+           throw record. Both helpers are SEH-guarded in the bridge, so a garbage record degrades
+           to silence. */
+        if (rec->ExceptionCode == 0xE06D7363u) {
+            extern const char* gdx_cxx_exception_name(const EXCEPTION_RECORD* rec);
+            extern const char* gdx_cxx_exception_what(const EXCEPTION_RECORD* rec);
+            const char* cxxName = gdx_cxx_exception_name(rec);
+            const char* cxxWhat = gdx_cxx_exception_what(rec);
+            gdx_port_logf("[crash]   cxx type=%s what=%s\n", cxxName ? cxxName : "?",
+                          cxxWhat ? cxxWhat : "?");
+            if (snprintf(reportLine, sizeof(reportLine), "[crash]   cxx type=%s what=%s\n",
+                         cxxName ? cxxName : "?", cxxWhat ? cxxWhat : "?") > 0) {
+                gdx_crash_report_write(reportLine);
+            }
+        }
+
+        /* Best-effort symbolization: Debug builds ship the PDB next to the exe, so a raw pc can be
+           named here instead of hand-mapping ASLR'd addresses across runs. Any failure just leaves
+           the raw-pc line above. */
         {
             static int sSymInit = 0;
             HANDLE proc = GetCurrentProcess();
@@ -483,11 +485,9 @@ void gdx_yield_to_host(void) {
     gdx_fiber_switch(sHostFiber);
 }
 
-// Diagnostic log helper for decomp .c files that can't include <stdio.h> (libc/stdint.h clash).
-// These four are called unconditionally, at high frequency (every VI frame from sys_gfx.c's
-// GDX_CK checkpoints and func_800690FC's entry trace; a burst more during every game-mode
-// transition from game.c's GMI_* checkpoints) -- see the comment on gdx_trace_enabled() in
-// port_log.h for why they're gated off by default (GDX_TRACE=1 re-enables them).
+// Diagnostic log helpers for decomp .c files that cannot include <stdio.h> (libc/stdint.h clash).
+// Called unconditionally and at high frequency from the decomp checkpoints, hence the GDX_TRACE
+// gate — see gdx_trace_enabled() in port_log.h.
 /* Real (non-inline) extern printf-style logger so the bounded
    [GDX-DBG ...] probes in transition.c (decomp) and interpreter.cpp (libultraship) can
    link against a single symbol -- gdx_port_logf is static inline (header-only) and does
@@ -515,11 +515,9 @@ void gdx_ckp(const char* s, void* p) {
     gdx_port_logf("%s=%p\n", s, p);
 }
 
-/* The gate accessors below used to each own a `static int sCached = -1;` + getenv. They now read
-   the shared Dev Tools gate cache (port/gdx_dev_gates.{h,c}), which is seeded from the same env
-   vars at startup and refreshed from its CVar once per frame. The signatures are unchanged: the
-   decomp C and the gfx bridge keep calling exactly these names. A gate read is now a single
-   aligned int load, so the per-frame call sites got cheaper, not more expensive. */
+/* The gate accessors below read the shared Dev Tools gate cache (port/gdx_dev_gates.{h,c}), so a
+   gate read is one aligned int load — cheap enough for the per-frame call sites. Keep these exact
+   names: the decomp C and the gfx bridge call them directly. */
 int gdx_unlock_diag_enabled(void) {
     return gdx_dev_gate(GDX_GATE_DIAG_UNLOCK);
 }
@@ -543,50 +541,31 @@ int gdx_diag_verbose(void) {
     return gdx_dev_gate(GDX_GATE_DIAG_VERBOSE);
 }
 
-/* GDX_RAIL_COLOR_TEST gate (decomp course.c rail primcolor sites): freezes the rail
-   chevron color sawtooth to a constant so one run distinguishes an interpolation
-   strobe from the frozen color animation stepping unevenly (strobe gone => build
-   primcolor value-interpolation in the bridge). CHANGES WHAT IS RENDERED, so this
-   is a Bucket B gate: OFF by default (stock color animation) and compiled out
-   entirely of a build without GDX_DEV_TOOLS. */
+/* Freezes the rail chevron color sawtooth (decomp course.c primcolor sites) so a strobe can be
+   attributed to interpolation rather than the color animation. CHANGES WHAT IS RENDERED — Bucket
+   B, off by default and compiled out entirely without GDX_DEV_TOOLS. */
 int gdx_rail_color_test_enabled(void) {
     return gdx_dev_gate(GDX_GATE_RAIL_COLOR_TEST);
 }
 
-/* GDX_DIAG_RIVAL gate (rival-icon investigation, decomp racer.c draw gate):
-   arms a once-per-second dump of every boolean in the rival-icon draw
-   condition plus, when the gate passes, the emitted texrect screen coords —
-   splitting "gate never passes" from "draw emitted but invisible"
-   (prim-depth/interpreter suspicion) in a single logged race. OFF by default. */
+/* Once-per-second dump of the rival-icon draw condition (decomp racer.c) plus the emitted texrect
+   coords, which separates "gate never passes" from "draw emitted but invisible". OFF by default. */
 int gdx_diag_rival_enabled(void) {
     return gdx_dev_gate(GDX_GATE_DIAG_RIVAL);
 }
 
-/* GDX_DIAG_CUSTOMMACHINE gate (Create Machine flat-navy preview): dumps the
-   gCustomMachine record the draw path actually reads. The struct is defined
-   `= { 0 }` (expansion_kit_data.c), and machine_create_draw.c indexes its
-   texture arrays as `logo - 1` / `number - 1` / `decal - 1`, so an
-   uninitialized record means index -1 and a black env color — which would
-   explain both the zero-content logo/number tiles and the untextured hull
-   without any resolver being at fault. One logged entry into the screen
-   separates "record never initialized" from "record fine, asset layer at
-   fault". Rate-limited to one line per distinct record. OFF by default. */
+/* Dumps the gCustomMachine record the Create Machine draw path reads. The struct is defined
+   `= { 0 }` (expansion_kit_data.c) while machine_create_draw.c indexes its texture arrays as
+   `logo - 1` etc., so an uninitialized record means index -1 and a black env color. One logged
+   entry separates that from an asset-layer fault. OFF by default. */
 int gdx_diag_custommachine_enabled(void) {
     return gdx_dev_gate(GDX_GATE_DIAG_CUSTOMMACHINE);
 }
 
-/* GDX_DIAG_LOOKAT gate (Create Machine flat-navy preview, narrowing pass): the
-   custom-machine part display lists are an environment-mapped reflection
-   overlay — seg-9 state DL D_90186C8, gSPLookAt, the D_9000008 16x16 RGBA16
-   reflection texture, prim alpha 80. The same pass over the same display lists
-   renders correctly on the machine-settings screen (ovl_i4/machine.c:1530), so
-   the asset, the DLs and texgen are all proven good; what differs is the matrix
-   fed to Light_SetLookAtSource. machine.c uses a real camera view matrix,
-   func_xk3_80130698 uses gGfxPool->unk_20108. A degenerate source there yields
-   a dead texgen basis and collapses the overlay to a flat fill showing the
-   stale cockpit env color — which is exactly the reported navy. This logs both
-   sites so the two bases can be compared directly. Rate-limited per site.
-   Diagnostic only: no rendering changes, safe in Release. */
+/* Logs both Light_SetLookAtSource call sites so their matrices can be compared. The same
+   custom-machine reflection display lists render correctly from machine.c (ovl_i4/machine.c:1530,
+   real camera view matrix) and flat from func_xk3_80130698 (gGfxPool->unk_20108), so a degenerate
+   source there is the suspect. Diagnostic only, no rendering change. */
 int gdx_diag_lookat_enabled(void) {
     return gdx_dev_gate(GDX_GATE_DIAG_LOOKAT);
 }
@@ -615,14 +594,11 @@ void gdx_addr_log(const char* kind, uintptr_t raw, void* resolved) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// [transition] timing probe. Game-mode transitions (title->menu, menu->race, race->results, ...)
-// run decomp/src/game/game.c's GAMEMODE_CHANGE_INIT case synchronously on the GAME thread:
-// Segment_LoadOverlays() + the mode's init function + Segment_LoadAssets(), all in one state-
-// machine tick with no host frame submitted in between (see game.c's GMI_A..GMI_F checkpoints).
-// That whole tick, and Segment_LoadAssets() specifically, are exactly the work that shows up as
-// the visible freeze. Always-on (not gated by GDX_TRACE): a transition happens at most a few
-// times a minute, so the log volume is negligible, and this is the number the user needs to
-// quantify each transition without having to flip on the full per-frame trace.
+// [transition] timing probe. game.c's GAMEMODE_CHANGE_INIT runs Segment_LoadOverlays(), the
+// mode's init function and Segment_LoadAssets() synchronously on the GAME thread in one tick with
+// no host frame in between — that tick is the visible freeze. Deliberately NOT gated by
+// GDX_TRACE: a transition happens a few times a minute, so the volume is negligible and a user
+// can quantify a freeze without turning on the full per-frame trace.
 #define GDX_TIMER_SLOTS 4
 static const char* sGdxTimerLabel[GDX_TIMER_SLOTS];
 #ifdef _WIN32
@@ -679,14 +655,10 @@ void gdx_transition_timer_end(const char* label) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// [transition] per-step breakdown within mode_change_tick (GMI_A..GMI_F). One tick can be as
-// fast as 6ms or as slow as 227ms (see the header comment above) and the top-level timer alone
-// doesn't say which of Segment_LoadOverlays / the mode's init function / Segment_LoadAssets /
-// Transition_AppearSet ate the time. Buffered rather than logged live: a transition happens at
-// most a few times a minute so log volume isn't the concern, but a normal (sub-50ms) transition
-// has nothing interesting to report and printing 5 extra lines for it would just be noise next
-// to the one summary line gdx_transition_timer_end() already prints. Only dump the per-step
-// breakdown once the whole tick is slow enough to matter.
+// [transition] per-step breakdown within mode_change_tick (GMI_A..GMI_F). A tick ranges from 6ms
+// to 227ms and the top-level timer alone doesn't say which step ate it. Buffered rather than
+// logged live so a normal sub-50ms transition contributes nothing beyond the one summary line
+// gdx_transition_timer_end() already prints.
 #define GDX_TRANSITION_STEP_SLOTS 8
 static const char* sGdxStepLabel[GDX_TRANSITION_STEP_SLOTS];
 static double sGdxStepMs[GDX_TRANSITION_STEP_SLOTS];
@@ -760,14 +732,12 @@ void gdx_transition_step_flush(double thresholdMs) {
 // spun while the VI/RDP advanced in the background (e.g. `while (osViGetCurrentFramebuffer() !=
 // fb) {}`). Re-enqueue self on the run queue and return to the host so it can advance VI state,
 // then we get re-dispatched to re-check the condition.
-/* Count of completed yields. A yield hands control to the HOST fiber, which finishes its frame
-   before re-dispatching us -- so the cost of one yield is NOT fixed: it is however much of the
-   host frame remained when the yield landed, measured anywhere from ~1.5ms to ~15ms. Sampled
-   across the asset decode window in n64_gfx_bridge.cpp, this settled where the Cup Select stall
-   time went: the same twelve decodes that measured 4.5-134ms on the game fiber (yields=2..9 each)
-   complete in 2.2ms TOTAL on the host thread, where yielding is impossible. The time was yield
-   round-trips, not decode work. (An earlier version of this comment claimed a fixed ~16.7ms per
-   yield; the boot-warm A/B disproved that.) Read-only diagnostic; nothing branches on it. */
+/* Count of completed yields, read-only diagnostic — nothing branches on it. A yield hands control
+   to the HOST fiber, which finishes its frame before re-dispatching, so one yield costs however
+   much of the host frame remained when it landed: measured between ~1.5ms and ~15ms, NOT a fixed
+   amount. That is where the Cup Select stall went — twelve decodes measuring 4.5-134ms on the
+   game fiber (2..9 yields each) complete in 2.2ms total on the host thread, where yielding is
+   impossible. */
 unsigned long gdx_yield_count = 0;
 
 void gdx_yield(void) {
@@ -842,21 +812,13 @@ extern void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes);
 extern void gdx_audio_lle_run(const void* dataPtr, unsigned int dataSizeBytes);
 
 /* ------------------------------------------------------------------------------------------
- * Phase 3 (port/gdx_audio_thread.cpp): dedicated-thread audio production entry point.
+ * Dedicated-thread audio production entry point (port/gdx_audio_thread.cpp).
  * ------------------------------------------------------------------------------------------
- * AudioThread_CreateTask (decomp/src/audio/disk/lib/audio.h) returns a decomp `AudioTask*`
- * (decomp/src/audio/disk/lib/audio.h: `{ OSTask task; OSMesgQueue* msgQueue; void* unk_44;
- * char unk_48[8]; }`). Rather than pulling decomp's "global.h"/"audio.h" into this
- * deliberately minimal, hand-picked-PR-headers TU (real risk of macro/typedef collisions with
- * the fiber-scheduler internals above -- this file untouched-builds today specifically because
- * it does NOT include those umbrella headers), declare a local view struct whose ONLY member
- * is `OSTask task` (OSTask/OSTask_t already fully known here via "PR/sptask.h", used the same
- * way by osSpTaskStartGo below). C does not type-check a function's return type across TUs at
- * link time, only within each TU's own visible declarations, so treating the real
- * AudioThread_CreateTask's returned pointer as a GdxAudioTaskView* is safe as long as this file
- * only ever reads the LEADING member -- which AudioTask's real layout guarantees is `OSTask
- * task` at offset 0. Do not add more fields here without cross-checking
- * decomp/src/audio/disk/lib/audio.h's real AudioTask layout first.
+ * A local view of decomp's AudioTask, so this TU stays out of decomp's "global.h"/"audio.h" —
+ * those umbrella headers collide with the fiber-scheduler internals above. Reading the real
+ * AudioThread_CreateTask's return through this type is only safe because AudioTask's layout
+ * (decomp/src/audio/disk/lib/audio.h) puts `OSTask task` at offset 0 and this file touches
+ * nothing else. Do NOT add fields here without cross-checking that layout first.
  */
 typedef struct GdxAudioTaskView {
     OSTask task;
@@ -864,50 +826,31 @@ typedef struct GdxAudioTaskView {
 
 extern GdxAudioTaskView* AudioThread_CreateTask(void);
 
-/* decomp/src/audio/disk/lib/load.c: `bool gAudioContextInitialized = false;` set true once
-   Audio_Init() finishes. decomp's `bool` is `typedef int bool;` (decomp/include/libc/
-   stdbool.h), i.e. plain 4-byte `int` -- declaring it here as `int` (not `bool`, which this TU
-   does not typedef) is layout-identical to the real declaration without needing that header. */
+/* Defined in decomp/src/audio/disk/lib/load.c as `bool`, which decomp typedefs to plain `int`
+   (decomp/include/libc/stdbool.h) — so declaring it `int` here is layout-identical and avoids
+   pulling in that header. */
 extern int gAudioContextInitialized;
 
-/* Called once per production tick by the dedicated audio thread (gdx_audio_thread.cpp's
- * AudioThreadMain, itself holding sAudioCtxMutex around this call -- see that file's MUTEX
- * BOUNDARY comment). Reproduces, unmodified and reusing the real decomp machinery, exactly the
- * two steps that used to run split across two different fiber contexts every VI wake:
- *   1) decomp/src/sys/sys_audio.c's Audio_ThreadEntry: AudioThread_CreateTask() ->
- *      AudioThread_CreateTaskImpl (audio/disk/lib/thread.c) builds this tick's Acmd command
- *      list, drains the game-thread's queued AUDIOCMD_* control commands (thread-cmd ring --
- *      see gdx_audio_thread.cpp's touchpoint enumeration), runs AudioLoad_ProcessLoads/
- *      ProcessScriptLoads (audio-heap-only, confirmed self-contained -- same enumeration), and
- *      calls osAiSetNextBuffer for the buffer that finished synthesizing two ticks ago.
- *   2) what used to be the "Sched"/"Main" thread's handling of EVENT_MESG_AUDIO_TASK_SET for
- *      that same task (sys_main.c's Sched_SpTaskStartAudio -> osSpTaskStart -> osSpTaskLoad +
- *      osSpTaskStartGo, i.e. exactly the M_AUDTASK branch below): execute the Acmd list through
- *      the software RSP interpreter (gdx_audio_hle_run) so the buffer actually contains PCM
- *      before it is due to be submitted two ticks from now.
- * Deliberately skips the SP/DP-done osSendMesg calls osSpTaskStartGo makes for M_AUDTASK
- * (gMainThreadMesgQueue/D_800DCAC8): those exist only to drive sys_main.c's SP_TASK_STATE
- * arbitration between GFX and AUDIO for the (simulated) shared RSP, which audio no longer
- * participates in once it has its own real thread -- the GFX-task path (osSpTaskStartGo's
- * M_GFXTASK branch, unchanged below) keeps using that arbitration exactly as before.
- * Returns 1 if a task was produced and executed this call, 0 if this tick was a legitimate
- * no-op (decomp's own totalTaskCount % specUnk4 gating inside CreateTaskImpl, a heap reset in
- * progress, or gAudioCtx not initialized yet during early boot) -- all expected, not errors.
+/* One production tick, called by gdx_audio_thread.cpp's AudioThreadMain while it holds
+ * sAudioCtxMutex. Fuses the two steps that used to run in separate fiber contexts per VI wake:
+ * Audio_ThreadEntry's task build, and the Sched thread's M_AUDTASK execution of the resulting
+ * Acmd list, so the buffer holds PCM before it is due for submission.
+ *
+ * The SP/DP-done osSendMesg calls that osSpTaskStartGo makes for M_AUDTASK are deliberately
+ * skipped: they exist only to drive sys_main.c's SP_TASK_STATE arbitration between GFX and AUDIO
+ * over the simulated shared RSP, which audio no longer participates in now that it owns a real
+ * thread. The M_GFXTASK path below still uses that arbitration unchanged.
+ *
+ * Returns 0 for a legitimate no-op tick (decomp's own totalTaskCount gating, a heap reset in
+ * progress, or gAudioCtx not yet initialized during early boot) — expected, not an error.
  */
 int gdx_audio_produce_one_tick(void) {
-    /* Audio_SetupCreateTask, NOT AudioThread_CreateTask: the wrapper
-       (decomp/src/audio/disk/external.c:2703) is the game's whole per-tick
-       audio frame — the EK sequence/bank load state-machine pump
-       (func_807427C0; skipping it left the boot riff stalled in
-       SEQ_LOAD_BANK forever, proven by the [seq-load] probe timeline),
-       BGM fade/pause routines, and AudioThread_ScheduleProcessCmds (the
-       command-group drain scheduler), before it finally calls
-       AudioThread_CreateTask itself. Calling the low-level creator
-       directly silently dropped all of that game-level work. Runs under
-       the same recursive gAudioCtx mutex as before (caller holds it);
-       the game-side flag variables it reads were equally unsynchronized
-       under the cooperative fiber, which interleaved at arbitrary yield
-       points. */
+    /* Audio_SetupCreateTask, NOT AudioThread_CreateTask. The wrapper
+       (decomp/src/audio/disk/external.c:2703) is the game's whole per-tick audio frame — the EK
+       sequence/bank load state-machine pump, the BGM fade/pause routines and
+       AudioThread_ScheduleProcessCmds — before it calls AudioThread_CreateTask itself. Calling
+       the low-level creator directly silently drops all of that and strands the boot riff in
+       SEQ_LOAD_BANK forever. */
     extern GdxAudioTaskView* Audio_SetupCreateTask(void);
     GdxAudioTaskView* task;
 
@@ -956,18 +899,12 @@ void osSpTaskStartGo(OSTask* tp) {
         gdx_port_logf("[sched] osSpTaskStartGo: dl=%p size=%u\n",
                       (void*)tp->t.data_ptr, (unsigned)tp->t.data_size);
     }
-    /* DETERMINISTIC ROOT-DL POINTER CARRY:
-       OSTask_t.data_ptr is a u64* -- on the host it already holds the FULL
-       64-bit pointer to gGfxPool->gfxBuffer (see Gfx_SetTask). This is the one
-       task pointer that MUST be carried intact: the
-       root DL is fed to the bridge BY POINTER, so it is NEVER subject to the
-       low32 truncation + module-window guessing that corrupts sub-DL/vertex
-       pointers. Passing tp->t.data_ptr straight through preserves that. The
-       high32==0 case is only anomalous when the EXE is based above 4GB (as on
-       the crashing run, module base 0x00007FF7........): log it once for
-       diagnosis, but do NOT skip -- a low-based EXE has valid high32==0
-       pointers, and the ROOT-validation failsafe in gdx_gfx_run/ConvertRoot
-       already renders nothing if the root is genuinely unreadable/garbage. */
+    /* The root DL pointer MUST be carried through intact. OSTask_t.data_ptr already holds the
+       full 64-bit pointer to gGfxPool->gfxBuffer (see Gfx_SetTask), and the bridge takes the root
+       BY POINTER, so it never suffers the low32 truncation + module-window guessing that corrupts
+       sub-DL and vertex pointers. high32==0 is only anomalous when the EXE is based above 4GB, so
+       log it and do NOT skip: a low-based EXE has legitimately zero high32, and ConvertRoot's own
+       validation already renders nothing if the root is genuinely garbage. */
     {
         unsigned long long dlBits = (unsigned long long)(uintptr_t)tp->t.data_ptr;
         if (dlBits != 0ull && (dlBits >> 32) == 0ull) {

@@ -1,10 +1,9 @@
 // port/gdx_console_log.cpp — routes the port's log output into libultraship's Console window.
 //
-// libultraship registers the Console (Gui.cpp) but never wired anything to it: nothing outside
-// ConsoleWindow itself calls ConsoleWindow::Append, so the only lines it has ever displayed are the
-// echoes of commands typed into it. This supplies the missing feed from both streams the port
-// has — gdx_port_logf (port_log.h, on by default) and spdlog (libultraship's own, silent unless
-// GDX_LOG makes main.cpp raise the level).
+// libultraship registers the Console (Gui.cpp) but nothing outside ConsoleWindow itself calls
+// ConsoleWindow::Append, so it only ever showed echoes of typed commands. This supplies the feed
+// from both of the port's streams: gdx_port_logf (port_log.h, on by default) and spdlog
+// (libultraship's own, silent unless GDX_LOG makes main.cpp raise the level).
 //
 // Producers are any thread or fiber, the consumer is the ImGui thread, so lines queue here and are
 // handed over during the frame.

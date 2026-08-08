@@ -1,8 +1,9 @@
-// G-Diffuser — resource factory registration (Slice 4c / R1).
-// Registers the Fast3D + generic resource factories libultraship provides, so the .o2r
-// entries Torch produced (textures, vertices, display lists, matrices, lights, blobs) load
-// as IResource objects. F-Zero-X-specific types (Course, EAD anim/limb, GhostRecord,
-// Sequence, SoundFont) get custom factories in a later R1 step.
+// G-Diffuser — resource factory registration.
+// Registers the Fast3D and generic factories libultraship provides, so the .o2r entries
+// Torch produced (textures, vertices, display lists, matrices, lights, blobs) load as
+// IResource objects. Types without a factory here cannot be served by LoadResource() at
+// all -- see GDiffuser_LoadArchiveFileBytes in port/AssetLoader.cpp for the raw-bytes
+// escape hatch those callers use.
 
 #include "resource/ResourceFactories.h"
 
@@ -155,7 +156,7 @@ void RegisterResourceFactories(std::shared_ptr<Ship::ResourceLoader> loader) {
     reg(std::make_shared<Fast::ResourceFactoryBinaryLightV0>(), "Light",
         static_cast<uint32_t>(Fast::ResourceType::Light), 0);
 
-    // TODO (R1b): F-Zero-X-specific factories — Course, EADAnimation, EADLimb, GhostRecord,
+    // TODO: F-Zero-X-specific factories — Course, EADAnimation, EADLimb, GhostRecord,
     // Sequence, SoundFont (mirror torch/src/factories/fzerox/).
 }
 

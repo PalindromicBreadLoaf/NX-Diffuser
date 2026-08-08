@@ -1,12 +1,11 @@
-// port/gdx_dump_launch.cpp — per-class offline "Dump All" launcher. See the
-// header for the contract. The UI thread only ever READS GdxDumpSnapshot(); all child-process work
-// happens on a detached worker thread. Per-class failure isolation is the load-bearing property: the
-// batch runs one child PER CLASS, so a class that exits non-zero is recorded and the worker moves on.
+// port/gdx_dump_launch.cpp — per-class offline "Dump All" launcher. See the header for the contract.
+// The UI thread only ever READS GdxDumpSnapshot(); all child-process work happens on a detached
+// worker thread. Per-class failure isolation is the load-bearing property: one child PER CLASS, so a
+// class that exits non-zero is recorded and the worker moves on.
 //
-// NATIVE-FIRST: when gdx-extract.exe sits next to the game exe it drives everything (`gdx-extract dump
-// --classes <name> -d <dir> ...`), archive-only, no Python. The Python + tools/gen_dump_all.py path is
-// the dev fallback when the native binary is absent. The two backends share the same child-process
-// plumbing (runChild) and differ only in the argv they build and the stdout count-parse they use.
+// The native (`gdx-extract dump --classes <name> -d <dir> ...`) and Python
+// (tools/gen_dump_all.py) backends share the same child-process plumbing (runChild) and differ only
+// in the argv they build and the stdout count-parse they use.
 
 #include "gdx_dump_launch.h"
 #include "port_log.h"
@@ -106,7 +105,6 @@ int parseDumpedCount(const std::string& line, int previous) {
     if (pos == std::string::npos) {
         return previous;
     }
-    // Walk backwards over the digits immediately preceding " dumped".
     size_t end = pos;
     while (end > 0 && (line[end - 1] == ' ')) {
         --end;
@@ -121,12 +119,12 @@ int parseDumpedCount(const std::string& line, int previous) {
     return std::atoi(line.substr(start, end - start).c_str());
 }
 
-// Native `gdx-extract dump` count parse. Each class prints its own summary verb, and one class can
-// emit MORE THAN ONE counting line (textures prints "textures: 1520 dumped" AND "ek textures: 310
-// dumped" -> 1830 total). So unlike the Python "last N wins" parse above, this ACCUMULATES the integer
-// preceding every "<n> dumped" / "<n> WAV decoded" / "<n> MIDI written" run across the whole class
-// output. Coverage/census lines ("N archive-covered", "archiveReads=N") use different words and are
-// intentionally ignored. `items` starts at -1 (unknown) and flips to a running sum on the first match.
+// Native `gdx-extract dump` count parse. One class can emit MORE THAN ONE counting line (textures
+// prints "textures: 1520 dumped" AND "ek textures: 310 dumped" -> 1830), so unlike the Python
+// "last N wins" parse above this ACCUMULATES the integer before every "<n> dumped" / "<n> WAV
+// decoded" / "<n> MIDI written". Coverage/census lines ("N archive-covered", "archiveReads=N") word
+// their counts differently and are ignored on purpose. `items` starts at -1 (unknown) and flips to a
+// running sum on the first match.
 void accumulateNativeCount(const std::string& line, int& items) {
     static const char* const kVerbs[] = {" dumped", " WAV decoded", " MIDI written"};
     for (const char* verb : kVerbs) {
@@ -161,12 +159,10 @@ constexpr char kPathSep = ':';
 const char* const kPythonCandidates[] = {"python3", "python"};
 #endif
 
-// Returns the resolved ABSOLUTE path of the first Python interpreter found on PATH, or "" if none.
-// No process is spawned. Returning the exact path we validated with fs::is_regular_file (rather
-// than the bare "python"/"py" command name) guarantees CreateProcess launches precisely the
-// executable we checked, instead of re-resolving the bare name against PATH a second time (which
-// could pick a different match if PATH changed between the check and the spawn, or if the child's
-// own PATH-search order disagrees with ours).
+// Resolved ABSOLUTE path of the first Python interpreter on PATH, or "" if none. No process is
+// spawned. Returning the exact path validated with fs::is_regular_file, rather than the bare
+// "python"/"py" name, keeps CreateProcess from re-resolving against PATH a second time and landing on
+// a different match (PATH changed since the check, or the child's search order disagrees with ours).
 std::string findPythonOnPath() {
     const char* pathEnv = std::getenv("PATH");
     if (pathEnv == nullptr) {
@@ -191,9 +187,8 @@ std::string findPythonOnPath() {
         for (const auto& dir : dirs) {
             fs::path cand = fs::path(dir) / kPythonCandidates[i];
             if (fs::is_regular_file(cand, ec)) {
-                // Normalize to an absolute path: a relative PATH directory entry (e.g. ".") would
-                // otherwise produce a relative result, contradicting the "ABSOLUTE path" contract
-                // documented above. Fall back to the unnormalized candidate on failure.
+                // A relative PATH entry (e.g. ".") would otherwise break the ABSOLUTE-path contract
+                // above. Fall back to the unnormalized candidate on failure.
                 std::error_code absEc;
                 fs::path absCand = fs::absolute(cand, absEc);
                 return absEc ? cand.string() : absCand.string();
@@ -330,8 +325,8 @@ bool runChild(const std::string& exe, const std::vector<std::string>& args, cons
     }
     SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
 
-    // Build the command line: <exe> <args...>. lpApplicationName is NULL so a bare name (e.g. "python")
-    // resolves against PATH; the native backend passes an absolute exe so this is exact either way.
+    // lpApplicationName stays NULL so a bare name (e.g. "python") resolves against PATH; the native
+    // backend passes an absolute exe, so the spawn is exact either way.
     std::wstring cmd = quoteArg(exe);
     for (const auto& a : args) {
         cmd.push_back(L' ');
@@ -405,7 +400,6 @@ bool runChild(const std::string& exe, const std::vector<std::string>& args, cons
         }
     }
 
-    // Hang guard.
     DWORD wait = WaitForSingleObject(pi.hProcess, kChildDeadlineSecs * 1000u);
     bool timedOut = false;
     if (wait == WAIT_TIMEOUT) {
@@ -540,10 +534,9 @@ struct BatchState {
 };
 
 BatchState& batch() {
-    // Intentionally leaked: detached worker threads (started below) can still be writing into this
-    // object when the process exits. A function-local `static BatchState` would be destructed
-    // during CRT static teardown while a detached thread races it (closing the game mid-dump), so
-    // this is heap-allocated and never freed on purpose to outlive that teardown.
+    // Leaked on purpose: the detached worker threads started below can still be writing here at
+    // process exit. A function-local `static BatchState` would be destructed during CRT static
+    // teardown while a detached thread races it (closing the game mid-dump).
     static BatchState* s = new BatchState;
     return *s;
 }
@@ -557,8 +550,8 @@ struct ClassListState {
 };
 
 ClassListState& classList() {
-    // Intentionally leaked, same reason as batch() above: the detached class-list probe thread can
-    // still be writing here at process-exit time, so this outlives CRT static teardown on purpose.
+    // Leaked on purpose, same reason as batch() above: the detached class-list probe thread can still
+    // be writing here at process exit.
     static ClassListState* s = new ClassListState;
     return *s;
 }
@@ -568,11 +561,10 @@ const char* const kFallbackClasses[] = {
     "ghosts",   "fonts",      "audio",  "midi",       "models",
 };
 
-// Reorders a freshly-probed `--list-classes` result so the checkbox order stays stable across the
-// fallback -> probe swap: classes that exist in the curated kFallbackClasses list keep their
-// curated rank; any unknown/new classes the probe returned are appended afterward, alphabetically.
-// Without this, `sorted(...)` on the Python side (tools/gen_dump_all.py --list-classes) reorders
-// the panel's checkboxes the moment the probe result lands, moments after the panel opened.
+// Keeps the checkbox order stable across the fallback -> probe swap: curated kFallbackClasses names
+// keep their curated rank, and anything new the probe returned is appended alphabetically. Without
+// this, `sorted(...)` on the Python side (tools/gen_dump_all.py --list-classes) reshuffles the
+// panel's checkboxes the moment the probe result lands, moments after the panel opened.
 std::vector<std::string> ReorderProbedClasses(const std::vector<std::string>& probed) {
     std::vector<std::string> ordered;
     ordered.reserve(probed.size());
@@ -594,9 +586,8 @@ std::vector<std::string> ReorderProbedClasses(const std::vector<std::string>& pr
             }
         }
         if (!isCurated) {
-            // Also skip a name already collected into extras, so a duplicate non-curated entry in
-            // `probed` can't produce a duplicate checkbox (curated names are already deduped above
-            // by the curated-list-driven outer loop).
+            // A duplicate non-curated entry in `probed` would otherwise produce a duplicate
+            // checkbox; curated names are already deduped by the outer loop above.
             bool alreadyExtra = false;
             for (const std::string& existing : extras) {
                 if (existing == name) {
@@ -706,19 +697,15 @@ void GdxDumpBeginClassListProbe(const DumpEnvironment& env) {
         // (an older tool build without the flag) the child errors and we keep the fallback list.
         int exitCode = 1, items = -1;
         std::string lastLine;
-        // Capture the full stdout ourselves via a dedicated collector: reuse runChild but it only keeps
-        // the last line, so instead collect through a temporary file is overkill — parse from the log is
-        // not available. Simplest robust path: re-run with output captured into a vector here.
+        // runChild keeps only the last output line, so this probe does its own full-stdout capture.
         std::vector<std::string> names;
 #ifdef _WIN32
-        // Minimal capture: spawn and read the pipe fully.
         SECURITY_ATTRIBUTES sa{};
         sa.nLength = sizeof(sa);
         sa.bInheritHandle = TRUE;
         HANDLE rd = nullptr, wr = nullptr;
         if (CreatePipe(&rd, &wr, &sa, 0)) {
             SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
-            // Native: `gdx-extract dump --list-classes`. Python: `python <tool> --list-classes`.
             std::wstring cmd;
             if (envCopy.backend == DumpBackend::Native) {
                 cmd = quoteArg(envCopy.extractBin) + L" " + quoteArg("dump") + L" " +
@@ -758,7 +745,6 @@ void GdxDumpBeginClassListProbe(const DumpEnvironment& env) {
                 exitCode = static_cast<int>(code);
                 CloseHandle(pi.hProcess);
                 CloseHandle(pi.hThread);
-                // Split lines.
                 size_t start = 0;
                 while (start <= acc.size()) {
                     size_t nl = acc.find('\n', start);
@@ -787,7 +773,6 @@ void GdxDumpBeginClassListProbe(const DumpEnvironment& env) {
                 dup2(pipefd[1], STDOUT_FILENO);
                 dup2(pipefd[1], STDERR_FILENO);
                 close(pipefd[1]);
-                // Native: `gdx-extract dump --list-classes`. Python: `python <tool> --list-classes`.
                 std::vector<const char*> argv;
                 if (envCopy.backend == DumpBackend::Native) {
                     argv = {envCopy.extractBin.c_str(), "dump", "--list-classes", nullptr};
@@ -864,9 +849,9 @@ bool GdxDumpRunOneClass(const DumpEnvironment& env, const std::string& className
     if (native) {
         // gdx-extract dump --classes <name> -d <dumpDir> [--archive ...] [--disk-archive ...]
         //   [--ipl-archive ...] [--recipes ...] [--manifest ...] [--rom ...]
-        // Each optional flag is passed only when its source file/dir was resolved, so we never hand
-        // the tool a dead path; absent optionals fall to its graceful per-class behavior. --archive is
-        // always the REAL cart archive (never gdiffuser.o2r) when resolved.
+        // An optional flag is passed only when its source resolved, so the tool never gets a dead
+        // path and falls back to its graceful per-class behavior instead. --archive, when present, is
+        // always the REAL cart archive, never gdiffuser.o2r.
         exe = env.extractBin;
         args = {"dump", "--classes", className, "-d", dumpDir};
         if (!env.archivePath.empty()) {
@@ -899,8 +884,7 @@ bool GdxDumpRunOneClass(const DumpEnvironment& env, const std::string& className
         args = {env.toolPath, "--classes", className, "--dump-dir", dumpDir};
     }
 
-    // Log the exact command line (proves the backend and that --archive resolves to the real cart
-    // archive, never gdiffuser.o2r).
+    // The exact command line is the only record of which backend ran and what --archive resolved to.
     {
         std::string cmdline = exe;
         for (const auto& a : args) {
@@ -977,7 +961,7 @@ void GdxDumpStartBatch(const DumpEnvironment& env, const std::vector<std::string
         int ranOk = 0, ranFail = 0, skipped = 0;
         for (size_t i = 0; i < classesCopy.size(); ++i) {
             if (bs.cancelRequested.load()) {
-                // Mark all remaining classes as skipped (leave them Queued-> keep phase, but count).
+                // Remaining classes stay Queued; they are only counted as skipped.
                 std::lock_guard<std::mutex> lk(bs.mtx);
                 for (size_t j = i; j < bs.classes.size(); ++j) {
                     ++skipped;
@@ -1026,13 +1010,10 @@ void GdxDumpStartBatch(const DumpEnvironment& env, const std::vector<std::string
 }
 
 // ── Env-gated headless self-test ────────────────────────────────────────────────────────────────────
-// GDX_DUMP_SELFTEST=<class> (or =1 for textures) runs a tiny two-class batch at process start ON A
-// DETACHED THREAD, proving: backend discovery (native gdx-extract preferred, python fallback), a child
-// runs and its exit code is captured, and per-class failure isolation (a bogus class FAILs first, the
-// real class still runs after it). GDX_DUMP_SELFTEST=all additionally drives ALL TEN classes through
-// the launcher's own detached batch path (GdxDumpStartBatch) and logs the summary + per-class counts.
-// Harmless and env-gated — it stays in the tree. It never blocks the game thread and writes only into
-// <exe>/dump.
+// GDX_DUMP_SELFTEST=<class> (or =1 for textures) runs a two-class batch at process start on a detached
+// thread, covering backend discovery, child spawn + exit-code capture, and per-class failure isolation
+// (the bogus class FAILs first and the real class still runs). GDX_DUMP_SELFTEST=all drives all ten
+// classes through GdxDumpStartBatch instead. Never blocks the game thread; writes only into <exe>/dump.
 namespace {
 
 const char* backendName(DumpBackend b) {
@@ -1057,10 +1038,9 @@ void logEnv(const DumpEnvironment& env) {
     }
 }
 
-// Drives all ten classes through the real detached batch path and blocks (on this self-test thread,
-// never the game thread) until it finishes, then logs the summary and per-class counts. The bogus
-// class is prepended so per-class failure isolation is proven INSIDE the batch (it FAILs first, then
-// all ten real classes still run), which also keeps every real class's count clean (nothing pre-dumped).
+// Blocks this self-test thread (never the game thread) until the batch finishes. The bogus class is
+// prepended so failure isolation is exercised INSIDE the batch, and so every real class's count starts
+// from nothing pre-dumped.
 void runFullBatchSelfTest(const DumpEnvironment& env, const std::string& dumpDir) {
     std::vector<std::string> classes;
     classes.push_back(kBogusClass);

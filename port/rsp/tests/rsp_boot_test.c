@@ -1,30 +1,26 @@
-/* LLE audio core unit test: proves the vendored cxd4 RSP interpreter boots and runs
- * the REAL aspMain audio microcode (nead/ABI2) to a clean task-complete BREAK, driven
- * entirely through the driver shim's public entry points.
+/* Proves the vendored cxd4 RSP interpreter boots the REAL aspMain audio microcode (nead/ABI2)
+ * and runs it to a clean task-complete BREAK, driven only through the driver shim's public entry
+ * points.
  *
- * Task setup (established by reverse-engineering the nead command dispatcher):
- *   - The ucode's OWN boot code DMAs OSTask.ucode_data (ucode_data_size bytes) from
- *     RDRAM into DMEM[0], rebuilding its runtime jump table at DMEM[0x10]. So the data
- *     section (aspmain_data.bin, 0x2E0 bytes) MUST live in RDRAM with ucode_data(+0x18)/
- *     ucode_data_size(+0x1C) pointing at it -- a manual DMEM[0] preload alone is clobbered.
- *   - The dispatcher advances a running RDRAM pointer (data_ptr) and decrements a byte
- *     counter k1 = data_size by 8 per command; when blez k1, it sets SP_STATUS SET_SIG2
- *     (0x4000) and executes BREAK at IMEM 0x10D0. Termination is the data_size counter,
- *     NOT a terminator opcode or fixed count.
- *   - Command opcode 0x00 is a HEAVY handler; the true no-op (loop-continue) opcodes are
- *     0x03/0x06/0x07/0x09/0x0E/0x18/0x19/0x1B/0x1C/0x1D. We use 0x03.
- *   - All multi-byte OSTask fields and command words are big-endian (RSP reads RDRAM/DMEM
- *     big-endian via cxd4's BES element-swap).
+ * Task setup, established by reverse-engineering the nead command dispatcher:
+ *   - The ucode's OWN boot code DMAs OSTask.ucode_data into DMEM[0] and rebuilds its jump table at
+ *     DMEM[0x10], so the data section MUST live in RDRAM with ucode_data(+0x18)/
+ *     ucode_data_size(+0x1C) pointing at it; a manual DMEM[0] preload alone is clobbered.
+ *   - The dispatcher advances data_ptr and decrements k1 = data_size by 8 per command; at blez k1
+ *     it sets SP_STATUS SET_SIG2 and BREAKs at IMEM 0x10D0. Termination is that byte counter, not
+ *     a terminator opcode or a fixed command count.
+ *   - Opcode 0x00 is a HEAVY handler; the true loop-continue no-ops are 0x03/0x06/0x07/0x09/0x0E/
+ *     0x18/0x19/0x1B/0x1C/0x1D. This test uses 0x03.
+ *   - All multi-byte OSTask fields and command words are big-endian (the RSP reads RDRAM/DMEM
+ *     big-endian through cxd4's BES element-swap).
  *
- * Asserts:
- *   1. First executed instruction is 0x200a0fc0 (ADDI $10,$0,0xFC0) -> IMEM BE->LE swap
- *      + boot shortcut correct.
- *   2. The run reaches BREAK with SP_STATUS_BROKE set (and SET_SIG2 = task-complete) ->
- *      the LLE core executes a full audio task to completion.
- * A high instruction budget (via cxd4's SP_EXECUTE_LOG hook) bounds the run so a
- * regression that fails to terminate is caught as a FAIL rather than hanging.
+ * Asserts (1) the first executed instruction is 0x200a0fc0 (ADDI $10,$0,0xFC0), which pins the
+ * IMEM BE->LE swap and the boot shortcut, and (2) the run reaches BREAK with SP_STATUS_BROKE and
+ * SET_SIG2, i.e. a full audio task completed. The instruction budget bounds the run so a
+ * regression that fails to terminate is a FAIL rather than a hang.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
 
@@ -41,15 +37,22 @@ typedef unsigned int u32;
 #define SP_STATUS_BROKE  0x0002u
 #define SP_STATUS_SIG2   0x4000u
 
+/* The blobs are Nintendo-copyrighted and not in the repo: slice them out of the user's own ROM
+ * (argv[1] or GDX_RSP_TEST_ROM), same ranges as decomp/assets/yaml/us/rev0/rsp_blob.yaml. */
+#define ROM_UCODE_TEXT_OFF 0x66270u
+#define ROM_UCODE_DATA_OFF 0x71CA0u
+#define UCODE_TEXT_BYTES   0x0D30u
+#define UCODE_DATA_BYTES   0x02E0u
+
 /* RDRAM layout for the offline test */
-#define RD_UCODE_DATA  0x1000u   /* aspmain_data.bin copy (ucode_data) */
+#define RD_UCODE_DATA  0x1000u   /* aspmain data copy (ucode_data) */
 #define RD_CMD_LIST    0x2000u   /* command list (data_ptr), 8-byte aligned */
 
 static jmp_buf g_bail;
 static u32 g_log[512];
 static int g_n = 0;
 static int g_overrun = 0;
-#define RUN_BUDGET 20000   /* correct BREAK hits in <200 steps; only a hang reaches this */
+#define RUN_BUDGET 20000   /* a correct BREAK hits in <200 steps; only a hang reaches this */
 
 void step_SP_commands(u32 inst) {
     if (g_n < (int)(sizeof g_log / sizeof g_log[0]))
@@ -70,12 +73,22 @@ static unsigned load_blob(const char* name, unsigned char* buf, unsigned cap) {
     return n;
 }
 
+static unsigned load_rom_slice(const char* romPath, unsigned off, unsigned char* buf, unsigned cap) {
+    FILE* f = fopen(romPath, "rb");
+    unsigned n;
+    if (!f) return 0;
+    if (fseek(f, (long)off, SEEK_SET) != 0) { fclose(f); return 0; }
+    n = (unsigned)fread(buf, 1, cap, f);
+    fclose(f);
+    return n;
+}
+
 static unsigned char rdram[0x1000000];
 static unsigned char text[8192], data[4096], ostask[64];
 
-/* cxd4 stores DMEM/RDRAM/IMEM as host-native little-endian 32-bit words (its BES/HES
- * element-swap macros, ENDIAN_M=~0, reconstruct big-endian byte/half access from that
- * storage). So values written for the RSP to read via LW are stored host-native... */
+/* cxd4 stores DMEM/RDRAM/IMEM as host-native little-endian 32-bit words; its BES/HES element-swap
+ * macros reconstruct big-endian byte/half access from that storage. So values the RSP will read
+ * via LW are stored host-native... */
 static void le32(unsigned char* p, unsigned v) {
     p[0] = (unsigned char)v;         p[1] = (unsigned char)(v >> 8);
     p[2] = (unsigned char)(v >> 16); p[3] = (unsigned char)(v >> 24);
@@ -89,24 +102,29 @@ static void copy_be_words_to_native(unsigned char* dst, const unsigned char* src
     }
 }
 
-int main(void) {
+int main(int argc, char** argv) {
     unsigned tn = load_blob("aspmain_text.bin", text, sizeof text);
     unsigned dn = load_blob("aspmain_data.bin", data, sizeof data);
+    const char* rom = (argc > 1) ? argv[1] : getenv("GDX_RSP_TEST_ROM");
     const unsigned NCMD = 8;
     unsigned data_size = NCMD * 8;
     unsigned i, st, saw_entry;
 
-    if (!tn || !dn) {
-        printf("SKIP: ucode blobs not present -- LLE boot test skipped.\n");
-        return 0; /* ROM-extracted blobs may be absent in a bare checkout */
+    if ((!tn || !dn) && rom != NULL) {
+        tn = load_rom_slice(rom, ROM_UCODE_TEXT_OFF, text, UCODE_TEXT_BYTES);
+        dn = load_rom_slice(rom, ROM_UCODE_DATA_OFF, data, UCODE_DATA_BYTES);
     }
 
-    /* RDRAM: the data section (byte-swapped BE->native words) that the ucode's boot DMA
-     * pulls into DMEM to rebuild its jump table... */
+    if (!tn || !dn) {
+        printf("SKIP: no ucode source -- pass a US rev0 ROM path (argv[1] or GDX_RSP_TEST_ROM).\n");
+        return 0; /* the blobs are never shipped; a bare checkout has nothing to boot */
+    }
+
+    /* The data section, byte-swapped BE->native, that the ucode's boot DMA pulls into DMEM to
+     * rebuild its jump table... */
     memset(rdram, 0, 0x4000);
     copy_be_words_to_native(rdram + RD_UCODE_DATA, data, dn);
-    /* ...and a command list of no-op packets. Opcode 0x03 is a true loop-continue no-op
-     * (opcode 0x00 is a heavy handler); stored host-native so w0>>24 == 0x03. */
+    /* ...and a command list of no-op packets, stored host-native so w0>>24 == 0x03. */
     for (i = 0; i < NCMD; i++)
         le32(rdram + RD_CMD_LIST + i * 8, 0x03000000u); /* w0: opcode 0x03; w1 stays 0 */
 
