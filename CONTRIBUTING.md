@@ -30,8 +30,8 @@ Full prerequisites and commands are in the [README](README.md#building). The sho
 | | |
 | --- | --- |
 | **Clone** | `git clone --recursive` — the build needs the submodules; a plain clone will not configure |
-| **Windows** | Visual Studio 2022, CMake 3.20+, Python 3 |
-| **Linux** | CMake 3.20+, Ninja, a C++20 compiler, Python 3, and libultraship's dependencies from your distribution |
+| **Windows** | Visual Studio 2022, CMake 3.24+, Python 3 |
+| **Linux** | CMake 3.24+, Ninja, a C++20 compiler, Python 3, and libultraship's dependencies from your distribution |
 
 **Python 3 is required, not optional.** `port/CMakeLists.txt:9` is
 `find_package(Python3 COMPONENTS Interpreter REQUIRED)` — configure fails outright without an
