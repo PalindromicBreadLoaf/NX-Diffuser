@@ -166,7 +166,7 @@ git clone --recursive https://github.com/Zorkats/G-Diffuser.git
 | --- | --- |
 | **Visual Studio 2022** | MSVC toolset, "Desktop development with C++" workload |
 | **CMake 3.24+** | The top level asks for 3.20, but `libultraship/` requires 3.24 |
-| **Python 3** | Required, not optional — CMake configure fails without an interpreter (build-time asset generators) |
+| **Python 3** | Required, not optional — CMake configure fails without an interpreter (build-time asset generators). The generators also need **PyYAML** and **Pillow** |
 
 > Build from a clean shell **without** MSYS2/MinGW on your `PATH`, or MSVC may pick up MinGW
 > headers. Use a Developer Command Prompt (`vcvars64`).

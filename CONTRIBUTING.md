@@ -35,7 +35,9 @@ Full prerequisites and commands are in the [README](README.md#building). The sho
 
 **Python 3 is required, not optional.** `port/CMakeLists.txt:9` is
 `find_package(Python3 COMPONENTS Interpreter REQUIRED)` — configure fails outright without an
-interpreter, because build-time generators run during the build.
+interpreter, because build-time generators run during the build. Those generators also import
+**PyYAML** and **Pillow** (`python3-yaml` and `python3-pil` on Debian-likes); CMake cannot check
+for them, so a missing one surfaces mid-build as a `ModuleNotFoundError`.
 
 Two things routinely trip people up on Windows:
 
