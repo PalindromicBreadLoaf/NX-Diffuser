@@ -457,6 +457,13 @@ else()
     # (needed on older glibc, harmless on newer).
     find_package(Threads REQUIRED)
     target_link_libraries(G-Diffuser PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+    # Release tarballs carry the dependencies no distribution can be relied on to provide in
+    # lib/ beside the executable (tools/package_linux.sh). $ORIGIN resolves them at load time,
+    # which beats a wrapper script because the binary stays directly runnable. No effect on a
+    # local build, where lib/ does not exist and the loader falls through to the system paths.
+    set_target_properties(G-Diffuser PROPERTIES
+        BUILD_WITH_INSTALL_RPATH TRUE
+        INSTALL_RPATH "$ORIGIN/lib")
 endif()
 
 if(GDX_PORT_WARN_FLAGS)

@@ -315,6 +315,33 @@ bump lands last.
 
 **Discussion venue:** GitHub Issues, for now. There is no Discord or forum yet.
 
+## Releases
+
+**Linux releases are built by CI, not by hand.** Push a `v*` tag, or run the
+*Release (Linux)* workflow manually, then download the tarball from the workflow artifacts and
+attach it to the GitHub release. Publishing stays a deliberate human step.
+
+The workflow builds inside an `ubuntu:22.04` container with pinned dependency versions. That is
+not fussiness. v1.0.0 was built by hand on a rolling distribution and inherited three defects that
+were invisible on the machine that produced it, each one reported separately by a different user:
+it demanded a glibc newer than most systems had, it declared an `x86-64-v4` CPU requirement for
+instructions it never executed, and it linked shared libraries that shipped nowhere. Pinning the
+build environment is what prevents all three.
+
+`tools/check_linux_abi.py` enforces that, and `tools/package_linux.sh` refuses to write a tarball
+until it passes. Run it against any Linux build before you hand it to anyone:
+
+```sh
+python3 tools/check_linux_abi.py build/x64-linux/port/G-Diffuser
+```
+
+It reports the glibc floor, the CPU level the loader will demand, and any dependency that would
+have to already be installed on the user's machine. Ceilings live in its `--help`; raising one is
+a decision about which distributions you are dropping, so change it deliberately.
+
+Windows releases are still built and packaged by hand, from the static `build/x64` tree — the
+dynamic `build_x64` tree produces an executable that needs eight DLLs beside it.
+
 ## Reporting a bug
 
 Bug reports do not need any of the above. The README has the

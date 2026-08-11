@@ -131,6 +131,11 @@ controller-navigation toggle.
 
 Both targets are driven by libultraship's Fast3D renderer.
 
+**Linux requirements:** glibc 2.35 or newer — Ubuntu 22.04+, Debian 12+, Fedora 36+, SteamOS 3,
+or any rolling distribution. No CPU features beyond the x86-64 baseline are needed, so anything
+64-bit will do. Libraries that distributions do not reliably ship travel in `lib/` beside the
+executable, so nothing has to be installed first.
+
 ## Custom Assets
 
 The release includes `gdiffuser.o2r`, which contains only the MIT-licensed Fast3D shaders needed
@@ -160,7 +165,7 @@ git clone --recursive https://github.com/Zorkats/G-Diffuser.git
 | Prerequisite | Notes |
 | --- | --- |
 | **Visual Studio 2022** | MSVC toolset, "Desktop development with C++" workload |
-| **CMake 3.20+** | |
+| **CMake 3.24+** | The top level asks for 3.20, but `libultraship/` requires 3.24 |
 | **Python 3** | Required, not optional — CMake configure fails without an interpreter (build-time asset generators) |
 
 > Build from a clean shell **without** MSYS2/MinGW on your `PATH`, or MSVC may pick up MinGW
@@ -201,7 +206,7 @@ cmake --build build/x64-ninja --target G-Diffuser
 
 ### Linux
 
-Install the toolchain and libultraship's dependencies from your distribution (CMake 3.20+, Ninja, a
+Install the toolchain and libultraship's dependencies from your distribution (CMake 3.24+, Ninja, a
 C++20 compiler, Python 3, SDL2, GLEW, zlib, bzip2, libzip, nlohmann-json, tinyxml2, spdlog), then:
 
 ```sh
@@ -293,7 +298,7 @@ Please do not attach ROMs, disk images, IPL dumps, or your generated `fzerox.o2r
 
 ## Regarding LLM Usage.
 
-To be fair, I was scared at first of saying I used LLM models to bring G-Diffuser into existence. I used LLM models to better understand how F-Zero X's quirks worked (it's probably one of the most complex N64 games) and yes, I used it to write code, but 70% of the code was written by me,  and 30% was written by an LLM but that code was later reviewed and tested by me, with every single iteration being a testing process. I also audited and made every single design and choice regarding the software, the models weren't involved in any of the ideas and thought processes I had during development. This was also tested by me and my older brother, each doing their own playthroughs of the game with this port.  I know some people (including people I have worked with before, and myself) will not be content with me using LLMs to accelerate a development process that would have taken more months, but the ones that know me, and know the work I have done for different communities is more worth it than me just using an LLM model to understand the game's source code and improve the workflow. I am a computer science student, modder for various games, and have made various hand made contributions to other projects, and this was a vacation project for me in order to distract myself from my own real world troubles. And this would not have been possible without the decompilation of inspectrdc, I am grateful to them and their team.  I hope that the quality of the project makes people play it and have a good experience. But if you don't want to play a project that was done with the help of an LLM, that's 100% okay, but just walk away and don't throw hate at me. I have enough with my own daily woes. A project that will be done 100% by hand will appear once the decomp reaches 100%, but in the meanwhile you can have this. I do believe there's a difference between making "slop" and using LLMs to automate and help with certain tasks. And that is probably what is going to matter from now on, having critical thinking to know when the model has made mistakes and know how to fix them yourself (or redirect the model in doing it). And to be clear, I AM against LLM generated art or assets. But code is different. There's a lot of difference between writing 200+ lines of DirectX boilerplate or header files and make the model write them while I focus on other tasks, than making the LLM do EVERYTHING. People will not realize that this wasn't a "generate me an F-Zero X port", there was a PRD (Product Requirement Document) made by hand by me, with the whole structure, and analysis, and code done beforehand before I even started using LLMs to code.
+To be fair, I was scared at first of saying I used LLM models to bring G-Diffuser into existence. I used LLM models to better understand how F-Zero X's quirks worked (it's probably one of the most complex N64 games) and yes, I used it to write code, but 70% of the code was written by me,  and 30% was written by an LLM but that code was later reviewed and tested by me, with every single iteration being a testing process. I also audited and made every single design and choice regarding the software, the models weren't involved in any of the ideas and thought processes I had during development. This was also tested by me and my older brother, each doing their own playthroughs of the game with this port.  I know some people (including people I have worked with before, and myself) will not be content with me using LLMs to accelerate a development process that would have taken more months, but the ones that know me, and know the work I have done for different communities is more worth it than me just using an LLM model to understand the game's source code and improve the workflow. I am a computer science student, modder for various games, and have made various hand made contributions to other projects, and this was a vacation project for me in order to distract myself from my own real world troubles. And this would not have been possible without the decompilation of inspectrdc, I am grateful to them and their team.  I hope that the quality of the project makes people play it and have a good experience. But if you don't want to play a project that was done with the help of an LLM, that's 100% okay, but just walk away and don't throw hate at me. I have enough with my own daily woes. A project that will be done 100% by hand will appear once the decomp reaches 100%, but in the meanwhile you can have this. I do believe there's a difference between making "slop" and using LLMs to automate and help with certain tasks. And that is probably what is going to matter from now on, having critical thinking to know when the model has made mistakes and know how to fix them yourself (or redirect the model in doing it). And to be clear, I AM against LLM generated art or assets. But code is different. There's a lot of difference between writing 200+ lines of DirectX boilerplate or header files and make the model write them, for example, while I focus on other tasks, than making the LLM do EVERYTHING. People will not realize that this wasn't a "generate me an F-Zero X port" prompt, there was a PRD (Product Requirement Document) made by hand by me, with the whole structure, and analysis, and code done beforehand before I even started using LLMs to code. 
 
 ## Credits
 
