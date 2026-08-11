@@ -119,6 +119,17 @@ jobs:
           cmake --build build-libzip --target install
           ldconfig
 
+      - name: Generate Expansion Kit asset stubs
+        # decomp sources #include zero-filled payload definitions under decomp/src/assets which
+        # are generated rather than tracked; the runtime fills them from the archive, so no ROM
+        # is involved. The same generator also rewrites port/gen/, which carries hand-maintained
+        # edits on top of its output -- restoring that directory keeps them. Skipping the restore
+        # silently reverts the machine-name texture over-allocation and ships the overflow
+        # corruption it was written to fix.
+        run: |
+          python3 tools/gen_ek_assets.py
+          git checkout -- port/gen
+
       - name: Build
         run: |
           cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=Release
