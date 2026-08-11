@@ -153,27 +153,27 @@ def scan_payload_includes():
     Torch emits asset payload C files (initialized arrays); several EK data
     files #include them directly, so the yaml's symbols must be DEFINED in a
     generated payload file rather than in EkAssetBindings.c (the include would
-    otherwise produce duplicate definitions at link)."""
+    otherwise produce duplicate definitions at link).
+
+    A file that includes a payload is compiled by definition, so every include found here
+    counts. This was previously filtered against source paths scraped out of
+    port/CMakeLists.txt, which silently stopped matching once those sources moved behind a
+    ${DECOMP} glob: the regex then matched nothing, no payload file was written at all, and
+    the breakage stayed invisible on any tree still holding the previously generated ones.
+
+    Note that the payload definitions do NOT replace the ones in EkAssetBindings.c. Both are
+    tentative definitions of the same symbols, and -fcommon (port/CMakeLists.txt) merges them
+    at the larger size -- which is what lets a hand-edited size in EkAssetBindings.c win over
+    the generator's. Regenerating that file over its hand-edits therefore changes runtime
+    behaviour even though the build still succeeds."""
     paths = set()
-
-    # Read CMakeLists.txt to see which files are actually compiled
-    cmake_path = os.path.join(REPO, "port", "CMakeLists.txt")
-    compiled_files = set()
-    with open(cmake_path, "r") as f:
-        cmake_content = f.read()
-        for m in re.finditer(r"decomp/src/([^\s]+)", cmake_content):
-            compiled_files.add(os.path.normpath(os.path.join(DECOMP_SRC, m.group(1))))
-
     for root, _dirs, files in os.walk(DECOMP_SRC):
         if os.sep + "assets" in root:
             continue
         for name in files:
             if not name.endswith((".c", ".h")):
                 continue
-            full_path = os.path.normpath(os.path.join(root, name))
-            if name.endswith(".c") and full_path not in compiled_files:
-                continue
-            with open(full_path, encoding="utf-8", errors="ignore") as f:
+            with open(os.path.join(root, name), encoding="utf-8", errors="ignore") as f:
                 for m in re.finditer(r"ASSET_SOURCE_EK\(([^)]+\.c)\)", f.read()):
                     paths.add(m.group(1).strip())
     return paths
