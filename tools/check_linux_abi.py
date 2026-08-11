@@ -219,9 +219,14 @@ def check(path, limits, bundled):
     missing = [lib for lib in libs if lib not in SYSTEM_LIBS and lib not in bundled]
     if missing:
         failures.append("depends on unbundled libraries: " + ", ".join(missing))
-    if bundled and not (runpath or "").startswith("$ORIGIN"):
-        failures.append(f"bundles libraries but its RUNPATH is {runpath or 'unset'}, "
-                        f"so the loader will never look in lib/")
+    # Only a binary that actually loads something out of lib/ needs to be told to look there;
+    # gdx-extract links nothing bundled, and a bundled library usually depends on none of its
+    # neighbours. When one does, it needs its own entry: DT_RUNPATH is not inherited, so the
+    # executable's does not cover a library's own dependencies.
+    from_lib = [lib for lib in libs if lib in bundled]
+    if from_lib and "$ORIGIN" not in (runpath or ""):
+        failures.append("loads {} from lib/, but its RUNPATH is {}".format(
+            ", ".join(from_lib), runpath or "unset"))
 
     for problem in failures:
         print(f"FAIL  {name}: {problem}")
