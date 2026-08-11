@@ -17,8 +17,12 @@ imgui.ini
 *.o2r
 *.otr
 /assets/extracted/
-# Torch-generated asset headers / C (built from ROM)
-/include/
+# Generated asset .c files carry real ROM content and are never committed. The matching
+# headers under include/ are the opposite -- extern declarations and #defines, no game data --
+# and they ARE tracked, because a fresh clone cannot build without them: 27 of the 65 come from
+# Torch's `header` mode, which requires the ROM nobody else has. Same reasoning as
+# port/gen/AssetBindings.c below. Regenerate the EK half with tools/gen_ek_assets.py, the rev0
+# half with `gdx-extract header <rom> -s decomp -d include`.
 /src/assets/
 torch.hash.yml
 # Generated asset bindings. These are generator OUTPUT plus hand-maintained rows on
