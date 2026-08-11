@@ -353,6 +353,16 @@ add_custom_command(TARGET G-Diffuser POST_BUILD
             "$<TARGET_FILE_DIR:G-Diffuser>/fonts"
     VERBATIM)
 
+# SDL only knows the pads that existed when it was released, and the one we bundle is pinned.
+# The community database is updated continuously and SDL_GameControllerAddMappingsFromFile layers
+# it on top, so a pad newer than the bundled SDL still works. It has to sit beside the exe under
+# this exact name: LocateFileAcrossAppDirs resolves it from the bare string in os.cpp.
+add_custom_command(TARGET G-Diffuser POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/gamecontrollerdb.txt"
+            "$<TARGET_FILE_DIR:G-Diffuser>/gamecontrollerdb.txt"
+    VERBATIM)
+
 # Keep the project license and every bundled/static dependency notice with binary releases.
 set(GDIFFUSER_LICENSE_DIR "${CMAKE_SOURCE_DIR}/LICENSES")
 add_custom_command(TARGET G-Diffuser POST_BUILD

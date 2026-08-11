@@ -27,6 +27,11 @@ miniz-cpp/miniz. Their complete notices are the correspondingly named files unde
 Montserrat and Inconsolata are distributed under the SIL Open Font License 1.1. Their license texts
 are included both under `LICENSES/` and beside the fonts in release packages.
 
+`gamecontrollerdb.txt` is the community SDL_GameControllerDB, carrying the same zlib license as SDL
+itself (`LICENSES/zlib-SDL2.txt`). It ships beside the executable and is layered on top of the
+mappings built into SDL, so a controller newer than the bundled SDL can be made to work by replacing
+that one file.
+
 ## Asset boundary
 
 - G-Diffuser distributions do not include Nintendo ROM, disk, IPL, texture, model, audio, or other

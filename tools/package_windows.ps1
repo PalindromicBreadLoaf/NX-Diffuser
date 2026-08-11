@@ -39,6 +39,7 @@ $payload = @(
     "G-Diffuser.exe",
     "gdx-extract.exe",
     "gdiffuser.o2r",
+    "gamecontrollerdb.txt",
     "fonts",
     "decomp-recipes",
     "LICENSE",

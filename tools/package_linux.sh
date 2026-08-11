@@ -39,6 +39,7 @@ payload=(
     G-Diffuser
     gdx-extract
     gdiffuser.o2r
+    gamecontrollerdb.txt
     fonts
     decomp-recipes
     LICENSE
