@@ -1,6 +1,7 @@
 # Build output
 build/
 /dist/
+/dist-ci/
 /out/
 /cmake-build-*/
 *.o

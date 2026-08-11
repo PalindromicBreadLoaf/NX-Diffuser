@@ -73,8 +73,14 @@ jobs:
       - name: Build
         # USE_AUTO_VCPKG lets libultraship bootstrap vcpkg into the build tree. --config Release
         # is required: the Visual Studio generator is multi-config and ignores CMAKE_BUILD_TYPE.
+        #
+        # Python3_EXECUTABLE is pinned to the interpreter pip installed into. The runner image
+        # carries several in its tool cache, and FindPython3 otherwise takes the highest version it
+        # can see -- which has none of the modules, so the build gets all the way to a linked
+        # executable before a POST_BUILD generator dies on ModuleNotFoundError. setup-python
+        # exports Python3_ROOT_DIR, but CMake reads that as a CMake variable, not an env one.
         run: |
-          cmake -S . -B build/x64 -DUSE_AUTO_VCPKG=ON
+          cmake -S . -B build/x64 -DUSE_AUTO_VCPKG=ON "-DPython3_EXECUTABLE=$env:pythonLocation\python.exe"
           cmake --build build/x64 --config Release --target G-Diffuser
 
       - name: Resolve version
