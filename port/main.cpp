@@ -39,6 +39,8 @@
 #include "gdx_frame_pacer.h"
 #include "n64_gfx_bridge.h"
 #include "gdx_host_path.h"
+#include "gdx_footprint.h"
+#include "gdx_thread_affinity.h"
 #ifdef __SWITCH__
 #include "ship/port/switch/SwitchImpl.h"
 #endif
@@ -118,6 +120,7 @@ extern "C" double gdx_host_sim_hz(void) {
     return gGdxSimHzMeasured;
 }
 
+
 // Bridge telemetry getters for the [interp-p2] line. Declared here rather than in
 // n64_gfx_bridge.h — same minimal-include idiom gdx_menu.cpp uses for the other accessors.
 extern "C" double gdx_gfx_interp_presents_per_sec(void);
@@ -147,6 +150,22 @@ static double gdx_host_now_seconds(void) {
     using namespace std::chrono;
     return duration<double>(steady_clock::now() - gGdxHostClockEpoch).count();
 }
+
+static size_t sGdxLoopTick = 0;
+static void GdxSampleSimHz(size_t tick) {
+    static double sMarkTime = 0.0;
+    static size_t sMarkTick = 0;
+    if ((tick % 30) != 0) {
+        return;
+    }
+    const double nowSec = gdx_host_now_seconds();
+    if (sMarkTime > 0.0 && nowSec > sMarkTime && tick > sMarkTick) {
+        gGdxSimHzMeasured = static_cast<double>(tick - sMarkTick) / (nowSec - sMarkTime);
+    }
+    sMarkTime = nowSec;
+    sMarkTick = tick;
+}
+
 // Hold the host thread until `deadlineSeconds` (same base as gdx_host_now_seconds). No-op if the
 // presents already spent the tick budget (VSync-on case). Keeps the SIM locked to 60 Hz when the
 // sub-frame loop finished early (VSync-off case) — this is interpolation's logic pacer.
@@ -639,6 +658,9 @@ int main(int argc, char** argv) {
 
     // Must precede every log call this process makes. Precedence rules in port/gdx_dev_gates.h.
     gdx_dev_gates_init_env();
+
+    // The scheduler thread.
+    gdx_thread_affinity_pin("main/scheduler", GDX_CORE_MAIN);
 
     // Must run before any libultraship path resolution, so config/logs/disk/IPL consolidate into
     // the resolved data dir.
@@ -1251,6 +1273,9 @@ int main(int argc, char** argv) {
         gdx_gfx_interp_tick_config(interpOn ? 1 : 0, interpTickStart, kGdxInterpTickSeconds,
                                    interpMaxSubframes);
 
+        const size_t loopTick = sGdxLoopTick++;
+        GdxSampleSimHz(loopTick);
+
         // The game frame ACTUALLY runs here, not in gdx_dispatch() below. gdx_vi_tick posts the VI
         // retrace message, which wakes the Main scheduler thread and dispatches the game fiber
         // inline (osSendMesg -> osStartThread -> __osDispatchThread, because __osRunningThread is
@@ -1270,8 +1295,12 @@ int main(int argc, char** argv) {
             // Default path: one tick, one Run, one present, paced by the frame pacer. Nothing on
             // this branch touches the interpolation machinery.
             gdx::PerfPhaseBegin(gdx::PerfGuiStart);
+            gdx_perf_sub_begin(GDX_PERF_SUB_GUI);
             w->GetGui()->StartDraw();
+            gdx_perf_sub_end(GDX_PERF_SUB_GUI);
+            gdx_perf_sub_begin(GDX_PERF_SUB_SFRAME);
             w->StartFrame(); // must precede gdx_dispatch: Run() needs an initialized frame
+            gdx_perf_sub_end(GDX_PERF_SUB_SFRAME);
             // Cross-thread message wakes recorded by the dedicated audio thread (sendmesg.c PORT
             // path) become runnable here, on the host thread, right before the threads dispatch.
             // See the guard block in n64_sched.c.
@@ -1293,14 +1322,39 @@ int main(int argc, char** argv) {
             // Presents the VI framebuffer's pixels when no GFX task rendered this frame (boot logo
             // phase, or any CPU-drawn screen). No-op when a real frame was produced.
             gdx_vi_present_fallback();
+            gdx_perf_sub_begin(GDX_PERF_SUB_GUI);
             w->GetGui()->EndDraw();
+            gdx_perf_sub_end(GDX_PERF_SUB_GUI);
+            // eframe is where a vsync/latency block lands. If this dominates, the loop is waiting
+            // on the display, not doing work — and no graphics-driver change addresses that.
+            gdx_perf_sub_begin(GDX_PERF_SUB_EFRAME);
             w->EndFrame();
+            gdx_perf_sub_end(GDX_PERF_SUB_EFRAME);
             gdx::PerfPhaseEnd(gdx::PerfPresent);
             // Port-level wall-clock pacer, gated on gEnhancements.Graphics.FramePacing (default OFF
             // — see the registration above). When on, holds the loop to the N64 NTSC field rate.
             gdx::PerfPhaseBegin(gdx::PerfPacer);
             gdx_frame_pacer_tick();
             gdx::PerfPhaseEnd(gdx::PerfPacer);
+
+            {
+                static size_t sLoopLogTick = 0;
+                const size_t logTick = sLoopLogTick++;
+                if (logTick < 8 || (logTick % 120) == 0) {
+                    uint64_t used = 0;
+                    uint64_t peak = 0;
+                    uint64_t total = 0;
+                    if (gdx_footprint_query(&used, &peak, &total)) {
+                        gdx_port_logf("[loop] ticks=%zu sim_hz=%.1f mem_used=%.1fMB mem_peak=%.1fMB "
+                                      "mem_total=%.1fMB\n",
+                                      logTick + 1, gGdxSimHzMeasured, used / 1048576.0,
+                                      peak / 1048576.0, total / 1048576.0);
+                    } else {
+                        gdx_port_logf("[loop] ticks=%zu sim_hz=%.1f mem=unavailable\n", logTick + 1,
+                                      gGdxSimHzMeasured);
+                    }
+                }
+            }
         } else {
             // The bridge owns the present on this branch: gdx_gfx_run replays the retained gfx task
             // as M sub-frames via fw->DrawAndRunGraphicsCommands, each a full StartDraw..EndFrame
@@ -1381,22 +1435,7 @@ int main(int argc, char** argv) {
                 // sim and the game runs in slow motion at exactly that ratio. A correct decoupled
                 // loop BREAKS the identity, holding sim_hz at 59.94 while presents/s moves freely.
                 //
-                // Rolling window, not cumulative, so a dip shows up in the line that contains it.
-                // Its own 30-tick cadence, independent of the 120-tick log cadence, keeps the FPS
-                // overlay moving while the player watches it.
-                {
-                    static double sSimHzMarkTime = 0.0;
-                    static size_t sSimHzMarkTick = 0;
-                    if ((tick % 30) == 0) {
-                        const double nowSec = gdx_host_now_seconds();
-                        if (sSimHzMarkTime > 0.0 && nowSec > sSimHzMarkTime && tick > sSimHzMarkTick) {
-                            gGdxSimHzMeasured =
-                                static_cast<double>(tick - sSimHzMarkTick) / (nowSec - sSimHzMarkTime);
-                        }
-                        sSimHzMarkTime = nowSec;
-                        sSimHzMarkTick = tick;
-                    }
-                }
+                // Sampled by GdxSampleSimHz ahead of the interpOn split.
                 const double simHz = gGdxSimHzMeasured;
                 if (tick < 8 || (tick % 120) == 0) {
                     const double avg = (tick + 1 > 0)
