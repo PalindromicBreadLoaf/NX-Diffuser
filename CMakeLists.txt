@@ -18,6 +18,13 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libultraship/CMakeLists.txt")
         "  git submodule update --init --recursive")
 endif()
 
+# --- Nintendo Switch (devkitA64 / libnx) --------------------------------------
+if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    set(CMAKE_C_FLAGS_RELEASE   "-O2 -DNDEBUG")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
+    message(STATUS "G-Diffuser: targeting Nintendo Switch")
+endif()
+
 # Match libultraship's static C runtime (/MT) across the whole tree, or the final link
 # fails with a RuntimeLibrary mismatch (LUS = MT_StaticRelease, default = MD_DynamicRelease).
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")

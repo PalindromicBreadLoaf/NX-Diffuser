@@ -6,7 +6,14 @@ if(NOT DEFINED PROJECT_NAME)
 endif()
 
 set(DECOMP "${CMAKE_CURRENT_SOURCE_DIR}/../decomp")
-find_package(Python3 COMPONENTS Interpreter REQUIRED)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)   # host-side generators only; never on device
+
+# Nintendo Switch port
+if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    set(GDX_SWITCH TRUE)
+else()
+    set(GDX_SWITCH FALSE)
+endif()
 
 # Warning flags for the port's own targets under GCC/Clang; the decomp library and vendored cxd4
 # stay -w (not ours to fix). No -Werror: a Linux first-configure should surface warnings, not fail.
@@ -14,6 +21,16 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang" OR CMAKE_CXX_COMPILER_ID MATCHES "GNU
     set(GDX_PORT_WARN_FLAGS -Wall -Wno-unused-parameter)
 else()
     set(GDX_PORT_WARN_FLAGS "")
+endif()
+
+# Switch adds the 32 to 64-bit pointer-truncation checks
+if(GDX_SWITCH)
+    list(APPEND GDX_PORT_WARN_FLAGS
+        $<$<COMPILE_LANGUAGE:C>:-Werror=pointer-to-int-cast>
+        $<$<COMPILE_LANGUAGE:C>:-Werror=int-to-pointer-cast>
+        $<$<COMPILE_LANGUAGE:C>:-Werror=int-conversion>
+        $<$<COMPILE_LANGUAGE:C>:-Werror=implicit-function-declaration>
+        $<$<COMPILE_LANGUAGE:C>:-Werror=incompatible-pointer-types>)
 endif()
 
 # Decomp game C compiled for PC. libultra/* is excluded (libultraship provides it) except gu/
@@ -255,11 +272,12 @@ endif()
 
 # Discord Rich Presence: vendored static discord-rpc (see its CMakeLists for provenance and the
 # strip rationale). EXCLUDE_FROM_ALL keeps it out of the test targets' builds.
-add_subdirectory(third_party/discord-rpc EXCLUDE_FROM_ALL)
+if(NOT GDX_SWITCH)
+    add_subdirectory(third_party/discord-rpc EXCLUDE_FROM_ALL)
+endif()
 
 add_executable(G-Diffuser
     main.cpp
-    gdx_discord.cpp
     gdx_gui.cpp
     gdx_menu.cpp
     gdx_menu_registry.cpp
@@ -286,7 +304,6 @@ add_executable(G-Diffuser
     resource/ResourceFactories.cpp
     gdx_firstboot.cpp
     gdx_extract_launch.cpp
-    gdx_dump_launch.cpp
     gdx_firstboot_gui.cpp
     rom_buffer.cpp
     sram_buffer.cpp
@@ -305,6 +322,12 @@ add_executable(G-Diffuser
                                 # rom_buffer.cpp and gen/AssetBindings.c
     "${CMAKE_CURRENT_SOURCE_DIR}/../torch/lib/libmio0/mio0.c"
     $<TARGET_OBJECTS:gdiffuser_game>)
+
+if(NOT GDX_SWITCH)
+    target_sources(G-Diffuser PRIVATE gdx_discord.cpp gdx_dump_launch.cpp)
+else()
+    target_sources(G-Diffuser PRIVATE gdx_switch_controller_applet.c)
+endif()
 
 if(GDX_EXPANSION_KIT)
     # All four files reference EK-only symbols (gdx_ek_assets_fill, machine_create labels, EK
@@ -394,6 +417,9 @@ add_custom_command(TARGET G-Diffuser POST_BUILD
             "$<TARGET_FILE_DIR:G-Diffuser>/LICENSES"
     VERBATIM)
 
+# Archives are produced on PC then copied to Switch
+if(NOT GDX_SWITCH)
+
 # gdx-extract, the standalone deterministic O2R extractor first boot spawns as a child process.
 # Isolated ExternalProject, NOT add_subdirectory'd:
 # Torch pulls its own spdlog/fmt/yaml-cpp via FetchContent, and out-of-tree prevents ODR/version
@@ -468,6 +494,8 @@ add_custom_command(TARGET G-Diffuser POST_BUILD
             --ek-yaml-dir "${CMAKE_SOURCE_DIR}/fzerox-expansion-kit/assets/yaml/jp"
     VERBATIM)
 
+endif()
+
 target_include_directories(G-Diffuser PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"   # for "resource/ResourceFactories.h"
     "${DECOMP}/include"
@@ -476,11 +504,20 @@ target_include_directories(G-Diffuser PRIVATE
 )
 
 target_link_libraries(G-Diffuser PRIVATE cxd4_rsp)
-target_link_libraries(G-Diffuser PRIVATE discord-rpc)
+if(NOT GDX_SWITCH)
+    target_link_libraries(G-Diffuser PRIVATE discord-rpc)
+endif()
 
 if(WIN32)
     # user32: MessageBox; Comdlg32: ROM picker; Comctl32: extraction progress marquee.
     target_link_libraries(G-Diffuser PRIVATE user32 Comdlg32 Comctl32)
+elseif(GDX_SWITCH)
+    find_package(SDL2 REQUIRED)
+    target_link_libraries(G-Diffuser PRIVATE SDL2::SDL2 -lglad)
+    target_compile_options(G-Diffuser PRIVATE -pthread)
+    target_link_options(G-Diffuser PRIVATE
+        -pthread
+        -Wl,--wrap=hidLaShowControllerSupportForSystem)
 else()
     # pthread for the fiber backend + audio thread; dl for dladdr in n64_gfx_bridge.cpp
     # (needed on older glibc, harmless on newer).
@@ -505,8 +542,11 @@ if(NOT MSVC)
     # Linux audio fix: the decomp's sinf/cosf were exported from .dynsym and interposed the ones
     # libSDL3's resampler imports -> silent/garbled audio. The version script localizes them so
     # libSDL3 gets glibc's. Full writeup in port/gdx_hide_libm.map.
-    target_link_options(G-Diffuser PRIVATE
-        "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/gdx_hide_libm.map")
+    # Not on Switch since it's static anyways.
+    if(NOT GDX_SWITCH)
+        target_link_options(G-Diffuser PRIVATE
+            "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/gdx_hide_libm.map")
+    endif()
 endif()
 if(TARGET libultraship)
     target_link_libraries(G-Diffuser PRIVATE libultraship)
@@ -515,6 +555,8 @@ if(TARGET libultraship)
         "${CMAKE_SOURCE_DIR}/libultraship/include"
     )
 endif()
+
+if(NOT GDX_SWITCH)
 
 # DSP unit-test harness: compiles n64_audio_hle.c UNMODIFIED and drives it black-box through
 # gdx_audio_hle_run (design rationale in dsp_tests.c's header). Stand-ins for the two
@@ -555,6 +597,8 @@ elseif(GDX_PORT_WARN_FLAGS)
     target_compile_options(gdx_vi_fallback_tests PRIVATE ${GDX_PORT_WARN_FLAGS})
 endif()
 
+endif()  # NOT GDX_SWITCH
+
 add_executable(gdx_fiber_tests
     tests/fiber_tests.c
     "${CMAKE_CURRENT_SOURCE_DIR}/gdx_fiber_${GDX_FIBER_BACKEND_RESOLVED}.c")
@@ -564,7 +608,10 @@ if(MSVC)
 elseif(GDX_PORT_WARN_FLAGS)
     target_compile_options(gdx_fiber_tests PRIVATE ${GDX_PORT_WARN_FLAGS})
 endif()
-if(NOT WIN32)
+if(GDX_SWITCH)
+    target_compile_options(gdx_fiber_tests PRIVATE -pthread)
+    target_link_options(gdx_fiber_tests PRIVATE -pthread)
+elseif(NOT WIN32)
     find_package(Threads REQUIRED)
     target_link_libraries(gdx_fiber_tests PRIVATE Threads::Threads)
 endif()
@@ -597,6 +644,8 @@ if(MSVC)
 elseif(GDX_PORT_WARN_FLAGS)
     target_compile_options(gdx_gfx_convert_tests PRIVATE ${GDX_PORT_WARN_FLAGS})
 endif()
+
+if(NOT GDX_SWITCH)
 
 # Resource smoke test: links libultraship only (no game objects), so the .o2r pipeline can be
 # verified independently of the full game.
@@ -636,6 +685,8 @@ else()
     target_compile_options(gdx_rsp_boot_tests PRIVATE -w)
 endif()
 
+endif()  # NOT GDX_SWITCH
+
 # EXPERIMENTAL second binary — G-Diffuser-JP (VERSION_JP profile).
 # The port is US-only in three compile-time layers (binding tables, golden constants, VERSION_JP
 # decomp branches), so US+JP cannot share one executable; the frozen decision
@@ -644,6 +695,11 @@ endif()
 # headers do not exist, the VERSION_JP decomp sites have never been built here, the EK gen files
 # are US-EK placeholders, and gen/LinkStubs.jp.c needs regenerating from a JP link log.
 option(GDX_BUILD_JP "Build the EXPERIMENTAL second binary G-Diffuser-JP (VERSION_JP profile)" OFF)
+
+if(GDX_SWITCH AND GDX_BUILD_JP)
+    message(STATUS "G-Diffuser: GDX_BUILD_JP is not supported on Switch.")
+    set(GDX_BUILD_JP OFF)
+endif()
 
 if(GDX_BUILD_JP)
     message(STATUS "G-Diffuser: GDX_BUILD_JP=ON — configuring EXPERIMENTAL VERSION_JP target G-Diffuser-JP.")
