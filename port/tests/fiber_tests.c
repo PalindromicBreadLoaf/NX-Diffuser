@@ -5,6 +5,7 @@
  * every check passes.
  */
 #include "gdx_fiber.h"
+#include "test_console_out.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -206,6 +207,7 @@ int main(void) {
     int allResumed = 1;
     int stacksDistinct = 1;
 
+    gdx_test_console_out("gdx_fiber_tests.log");
     printf("=== gdx_fiber_tests ===\n");
 #if GDX_FIBER_TEST_REGISTERS
     printf("backend under test: aarch64\n");

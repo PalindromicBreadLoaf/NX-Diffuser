@@ -5,6 +5,7 @@
 // Returns 0 iff every check passes; non-zero (and prints [FAIL]) otherwise.
 
 #include "n64_gfx_convert.h"
+#include "test_console_out.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -256,6 +257,7 @@ static void TestCache() {
 }
 
 int main() {
+    gdx_test_console_out("gdx_gfx_convert_tests.log");
     printf("== Phase G2 binary-DL converter tests ==\n");
     TestLayout();
     TestClassify();

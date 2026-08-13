@@ -18,6 +18,8 @@
 /* K0_TO_PHYS, for the gSPMatrix(gfx, K0_TO_PHYS(&mtx), ...) idiom. */
 #include <PR/R4300.h>
 
+#include "test_console_out.h"
+
 #include <stdio.h>
 #include <string.h>
 
@@ -66,6 +68,7 @@ static unsigned int read_opcode(const void* base, size_t index) {
 }
 
 int main(void) {
+    gdx_test_console_out("gdx_gfx_pack_tests.log");
     printf("=== Phase G1 wide-Gfx packing tests ===\n");
 
     check_sz("sizeof(Gfx)", sizeof(Gfx), 16);
