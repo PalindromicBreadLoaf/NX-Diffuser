@@ -328,8 +328,8 @@ if(NOT GDX_SWITCH)
     target_sources(G-Diffuser PRIVATE gdx_discord.cpp gdx_dump_launch.cpp)
 else()
     # gdx_switch_stubs.cpp defines what the two sources above it are being dropped for.
-    target_sources(G-Diffuser PRIVATE gdx_switch_controller_applet.c gdx_switch_memquery.c
-                                      gdx_switch_stubs.cpp)
+    target_sources(G-Diffuser PRIVATE gdx_switch_controller_applet.c gdx_switch_exception.c
+                                      gdx_switch_memquery.c gdx_switch_stubs.cpp)
 endif()
 
 if(GDX_EXPANSION_KIT)

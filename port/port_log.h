@@ -155,6 +155,9 @@ static inline void gdx_crash_report_write(const char* message) {
             fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
             if (fd >= 0) {
                 write(fd, message, strlen(message));
+#if defined(__SWITCH__)
+                fsync(fd);
+#endif
                 close(fd);
             }
         }
