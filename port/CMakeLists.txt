@@ -326,7 +326,9 @@ add_executable(G-Diffuser
 if(NOT GDX_SWITCH)
     target_sources(G-Diffuser PRIVATE gdx_discord.cpp gdx_dump_launch.cpp)
 else()
-    target_sources(G-Diffuser PRIVATE gdx_switch_controller_applet.c gdx_switch_memquery.c)
+    # gdx_switch_stubs.cpp defines what the two sources above it are being dropped for.
+    target_sources(G-Diffuser PRIVATE gdx_switch_controller_applet.c gdx_switch_memquery.c
+                                      gdx_switch_stubs.cpp)
 endif()
 
 if(GDX_EXPANSION_KIT)
@@ -513,7 +515,7 @@ if(WIN32)
     target_link_libraries(G-Diffuser PRIVATE user32 Comdlg32 Comctl32)
 elseif(GDX_SWITCH)
     find_package(SDL2 REQUIRED)
-    target_link_libraries(G-Diffuser PRIVATE SDL2::SDL2 -lglad)
+    target_link_libraries(G-Diffuser PRIVATE SDL2::SDL2)
     target_compile_options(G-Diffuser PRIVATE -pthread)
     target_link_options(G-Diffuser PRIVATE
         -pthread
@@ -554,6 +556,17 @@ if(TARGET libultraship)
         "${CMAKE_SOURCE_DIR}/libultraship/src"
         "${CMAKE_SOURCE_DIR}/libultraship/include"
     )
+endif()
+
+if(GDX_SWITCH)
+    target_link_libraries(G-Diffuser PRIVATE -lglad)
+
+    # Keep identical to kGdxVersionString
+    nx_generate_nacp(G-Diffuser.nacp
+        NAME    "G-Diffuser"
+        AUTHOR  "Zorkats & PalindromicBreadLoaf"
+        VERSION "1.0.0")
+    nx_create_nro(G-Diffuser NACP G-Diffuser.nacp)
 endif()
 
 if(NOT GDX_SWITCH)
@@ -686,6 +699,16 @@ else()
 endif()
 
 endif()  # NOT GDX_SWITCH
+
+if(GDX_SWITCH)
+    foreach(gdx_test_nro gdx_fiber_tests gdx_gfx_pack_tests gdx_gfx_convert_tests)
+        nx_generate_nacp(${gdx_test_nro}.nacp
+            NAME    "${gdx_test_nro}"
+            AUTHOR  "Zorkats & PalindromicBreadLoaf"
+            VERSION "1.0.0")
+        nx_create_nro(${gdx_test_nro} NACP ${gdx_test_nro}.nacp)
+    endforeach()
+endif()
 
 # EXPERIMENTAL second binary — G-Diffuser-JP (VERSION_JP profile).
 # The port is US-only in three compile-time layers (binding tables, golden constants, VERSION_JP
