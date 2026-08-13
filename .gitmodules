@@ -7,7 +7,8 @@
 	url = https://github.com/Zorkats/Torch.git
 [submodule "decomp"]
 	path = decomp
-	url = https://github.com/Zorkats/fzerox.git
+	url = https://github.com/PalindromicBreadLoaf/fzerox.git
+	branch = switch
 [submodule "fzerox-expansion-kit"]
 	path = fzerox-expansion-kit
 	url = https://github.com/Zorkats/fzerox-expansion-kit.git
