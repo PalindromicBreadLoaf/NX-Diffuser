@@ -50,6 +50,7 @@
 #include "gdx_audio_thread.h"
 #include "gdx_perf.h"
 #include "port_log.h"
+#include "gdx_thread_affinity.h"
 #include "libultraship/bridge/audiobridge.h"
 
 #include <atomic>
@@ -214,6 +215,7 @@ bool ResolveKillSwitch(int argc, char** argv) {
 
 void AudioThreadMain() {
     using namespace std::chrono_literals;
+    gdx_thread_affinity_pin("audio", GDX_CORE_AUDIO);
     gdx_port_logf("[audio-thread] dedicated audio thread started (DesiredBuffered=%d)\n",
                   AudioPlayerGetDesiredBuffered());
 

@@ -43,6 +43,7 @@ struct PerfState {
 
     // Main-thread-only; no lock needed.
     Clock::time_point subStart[GDX_PERF_SUB_COUNT]{};
+    bool subOpen[GDX_PERF_SUB_COUNT]{};
     double subMs[GDX_PERF_SUB_COUNT]{};      // current frame
     double subAccumMs[GDX_PERF_SUB_COUNT]{}; // summary window accumulation
     std::thread::id mainThread{};            // captured at PerfFrameBegin; sub timers guard against it
@@ -55,9 +56,12 @@ struct PerfState {
     std::vector<double> audioTicks;
 };
 
-// Clamped at 0 in case a seam's wall-clock straddles the phase boundary by a hair.
-double subLogicMs(double gametickMs, const double* sub) {
-    double logic = gametickMs - sub[GDX_PERF_SUB_XLATE] - sub[GDX_PERF_SUB_RUN] - sub[GDX_PERF_SUB_MIRROR];
+double gameFrameMs(const double* phase) {
+    return phase[PerfGameTick] + phase[PerfDispatch];
+}
+
+double subLogicMs(double gameMs, const double* sub) {
+    double logic = gameMs - sub[GDX_PERF_SUB_XLATE] - sub[GDX_PERF_SUB_RUN] - sub[GDX_PERF_SUB_MIRROR];
     return logic > 0.0 ? logic : 0.0;
 }
 
@@ -120,7 +124,11 @@ void emitSummary(PerfState& s) {
     for (int i = 0; i < GDX_PERF_SUB_COUNT; ++i) {
         subMean[i] = s.subAccumMs[i] / n;
     }
-    const double logicMean = subLogicMs(s.phaseAccumMs[PerfGameTick] / n, subMean);
+    double phaseMean[PerfPhaseCount];
+    for (int i = 0; i < PerfPhaseCount; ++i) {
+        phaseMean[i] = s.phaseAccumMs[i] / n;
+    }
+    const double logicMean = subLogicMs(gameFrameMs(phaseMean), subMean);
 
     // run[...] is the breakdown INSIDE run, not extra time on top of it. Read it per TICK, not per
     // pass: each term is already summed over the M sub-frames the tick presented, which is the
@@ -137,7 +145,7 @@ void emitSummary(PerfState& s) {
                   // bridge = what gdx_gfx_run spends OUTSIDE translation and the sub-frame burst;
                   // decomp = the actual game frame. Separate owners, so never one "logic" figure.
                   subMean[GDX_PERF_SUB_GFXRUN] - subMean[GDX_PERF_SUB_XLATE] - subMean[GDX_PERF_SUB_RUN],
-                  (s.phaseAccumMs[PerfGameTick] / n) - subMean[GDX_PERF_SUB_GFXRUN],
+                  gameFrameMs(phaseMean) - subMean[GDX_PERF_SUB_GFXRUN],
                   subMean[GDX_PERF_SUB_SETUP], subMean[GDX_PERF_SUB_POST],
                   subMean[GDX_PERF_SUB_FBMIRROR], aP95, aMax);
 
@@ -171,6 +179,8 @@ void PerfFrameBegin() {
     s.mainThread = std::this_thread::get_id();
     std::memset(s.phaseMs, 0, sizeof(s.phaseMs));
     std::memset(s.subMs, 0, sizeof(s.subMs));
+    // A seam still open at a frame boundary belongs to no frame.
+    std::memset(s.subOpen, 0, sizeof(s.subOpen));
 }
 
 void PerfPhaseBegin(PerfPhase p) {
@@ -209,7 +219,7 @@ void PerfFrameEnd() {
     const double workMs = total - waitMs;
     if (workMs > kSpikeThresholdMs) {
         ++s.spikeCount;
-        const double logic = subLogicMs(s.phaseMs[PerfGameTick], s.subMs);
+        const double logic = subLogicMs(gameFrameMs(s.phaseMs), s.subMs);
         gdx_port_logf("[GDX perf] SPIKE work=%.1fms total=%.1fms: events=%.1f input=%.1f "
                       "gametick=%.1f guistart=%.1f dispatch=%.1f ticks=%.1f present=%.1f pacer=%.1f "
                       "| sub: logic=%.1f xlate=%.1f run=%.1f mirror=%.1f\n",
@@ -250,6 +260,7 @@ extern "C" void gdx_perf_sub_begin(int id) {
         return;
     }
     s.subStart[id] = gdx::Clock::now();
+    s.subOpen[id] = true;
 }
 
 extern "C" void gdx_perf_sub_end(int id) {
@@ -260,5 +271,9 @@ extern "C" void gdx_perf_sub_end(int id) {
     if (s.mainThread != std::this_thread::get_id()) {
         return;
     }
+    if (!s.subOpen[id]) {
+        return;
+    }
+    s.subOpen[id] = false;
     s.subMs[id] += gdx::toMs(gdx::Clock::now() - s.subStart[id]);
 }
