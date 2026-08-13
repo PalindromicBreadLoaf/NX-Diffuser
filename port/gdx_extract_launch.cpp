@@ -2039,6 +2039,11 @@ int GdxExtractExpectedIplEntryCount() {
     return static_cast<int>(kIplExpectedEntryCount);
 }
 
+std::string GdxExtractExpectedCartSha256() {
+    std::string expected = toLowerHex(std::string(GDX_O2R_EXPECTED_SHA256));
+    return isPlaceholderSha256(expected) ? std::string() : expected;
+}
+
 void GdxExtractResetAsync() {
     AsyncExtractState& s = asyncState();
     if (s.worker.joinable()) {

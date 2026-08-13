@@ -704,4 +704,88 @@ bool GdxFirstBootSetupRun(const std::string& dataDir, const std::string& exeDir,
     return completed;
 }
 
+void GdxHostArchiveNoticeRun(const std::string& dataDir, const std::string& reason) {
+    auto ctx = Ship::Context::GetInstance();
+    auto w = (ctx != nullptr) ? ctx->GetWindow() : nullptr;
+    if (w == nullptr) {
+        gdx_port_logf("[setup] cannot show the missing archive screen\n");
+        return;
+    }
+
+    // Nothing on device can change these while the screen is up
+    const std::vector<GdxArchiveRequirement> rows = GdxDescribeHostProducedArchives(dataDir);
+
+    while (w->IsRunning()) {
+        w->HandleEvents();
+
+        w->GetMouseStateManager()->StartFrame();
+        w->GetGui()->StartDraw();
+
+        const ImGuiViewport* vp = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(760.0f, 0.0f), ImGuiCond_Always);
+        const ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
+                                       ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                                       ImGuiWindowFlags_NoDocking;
+        if (ImGui::Begin("G-Diffuser files needed", nullptr, flags)) {
+            ImFont* large = GdxGuiFontLarge();
+            if (large != nullptr) {
+                ImGui::PushFont(large);
+            }
+            ImGui::TextUnformatted("Copy these files next to G-Diffuser.nro");
+            if (large != nullptr) {
+                ImGui::PopFont();
+            }
+            if (!reason.empty()) {
+                ImGui::TextColored(ImVec4(0.90f, 0.45f, 0.35f, 1.0f), "%s", reason.c_str());
+                ImGui::Spacing();
+            }
+            ImGui::TextWrapped(
+                "NX-Diffuser cannot build its asset archives. Build "
+                "them once with the Windows or Linux build's gdx-extract, using your own F-Zero X "
+                "cartridge, Expansion Kit disk and 64DD IPL dumps, then copy the results into:");
+            ImFont* mono = GdxGuiFontMono();
+            if (mono != nullptr) {
+                ImGui::PushFont(mono);
+            }
+            ImGui::TextWrapped("%s", dataDir.c_str());
+            if (mono != nullptr) {
+                ImGui::PopFont();
+            }
+            ImGui::Separator();
+
+            for (const GdxArchiveRequirement& r : rows) {
+                ImGui::SeparatorText(r.fileName);
+                if (r.satisfied) {
+                    ImGui::TextColored(ImVec4(0.35f, 0.80f, 0.35f, 1.0f), "OK  (%s)", r.detail.c_str());
+                } else {
+                    ImGui::TextColored(ImVec4(0.90f, 0.45f, 0.35f, 1.0f), "%s", r.detail.c_str());
+                }
+                ImGui::TextWrapped("%s", r.what);
+                if (!r.satisfied) {
+                    if (mono != nullptr) {
+                        ImGui::PushFont(mono);
+                    }
+                    ImGui::TextWrapped("%s", r.howToBuild);
+                    if (mono != nullptr) {
+                        ImGui::PopFont();
+                    }
+                }
+            }
+
+            ImGui::Separator();
+            ImGui::TextWrapped(
+                "Close G-Diffuser, add the files above to the SD card, then relaunch from hbmenu.");
+        }
+        ImGui::End();
+
+        w->StartFrame();
+        w->RunGuiOnly();
+        w->GetGui()->EndDraw();
+        w->EndFrame();
+    }
+
+    gdx_port_logf("[setup] missing archive screen closed\n");
+}
+
 } // namespace gdx

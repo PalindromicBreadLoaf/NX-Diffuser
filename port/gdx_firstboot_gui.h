@@ -27,4 +27,7 @@ namespace gdx {
 // with those rows pre-filled.
 bool GdxFirstBootSetupRun(const std::string& dataDir, const std::string& exeDir, std::string& outRomPath);
 
+// The console counterpart of the wizard.
+void GdxHostArchiveNoticeRun(const std::string& dataDir, const std::string& reason = {});
+
 } // namespace gdx

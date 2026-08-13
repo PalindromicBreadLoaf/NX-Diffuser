@@ -57,6 +57,8 @@ constexpr const char* kDiskArchiveName = "fzerox-disk.o2r";
 // the in-tree archive at assets/extracted/generic.o2r. GdxFirstBootDescribeMissing accepts either
 // name as satisfying the game-archive input.
 constexpr const char* kGameArchiveDevName = "generic.o2r";
+constexpr const char* kShaderArchiveName = "gdiffuser.o2r";
+constexpr const char* kShaderArchiveDevName = "f3d.o2r";
 
 // ── Known-good SHA-1 identity tables (region/dump recognition) ──────────────────────────────────────
 // Named tables so the future JP build can reuse the same sets (it would accept kRomSha1JpRev0 as
@@ -136,6 +138,9 @@ const char* const kRomDevCandidates[] = { "baserom.us.rev0.z64", "fzerox.z64", "
 
 fs::path executableDir(const char* argv0) {
     std::error_code ec;
+    if constexpr (kGdxExeDirIsWorkingDir) {
+        return fs::current_path(ec);
+    }
 #ifdef _WIN32
     wchar_t buf[MAX_PATH] = {};
     DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
@@ -766,6 +771,26 @@ FirstBootResult FirstBootRun(const char* argv0) {
                       dataDir.string().c_str());
     }
 
+    if constexpr (kGdxArchivesAreHostProduced) {
+        std::vector<GdxArchiveRequirement> rows = GdxDescribeHostProducedArchives(dataDir.string());
+        bool ready = true;
+        for (const GdxArchiveRequirement& r : rows) {
+            gdx_port_logf("[firstboot] %-16s %s (%s)\n", r.fileName, r.satisfied ? "OK" : "MISSING",
+                          r.detail.c_str());
+            ready = ready && r.satisfied;
+        }
+        if (ready) {
+            result.status = FirstBootStatus::SetupComplete;
+            gdx_port_logf("[firstboot] booting archive from %s\n",
+                          dataDir.string().c_str());
+        } else {
+            result.status = FirstBootStatus::NeedsSetup;
+            gdx_port_logf("[firstboot] showing the 'copy these files' message"
+                          "screen (%s)\n", dataDir.string().c_str());
+        }
+        return result;
+    }
+
     SetupState st = loadState(dataDir);
 
     // Fast path: setup previously completed AND every input is still satisfied. Each canonical input
@@ -1135,6 +1160,103 @@ std::string GdxFirstBootDescribeMissing(const std::string& dataDirIn) {
         out += "  - " + line + "\n";
     }
     return out;
+}
+
+std::vector<GdxArchiveRequirement> GdxDescribeHostProducedArchives(const std::string& dataDirIn) {
+    std::error_code ec;
+    const fs::path dataDir = dataDirIn.empty() ? fs::current_path(ec) : fs::path(dataDirIn);
+    ec.clear();
+
+    std::vector<GdxArchiveRequirement> rows;
+    {
+        GdxArchiveRequirement r{ kShaderArchiveName, "Fast3D shaders",
+                                 "included in the release zip", false, {} };
+        if (fileExists(dataDir / kShaderArchiveName) || fileExists(dataDir / kShaderArchiveDevName)) {
+            r.satisfied = true;
+            r.detail = "found";
+        } else {
+            r.detail = "missing. Please copy it from the release zip";
+        }
+        rows.push_back(r);
+    }
+
+    // Game assets.
+    {
+        GdxArchiveRequirement r{ kGameArchiveName, "game assets, built from your F-Zero X ROM",
+                                 "gdx-extract o2r baserom.us.rev0.z64 -s decomp-recipes -d . -u 2027490995",
+                                 false, {} };
+        const fs::path archive = dataDir / kGameArchiveName;
+        if (!fileExists(archive)) {
+            r.detail = fileExists(dataDir / (std::string(kGameArchiveName) + ".bad"))
+                           ? "missing because a previous boot quarantined it as fzerox.o2r.bad"
+                           : "missing";
+        } else {
+            const std::string expected = GdxExtractExpectedCartSha256();
+            if (expected.empty()) {
+                r.satisfied = true;
+                r.detail = "found";
+            } else if (GdxExtractIsArchiveValidatedThisBoot(GdxExtractArchiveKind::Cart)) {
+                r.satisfied = true;
+                r.detail = "verified";
+            } else {
+                const std::string actual = GdxExtractFileSha256(archive.string().c_str());
+                if (actual.empty()) {
+                    r.detail = "unreadable";
+                } else if (actual == expected) {
+                    GdxExtractMarkArchiveValidated(GdxExtractArchiveKind::Cart);
+                    r.satisfied = true;
+                    r.detail = "verified";
+                } else {
+                    r.detail = "does not match this build. Please rebuild it on the PC";
+                }
+            }
+        }
+        rows.push_back(r);
+    }
+
+    // EK disk and IPL
+    {
+        GdxArchiveRequirement r{ kDiskArchiveName, "Expansion Kit disk",
+                                 "gdx-extract disk baserom.translated.ek.ndd -d . "
+                                 "-m decomp-recipes/ek_slice_manifest.txt",
+                                 false, {} };
+        if (fileExists(dataDir / kDiskArchiveName)) {
+            r.satisfied = true;
+            r.detail = "found";
+        } else if (fileExists(dataDir / kDiskName) || fileExists(dataDir / kDiskNameJp)) {
+            r.satisfied = true;
+            r.detail = "satisfied by the disk image itself";
+        } else {
+            r.detail = "missing";
+        }
+        rows.push_back(r);
+    }
+
+    {
+        GdxArchiveRequirement r{ kIplArchiveName, "64DD IPL font block",
+                                 "gdx-extract ipl N64DDIPLROM.n64 -d .", false, {} };
+        if (fileExists(dataDir / kIplArchiveName)) {
+            r.satisfied = true;
+            r.detail = "found";
+        } else if (!GdxFindIplSourceInDir(dataDir.string()).empty()) {
+            r.satisfied = true;
+            r.detail = "satisfied by the IPL ROM";
+        } else {
+            r.detail = "missing";
+        }
+        rows.push_back(r);
+    }
+
+    return rows;
+}
+
+bool GdxHostProducedArchivesReady(const std::string& dataDir) {
+    for (const GdxArchiveRequirement& r : GdxDescribeHostProducedArchives(dataDir)) {
+        if (!r.satisfied) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool NativeFilePickerAvailable() {

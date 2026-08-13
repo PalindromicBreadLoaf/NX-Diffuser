@@ -107,6 +107,9 @@ int GdxExtractExpectedCartEntryCount();
 // constant so gdx_extract_launch.cpp stays the single source of truth for the value.
 int GdxExtractExpectedIplEntryCount();
 
+// The golden SHA-256 (lowercase hex) this build expects fzerox.o2r to have.
+std::string GdxExtractExpectedCartSha256();
+
 // ── ROM identity helpers for the setup GUI ───────────────────────────────────────────────────────
 // The setup screen shows the user their ROM's SHA-1 against the expected US-rev0 hash so a wrong
 // dump is diagnosed at acquisition time rather than at extraction time.

@@ -9,8 +9,25 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace gdx {
+
+// True on platforms that cannot run gdx-extract
+inline constexpr bool kGdxArchivesAreHostProduced =
+#if defined(__SWITCH__)
+    true;
+#else
+    false;
+#endif
+
+// True where argv[0] is device-qualified
+inline constexpr bool kGdxExeDirIsWorkingDir =
+#if defined(__SWITCH__)
+    true;
+#else
+    false;
+#endif
 
 enum class FirstBootStatus {
     DevLayout,      // A development tree supplies generic.o2r, a ROM, AND a valid EK disk + IPL, so
@@ -210,6 +227,19 @@ enum class GdxFirstbootArchiveKind { Game, Ipl, Disk };
 // Browse click), never per-frame. A future per-frame caller MUST memoize on (kind, mtime, size)
 // first -- the underlying hash is not free.
 bool GdxFirstbootArchiveSatisfies(GdxFirstbootArchiveKind kind, const std::string& dataDir);
+
+struct GdxArchiveRequirement {
+    const char* fileName;
+    const char* what;
+    const char* howToBuild;
+    bool satisfied = false;
+    std::string detail;     // why not satisfied
+};
+
+std::vector<GdxArchiveRequirement> GdxDescribeHostProducedArchives(const std::string& dataDir);
+
+// True when everything is ready to boot.
+bool GdxHostProducedArchivesReady(const std::string& dataDir);
 
 // True when a native "Browse…" file picker is available on this platform (Windows only). On other
 // platforms the GUI relies exclusively on drag & drop (no native picker in this port).

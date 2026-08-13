@@ -38,6 +38,10 @@
 #include "gdx_audio_thread.h"
 #include "gdx_frame_pacer.h"
 #include "n64_gfx_bridge.h"
+#include "gdx_host_path.h"
+#ifdef __SWITCH__
+#include "ship/port/switch/SwitchImpl.h"
+#endif
 #include <SDL2/SDL.h>
 
 #include <algorithm>
@@ -489,10 +493,7 @@ static void addArchiveCandidateRoots(std::vector<std::filesystem::path>& roots, 
         return;
     }
 
-    start = std::filesystem::absolute(start, ec);
-    if (ec) {
-        ec.clear();
-    }
+    start = gdx::HostAbsolute(start);
     if (std::filesystem::is_regular_file(start, ec)) {
         start = start.parent_path();
         ec.clear();
@@ -568,7 +569,7 @@ static std::vector<std::string> findArchivePaths(const char* argv0) {
             for (const auto& root : roots) {
                 const auto candidate = root / name;
                 if (std::filesystem::exists(candidate, ec) && std::filesystem::is_regular_file(candidate, ec)) {
-                    archives.push_back(std::filesystem::absolute(candidate, ec).string());
+                    archives.push_back(gdx::HostAbsolute(candidate).string());
                     found = true;
                     break;
                 }
@@ -617,7 +618,7 @@ static std::vector<std::string> findArchivePaths(const char* argv0) {
                 gdx_port_logf("[workshop] pack: %s (disabled)\n", basename.c_str());
                 continue;
             }
-            mods.emplace_back(keyLower, std::filesystem::absolute(entry.path(), ec).string());
+            mods.emplace_back(keyLower, gdx::HostAbsolute(entry.path()).string());
         }
         std::sort(mods.begin(), mods.end());
         for (const auto& [keyLower, path] : mods) {
@@ -632,6 +633,10 @@ static std::vector<std::string> findArchivePaths(const char* argv0) {
 }
 
 int main(int argc, char** argv) {
+#ifdef __SWITCH__
+    Ship::Switch::Init(Ship::PreInitPhase);
+#endif
+
     // Must precede every log call this process makes. Precedence rules in port/gdx_dev_gates.h.
     gdx_dev_gates_init_env();
 
@@ -646,7 +651,9 @@ int main(int argc, char** argv) {
     // a freshly extracted archive is picked up this same boot. Skipped on a development tree,
     // where re-extraction would clobber the developer's working generic.o2r. Never blocks boot —
     // on any failure the raw-ROM fallback carries the session.
-    if (firstBoot.status != gdx::FirstBootStatus::NeedsSetup) {
+    if constexpr (gdx::kGdxArchivesAreHostProduced) {
+        gdx_port_logf("[G-Diffuser] asset extraction is not available on this platform.\n");
+    } else if (firstBoot.status != gdx::FirstBootStatus::NeedsSetup) {
         std::error_code cwdEc;
         const bool devTreeArchive = gdx::DevelopmentTreeProvidesArchive(
             firstBoot.exeDir, std::filesystem::current_path(cwdEc).string());
@@ -908,6 +915,11 @@ int main(int argc, char** argv) {
     // RegisterResourceFactories, LoadAllAssets and bootproc all require the ROM. Closing the
     // window during setup exits cleanly; partial files persist and the next launch resumes.
     if (firstBoot.status == gdx::FirstBootStatus::NeedsSetup) {
+        // A console reaches NeedsSetup only with an archive missing or unverified and thus must close.
+        if constexpr (gdx::kGdxArchivesAreHostProduced) {
+            gdx::GdxHostArchiveNoticeRun(firstBoot.dataDir);
+            return 0;
+        }
         std::string setupRomPath;
         if (!gdx::GdxFirstBootSetupRun(firstBoot.dataDir, firstBoot.exeDir, setupRomPath)) {
             // The dedicated audio thread has not started yet (gdx_audio_thread_start is below), so a
@@ -957,6 +969,13 @@ int main(int argc, char** argv) {
             gdx_port_logf("[G-Diffuser] FATAL: no ROM loaded and no validated archive — cannot start game.\n");
             gdx_port_logf("[G-Diffuser] Place baserom.us.rev0.z64 next to the exe, pass it as an argument, "
                           "or complete first-boot setup so a validated fzerox.o2r archive is installed.\n");
+            if constexpr (gdx::kGdxArchivesAreHostProduced) {
+                gdx::GdxHostArchiveNoticeRun(
+                    firstBoot.dataDir,
+                    "fzerox.o2r was rejected when it was mounted."
+                    "Rebuild it on the PC with -u 2027490995 and copy it back.");
+                return 1;
+            }
 #ifdef _WIN32
             MessageBoxA(nullptr,
                 "No F-Zero X ROM was loaded, and no validated asset archive was found either.\n\n"
