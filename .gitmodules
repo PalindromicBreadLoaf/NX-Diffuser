@@ -1,6 +1,7 @@
 [submodule "libultraship"]
 	path = libultraship
-	url = https://github.com/Zorkats/libultraship.git
+	url = https://github.com/PalindromicBreadLoaf/libultraship-switch.git
+	branch = NX-Diffuser
 [submodule "torch"]
 	path = torch
 	url = https://github.com/Zorkats/Torch.git
