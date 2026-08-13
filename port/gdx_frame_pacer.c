@@ -256,6 +256,7 @@ static void gdx_frame_pacer_init_posix(void) {
 }
 
 static void gdx_sleep_until_ns(int64_t deadlineNs) {
+#if defined(_POSIX_CLOCK_SELECTION)
     struct timespec abs;
     abs.tv_sec = (time_t)(deadlineNs / GDX_PACER_NS_PER_SEC);
     abs.tv_nsec = (long)(deadlineNs % GDX_PACER_NS_PER_SEC);
@@ -270,6 +271,21 @@ static void gdx_sleep_until_ns(int64_t deadlineNs) {
             return; // unexpected error: give up waiting rather than spin
         }
     }
+#else
+    // Rebuild the absolute deadline out of relative nanosleep instead of clock_nanosleep
+    for (;;) {
+        struct timespec rel;
+        int64_t remaining = deadlineNs - gdx_monotonic_now_ns();
+        if (remaining <= 0) {
+            return;
+        }
+        rel.tv_sec = (time_t)(remaining / GDX_PACER_NS_PER_SEC);
+        rel.tv_nsec = (long)(remaining % GDX_PACER_NS_PER_SEC);
+        if (nanosleep(&rel, NULL) != 0 && errno != EINTR) {
+            return;
+        }
+    }
+#endif
 }
 
 void gdx_frame_pacer_tick(void) {
