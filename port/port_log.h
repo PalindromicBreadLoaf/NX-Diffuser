@@ -53,6 +53,8 @@ static inline int gdx_log_file_enabled(void) {
 
 // Exe-relative, matching the saves convention in sram_buffer.cpp; falls back to a CWD-relative
 // bare filename. Shared by both sinks below so they cannot disagree on where the files land.
+// Horizon has no /proc, so the readlink always fails there and the filename fallback IS the
+// console path.
 static inline const char* gdx_exe_relative_path(char* outPath, size_t outCap, const char* fileName) {
 #ifdef _WIN32
     {
@@ -98,9 +100,14 @@ static inline const char* gdx_crash_report_path(char* outPath, size_t outCap) {
     return gdx_exe_relative_path(outPath, outCap, "gdiffuser-crash.txt");
 }
 
-// Holds the file handle open instead of fopen/fclose per call: the Debug CRT's internal dynamic
-// buffer deallocates on a stack frame the fiber scheduler may have switched out, which corrupts
-// the heap when this is called from the GFX fiber.
+#ifdef __cplusplus
+extern "C" {
+#endif
+void gdx_port_log_file_write(const char* message);
+#ifdef __cplusplus
+}
+#endif
+
 static inline void gdx_port_write_log(const char* message) {
     if (message == NULL) {
         return;
@@ -112,45 +119,10 @@ static inline void gdx_port_write_log(const char* message) {
 
 #ifdef _WIN32
     OutputDebugStringA(message);
-    // GUI-subsystem builds have no console, so the file sink is the only way to get boot
-    // diagnostics off a user's machine.
-    if (gdx_log_file_enabled()) {
-        static HANDLE sLogFile = INVALID_HANDLE_VALUE;
-        static int sTriedOpen = 0;
-        if (!sTriedOpen) {
-            sTriedOpen = 1;
-            char logPath[MAX_PATH];
-            gdx_log_file_path(logPath, sizeof(logPath));
-            sLogFile = CreateFileA(logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                                   OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        }
-        if (sLogFile != INVALID_HANDLE_VALUE) {
-            DWORD written = 0;
-            WriteFile(sLogFile, message, (DWORD)lstrlenA(message), &written, NULL);
-        }
-    }
-    fputs(message, stderr);
-    fflush(stderr);
-#else
-    if (gdx_log_file_enabled()) {
-        static FILE* sLogFile = NULL;
-        static int sTriedOpen = 0;
-        if (!sTriedOpen) {
-            sTriedOpen = 1;
-            char logPath[4096];
-            gdx_log_file_path(logPath, sizeof(logPath));
-            if (logPath[0] != '\0') {
-                sLogFile = fopen(logPath, "ab");
-            }
-        }
-        if (sLogFile != NULL) {
-            fputs(message, sLogFile);
-            fflush(sLogFile);
-        }
-    }
-    fputs(message, stderr);
-    fflush(stderr);
 #endif
+    gdx_port_log_file_write(message);
+    fputs(message, stderr);
+    fflush(stderr);
 }
 
 // Deliberately bypasses gdx_log_file_enabled(): field testers set no diagnostic gates, so without

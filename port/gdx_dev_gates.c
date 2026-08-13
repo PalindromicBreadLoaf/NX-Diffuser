@@ -24,6 +24,12 @@ void (*gdx_port_log_tap)(const char* message) = NULL;
 #define GDX_GATE_TRACE_DEFAULT 1
 #endif
 
+#if defined(__SWITCH__)
+#define GDX_GATE_LOG_FILE_DEFAULT 1
+#else
+#define GDX_GATE_LOG_FILE_DEFAULT 0
+#endif
+
 // One positional table — no designated initializers, because the port's C sources are built by
 // MSVC in its default C mode as well as by GCC/Clang.
 typedef struct GdxGateDesc {
@@ -40,7 +46,7 @@ typedef struct GdxGateDesc {
 // clang-format off
 static const GdxGateDesc kGates[GDX_GATE_COUNT] = {
     /* ── Bucket D — logging, boot-seeded (env pins for the run, CVar persists) ───────────────── */
-    /* LOG_FILE          */ { "GDX_LOG",                  "gDevTools.Log.FileSink",           "Write gdiffuser-run.log",       "Opens the persistent file log next to the executable. Also implied by any gate below.",                 GDX_GATE_ENV_OPT_IN,      GDX_GATE_GROUP_LOGGING,    GDX_GATE_BUCKET_BOOT,     0 },
+    /* LOG_FILE          */ { "GDX_LOG",                  "gDevTools.Log.FileSink",           "Write gdiffuser-run.log",       "Opens the persistent file log next to the executable. Also implied by any gate below.",                 GDX_GATE_ENV_OPT_IN,      GDX_GATE_GROUP_LOGGING,    GDX_GATE_BUCKET_BOOT,     GDX_GATE_LOG_FILE_DEFAULT },
     /* TRACE             */ { "GDX_TRACE",                "gDevTools.Log.Trace",              "High-frequency trace",          "Unsilences the per-frame gdx_ck/gdx_cki breadcrumbs sprinkled through the decomp. Debug default: on.",  GDX_GATE_ENV_TRISTATE,    GDX_GATE_GROUP_LOGGING,    GDX_GATE_BUCKET_BOOT,     GDX_GATE_TRACE_DEFAULT },
     /* DIAG_VERBOSE      */ { "GDX_DIAG_VERBOSE",         "gDevTools.Log.Verbose",            "Verbose per-frame families",    "Unsilences [gfxdiag] [game] [seg] [sched] [phasegeom] [bigtri] and the bridge's per-frame aggregates.", GDX_GATE_ENV_OPT_IN,      GDX_GATE_GROUP_LOGGING,    GDX_GATE_BUCKET_BOOT,     0 },
     /* DIAG_UNLOCK       */ { "GDX_DIAG_UNLOCK",          "gDevTools.Log.Unlock",             "Unlock-code path",              "Logs the unlock-code / audio-unlock decision path.",                                                   GDX_GATE_ENV_OPT_IN,      GDX_GATE_GROUP_LOGGING,    GDX_GATE_BUCKET_BOOT,     0 },
