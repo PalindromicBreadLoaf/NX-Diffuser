@@ -21,6 +21,7 @@
 #include "ship/resource/archive/ArchiveManager.h"
 #include "libultraship/bridge/consolevariablebridge.h"
 #include "port_log.h"
+#include "gdx_host_path.h"
 
 #include <algorithm>
 #include <cctype>
@@ -553,7 +554,7 @@ extern "C" void GdxWorkshopReload(char* outStatus, size_t outStatusLen) {
             if (packDisabled(entry.path().filename().string())) {
                 continue;
             }
-            packs.push_back(std::filesystem::absolute(entry.path(), ec).string());
+            packs.push_back(gdx::HostAbsolute(entry.path()).string());
         }
         std::sort(packs.begin(), packs.end(),
                   [](const std::string& a, const std::string& b) { return toLower(a) < toLower(b); });
@@ -641,7 +642,7 @@ std::vector<GdxWorkshopPackInfo> GdxWorkshopListPacks() {
         }
         GdxWorkshopPackInfo info;
         info.basename = entry.path().filename().string();
-        info.path = std::filesystem::absolute(entry.path(), ec).string();
+        info.path = gdx::HostAbsolute(entry.path()).string();
         info.disabled = packDisabled(info.basename);
         info.manifestPresent = !manifestJson.empty();
         info.name = mName;
