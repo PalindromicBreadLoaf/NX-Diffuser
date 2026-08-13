@@ -252,7 +252,8 @@ bool looksLikeEntryProgressLine(const std::string& line) {
     return line.find("- [") != std::string::npos && line.find("] Processing ") != std::string::npos;
 }
 
-void gdxAsyncPublishStage(const std::string& line) {
+// maybe_unused? I dunno
+[[maybe_unused]] void gdxAsyncPublishStage(const std::string& line) {
     AsyncExtractState& s = asyncState();
     std::lock_guard<std::mutex> lk(s.mtx);
     s.stage = line;
@@ -855,7 +856,7 @@ bool atomicReplace(const fs::path& tmp, const fs::path& final) {
 // The exact wording belongs to the extractor, so this scans case-insensitively for "fingerprint" /
 // "extractor" tokens and takes the trailing value. The golden SHA-256 is the gating authority, so an
 // unparsed line never affects correctness.
-void scanStdoutLine(const std::string& line, ExtractState& st) {
+[[maybe_unused]] void scanStdoutLine(const std::string& line, ExtractState& st) {
     auto lower = [](std::string s) {
         for (char& c : s) {
             if (c >= 'A' && c <= 'Z') {
@@ -1082,6 +1083,21 @@ bool runExtractorWindows(const fs::path& exe, const std::wstring& cmdLine, const
         DestroyWindow(wnd);
     }
     return exitCode == 0;
+}
+
+#elif defined(__SWITCH__)
+
+// Archives are built by a desktop G-Diffuser and copied to the SD card beside the NRO.
+bool runExtractorPosix(const fs::path& exe, const std::vector<std::string>& args, const fs::path& workDir,
+                       int& exitCode, ExtractState& state) {
+    (void)exe;
+    (void)args;
+    (void)workDir;
+    (void)state;
+    gdx_port_logf("[extract] ERROR: this build cannot run the extractor. Build the archives with a "
+                  "desktop G-Diffuser and copy them next to the executable.\n");
+    exitCode = 127;
+    return false;
 }
 
 #else // POSIX
