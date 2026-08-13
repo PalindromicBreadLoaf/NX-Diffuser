@@ -152,13 +152,32 @@ if(GDX_EXPANSION_KIT)
     target_compile_definitions(gdiffuser_game PRIVATE EXPANSION_KIT=1 MFS_VERSION=1 BUILD_VERSION=VERSION_J)
 endif()
 
-# Fiber backend for the scheduler (n64_sched.c -> gdx_fiber.h): Win32 fibers on Windows,
-# POSIX ucontext elsewhere.
-if(WIN32)
-    target_sources(gdiffuser_game PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/gdx_fiber_win32.c")
+# AARCH64 fiber backend for the scheduler
+set(GDX_FIBER_BACKEND "auto" CACHE STRING "Fiber backend: auto | win32 | aarch64 | ucontext")
+set_property(CACHE GDX_FIBER_BACKEND PROPERTY STRINGS auto win32 aarch64 ucontext)
+
+if(GDX_FIBER_BACKEND STREQUAL "auto")
+    if(WIN32)
+        set(GDX_FIBER_BACKEND_RESOLVED "win32")
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+        set(GDX_FIBER_BACKEND_RESOLVED "aarch64")
+    else()
+        set(GDX_FIBER_BACKEND_RESOLVED "ucontext")
+    endif()
 else()
-    target_sources(gdiffuser_game PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/gdx_fiber_ucontext.c")
+    set(GDX_FIBER_BACKEND_RESOLVED "${GDX_FIBER_BACKEND}")
 endif()
+
+if(GDX_FIBER_BACKEND_RESOLVED STREQUAL "win32")
+    target_sources(gdiffuser_game PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/gdx_fiber_win32.c")
+elseif(GDX_FIBER_BACKEND_RESOLVED STREQUAL "aarch64")
+    target_sources(gdiffuser_game PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/gdx_fiber_aarch64.c")
+elseif(GDX_FIBER_BACKEND_RESOLVED STREQUAL "ucontext")
+    target_sources(gdiffuser_game PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/gdx_fiber_ucontext.c")
+else()
+    message(FATAL_ERROR "GDX_FIBER_BACKEND='${GDX_FIBER_BACKEND}' is not one of auto win32 aarch64 ucontext")
+endif()
+message(STATUS "Fiber backend: ${GDX_FIBER_BACKEND_RESOLVED}")
 
 target_include_directories(gdiffuser_game PRIVATE
     "${DECOMP}"            # decomp root: the C uses includes relative to it (e.g. "src/audio/...")
@@ -534,6 +553,20 @@ if(MSVC)
     target_compile_options(gdx_vi_fallback_tests PRIVATE /W3)
 elseif(GDX_PORT_WARN_FLAGS)
     target_compile_options(gdx_vi_fallback_tests PRIVATE ${GDX_PORT_WARN_FLAGS})
+endif()
+
+add_executable(gdx_fiber_tests
+    tests/fiber_tests.c
+    "${CMAKE_CURRENT_SOURCE_DIR}/gdx_fiber_${GDX_FIBER_BACKEND_RESOLVED}.c")
+target_include_directories(gdx_fiber_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+if(MSVC)
+    target_compile_options(gdx_fiber_tests PRIVATE /W3)
+elseif(GDX_PORT_WARN_FLAGS)
+    target_compile_options(gdx_fiber_tests PRIVATE ${GDX_PORT_WARN_FLAGS})
+endif()
+if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(gdx_fiber_tests PRIVATE Threads::Threads)
 endif()
 
 # Wide-Gfx packing test: compiles only the real decomp gbi.h with the game's defines, so the
