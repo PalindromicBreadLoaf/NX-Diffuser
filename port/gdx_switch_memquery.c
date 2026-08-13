@@ -26,4 +26,18 @@ void gdx_switch_module_range(uintptr_t* begin, uintptr_t* end) {
     *end = (uintptr_t)__end__;
 }
 
+int gdx_switch_memory_usage(uint64_t* used, uint64_t* total) {
+    u64 usedSize = 0;
+    u64 totalSize = 0;
+
+    if (R_FAILED(svcGetInfo(&usedSize, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0)) ||
+        R_FAILED(svcGetInfo(&totalSize, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0))) {
+        return 0;
+    }
+
+    *used = (uint64_t)usedSize;
+    *total = (uint64_t)totalSize;
+    return 1;
+}
+
 #endif /* __SWITCH__ */

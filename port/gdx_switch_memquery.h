@@ -15,6 +15,8 @@ int gdx_switch_query_memory(uintptr_t addr, uintptr_t* begin, uintptr_t* end, in
 /* The NRO's load range */
 void gdx_switch_module_range(uintptr_t* begin, uintptr_t* end);
 
+int gdx_switch_memory_usage(uint64_t* used, uint64_t* total);
+
 #ifdef __cplusplus
 }
 #endif

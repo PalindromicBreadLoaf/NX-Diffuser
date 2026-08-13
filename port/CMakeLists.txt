@@ -299,6 +299,8 @@ add_executable(G-Diffuser
     gdx_audio_thread.cpp
     gdx_audio_capture.c
     gdx_frame_pacer.c          # default OFF: LUS's Fast3D backend already paces EndFrame() to 60fps
+    gdx_footprint.c
+    gdx_thread_affinity.c
     shims.c
     AssetLoader.cpp
     resource/ResourceFactories.cpp
@@ -512,8 +514,7 @@ if(NOT GDX_SWITCH)
 endif()
 
 if(WIN32)
-    # user32: MessageBox; Comdlg32: ROM picker; Comctl32: extraction progress marquee.
-    target_link_libraries(G-Diffuser PRIVATE user32 Comdlg32 Comctl32)
+    target_link_libraries(G-Diffuser PRIVATE user32 Comdlg32 Comctl32 Psapi)
 elseif(GDX_SWITCH)
     find_package(SDL2 REQUIRED)
     target_link_libraries(G-Diffuser PRIVATE SDL2::SDL2)
@@ -842,6 +843,8 @@ if(GDX_BUILD_JP)
         gdx_audio_thread.cpp
         gdx_audio_capture.c
         gdx_frame_pacer.c
+        gdx_footprint.c
+        gdx_thread_affinity.c
         shims.c
         AssetLoader.cpp
         resource/ResourceFactories.cpp
@@ -902,7 +905,7 @@ if(GDX_BUILD_JP)
     target_link_libraries(G-Diffuser-JP PRIVATE discord-rpc)
 
     if(WIN32)
-        target_link_libraries(G-Diffuser-JP PRIVATE user32 Comdlg32 Comctl32)
+        target_link_libraries(G-Diffuser-JP PRIVATE user32 Comdlg32 Comctl32 Psapi)
     else()
         find_package(Threads REQUIRED)
         target_link_libraries(G-Diffuser-JP PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
