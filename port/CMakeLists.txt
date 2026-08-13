@@ -315,6 +315,7 @@ add_executable(G-Diffuser
     gdx_perf.cpp
     gdx_dev_gates.c            # dependency-free C: CVar entry points arrive as function pointers
                                 # from main.cpp, so the standalone test targets compile it unchanged
+    port_log.c
     gdx_imgui_nav.cpp
     gdx_workshop.cpp
     mio0_wrap.c
@@ -579,7 +580,8 @@ if(NOT GDX_SWITCH)
 add_executable(gdx_dsp_tests
     tests/dsp_tests.c
     n64_audio_hle.c
-    gdx_dev_gates.c)
+    gdx_dev_gates.c
+    port_log.c)
 if(MSVC)
     target_compile_options(gdx_dsp_tests PRIVATE /W3)
 elseif(GDX_PORT_WARN_FLAGS)
@@ -592,7 +594,8 @@ endif()
 add_executable(gdx_pcm_capture_tests
     tests/pcm_capture_tests.c
     gdx_audio_capture.c
-    gdx_dev_gates.c)   # port_log.h's log/trace gates read the developer-gate cache
+    gdx_dev_gates.c
+    port_log.c)
 if(MSVC)
     target_compile_options(gdx_pcm_capture_tests PRIVATE /W3)
 elseif(GDX_PORT_WARN_FLAGS)
@@ -708,6 +711,39 @@ if(GDX_SWITCH)
             VERSION "1.0.0")
         nx_create_nro(${gdx_test_nro} NACP ${gdx_test_nro}.nacp)
     endforeach()
+
+    # SD card staging.
+    set(GDX_SD_STAGE_DIR "${CMAKE_BINARY_DIR}/sdcard/switch/G-Diffuser")
+    set(GDX_SD_ASSET_DIR "" CACHE PATH
+        "Directory holding fzerox.o2r / fzerox-disk.o2r / n64ddipl.o2r to stage onto the SD layout")
+
+    set(gdx_sd_commands
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${GDX_SD_STAGE_DIR}"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "$<TARGET_FILE_DIR:G-Diffuser>/G-Diffuser.nro"
+                "$<TARGET_FILE_DIR:G-Diffuser>/gdx_fiber_tests.nro"
+                "$<TARGET_FILE_DIR:G-Diffuser>/gdx_gfx_pack_tests.nro"
+                "$<TARGET_FILE_DIR:G-Diffuser>/gdx_gfx_convert_tests.nro"
+                "$<TARGET_FILE_DIR:G-Diffuser>/gdiffuser.o2r"
+                "$<TARGET_FILE_DIR:G-Diffuser>/gamecontrollerdb.txt"
+                "${GDX_SD_STAGE_DIR}"
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory
+                "$<TARGET_FILE_DIR:G-Diffuser>/fonts" "${GDX_SD_STAGE_DIR}/fonts")
+
+    foreach(gdx_sd_asset fzerox.o2r fzerox-disk.o2r n64ddipl.o2r)
+        if(GDX_SD_ASSET_DIR AND EXISTS "${GDX_SD_ASSET_DIR}/${gdx_sd_asset}")
+            list(APPEND gdx_sd_commands
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                        "${GDX_SD_ASSET_DIR}/${gdx_sd_asset}" "${GDX_SD_STAGE_DIR}")
+        endif()
+    endforeach()
+
+    add_custom_target(gdx_switch_sdcard
+        ${gdx_sd_commands}
+        COMMENT "Staging the SD card layout in ${GDX_SD_STAGE_DIR}"
+        VERBATIM)
+    add_dependencies(gdx_switch_sdcard
+        G-Diffuser_nro gdx_fiber_tests_nro gdx_gfx_pack_tests_nro gdx_gfx_convert_tests_nro)
 endif()
 
 # EXPERIMENTAL second binary — G-Diffuser-JP (VERSION_JP profile).
@@ -822,6 +858,7 @@ if(GDX_BUILD_JP)
         gdx_fps_overlay.cpp
         gdx_perf.cpp
         gdx_dev_gates.c
+        port_log.c
         gdx_imgui_nav.cpp
         gdx_workshop.cpp
         mio0_wrap.c
