@@ -7860,17 +7860,7 @@ extern "C" int gdx_load_venue_texture_segment(int venue) {
 
     const uint32_t symbol = Low32(reinterpret_cast<uintptr_t>(kGdxVenueSegmentSymbols[venue]));
     uint32_t offset = 0;
-    // [venueload] Attribute the Cup Select stall. This path is invisible to the existing
-    // [transition] timers, which only bracket mode-change ticks -- and Cup Select's course preview
-    // loading is NOT a mode change. It runs one course per game tick from
-    // course_model.c:35-39, so the ~350ms the owner sees is really ~6 consecutive ticks.
-    //
-    // Two candidate causes, and they need opposite fixes, which is why this measures rather than
-    // assumes: either the LOAD itself is expensive (archive read + MIO0 decode + fixups), in which
-    // case preloading the blobs at boot removes it; or the load is cheap and the cost is the
-    // ++gConvertEpoch below invalidating every cached display-list conversion, in which case
-    // preloading changes NOTHING and the fix is scoped epoch invalidation. The epoch counter is
-    // logged alongside so the following ticks' xlate can be correlated.
+
     const double gdxVenueT0 = (gGdxInterpNowFn != nullptr) ? gGdxInterpNowFn() : 0.0;
     const uint32_t gdxEpochBefore = gConvertEpoch;
     const uintptr_t base = EnsureAssetSegmentForSymbol(symbol, &offset);
@@ -7878,7 +7868,7 @@ extern "C" int gdx_load_venue_texture_segment(int venue) {
         gdx_port_logf("[segment] failed to load venue=%d symbol=%08X\n", venue, symbol);
         return 0;
     }
-    if (gGdxInterpNowFn != nullptr) {
+    if (gGdxInterpNowFn != nullptr && gdx_diag_verbose()) {
         gdx_port_logf("[venueload] venue=%d symbol=%08X load=%.2fms epoch %u->%u\n", venue, symbol,
                       (gGdxInterpNowFn() - gdxVenueT0) * 1000.0, (unsigned) gdxEpochBefore,
                       (unsigned) gConvertEpoch);
@@ -8617,7 +8607,7 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
     // cost is the load itself and a boot-time preload fixes it. If it spikes, the ++gConvertEpoch
     // in the load path invalidated every cached conversion and we are paying full re-translation
     // for several consecutive ticks -- which no amount of preloading would avoid.
-    if (gGdxVenueWatchTicks > 0 && gGdxInterpNowFn != nullptr) {
+    if (gGdxVenueWatchTicks > 0 && gGdxInterpNowFn != nullptr && gdx_diag_verbose()) {
         --gGdxVenueWatchTicks;
         gdx_port_logf("[venueload] post tick=%d xlate=%.2fms lists=%zu cmds_out=%zu epoch=%u\n",
                       8 - gGdxVenueWatchTicks, (gGdxInterpNowFn() - gdxXlateT0) * 1000.0,
