@@ -15,8 +15,12 @@
 /* POSIX memory-probe backend: /proc/self/maps snapshot helpers plus the #else branches of
  * GetMainModuleRange / ReadableByteLimit / ReadableCommandLimit / IsReadableAddress. */
 #include <atomic>
-#include <dlfcn.h>
 #include <unistd.h>
+#ifdef __SWITCH__
+#include "gdx_switch_memquery.h"
+#else
+#include <dlfcn.h>
+#endif
 #endif
 
 #include "ship/Context.h"
@@ -1821,6 +1825,23 @@ static std::atomic<uint32_t>   sMapsGeneration{0};
 
 static void ParseProcMaps() {
     std::vector<MapsRegion> parsed;
+#ifdef __SWITCH__
+    uintptr_t addr = 0;
+    for (size_t guard = 0; guard < 4096; ++guard) {
+        uintptr_t begin = 0;
+        uintptr_t end = 0;
+        int readable = 0;
+        if (gdx_switch_query_memory(addr, &begin, &end, &readable) == 0 || end <= addr) {
+            break;
+        }
+        MapsRegion r;
+        r.begin = begin;
+        r.end = end;
+        r.readable = readable != 0;
+        parsed.push_back(r);
+        addr = end;
+    }
+#else
     FILE* f = std::fopen("/proc/self/maps", "r");
     if (f != nullptr) {
         char line[512];
@@ -1838,6 +1859,7 @@ static void ParseProcMaps() {
         }
         std::fclose(f);
     }
+#endif
 
     std::sort(parsed.begin(), parsed.end(),
               [](const MapsRegion& a, const MapsRegion& b) { return a.begin < b.begin; });
@@ -1914,6 +1936,11 @@ void GetMainModuleRange(uintptr_t& moduleBegin, uintptr_t& moduleEnd) {
 
     moduleBegin = reinterpret_cast<uintptr_t>(module);
     moduleEnd = moduleBegin + ntHeaders->OptionalHeader.SizeOfImage;
+#elif defined(__SWITCH__)
+    // The NRO is one contiguous PIE image, so switch.ld's own bounds are the exact analogue of
+    // "module base + SizeOfImage" -- and __end__ sits past .bss, which the callers at the
+    // venue-bank stubs depend on.
+    gdx_switch_module_range(&moduleBegin, &moduleEnd);
 #else
     // Mirror "module base + SizeOfImage": take the contiguous run of /proc/self/maps entries whose
     // pathname is the main executable, using begin-of-first .. end-of-last. dladdr on a local
@@ -4685,7 +4712,7 @@ class N64DisplayListAdapter {
             }
             required = std::min(readable, kMaxRawTextureCopyBytes);
         }
-        
+
         // Always clamp to what is actually readable to avoid page faults
         required = std::min(required, readable);
 

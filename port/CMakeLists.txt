@@ -326,7 +326,7 @@ add_executable(G-Diffuser
 if(NOT GDX_SWITCH)
     target_sources(G-Diffuser PRIVATE gdx_discord.cpp gdx_dump_launch.cpp)
 else()
-    target_sources(G-Diffuser PRIVATE gdx_switch_controller_applet.c)
+    target_sources(G-Diffuser PRIVATE gdx_switch_controller_applet.c gdx_switch_memquery.c)
 endif()
 
 if(GDX_EXPANSION_KIT)
