@@ -7,6 +7,7 @@
 extern "C" {
 #endif
 
+#define GDX_CORE_WORKER 0
 #define GDX_CORE_MAIN 1
 #define GDX_CORE_AUDIO 2
 

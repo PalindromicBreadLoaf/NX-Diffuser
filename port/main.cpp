@@ -32,6 +32,7 @@
 #include "gdx_firstboot.h"
 #include "gdx_firstboot_gui.h"
 #include "gdx_fps_overlay.h"
+#include "gdx_updater.h"
 #include "gdx_perf.h"
 #include "gdx_dev_gates.h"
 #include "gdx_extract_launch.h"
@@ -663,6 +664,9 @@ int main(int argc, char** argv) {
     // The scheduler thread.
     gdx_thread_affinity_pin("main/scheduler", GDX_CORE_MAIN);
 
+    gdx::updater::SetProgramPath((argc > 0) ? argv[0] : nullptr);
+    gdx::updater::ApplyPendingUpdate();
+
     // Must run before any libultraship path resolution, so config/logs/disk/IPL consolidate into
     // the resolved data dir.
     gdx::FirstBootResult firstBoot = gdx::FirstBootRun((argc > 0) ? argv[0] : nullptr);
@@ -861,6 +865,9 @@ int main(int argc, char** argv) {
             std::make_shared<GdxGhostWindow>("gEnhancements.Practice.GhostBrowserOpen", "Ghost Browser"));
         pgui->AddGuiWindow(std::make_shared<GdxInputViewer>());
         pgui->AddGuiWindow(std::make_shared<GdxFpsOverlay>());
+        if (gdx::kGdxHasUpdater) {
+            pgui->AddGuiWindow(std::make_shared<GdxUpdaterToast>());
+        }
 
         // Default OFF on all platforms: the backend vsync caps correctly and the port pacer
         // misbehaves when on (owner evidence, ROG Ally X/Linux). Must run BEFORE the GdxMenu ctor
@@ -890,6 +897,8 @@ int main(int argc, char** argv) {
         // SetMenu calls Init(), where the GdxMenu ctor registers the port's gEnhancements.* CVars
         // at their 1:1 defaults.
         pgui->SetMenu(std::make_shared<GdxMenu>());
+
+        gdx::updater::Init();
     }
 
     logStep("InitAudio");
@@ -1495,6 +1504,7 @@ int main(int argc, char** argv) {
     // window is already gone; last, it would leave a silent zombie process. ClearPresence +
     // RunCallbacks run inside so the profile clears before the socket dies.
     gdx_discord_shutdown();
+    gdx::updater::Shutdown();
     // gdx_disk_save_tick() only flushes after the write burst has been idle for kDebounceFrames
     // (~0.5s), so a save landing inside that final window would be dropped on close.
     gdx_disk_save_flush();

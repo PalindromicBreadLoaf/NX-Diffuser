@@ -71,6 +71,7 @@ extern "C" const char* SDL_GetCurrentAudioDriver(void);
 #include "gdx_firstboot.h"   // Data & Files: canonical file names + gdx::ManagedDiskPath
 #include "gdx_segment_source.h" // Data & Files: archive-coverage telemetry (fallback counters)
 #include "gdx_dev_gates.h"   // Dev Tools: the developer-gate table driving DrawDevGates()
+#include "gdx_version.h"     // About page: GDX_VERSION_STRING
 
 #include <vector>
 #include <filesystem>
@@ -2043,9 +2044,7 @@ void GdxMenu::DrawDevGates() {
     ImGui::BulletText("GDX_INTERP_P1 / GDX_INTERP_P2 - interpolation test overrides (see Graphics)");
 }
 
-// The port's release version, single source of truth for user-facing surfaces. Bumped by hand at
-// release points: a version a human did not choose is a build id, not a version.
-static constexpr const char* kGdxVersionString = "1.0.0";
+static constexpr const char* kGdxVersionString = GDX_VERSION_STRING;
 
 void GdxMenu::DrawAboutMenu() {
     // Lazy one-shot load on first open rather than at boot: the About page is visited rarely, and a

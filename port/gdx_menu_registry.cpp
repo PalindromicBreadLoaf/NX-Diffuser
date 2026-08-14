@@ -41,6 +41,7 @@
 #include "gdx_menu.h"
 #include "gdx_menu_internal.h"
 #include "gdx_discord.h" // gdx::kGdxHasDiscordPresence
+#include "gdx_updater.h"
 
 #include <imgui.h>
 
@@ -159,6 +160,11 @@ void GdxMenu::RegisterMenu() {
     AddSidebarEntry("Settings", "Controls", 1,
                     "controls controller configuration keyboard gamepad mouse bindings remap");
     AddSidebarEntry("Settings", "Input Viewer", 2, "input viewer overlay analog stick buttons speedrun");
+
+    if (gdx::kGdxHasUpdater) {
+        AddSidebarEntry("Settings", "Updates", 1,
+                        "updates updater version release github download install restart nro");
+    }
 
     AddSidebarEntry("Enhancements", "Visuals", 2,
                     "visuals graphics enhancements widescreen hud ui draw distance lod frame pacing "
@@ -658,6 +664,28 @@ void GdxMenu::RegisterMenu() {
                                   "bindings and analog curves. Inputs intentionally read neutral while this "
                                   "menu owns game input.",
                           .type = GdxUI::WIDGET_TEXT });
+
+    if (gdx::kGdxHasUpdater) {
+        AddWidget("Settings", "Updates", SECTION_COLUMN_1,
+                  WidgetInfo{ .name = "NX-Diffuser Updates", .type = GdxUI::WIDGET_SEPARATOR_TEXT });
+
+        AddWidget("Settings", "Updates", SECTION_COLUMN_1,
+                  WidgetInfo{ .name = "Updater", .type = GdxUI::WIDGET_CUSTOM }
+                      .CustomFunction([](WidgetInfo&) { gdx::updater::DrawUpdatesPanel(); })
+                      .SearchTerms("check download install verify checksum restart release notes"));
+
+        AddWidget("Settings", "Updates", SECTION_COLUMN_1,
+                  WidgetInfo{ .name = "Options", .type = GdxUI::WIDGET_SEPARATOR_TEXT });
+
+        AddWidget("Settings", "Updates", SECTION_COLUMN_1,
+                  WidgetInfo{ .name = "Check at startup",
+                              .cVar = "gSettings.Updater.CheckOnBoot",
+                              .type = GdxUI::WIDGET_CVAR_CHECKBOX }
+                      .Options(UIWidgets::CheckboxOptions().DefaultValue(false).Tooltip(
+                          "Check for the newest release when NX-Diffuser starts and show a "
+                          "notification if it is newer than this build."))
+                      .SearchTerms("boot automatic notification"));
+    }
 
     // ═════════════════════════════════════════════════════════════════════════════════════════
     // ENHANCEMENTS -> Visuals (2 columns: aspect/detail on the left, pacing on the right)
