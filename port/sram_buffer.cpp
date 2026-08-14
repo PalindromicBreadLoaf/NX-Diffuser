@@ -1,4 +1,5 @@
 #include "sram_buffer.h"
+#include "gdx_replace_file.h"
 #include "port_log.h"
 #include <cstdio>
 #include <cstring>
@@ -311,7 +312,7 @@ static void gdx_sram_flush(void) {
         remove(tempPath);
         return;
     }
-    if (rename(tempPath, path) != 0) {
+    if (!gdx_replace_file(tempPath, path)) {
         gdx_port_logf("[sram] WARNING: could not replace fzerox.sav; save not persisted.\n");
         remove(tempPath);
         return;

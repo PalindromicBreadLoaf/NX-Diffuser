@@ -22,6 +22,7 @@
 #define _CRT_SECURE_NO_WARNINGS /* plain fopen/fwrite below; harmless on non-MSVC */
 
 #include "disk_savefile.h"
+#include "gdx_replace_file.h"
 #include "port_log.h"
 #include "libultraship/bridge/consolevariablebridge.h" /* one-shot DD-format CVar (Workshop menu) */
 
@@ -502,8 +503,8 @@ void gdx_disk_save_flush(void) {
         return;
     }
 #else
-    rename(g_gddPath.c_str(), g_bakPath.c_str()); /* best-effort; missing .gdd is fine */
-    if (rename(g_tmpPath.c_str(), g_gddPath.c_str()) != 0) {
+    gdx_replace_file(g_gddPath.c_str(), g_bakPath.c_str()); /* best-effort; missing .gdd is fine */
+    if (!gdx_replace_file(g_tmpPath.c_str(), g_gddPath.c_str())) {
         g_lastFlushOk = false;
         gdx_port_logf("[disk-save] WARNING: could not replace %s; save not persisted (backup intact)\n",
                       g_gddPath.c_str());

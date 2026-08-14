@@ -20,6 +20,7 @@
 #define _CRT_SECURE_NO_WARNINGS /* plain fopen/fread/fwrite below; harmless on non-MSVC */
 
 #include "gdx_ghost_io.h"
+#include "gdx_replace_file.h"
 
 #include <errno.h>
 #include <stdint.h>
@@ -414,7 +415,7 @@ static int gdx_ghost_write_container(const char* path, GdxGhostSave* save) {
         return GDX_GHOST_ERR_IO;
     }
 #else
-    if (rename(tempPath, path) != 0) {
+    if (!gdx_replace_file(tempPath, path)) {
         remove(tempPath);
         return GDX_GHOST_ERR_IO;
     }
@@ -654,7 +655,7 @@ static int gdx_ghost_selection_write(const GdxGhostSelection* selections, int co
         return GDX_GHOST_ERR_IO;
     }
 #else
-    if (rename(tempPath, path) != 0) {
+    if (!gdx_replace_file(tempPath, path)) {
         remove(tempPath);
         return GDX_GHOST_ERR_IO;
     }

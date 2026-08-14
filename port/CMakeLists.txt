@@ -310,6 +310,7 @@ add_executable(G-Diffuser
     rom_buffer.cpp
     sram_buffer.cpp
     disk_savefile.cpp
+    gdx_replace_file.c
     gdx_ghost_io.c
     gdx_ghost_window.cpp
     gdx_input_viewer.cpp
@@ -856,6 +857,7 @@ if(GDX_BUILD_JP)
         rom_buffer.cpp
         sram_buffer.cpp
         disk_savefile.cpp
+        gdx_replace_file.c
         gdx_ghost_io.c
         gdx_ghost_window.cpp
         gdx_input_viewer.cpp
