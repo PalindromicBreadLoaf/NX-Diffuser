@@ -2,6 +2,7 @@
 
 #include "n64_gfx_convert.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace gdx {
@@ -11,6 +12,8 @@ namespace {
 // F3DEX2 / F3D G_ENDDL opcodes. A converted list always ends on one of these.
 constexpr uint8_t kOpEndDlEx2 = 0xDF;
 constexpr uint8_t kOpEndDlF3D = 0xB8;
+
+constexpr size_t kReserveCommands = 256;
 
 inline uint32_t Read32LE(const uint8_t* p) {
     // Raw machine word: the bytes are in the source's own byte order and ConvertList swaps
@@ -56,10 +59,11 @@ std::vector<WideGfx> ConvertList(const void* src, size_t max_commands, bool is_b
     if (src == nullptr) {
         return out;
     }
-    out.reserve(max_commands + 1);
+    const size_t walk_limit = std::min(max_commands, kMaxConvertedCommands);
+    out.reserve(std::min(walk_limit + 1, kReserveCommands));
 
     const auto* bytes = static_cast<const uint8_t*>(src);
-    for (size_t i = 0; i < max_commands; ++i) {
+    for (size_t i = 0; i < walk_limit; ++i) {
         const uint8_t* p = bytes + (i * 8);
         uint32_t w0 = Read32LE(p + 0);
         uint32_t w1 = Read32LE(p + 4);

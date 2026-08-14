@@ -16,6 +16,7 @@ using gdx::ClassifyW1;
 using gdx::ConvertContext;
 using gdx::ConvertList;
 using gdx::GfxWideCache;
+using gdx::kMaxConvertedCommands;
 using gdx::W1Kind;
 using gdx::WideGfx;
 
@@ -222,6 +223,27 @@ static void TestTermination() {
     check_u32("F3D terminator preserved", outC.back().w0 >> 24, OP_ENDDL_F3D);
 }
 
+static void TestBoundIsNotLength() {
+    ConvertContext ctx;  // no resolver
+
+    std::vector<uint8_t> src;
+    PushLE(src, MakeW0(OP_SETPRIMCOLOR, 0), 0x11223344u);
+    PushLE(src, MakeW0(OP_ENDDL, 0), 0);
+    std::vector<WideGfx> out = ConvertList(src.data(), 0x01000000u / 8, false, false, ctx);
+    check_sz("segment-sized bound - real length", out.size(), 2);
+    check_sz("segment-sized bound - capacity stays bounded",
+             out.capacity() <= 4096 ? 1u : out.capacity(), 1u);
+
+    // A source that never reaches an ENDDL stops at the walk cap.
+    std::vector<uint8_t> run;
+    for (size_t i = 0; i < kMaxConvertedCommands + 16; ++i) {
+        PushLE(run, MakeW0(OP_SETPRIMCOLOR, 0), 0u);
+    }
+    std::vector<WideGfx> capped = ConvertList(run.data(), run.size() / 8, false, false, ctx);
+    check_sz("unterminated - capped walk + terminator", capped.size(), kMaxConvertedCommands + 1);
+    check_u32("capped list terminated", capped.back().w0 >> 24, OP_ENDDL);
+}
+
 static void TestCache() {
     std::vector<uint8_t> src;
     PushLE(src, MakeW0(OP_VTX_EX2, 0x001020), 0x06001000u);
@@ -265,6 +287,7 @@ int main() {
     TestValueSafetyAndLow32();
     TestSubDlPolicy();
     TestTermination();
+    TestBoundIsNotLength();
     TestCache();
 
     if (g_failures == 0) {

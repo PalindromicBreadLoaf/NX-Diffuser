@@ -59,8 +59,11 @@ inline bool IsSegmentedToken(uint32_t raw) {
     return (top >= 0x01) && (top <= 0x0F);
 }
 
-// Walks up to `max_commands` 8-byte packets from `src`, byteswapping when `is_big`, stopping
-// after the first G_ENDDL (F3DEX2 0xDF / F3D 0xB8). The output is always terminated.
+// Callers derive `max_commands` from whatever mapping encloses the source.
+constexpr size_t kMaxConvertedCommands = 1u << 16;
+
+// Walks up to `max_commands` (capped at kMaxConvertedCommands) 8-byte packets from `src`,
+// byteswapping when `is_big`.
 std::vector<WideGfx> ConvertList(const void* src, size_t max_commands, bool is_big,
                                  bool is_f3d, const ConvertContext& ctx);
 
