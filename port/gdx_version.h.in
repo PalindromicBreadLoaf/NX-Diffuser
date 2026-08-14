@@ -1,0 +1,12 @@
+#ifndef GDX_VERSION_H
+#define GDX_VERSION_H
+
+#define GDX_VERSION_STRING "@GDX_VERSION@"
+#define GDX_VERSION_MAJOR @GDX_VERSION_MAJOR@
+#define GDX_VERSION_MINOR @GDX_VERSION_MINOR@
+#define GDX_VERSION_PATCH @GDX_VERSION_PATCH@
+
+// GitHub owner/repo the updater asks for releases.
+#define GDX_UPDATE_REPO "@GDX_UPDATE_REPO@"
+
+#endif /* GDX_VERSION_H */

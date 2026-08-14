@@ -15,6 +15,17 @@ else()
     set(GDX_SWITCH FALSE)
 endif()
 
+set(GDX_VERSION "1.0.1" CACHE STRING "G-Diffuser release version (X.Y.Z)")
+set(GDX_UPDATE_REPO "PalindromicBreadLoaf/NX-Diffuser" CACHE STRING "GitHub owner/repo the updater polls")
+if(NOT GDX_VERSION MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)$")
+    message(FATAL_ERROR "GDX_VERSION must be X.Y.Z, got '${GDX_VERSION}'")
+endif()
+set(GDX_VERSION_MAJOR ${CMAKE_MATCH_1})
+set(GDX_VERSION_MINOR ${CMAKE_MATCH_2})
+set(GDX_VERSION_PATCH ${CMAKE_MATCH_3})
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/gdx_version.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/gdx_version.h" @ONLY)
+
 # Warning flags for the port's own targets under GCC/Clang; the decomp library and vendored cxd4
 # stay -w (not ours to fix). No -Werror: a Linux first-configure should surface warnings, not fail.
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang" OR CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -322,6 +333,7 @@ add_executable(G-Diffuser
     gdx_imgui_nav.cpp
     gdx_swkbd.cpp
     gdx_workshop.cpp
+    gdx_updater.cpp            # console updater
     mio0_wrap.c
     gdx_segment_source.c       # in the exe, not gdiffuser_game: needs symbols from AssetLoader.cpp,
                                 # rom_buffer.cpp and gen/AssetBindings.c
@@ -334,6 +346,17 @@ else()
     # gdx_switch_stubs.cpp defines what the two sources above it are being dropped for.
     target_sources(G-Diffuser PRIVATE gdx_switch_controller_applet.c gdx_switch_exception.c
                                       gdx_switch_memquery.c gdx_switch_stubs.cpp)
+endif()
+
+# The updater is console-only
+option(GDX_ENABLE_UPDATER "Build the in-game updater" ON)
+if(GDX_ENABLE_UPDATER AND GDX_SWITCH)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(GDX_CURL REQUIRED IMPORTED_TARGET libcurl)
+    find_package(libzip REQUIRED)
+    target_sources(G-Diffuser PRIVATE gdx_updater_switch.cpp)
+    target_link_libraries(G-Diffuser PRIVATE PkgConfig::GDX_CURL libzip::zip)
+    target_compile_definitions(G-Diffuser PRIVATE GDX_ENABLE_UPDATER=1)
 endif()
 
 if(GDX_EXPANSION_KIT)
@@ -505,6 +528,7 @@ endif()
 
 target_include_directories(G-Diffuser PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"   # for "resource/ResourceFactories.h"
+    "${CMAKE_CURRENT_BINARY_DIR}"   # for the configured gdx_version.h
     "${DECOMP}/include"
     "${DECOMP}/src"
     "${CMAKE_CURRENT_SOURCE_DIR}/../torch/lib/libmio0"  # mio0.h + utils.h for mio0_wrap.c and mio0.c
@@ -565,11 +589,10 @@ endif()
 if(GDX_SWITCH)
     target_link_libraries(G-Diffuser PRIVATE -lglad)
 
-    # Keep identical to kGdxVersionString
     nx_generate_nacp(G-Diffuser.nacp
         NAME    "G-Diffuser"
         AUTHOR  "Zorkats & PalindromicBreadLoaf"
-        VERSION "1.0.0")
+        VERSION "${GDX_VERSION}")
     nx_create_nro(G-Diffuser NACP G-Diffuser.nacp)
 endif()
 
@@ -868,6 +891,7 @@ if(GDX_BUILD_JP)
         gdx_imgui_nav.cpp
         gdx_swkbd.cpp
         gdx_workshop.cpp
+        gdx_updater.cpp
         mio0_wrap.c
         gdx_segment_source.c
         "${CMAKE_CURRENT_SOURCE_DIR}/../torch/lib/libmio0/mio0.c"
@@ -900,6 +924,7 @@ if(GDX_BUILD_JP)
 
     target_include_directories(G-Diffuser-JP PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_BINARY_DIR}"
         "${DECOMP}/include"
         "${DECOMP}/src"
         "${CMAKE_CURRENT_SOURCE_DIR}/../include"
