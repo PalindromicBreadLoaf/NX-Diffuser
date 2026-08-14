@@ -233,6 +233,20 @@ extern "C" const char* gdx_lookup_asset_segment_o2r_key(unsigned int sym_low32);
 extern "C" int gdx_workshop_texture_packs_enabled(void);
 extern "C" const char* GdxWorkshopLookupOverridePath(const char* key);
 
+extern "C" unsigned long gdx_yield_count;
+extern "C" signed char gGamePaused;
+extern "C" unsigned char sTransition[];
+
+extern "C" {
+extern int gRandSeed1;
+extern unsigned int gRandMask1;
+extern int gRandSeed2;
+extern unsigned int gRandMask2;
+}
+
+extern "C" int16_t D_i5_80118FF0[2][6][8];
+static_assert(sizeof(D_i5_80118FF0) == 2 * 6 * 16, "carousel viewport array shape");
+
 namespace {
 
 // The decomp builds N64 display-list packets as two 32-bit words. libultraship's Fast3D
@@ -373,11 +387,6 @@ struct ResolvedAddress {
 
 // [venueload] diagnostic, strip later: ticks still owed a post-venue-load translation-cost line.
 static int gGdxVenueWatchTicks = 0;
-
-// Scheduler yield counter (n64_sched.c). Each yield returns to the host fiber, which pumps a whole
-// frame before re-dispatching, so one yield inside a load costs a full ~16.7ms tick of wall clock
-// irrespective of the load's own work. Used to tell real decode cost apart from yield latency.
-extern "C" unsigned long gdx_yield_count;
 
 struct ConversionStats {
     std::array<size_t, 256> opCounts{};
@@ -2446,13 +2455,6 @@ int gGdxInterpLastTasks = 0;
 bool gGdxInterpCutThisTick = false;
 } // namespace
 
-// In-race pause flag (game.c), read directly the same way gSegments/D_8024DCE0 are. Pause must be
-// handled on the interpolation branch: a paused tick forces one crisp t=1 present here while the
-// host's logic-deadline pacer holds 60 Hz. Routing it through main.cpp's default path hands pacing
-// to gdx_frame_pacer_tick(), a no-op while FrameInterpolation is on, and free-runs the present on
-// a VSync-off panel. Read-only.
-extern "C" { extern signed char gGamePaused; }
-
 // Implemented in libultraship/src/fast/Fast3dWindow.cpp. Overrides the DXGI software rate limiter's
 // verdict while the interpolation sub-frame loop is driving presents; the swapchain's waitable
 // object provides the actual pacing. See the block comment at the definition.
@@ -2477,23 +2479,10 @@ extern "C" void gdx_fast3d_set_subframe_present(int on);
 // Layout: flag bit is (1<<0); `flags` is a u16 at struct offset 0x12 (activeType s32, queuedType
 // s32, state s32, timer s16, argument s16, appearType u16, flags u16 at natural alignment, per
 // transition.h:34-45).
-extern "C" { extern unsigned char sTransition[]; }
 static inline bool GdxTransitionCapturePendingThisTick() {
     const unsigned short flags =
         *reinterpret_cast<const unsigned short*>(&sTransition[0x12]);
     return (flags & 0x1u /* TRANSITION_FLAG_SET_BACKGROUND_BUFFER */) != 0;
-}
-
-// Determinism canary. The game's two LCG states (math.c:185-188) are advanced ONLY by game logic,
-// never by the render path -- interpolation reads GfxPools and writes only scratch. So the
-// per-tick RNG fingerprint must be identical with interpolation ON and OFF given identical input,
-// and the first tick whose fingerprint differs localizes a sub-frame value leaking back into
-// logic. Read-only; see GdxInterpDeterminismTick below.
-extern "C" {
-extern int gRandSeed1;
-extern unsigned int gRandMask1;
-extern int gRandSeed2;
-extern unsigned int gRandMask2;
 }
 
 // GfxPool span from the segment-1 base. Gfx_InitBuffer does Segment_SetPhysicalAddress(1, gGfxPool)
@@ -2819,13 +2808,6 @@ static inline bool GdxEffectsVtxInSpan(uintptr_t p, size_t bytes) {
     const uintptr_t lo = base + kOffset;
     return p >= lo && (p + bytes) <= (lo + kBytes);
 }
-
-// Course-select carousel viewports (course_view.c: Vp D_i5_80118FF0[2][6], first index is the
-// D_800DCCFC parity). Overlays are statically linked, so naming the symbol directly is fine.
-// Declared as raw s16 lanes rather than the decomp Vp union to keep this TU out of the decomp
-// include tree; sizeof(Vp)==16, layout vscale[4] then vtrans[4], asserted below.
-extern "C" int16_t D_i5_80118FF0[2][6][8];
-static_assert(sizeof(D_i5_80118FF0) == 2 * 6 * 16, "carousel viewport array shape");
 
 static inline void GdxP0FnvAccum(uint64_t& h, uint64_t word) {
     h ^= word;
