@@ -593,7 +593,13 @@ if(GDX_SWITCH)
         NAME    "G-Diffuser"
         AUTHOR  "Zorkats & PalindromicBreadLoaf"
         VERSION "${GDX_VERSION}")
-    nx_create_nro(G-Diffuser NACP G-Diffuser.nacp)
+    set(GDX_SWITCH_ICON "${CMAKE_SOURCE_DIR}/assets/branding/gdiffuser-switch-icon.jpg")
+    if(EXISTS "${GDX_SWITCH_ICON}")
+        nx_create_nro(G-Diffuser NACP G-Diffuser.nacp ICON "${GDX_SWITCH_ICON}")
+    else()
+        message(WARNING "G-Diffuser: ${GDX_SWITCH_ICON} is missing; the NRO gets libnx's default icon.")
+        nx_create_nro(G-Diffuser NACP G-Diffuser.nacp)
+    endif()
 endif()
 
 if(NOT GDX_SWITCH)
