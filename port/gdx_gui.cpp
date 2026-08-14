@@ -7,6 +7,7 @@
 #include "ship/window/gui/IconsFontAwesome4.h"
 
 #include "gdx_imgui_nav.h"
+#include "gdx_swkbd.h"
 
 namespace {
 
@@ -70,6 +71,8 @@ void GdxFast3dGui::ImGuiWMNewFrame() {
     // the caller runs next: the feed both reads the backend's HasGamepad claim and queues key events
     // for this frame. See port/gdx_imgui_nav.h.
     gdx_imgui_nav_tick();
+    // Reads the WantTextInput ImGui::NewFrame left behind last frame.
+    gdx_swkbd_tick();
 }
 
 ImFont* GdxGuiFontStandard() {

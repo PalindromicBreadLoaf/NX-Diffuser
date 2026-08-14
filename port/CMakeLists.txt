@@ -319,6 +319,7 @@ add_executable(G-Diffuser
                                 # from main.cpp, so the standalone test targets compile it unchanged
     port_log.c
     gdx_imgui_nav.cpp
+    gdx_swkbd.cpp
     gdx_workshop.cpp
     mio0_wrap.c
     gdx_segment_source.c       # in the exe, not gdiffuser_game: needs symbols from AssetLoader.cpp,
@@ -863,6 +864,7 @@ if(GDX_BUILD_JP)
         gdx_dev_gates.c
         port_log.c
         gdx_imgui_nav.cpp
+        gdx_swkbd.cpp
         gdx_workshop.cpp
         mio0_wrap.c
         gdx_segment_source.c
