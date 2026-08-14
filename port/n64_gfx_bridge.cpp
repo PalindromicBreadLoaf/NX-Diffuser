@@ -5317,8 +5317,10 @@ class N64DisplayListAdapter {
                                 }
                             }
                             /* Segment-8 raws only: general sources burn the budget before race
-                               time, and the decoration family is the open investigation. */
-                            if (!vcDup && sVtxCensusCount < 48 && outW1 != 0 &&
+                               time, and the decoration family is the open investigation.
+                               Gated like [dl-census] and [tex-census].
+                             */
+                            if (gdx_diag_verbose() && !vcDup && sVtxCensusCount < 48 && outW1 != 0 &&
                                 ((in.w1 >> 24) & 0xFFu) == 0x08u) {
                                 sVtxCensusSeen[sVtxCensusCount++] = in.w1;
                                 const char* vcls = IsRdramHostPointer(outW1) ? "rdram"
@@ -5767,8 +5769,8 @@ class N64DisplayListAdapter {
                                 // drown the budget.
                                 static uintptr_t sStubMissSeen[24] = {};
                                 static int sStubMissCount = 0;
-                                bool alreadySeen = false;
-                                for (int s = 0; s < sStubMissCount; s++) {
+                                bool alreadySeen = sStubMissCount >= 24;
+                                for (int s = 0; !alreadySeen && s < sStubMissCount; s++) {
                                     if (sStubMissSeen[s] == w1full) {
                                         alreadySeen = true;
                                         break;
@@ -8558,7 +8560,7 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
     // back to the content/flicker-blend class; lines here confirm it and name the racer.
     // Unconditional but self-limiting (24 lines a session): a disagreement is rare by construction,
     // so there is nothing to gate against, and a gate would just be one more thing to forget to arm.
-    {
+    if (adapter.GdxP1Enabled()) {
         // POSITIVE CONTROL FIRST. A probe that reports zero without proving its subject occurred is
         // worthless -- the first run of this probe returned a confident zero from a script that
         // never reached a race. So count the ticks on which ANY highlight matrix was referenced at
