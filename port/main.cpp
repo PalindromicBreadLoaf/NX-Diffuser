@@ -1286,10 +1286,12 @@ int main(int argc, char** argv) {
         gdx_vi_tick();   // advance VI framebuffer + post retrace -> runs the Main game fiber here
         gdx::PerfPhaseEnd(gdx::PerfGameTick);
         gdx::PerfPhaseBegin(gdx::PerfInput);
+        gdx_perf_sub_begin(GDX_PERF_SUB_INOTIFY);
         // The audio thread also self-pumps every 5ms, so a lost or late notify here is a pacing
         // hint, not a correctness issue. See gdx_audio_thread.cpp.
         gdx_audio_thread_notify_frame();
         w->GetMouseStateManager()->StartFrame();
+        gdx_perf_sub_end(GDX_PERF_SUB_INOTIFY);
         gdx::PerfPhaseEnd(gdx::PerfInput);
         if (!interpOn) {
             // Default path: one tick, one Run, one present, paced by the frame pacer. Nothing on

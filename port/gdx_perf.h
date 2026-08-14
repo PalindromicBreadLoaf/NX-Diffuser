@@ -63,6 +63,8 @@ enum GdxPerfSub {
     // anywhere in the task -- distinct from GDX_PERF_SUB_MIRROR, which times only
     // GdxUpdateFrameMirror.
     GDX_PERF_SUB_FBMIRROR,
+    GDX_PERF_SUB_PADS,
+    GDX_PERF_SUB_INOTIFY,
     GDX_PERF_SUB_COUNT
 };
 

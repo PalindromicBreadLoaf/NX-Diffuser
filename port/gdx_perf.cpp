@@ -65,6 +65,12 @@ double subLogicMs(double gameMs, const double* sub) {
     return logic > 0.0 ? logic : 0.0;
 }
 
+// The input phase minus its two seams.
+double subInputRestMs(double inputMs, const double* sub) {
+    const double rest = inputMs - sub[GDX_PERF_SUB_PADS] - sub[GDX_PERF_SUB_INOTIFY];
+    return rest > 0.0 ? rest : 0.0;
+}
+
 PerfState& state() {
     static PerfState s; // holds a mutex — must be constructed in place, never copied
     static const bool initialized = [] {
@@ -137,6 +143,7 @@ void emitSummary(PerfState& s) {
                   "spikes=%d | mean: %s| sub: logic=%.2f xlate=%.2f run=%.2f mirror=%.2f "
                   "| run[gui=%.2f sframe=%.2f irun=%.2f eframe=%.2f] "
                   "| gfxrun=%.2f bridge=%.2f decomp=%.2f setup=%.2f post=%.2f fbmirror=%.2f "
+                  "| input[pads=%.2f notify=%.2f rest=%.2f] "
                   "| audio p95=%.2fms max=%.2fms\n",
                   totals.size(), p50, p95, p99, mx, s.spikeCount, phases, logicMean,
                   subMean[GDX_PERF_SUB_XLATE], subMean[GDX_PERF_SUB_RUN], subMean[GDX_PERF_SUB_MIRROR],
@@ -147,7 +154,9 @@ void emitSummary(PerfState& s) {
                   subMean[GDX_PERF_SUB_GFXRUN] - subMean[GDX_PERF_SUB_XLATE] - subMean[GDX_PERF_SUB_RUN],
                   gameFrameMs(phaseMean) - subMean[GDX_PERF_SUB_GFXRUN],
                   subMean[GDX_PERF_SUB_SETUP], subMean[GDX_PERF_SUB_POST],
-                  subMean[GDX_PERF_SUB_FBMIRROR], aP95, aMax);
+                  subMean[GDX_PERF_SUB_FBMIRROR],
+                  subMean[GDX_PERF_SUB_PADS], subMean[GDX_PERF_SUB_INOTIFY],
+                  subInputRestMs(phaseMean[PerfInput], subMean), aP95, aMax);
 
     s.frameTotals.clear();
     s.spikeCount = 0;

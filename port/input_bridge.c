@@ -49,6 +49,7 @@
 #include "controller.h"
 #include "fzx_game.h" // GameMode values + GET_MODE (in-race safety checks)
 #include "gdx_input_script.h" // GDX_INPUT_SCRIPT: dev-only deterministic input playback (see file header)
+#include "gdx_perf.h"
 #include "port_log.h"
 
 #include <stdbool.h>
@@ -656,12 +657,14 @@ void gdx_controller_poll(void) {
 
     // The button field is already the N64 bitmask (identical layout to the decomp — see the file
     // header) and the stick is already in the -80..80 range, so both copy straight across.
+    gdx_perf_sub_begin(GDX_PERF_SUB_PADS);
     if (!gdx_lus_read_pads(MAXCONTROLLERS, buttons, stick_x, stick_y, connected)) {
         memset(buttons, 0, sizeof(buttons));
         memset(stick_x, 0, sizeof(stick_x));
         memset(stick_y, 0, sizeof(stick_y));
         memset(connected, 0, sizeof(connected));
     }
+    gdx_perf_sub_end(GDX_PERF_SUB_PADS);
 
     // Port 1 is pinned connected — see the PORT 1 IS PINNED note on gdx_sync_controller_ports().
     // It is also what keeps the "ControlDeck unavailable" path usable: zero input, but still a
