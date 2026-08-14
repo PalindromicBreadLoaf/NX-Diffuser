@@ -40,6 +40,7 @@
 
 #include "gdx_menu.h"
 #include "gdx_menu_internal.h"
+#include "gdx_discord.h" // gdx::kGdxHasDiscordPresence
 
 #include <imgui.h>
 
@@ -129,6 +130,11 @@ void GdxMenu::RegisterDisableReasons() {
     mDisabledInfo[GdxUI::DISABLE_FOR_RACE_IN_PROGRESS] = {
         [](GdxUI::DisabledInfo&) { return gdx_input_in_gameplay() != 0; },
         "A race is in progress. Ghost state must not be changed alongside the running game."
+    };
+
+    mDisabledInfo[GdxUI::DISABLE_FOR_NO_DISCORD] = {
+        [](GdxUI::DisabledInfo&) { return !gdx::kGdxHasDiscordPresence; },
+        "Discord Rich Presence is not available on this platform."
     };
 }
 
@@ -1053,38 +1059,44 @@ void GdxMenu::RegisterMenu() {
                       "while this is on. Turning it off clears the presence immediately.\n"
                       "Course Edit never shows your track names."))
                   .ModifiedMarker()
-                  .SearchTerms("discord rich presence status privacy online activity"));
+                  .SearchTerms("discord rich presence status privacy online activity")
+                  .HideWhen({ GdxUI::DISABLE_FOR_NO_DISCORD }));
     AddWidget("Online", "Overview", SECTION_COLUMN_1,
               WidgetInfo{ .name = "Show course", .cVar = "gEnhancements.Online.DiscordShowCourse",
                           .type = GdxUI::WIDGET_CVAR_CHECKBOX }
                   .Options(UIWidgets::CheckboxOptions().DefaultValue(true).Tooltip(
                       "Include the course name (e.g. Big Blue) in the presence."))
-                  .SearchTerms("discord course track name"));
+                  .SearchTerms("discord course track name")
+                  .HideWhen({ GdxUI::DISABLE_FOR_NO_DISCORD }));
     AddWidget("Online", "Overview", SECTION_COLUMN_1,
               WidgetInfo{ .name = "Show lap", .cVar = "gEnhancements.Online.DiscordShowLap",
                           .type = GdxUI::WIDGET_CVAR_CHECKBOX }
                   .Options(UIWidgets::CheckboxOptions().DefaultValue(true).Tooltip(
                       "Include the current lap (e.g. Lap 2/3) in the presence."))
-                  .SearchTerms("discord lap"));
+                  .SearchTerms("discord lap")
+                  .HideWhen({ GdxUI::DISABLE_FOR_NO_DISCORD }));
     AddWidget("Online", "Overview", SECTION_COLUMN_1,
               WidgetInfo{ .name = "Show race position", .cVar = "gEnhancements.Online.DiscordShowPosition",
                           .type = GdxUI::WIDGET_CVAR_CHECKBOX }
                   .Options(UIWidgets::CheckboxOptions().DefaultValue(true).Tooltip(
                       "Include your current position (e.g. P4) in the presence."))
-                  .SearchTerms("discord position rank place"));
+                  .SearchTerms("discord position rank place")
+                  .HideWhen({ GdxUI::DISABLE_FOR_NO_DISCORD }));
     AddWidget("Online", "Overview", SECTION_COLUMN_1,
               WidgetInfo{ .name = "Show mode and cup", .cVar = "gEnhancements.Online.DiscordShowMode",
                           .type = GdxUI::WIDGET_CVAR_CHECKBOX }
                   .Options(UIWidgets::CheckboxOptions().DefaultValue(true).Tooltip(
                       "Include the game mode and cup (e.g. Grand Prix, Jack Cup - Expert)."))
-                  .SearchTerms("discord mode cup difficulty grand prix"));
+                  .SearchTerms("discord mode cup difficulty grand prix")
+                  .HideWhen({ GdxUI::DISABLE_FOR_NO_DISCORD }));
     AddWidget("Online", "Overview", SECTION_COLUMN_1,
               WidgetInfo{ .name = "Show race timer", .cVar = "gEnhancements.Online.DiscordShowTimer",
                           .type = GdxUI::WIDGET_CVAR_CHECKBOX }
                   .Options(UIWidgets::CheckboxOptions().DefaultValue(true).Tooltip(
                       "Show a live elapsed timer for the CURRENT RACE only. Session length\n"
                       "is never shown."))
-                  .SearchTerms("discord timer elapsed"));
+                  .SearchTerms("discord timer elapsed")
+                  .HideWhen({ GdxUI::DISABLE_FOR_NO_DISCORD }));
 
     AddWidget("Online", "Overview", SECTION_COLUMN_1,
               WidgetInfo{ .name = "Leaderboards (per course)", .type = GdxUI::WIDGET_COMING_SOON });

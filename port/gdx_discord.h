@@ -20,6 +20,16 @@
  * of leaving a zombie process after the window closed. */
 
 #ifdef __cplusplus
+namespace gdx {
+// False where port/CMakeLists.txt drops gdx_discord.cpp.
+inline constexpr bool kGdxHasDiscordPresence =
+#if defined(__SWITCH__)
+    false;
+#else
+    true;
+#endif
+} // namespace gdx
+
 extern "C" {
 #endif
 

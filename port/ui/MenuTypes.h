@@ -82,6 +82,9 @@ enum DisableOption {
     // Game state
     DISABLE_FOR_RACE_IN_PROGRESS, // mutating ghost state must not race the game fiber
 
+    // Platform
+    DISABLE_FOR_NO_DISCORD, // (hide condition) the presence subsystem is not built
+
     DISABLE_OPTION_COUNT
 };
 
