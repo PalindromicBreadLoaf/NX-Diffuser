@@ -246,8 +246,11 @@ else()
     # -fno-strict-aliasing / -fwrapv are LOAD-BEARING at -O2/-O3: the decomp type-puns constantly
     # and assumes wrapping arithmetic; TBAA miscompiled the Release audio command path (near-silent
     # audio, ai-tap rms 482 vs Debug's 2498) while -O0 was healthy. Keep on ALL build types.
+    # -ffp-contract=off must be set on any target that has a fused multiply-add instruction.
+    # The N64 had no such thing, and as such games weren't tested around it. GCC's default contracts
+    # them into one instruction wherever the ISA allows, which is never on baseline x86-64 and always on aarch64.
     target_compile_options(gdiffuser_game PRIVATE -w -Werror=return-type -fcommon
-        -fno-strict-aliasing -fwrapv
+        -fno-strict-aliasing -fwrapv -ffp-contract=off
         -Wno-error=int-conversion
         -Wno-error=incompatible-pointer-types
         -Wno-error=implicit-function-declaration)
@@ -311,6 +314,7 @@ add_executable(G-Diffuser
     gdx_audio_capture.c
     gdx_frame_pacer.c          # default OFF: LUS's Fast3D backend already paces EndFrame() to 60fps
     gdx_footprint.c
+    gdx_stall_watchdog.c
     gdx_thread_affinity.c
     shims.c
     AssetLoader.cpp
@@ -844,7 +848,7 @@ if(GDX_BUILD_JP)
         target_compile_options(gdiffuser_game_jp PRIVATE /W0 /w14715 /w14716)
     else()
         target_compile_options(gdiffuser_game_jp PRIVATE -w -Werror=return-type -fcommon
-            -fno-strict-aliasing -fwrapv
+            -fno-strict-aliasing -fwrapv -ffp-contract=off
             -Wno-error=int-conversion
             -Wno-error=incompatible-pointer-types
             -Wno-error=implicit-function-declaration)
@@ -873,6 +877,7 @@ if(GDX_BUILD_JP)
         gdx_audio_lle.c
         gdx_audio_thread.cpp
         gdx_audio_capture.c
+        gdx_stall_watchdog.c
         gdx_frame_pacer.c
         gdx_footprint.c
         gdx_thread_affinity.c
