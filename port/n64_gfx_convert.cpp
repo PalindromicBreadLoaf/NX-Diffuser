@@ -53,15 +53,19 @@ W1Kind ClassifyW1(uint8_t op, bool isF3d) {
     }
 }
 
-std::vector<WideGfx> ConvertList(const void* src, size_t max_commands, bool is_big,
-                                 bool is_f3d, const ConvertContext& ctx) {
-    std::vector<WideGfx> out;
+void ConvertListInto(std::vector<WideGfx>& out, const void* src, size_t max_commands, bool is_big,
+                     bool is_f3d, const ConvertContext& ctx, size_t* out_source_commands) {
+    out.clear();
+    if (out_source_commands != nullptr) {
+        *out_source_commands = 0;
+    }
     if (src == nullptr) {
-        return out;
+        return;
     }
     const size_t walk_limit = std::min(max_commands, kMaxConvertedCommands);
     out.reserve(std::min(walk_limit + 1, kReserveCommands));
 
+    size_t consumed = 0;
     const auto* bytes = static_cast<const uint8_t*>(src);
     for (size_t i = 0; i < walk_limit; ++i) {
         const uint8_t* p = bytes + (i * 8);
@@ -95,6 +99,7 @@ std::vector<WideGfx> ConvertList(const void* src, size_t max_commands, bool is_b
         }
 
         out.push_back(wg);
+        ++consumed;
         if (IsEndDl(op)) {
             break;
         }
@@ -110,7 +115,34 @@ std::vector<WideGfx> ConvertList(const void* src, size_t max_commands, bool is_b
         out.push_back(end);
     }
 
+    if (out_source_commands != nullptr) {
+        *out_source_commands = consumed;
+    }
+}
+
+std::vector<WideGfx> ConvertList(const void* src, size_t max_commands, bool is_big,
+                                 bool is_f3d, const ConvertContext& ctx,
+                                 size_t* out_source_commands) {
+    std::vector<WideGfx> out;
+    ConvertListInto(out, src, max_commands, is_big, is_f3d, ctx, out_source_commands);
     return out;
+}
+
+bool GfxWideCache::SourceMutated(const void* src, const Entry& entry) const {
+    if (mCtx.range_changed == nullptr || entry.srcBytes == 0) {
+        return false;
+    }
+    return mCtx.range_changed(mCtx.user, src, entry.srcBytes, entry.writeGen);
+}
+
+void GfxWideCache::Build(const void* src, size_t max_commands, bool is_big, bool is_f3d,
+                         uint64_t stamp, Entry& entry) {
+    entry.writeGen = (mCtx.write_generation != nullptr) ? mCtx.write_generation(mCtx.user) : 0;
+    size_t sourceCommands = 0;
+    ConvertListInto(entry.cmds, src, max_commands, is_big, is_f3d, mCtx, &sourceCommands);
+    entry.srcBytes = sourceCommands * 8;
+    entry.stamp = stamp;
+    entry.lastUseFrame = mCurrentFrame;
 }
 
 const std::vector<WideGfx>& GfxWideCache::GetOrBuild(const void* src, size_t max_commands,
@@ -118,21 +150,18 @@ const std::vector<WideGfx>& GfxWideCache::GetOrBuild(const void* src, size_t max
     auto it = mCache.find(src);
     if (it != mCache.end()) {
         it->second.lastUseFrame = mCurrentFrame;
-        if (it->second.stamp == stamp) {
+        if (it->second.stamp == stamp && !SourceMutated(src, it->second)) {
             return it->second.cmds;
         }
         // Rebuild IN PLACE so the entry's address stays stable for callers holding it.
-        it->second.cmds = ConvertList(src, max_commands, is_big, is_f3d, mCtx);
-        it->second.stamp = stamp;
+        Build(src, max_commands, is_big, is_f3d, stamp, it->second);
         return it->second.cmds;
     }
 
-    Entry entry;
-    entry.cmds = ConvertList(src, max_commands, is_big, is_f3d, mCtx);
-    entry.stamp = stamp;
-    entry.lastUseFrame = mCurrentFrame;
-    auto inserted = mCache.emplace(src, std::move(entry));
-    return inserted.first->second.cmds;
+    auto inserted = mCache.emplace(src, Entry{});
+    Entry& entry = inserted.first->second;
+    Build(src, max_commands, is_big, is_f3d, stamp, entry);
+    return entry.cmds;
 }
 
 void GfxWideCache::Invalidate(const void* src) {

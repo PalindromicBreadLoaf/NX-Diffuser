@@ -41,6 +41,11 @@ struct ConvertContext {
     // Return false to leave the 32-bit token in place (high32 == 0) so the draw-time path still
     // handles it unchanged. Only invoked for pointer-carrying opcodes, never for value words.
     bool (*resolve_physical)(void* user, uint32_t raw, size_t required_bytes, uintptr_t* out_host) = nullptr;
+
+    // Mutable-source tracking.
+    uint64_t (*write_generation)(void* user) = nullptr;
+    bool (*range_changed)(void* user, const void* src, size_t bytes, uint64_t since) = nullptr;
+
     void* user = nullptr;
 };
 
@@ -65,7 +70,14 @@ constexpr size_t kMaxConvertedCommands = 1u << 16;
 // Walks up to `max_commands` (capped at kMaxConvertedCommands) 8-byte packets from `src`,
 // byteswapping when `is_big`.
 std::vector<WideGfx> ConvertList(const void* src, size_t max_commands, bool is_big,
-                                 bool is_f3d, const ConvertContext& ctx);
+                                 bool is_f3d, const ConvertContext& ctx,
+                                 size_t* out_source_commands = nullptr);
+
+// In-place variant: refills `out` using its existing capacity instead of returning a fresh vector,
+// so a cache rebuild allocates nothing once the entry has been sized.
+void ConvertListInto(std::vector<WideGfx>& out, const void* src, size_t max_commands, bool is_big,
+                     bool is_f3d, const ConvertContext& ctx,
+                     size_t* out_source_commands = nullptr);
 
 // Cross-frame cache keyed by narrow source address, with a caller-driven invalidation stamp.
 // Reference stability of std::unordered_map mapped values is what guarantees the returned buffer
@@ -75,7 +87,8 @@ class GfxWideCache {
     void SetContext(const ConvertContext& ctx) { mCtx = ctx; }
     const ConvertContext& Context() const { return mCtx; }
 
-    // Rebuilds when no entry exists or the stored stamp differs from `stamp`.
+    // Rebuilds when no entry exists, the stored stamp differs from `stamp`, or the context reports
+    // that the source bytes this entry was built from have been written since.
     const std::vector<WideGfx>& GetOrBuild(const void* src, size_t max_commands, bool is_big,
                                            bool is_f3d, uint64_t stamp);
 
@@ -99,7 +112,13 @@ class GfxWideCache {
         std::vector<WideGfx> cmds;
         uint64_t stamp = 0;
         uint64_t lastUseFrame = 0;
+        size_t srcBytes = 0;
+        uint64_t writeGen = 0;
     };
+
+    bool SourceMutated(const void* src, const Entry& entry) const;
+    void Build(const void* src, size_t max_commands, bool is_big, bool is_f3d, uint64_t stamp,
+               Entry& entry);
     static constexpr size_t kEvictHighWatermark = 512;
     static constexpr uint64_t kStaleFrameLimit = 600;
 

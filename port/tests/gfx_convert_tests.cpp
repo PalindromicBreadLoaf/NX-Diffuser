@@ -278,6 +278,124 @@ static void TestCache() {
     check_sz("Clear empties cache", cache.CachedCount(), 0);
 }
 
+// A stand-in for the bridge's gDmaGeneration / gDmaDirtyRanges pair.
+namespace mockwrites {
+
+struct Write {
+    const uint8_t* begin;
+    const uint8_t* end;
+    uint64_t generation;
+};
+
+static uint64_t g_generation = 0;
+static std::vector<Write> g_writes;
+// GetOrBuild calls write_generation exactly once per BUILD, so this counts rebuilds.
+static int g_builds = 0;
+
+static void Reset() {
+    g_generation = 0;
+    g_writes.clear();
+    g_builds = 0;
+}
+
+static void RecordWrite(const uint8_t* begin, size_t bytes) {
+    ++g_generation;
+    g_writes.push_back({ begin, begin + bytes, g_generation });
+}
+
+static uint64_t WriteGeneration(void* /*user*/) {
+    ++g_builds;
+    return g_generation;
+}
+
+static bool RangeChanged(void* /*user*/, const void* src, size_t bytes, uint64_t since) {
+    const auto* begin = static_cast<const uint8_t*>(src);
+    const uint8_t* end = begin + bytes;
+    for (const Write& w : g_writes) {
+        if (w.generation > since && begin < w.end && end > w.begin) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace mockwrites
+
+// An unrelated write must NOT evict a cached list.
+// Keyed on a global write counter every check below flips.
+static void TestCacheMutationTracking() {
+    std::vector<uint8_t> listA;
+    PushLE(listA, MakeW0(OP_VTX_EX2, 0x001020), 0x06001000u);
+    PushLE(listA, MakeW0(OP_ENDDL, 0), 0);
+
+    std::vector<uint8_t> elsewhere(64, 0);
+
+    mockwrites::Reset();
+    ConvertContext ctx;
+    ctx.resolve_physical = &MockResolvePhysical;
+    ctx.write_generation = &mockwrites::WriteGeneration;
+    ctx.range_changed = &mockwrites::RangeChanged;
+    GfxWideCache cache;
+    cache.SetContext(ctx);
+
+    const std::vector<WideGfx>& first = cache.GetOrBuild(listA.data(), 2, false, false, /*stamp=*/1);
+    check_u32("mutation: first build content", first[0].w0, MakeW0(OP_VTX_EX2, 0x001020));
+    check_sz("mutation: one build so far", (size_t)mockwrites::g_builds, 1);
+
+    mockwrites::RecordWrite(elsewhere.data(), elsewhere.size());
+    cache.GetOrBuild(listA.data(), 2, false, false, /*stamp=*/1);
+    check_sz("unrelated write -> no rebuild", (size_t)mockwrites::g_builds, 1);
+
+    std::vector<uint8_t> replacement;
+    PushLE(replacement, MakeW0(OP_SETPRIMCOLOR, 0x00ABCD), 0u);
+    PushLE(replacement, MakeW0(OP_ENDDL, 0), 0);
+    std::memcpy(listA.data(), replacement.data(), listA.size());
+    mockwrites::RecordWrite(listA.data(), listA.size());
+    const std::vector<WideGfx>& afterOverlap =
+        cache.GetOrBuild(listA.data(), 2, false, false, /*stamp=*/1);
+    check_u32("overlapping write - rebuilt content", afterOverlap[0].w0,
+              MakeW0(OP_SETPRIMCOLOR, 0x00ABCD));
+    check_sz("overlapping write - did rebuild", (size_t)mockwrites::g_builds, 2);
+    check_sz("overlapping write - still one entry", cache.CachedCount(), 1);
+
+    // Watched extent is what the walk CONSUMED, not the max_commands bound.
+    std::vector<uint8_t> padded;
+    PushLE(padded, MakeW0(OP_VTX_EX2, 0x002040), 0x06002000u);
+    PushLE(padded, MakeW0(OP_ENDDL, 0), 0);
+    padded.resize(padded.size() + 64, 0);  // tail the walk never reads
+
+    const std::vector<WideGfx>& pfirst =
+        cache.GetOrBuild(padded.data(), padded.size() / 8, false, false, /*stamp=*/1);
+    check_sz("bounded list converts to 2 commands", pfirst.size(), 2);
+    check_sz("bounded list built once", (size_t)mockwrites::g_builds, 3);
+
+    mockwrites::RecordWrite(padded.data() + 16, 64);  // strictly past the terminator
+    cache.GetOrBuild(padded.data(), padded.size() / 8, false, false, /*stamp=*/1);
+    check_sz("write past ENDDL - no rebuild", (size_t)mockwrites::g_builds, 3);
+
+    const uint64_t genBefore = mockwrites::g_generation;
+    cache.GetOrBuild(padded.data(), padded.size() / 8, false, false, /*stamp=*/2);
+    check_sz("stamp change alone rebuilds", (size_t)mockwrites::g_builds, 4);
+    check_bool("stamp rebuild recorded no write", mockwrites::g_generation == genBefore, true);
+    check_sz("stamp rebuild adds no entry", cache.CachedCount(), 2);
+}
+
+static void TestCacheNoMutationContext() {
+    std::vector<uint8_t> src;
+    PushLE(src, MakeW0(OP_VTX_EX2, 0x001020), 0x06001000u);
+    PushLE(src, MakeW0(OP_ENDDL, 0), 0);
+
+    ConvertContext ctx;  // no resolver, no write tracking
+    GfxWideCache cache;
+    cache.SetContext(ctx);
+
+    const std::vector<WideGfx>& first = cache.GetOrBuild(src.data(), 2, false, false, /*stamp=*/1);
+    const WideGfx* firstData = first.data();
+    const std::vector<WideGfx>& second = cache.GetOrBuild(src.data(), 2, false, false, /*stamp=*/1);
+    check_bool("no write tracking -> same stamp hits", second.data() == firstData, true);
+    check_sz("no write tracking -> one entry", cache.CachedCount(), 1);
+}
+
 int main() {
     gdx_test_console_out("gdx_gfx_convert_tests.log");
     printf("== Phase G2 binary-DL converter tests ==\n");
@@ -289,6 +407,8 @@ int main() {
     TestTermination();
     TestBoundIsNotLength();
     TestCache();
+    TestCacheMutationTracking();
+    TestCacheNoMutationContext();
 
     if (g_failures == 0) {
         printf("\nALL PASS\n");

@@ -1379,6 +1379,23 @@ bool G2ResolvePhysical(void* /*user*/, uint32_t raw, size_t required_bytes, uint
     return ResolveRdramLow32(raw, required_bytes, out_host);
 }
 
+uint64_t G2WriteGeneration(void* /*user*/) { return gDmaGeneration; }
+
+bool G2RangeChanged(void* /*user*/, const void* src, size_t bytes, uint64_t since) {
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(src);
+    // Asset/ROM-backed lists are decoded once into gLoadedAssetSegments, which never evicts, so
+    // the bytes at a given address never change; a reload lands at a fresh address, and a rebind
+    // bumps gConvertEpoch, which the stamp already covers.
+    if (!IsRdramHostPointer(addr)) {
+        return false;
+    }
+    // Same range tracking the raw-texture copies use (see PersistentRawTextureCopy). It carries
+    // the same contract: a write into the arena that is never handed to gdx_record_dma_load or
+    // RecordHostWrite is invisible here. That contract predates this call site -- see the
+    // GDX_RecordAssetWrite comment in decomp/src/game/object.c, which exists to honour it.
+    return HostRangeChanged(addr, bytes, since);
+}
+
 void EnsureG2ConvertInit() {
     if (gG2ConvertInit) {
         return;
@@ -1399,19 +1416,14 @@ void EnsureG2ConvertInit() {
     }
     gdx::ConvertContext ctx;
     ctx.resolve_physical = &G2ResolvePhysical;
+    ctx.write_generation = &G2WriteGeneration;
+    ctx.range_changed = &G2RangeChanged;
     ctx.user = nullptr;
     gWideCache.SetContext(ctx);
 }
 
-uint64_t G2StampFor(const N64Gfx* src) {
-    // Two disjoint stamp namespaces so a DMA generation never collides with an asset epoch.
-    // RDRAM-backed lists are mutable (course loads overwrite the arena), so key them on the DMA
-    // generation; asset/ROM lists are immutable once decoded (a reload lands at a fresh heap
-    // address = new key), so key them on the asset epoch with the high bit set.
-    if (IsRdramHostPointer(reinterpret_cast<uintptr_t>(src))) {
-        return gDmaGeneration;
-    }
-    return 0x8000000000000000ull | static_cast<uint64_t>(gConvertEpoch);
+uint64_t G2StampFor(const N64Gfx* /*src*/) {
+    return gConvertEpoch;
 }
 
 bool ResolveGeneratedAssetStub(uint32_t raw, ResolvedAddress& out, size_t requiredBytes = 1) {
