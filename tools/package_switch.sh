@@ -21,7 +21,12 @@ if [ ! -f "$binary_dir/G-Diffuser.nro" ]; then
     exit 1
 fi
 
-stage="$out_dir/G-Diffuser-v$version-switch"
+case "$version" in
+    *-switch) release_name="G-Diffuser-v$version" ;;
+    *)        release_name="G-Diffuser-v$version-switch" ;;
+esac
+
+stage="$out_dir/$release_name"
 rm -rf "$stage"
 mkdir -p "$stage"
 
@@ -49,7 +54,7 @@ done
 
 python3 "$repo_root/tools/check_switch_package.py" --version "$version" "$stage"
 
-archive="$out_dir/G-Diffuser-v$version-switch.zip"
+archive="$out_dir/$release_name.zip"
 rm -f "$archive"
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-0}" python3 - "$stage" "$archive" <<'PY'
 import os, sys, time, zipfile

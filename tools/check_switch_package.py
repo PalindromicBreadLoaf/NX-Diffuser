@@ -157,11 +157,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("stage", help="the staged payload directory")
-    parser.add_argument("--version", required=True, help="release version, X.Y.Z, without the v")
+    parser.add_argument("--version", required=True,
+                        help="release version, X.Y.Z or X.Y.Z-suffix, without the v")
     args = parser.parse_args()
 
-    if not re.fullmatch(r"\d+\.\d+\.\d+", args.version):
-        print(f"error: --version must be X.Y.Z, got {args.version!r}", file=sys.stderr)
+    if not re.fullmatch(r"\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?", args.version):
+        print(f"error: --version must be X.Y.Z or X.Y.Z-suffix, got {args.version!r}", file=sys.stderr)
+        return 2
+    if len(args.version) > 15:
+        print(f"error: --version is {len(args.version)} characters. Cannot be longer than 15.",
+              file=sys.stderr)
         return 2
     if not os.path.isdir(args.stage):
         print(f"error: {args.stage} is not a directory", file=sys.stderr)
