@@ -314,7 +314,6 @@ add_executable(G-Diffuser
     gdx_audio_capture.c
     gdx_frame_pacer.c          # default OFF: LUS's Fast3D backend already paces EndFrame() to 60fps
     gdx_footprint.c
-    gdx_stall_watchdog.c
     gdx_thread_affinity.c
     shims.c
     AssetLoader.cpp
@@ -877,7 +876,6 @@ if(GDX_BUILD_JP)
         gdx_audio_lle.c
         gdx_audio_thread.cpp
         gdx_audio_capture.c
-        gdx_stall_watchdog.c
         gdx_frame_pacer.c
         gdx_footprint.c
         gdx_thread_affinity.c
