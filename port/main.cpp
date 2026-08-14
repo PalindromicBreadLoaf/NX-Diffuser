@@ -40,6 +40,7 @@
 #include "n64_gfx_bridge.h"
 #include "gdx_host_path.h"
 #include "gdx_footprint.h"
+#include "gdx_replace_file.h"
 #include "gdx_thread_affinity.h"
 #ifdef __SWITCH__
 #include "ship/port/switch/SwitchImpl.h"
@@ -1501,5 +1502,7 @@ int main(int argc, char** argv) {
     // the file and folds the SHA, so it must not race a still-running audio thread calling feed().
     gdx_audio_thread_stop();
     gdx_pcm_capture_shutdown();
+    // Catchall for everything written through a path that does not commit itself.
+    gdx_storage_commit();
     return 0;
 }

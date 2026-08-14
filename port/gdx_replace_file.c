@@ -1,5 +1,9 @@
 #include "gdx_replace_file.h"
 
+#if defined(__SWITCH__)
+#include <switch.h>
+#endif
+
 #ifndef _WIN32
 
 #include <errno.h>
@@ -22,3 +26,9 @@ int gdx_replace_file(const char* srcPath, const char* dstPath) {
 }
 
 #endif /* !_WIN32 */
+
+void gdx_storage_commit(void) {
+#if defined(__SWITCH__)
+    fsdevCommitDevice("sdmc");
+#endif
+}

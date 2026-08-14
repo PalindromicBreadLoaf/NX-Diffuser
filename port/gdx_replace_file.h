@@ -7,6 +7,8 @@ extern "C" {
 /* Moves srcPath onto dstPath, replacing dstPath when it already exists. */
 int gdx_replace_file(const char* srcPath, const char* dstPath);
 
+void gdx_storage_commit(void);
+
 #ifdef __cplusplus
 }
 #endif

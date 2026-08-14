@@ -512,6 +512,7 @@ void gdx_disk_save_flush(void) {
         return;
     }
 #endif
+    gdx_storage_commit();
     g_lastFlushOk = true;
     g_sidecarPresent = true;
     gdx_port_logf("[disk-save] flushed %zu record(s) to %s\n", g_ranges.size(), g_gddPath.c_str());

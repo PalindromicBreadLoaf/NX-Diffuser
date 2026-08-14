@@ -318,6 +318,7 @@ static void gdx_sram_flush(void) {
         return;
     }
 #endif
+    gdx_storage_commit();
 }
 
 void gdx_sram_read(unsigned int offset, void* dst, unsigned int size) {

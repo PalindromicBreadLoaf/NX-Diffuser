@@ -420,6 +420,7 @@ static int gdx_ghost_write_container(const char* path, GdxGhostSave* save) {
         return GDX_GHOST_ERR_IO;
     }
 #endif
+    gdx_storage_commit();
     return GDX_GHOST_OK;
 }
 
@@ -660,6 +661,7 @@ static int gdx_ghost_selection_write(const GdxGhostSelection* selections, int co
         return GDX_GHOST_ERR_IO;
     }
 #endif
+    gdx_storage_commit();
     return GDX_GHOST_OK;
 }
 
