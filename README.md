@@ -110,5 +110,5 @@ This project is an unofficial compatibility project and is not affiliated with, 
 sponsored by, or associated with Nintendo. F-Zero and Nintendo are trademarks of Nintendo.
 G-Diffuser distributions contain no Nintendo IP.
 
-If you wish to support development of NX-Diffuser, you can
+If you wish to support me, you can
   [donate to PalindromicBreadLoaf on Ko-fi](https://ko-fi.com/palindromicbreadloaf)
