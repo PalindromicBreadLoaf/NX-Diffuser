@@ -44,7 +44,7 @@
 #include "libultraship/bridge/consolevariablebridge.h" // CVarGet/Set/Register*
 #include "libultraship/bridge/audiobridge.h"           // AudioPlayerBuffered (Audio tab status line)
 
-#include "port_log.h"      // gdx_port_logf (the GDX_DIAG_IMGUI probe below)
+#include "port_log.h"      // gdx_port_logf
 #include "gdx_dev_gates.h" // gdx_dev_gate / GDX_GATE_DIAG_IMGUI
 
 #include <cstring> // strcmp (Audio tab: SDL driver-name check)
@@ -253,8 +253,6 @@ void GdxPopModernStyle() {
     ImGui::PopStyleVar(8);
 }
 
-// GDX_DIAG_IMGUI throttle: true at most once a second, and only while the gate is on. Every probe
-// below shares this clock so one second's lines belong to one frame and can be read together.
 bool GdxMenuDiagTick() {
     if (!gdx_dev_gate(GDX_GATE_DIAG_IMGUI)) {
         return false;
@@ -268,13 +266,9 @@ bool GdxMenuDiagTick() {
     return true;
 }
 
-// Set for the whole of one frame by DrawElement, so the per-widget probes fire together with the
-// frame summary rather than each on its own clock.
 bool gGdxMenuDiagFrame = false;
 
-// What a colour actually resolves to at the point of drawing, after style.Alpha and every pushed
-// override. A highlight that is "not visible" is either not drawn, drawn somewhere unexpected, or
-// drawn in a colour that is not what the source says — this reports all three.
+// What a colour actually resolves to at the point of drawing, after style.
 void GdxDiagRect(const char* what, const ImVec2& min, const ImVec2& max, ImU32 color) {
     const ImGuiWindow* w = ImGui::GetCurrentWindowRead();
     const ImVec4 clip = (w != nullptr) ? ImVec4(w->ClipRect.Min.x, w->ClipRect.Min.y, w->ClipRect.Max.x,
@@ -712,13 +706,13 @@ void GdxMenu::DrawElement() {
 
     const bool navActive = CVarGetInteger("gControlNav", 0) != 0;
 
-    // GDX_DIAG_IMGUI. Latched for the whole frame so the per-widget probes below share this tick.
+    // GDX_DIAG_IMGUI
     gGdxMenuDiagFrame = GdxMenuDiagTick();
     if (gGdxMenuDiagFrame) {
         const ImGuiIO& io = ImGui::GetIO();
         const ImGuiStyle& style = ImGui::GetStyle();
         const ImVec4 btn = style.Colors[ImGuiCol_Button];
-        gdx_port_logf("[imguidiag] --- frame: nav=%d section='%s' sidebar='%s' display=%.0fx%.0f "
+        gdx_port_logf("[imguidiag] frame: nav=%d section='%s' sidebar='%s' display=%.0fx%.0f "
                       "fbscale=%.2fx%.2f alpha=%.2f Col_Button=(%.3f,%.3f,%.3f,%.3f)\n",
                       navActive ? 1 : 0, mActiveSection.c_str(), ActiveSidebar().c_str(), io.DisplaySize.x,
                       io.DisplaySize.y, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y,
@@ -880,11 +874,6 @@ void GdxMenu::DrawHeader() {
     const float controlsWidth = ImGui::GetFrameHeight() * 3.0f + headerStyle.ItemSpacing.x * 2.0f;
     const float searchWidth = ImGui::GetContentRegionAvail().x >= 900.0f ? 210.0f : 140.0f;
 
-    // A HorizontalScrollbar child takes its scrollbar out of its own height, so a strip sized to
-    // exactly one frame gets its buttons clipped the moment the tabs overflow — the selection fill
-    // and outline are the first thing to go, since they are drawn at the button's full extent.
-    // Measure the strip the same way the loop below lays it out and pay for the scrollbar when it
-    // is going to appear.
     float stripWidth = 0.0f;
     for (int i = 0; i < tabCount; ++i) {
         stripWidth += ImGui::CalcTextSize(mMenuOrder[i].c_str()).x + 20.0f + headerStyle.ItemSpacing.x;
@@ -931,9 +920,6 @@ void GdxMenu::DrawHeader() {
                     mSearch[0] = '\0';
                     SelectSection(mMenuOrder[i]);
                 }
-                // Cycling tabs with L1/R1 can land on one that is scrolled out of the strip, which
-                // reads as the selection vanishing. Only when it is actually clipped, so this
-                // corrects itself and then leaves a hand-scrolled strip alone.
                 if (isActiveTab && headerScrolls && !ImGui::IsItemVisible()) {
                     ImGui::SetScrollHereX(0.5f);
                 }
