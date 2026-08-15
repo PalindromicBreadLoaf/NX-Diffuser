@@ -109,6 +109,3 @@ for the component and asset boundary.
 This project is an unofficial compatibility project and is not affiliated with, endorsed by,
 sponsored by, or associated with Nintendo. F-Zero and Nintendo are trademarks of Nintendo.
 G-Diffuser distributions contain no Nintendo IP.
-
-If you wish to support me, you can
-  [donate to PalindromicBreadLoaf on Ko-fi](https://ko-fi.com/palindromicbreadloaf)
