@@ -44,6 +44,9 @@
 #include "libultraship/bridge/consolevariablebridge.h" // CVarGet/Set/Register*
 #include "libultraship/bridge/audiobridge.h"           // AudioPlayerBuffered (Audio tab status line)
 
+#include "port_log.h"      // gdx_port_logf (the GDX_DIAG_IMGUI probe below)
+#include "gdx_dev_gates.h" // gdx_dev_gate / GDX_GATE_DIAG_IMGUI
+
 #include <cstring> // strcmp (Audio tab: SDL driver-name check)
 
 // Declared here rather than pulling in <SDL2/SDL.h>: this TU builds inside libultraship's include
@@ -250,13 +253,56 @@ void GdxPopModernStyle() {
     ImGui::PopStyleVar(8);
 }
 
+// GDX_DIAG_IMGUI throttle: true at most once a second, and only while the gate is on. Every probe
+// below shares this clock so one second's lines belong to one frame and can be read together.
+bool GdxMenuDiagTick() {
+    if (!gdx_dev_gate(GDX_GATE_DIAG_IMGUI)) {
+        return false;
+    }
+    static double sNext = 0.0;
+    const double now = ImGui::GetTime();
+    if (now < sNext) {
+        return false;
+    }
+    sNext = now + 1.0;
+    return true;
+}
+
+// Set for the whole of one frame by DrawElement, so the per-widget probes fire together with the
+// frame summary rather than each on its own clock.
+bool gGdxMenuDiagFrame = false;
+
+// What a colour actually resolves to at the point of drawing, after style.Alpha and every pushed
+// override. A highlight that is "not visible" is either not drawn, drawn somewhere unexpected, or
+// drawn in a colour that is not what the source says — this reports all three.
+void GdxDiagRect(const char* what, const ImVec2& min, const ImVec2& max, ImU32 color) {
+    const ImGuiWindow* w = ImGui::GetCurrentWindowRead();
+    const ImVec4 clip = (w != nullptr) ? ImVec4(w->ClipRect.Min.x, w->ClipRect.Min.y, w->ClipRect.Max.x,
+                                                w->ClipRect.Max.y)
+                                       : ImVec4(0, 0, 0, 0);
+    gdx_port_logf("[imguidiag] %s rect=(%.1f,%.1f)-(%.1f,%.1f) size=%.1fx%.1f rgba=0x%08X "
+                  "clip=(%.1f,%.1f)-(%.1f,%.1f) win=%s vtx=%d\n",
+                  what, min.x, min.y, max.x, max.y, max.x - min.x, max.y - min.y,
+                  static_cast<unsigned>(color), clip.x, clip.y, clip.z, clip.w,
+                  (w != nullptr && w->Name != nullptr) ? w->Name : "?",
+                  (w != nullptr) ? w->DrawList->VtxBuffer.Size : -1);
+}
+
 bool GdxNavigationButton(const char* label, bool selected, const ImVec2& size) {
     if (!selected) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
     }
+    const int vtxBefore = ImGui::GetWindowDrawList()->VtxBuffer.Size;
+    const ImU32 fill = ImGui::GetColorU32(ImGuiCol_Button);
     const bool pressed = ImGui::Button(label, size);
     if (!selected) {
         ImGui::PopStyleColor();
+    }
+    if (selected && gGdxMenuDiagFrame) {
+        gdx_port_logf("[imguidiag] button '%s' selected fill=0x%08X vtx+%d alpha=%.2f\n", label,
+                      static_cast<unsigned>(fill),
+                      ImGui::GetWindowDrawList()->VtxBuffer.Size - vtxBefore, ImGui::GetStyle().Alpha);
+        GdxDiagRect("  section-fill", ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), fill);
     }
     return pressed;
 }
@@ -666,6 +712,19 @@ void GdxMenu::DrawElement() {
 
     const bool navActive = CVarGetInteger("gControlNav", 0) != 0;
 
+    // GDX_DIAG_IMGUI. Latched for the whole frame so the per-widget probes below share this tick.
+    gGdxMenuDiagFrame = GdxMenuDiagTick();
+    if (gGdxMenuDiagFrame) {
+        const ImGuiIO& io = ImGui::GetIO();
+        const ImGuiStyle& style = ImGui::GetStyle();
+        const ImVec4 btn = style.Colors[ImGuiCol_Button];
+        gdx_port_logf("[imguidiag] --- frame: nav=%d section='%s' sidebar='%s' display=%.0fx%.0f "
+                      "fbscale=%.2fx%.2f alpha=%.2f Col_Button=(%.3f,%.3f,%.3f,%.3f)\n",
+                      navActive ? 1 : 0, mActiveSection.c_str(), ActiveSidebar().c_str(), io.DisplaySize.x,
+                      io.DisplaySize.y, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y,
+                      style.Alpha, btn.x, btn.y, btn.z, btn.w);
+    }
+
     // On each open, seed nav focus onto the active sidebar page (consumed in DrawSidebar). Only when
     // gamepad nav is on, so mouse/keyboard users are not force-focused away from the search box.
     if (!mMenuWasVisible) {
@@ -817,9 +876,31 @@ void GdxMenu::DrawHeader() {
         }
     }
 
-    const float height = ImGui::GetFrameHeight() + 4.0f;
-    const float controlsWidth = ImGui::GetFrameHeight() * 3.0f + ImGui::GetStyle().ItemSpacing.x * 2.0f;
+    const ImGuiStyle& headerStyle = ImGui::GetStyle();
+    const float controlsWidth = ImGui::GetFrameHeight() * 3.0f + headerStyle.ItemSpacing.x * 2.0f;
     const float searchWidth = ImGui::GetContentRegionAvail().x >= 900.0f ? 210.0f : 140.0f;
+
+    // A HorizontalScrollbar child takes its scrollbar out of its own height, so a strip sized to
+    // exactly one frame gets its buttons clipped the moment the tabs overflow — the selection fill
+    // and outline are the first thing to go, since they are drawn at the button's full extent.
+    // Measure the strip the same way the loop below lays it out and pay for the scrollbar when it
+    // is going to appear.
+    float stripWidth = 0.0f;
+    for (int i = 0; i < tabCount; ++i) {
+        stripWidth += ImGui::CalcTextSize(mMenuOrder[i].c_str()).x + 20.0f + headerStyle.ItemSpacing.x;
+    }
+    if (navActive) {
+        stripWidth += ImGui::CalcTextSize(ICON_FA_CHEVRON_LEFT " LB").x +
+                      ImGui::CalcTextSize("RB " ICON_FA_CHEVRON_RIGHT).x + headerStyle.ItemSpacing.x * 2.0f;
+    }
+    const float navColumnWidth =
+        ImGui::GetContentRegionAvail().x - searchWidth - controlsWidth - headerStyle.ItemSpacing.x * 2.0f;
+    const bool headerScrolls = stripWidth > navColumnWidth;
+
+    float height = ImGui::GetFrameHeight() + 4.0f;
+    if (headerScrolls) {
+        height += headerStyle.ScrollbarSize;
+    }
 
     if (ImGui::BeginTable("##ModernHeader", 3, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoPadOuterX)) {
         ImGui::TableSetupColumn("Navigation", ImGuiTableColumnFlags_WidthStretch);
@@ -845,9 +926,16 @@ void GdxMenu::DrawHeader() {
                 }
                 const char* label = mMenuOrder[i].c_str();
                 const ImVec2 buttonSize(ImGui::CalcTextSize(label).x + 20.0f, ImGui::GetFrameHeight());
-                if (GdxNavigationButton(label, mActiveSection == mMenuOrder[i], buttonSize)) {
+                const bool isActiveTab = mActiveSection == mMenuOrder[i];
+                if (GdxNavigationButton(label, isActiveTab, buttonSize)) {
                     mSearch[0] = '\0';
                     SelectSection(mMenuOrder[i]);
+                }
+                // Cycling tabs with L1/R1 can land on one that is scrolled out of the strip, which
+                // reads as the selection vanishing. Only when it is actually clipped, so this
+                // corrects itself and then leaves a hand-scrolled strip alone.
+                if (isActiveTab && headerScrolls && !ImGui::IsItemVisible()) {
+                    ImGui::SetScrollHereX(0.5f);
                 }
             }
             if (navActive) {
@@ -896,14 +984,16 @@ void GdxMenu::DrawSidebar() {
     // on the active page. SetKeyboardFocusHere() targets the NEXT submitted item and is the
     // reliable idiom under NavEnableGamepad; SetItemDefaultFocus() covers the child's very first
     // appearance.
-    const bool wantFocus = mFocusSidebar && CVarGetInteger("gControlNav", 0) != 0;
+    const bool navActive = CVarGetInteger("gControlNav", 0) != 0;
+    const bool wantFocus = mFocusSidebar && navActive;
 
     auto sidebarButton = [&](const std::string& sidebar) {
         const bool isActive = mSearch[0] == '\0' && ActiveSidebar() == sidebar;
         if (wantFocus && isActive) {
             ImGui::SetKeyboardFocusHere();
         }
-        if (GdxNavigationButton(sidebar.c_str(), isActive, ImVec2(ImGui::GetContentRegionAvail().x, 0.0f))) {
+        if (GdxNavigationButton(sidebar.c_str(), isActive,
+                                ImVec2(ImGui::GetContentRegionAvail().x, 0.0f))) {
             mSearch[0] = '\0';
             SelectSidebar(sidebar);
         }
